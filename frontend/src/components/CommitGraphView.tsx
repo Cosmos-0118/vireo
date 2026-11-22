@@ -54,6 +54,30 @@ const FULL_ROW_H = 28;
 const FULL_LANE_W = 14;
 const FULL_MAX_LANES = 16;
 import { GitActionModal, type GitModalState } from './GitActionModal';
+import ResizeHandle from './ResizeHandle';
+
+const INSPECTOR_KEY = 'vireo-graph-inspector-v1';
+const INSPECTOR_DEFAULT = { w: 460, h: 320 };
+const INSPECTOR_MIN = { w: 320, h: 170 };
+/** Below this page width the detail panel docks under the list instead of beside it. */
+const SIDE_DOCK_MIN_WIDTH = 880;
+const LIST_MIN_WIDTH = 360;
+
+function loadInspectorSize() {
+  try {
+    const raw = JSON.parse(localStorage.getItem(INSPECTOR_KEY) || 'null');
+    if (raw && Number.isFinite(raw.w) && Number.isFinite(raw.h)) return { w: raw.w, h: raw.h };
+  } catch {
+    // ignore
+  }
+  return INSPECTOR_DEFAULT;
+}
+
+function authorColor(name: string) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) % 360;
+  return `hsl(${h} 45% 42%)`;
+}
 
 interface CommitGraphViewProps {
   gitStatus: GitStatusRes | null;
@@ -98,7 +122,9 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
   } | null>(null);
   const [treeView, setTreeView] = useState(true);
   const [collapsedDirs, setCollapsedDirs] = useState<Record<string, boolean>>({});
-  const [inspectorHeight, setInspectorHeight] = useState(270);
+  const [inspectorSize, setInspectorSize] = useState(loadInspectorSize);
+  const [rootEl, setRootEl] = useState<HTMLDivElement | null>(null);
+  const [rootSize, setRootSize] = useState({ w: 0, h: 0 });
   const [copiedHash, setCopiedHash] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [modal, setModal] = useState<GitModalState>(null);
@@ -175,6 +201,28 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
       cancelled = true;
     };
   }, [selectedHash]);
+
+  useEffect(() => {
+    if (!rootEl) return;
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0].contentRect;
+      setRootSize((prev) =>
+        Math.round(prev.w) === Math.round(r.width) && Math.round(prev.h) === Math.round(r.height)
+          ? prev
+          : { w: r.width, h: r.height }
+      );
+    });
+    ro.observe(rootEl);
+    return () => ro.disconnect();
+  }, [rootEl]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(INSPECTOR_KEY, JSON.stringify(inspectorSize));
+    } catch {
+      // ignore
+    }
+  }, [inspectorSize]);
 
   const uncommittedCount = gitStatus?.files.length ?? 0;
   const filtered = search.trim().length > 0;
@@ -292,22 +340,6 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
     setContextMenu({ x: e.clientX, y: e.clientY, items });
   };
 
-  const startInspectorResize = (e: React.MouseEvent) => {
-    e.preventDefault();
-    let lastY = e.clientY;
-    const onMove = (ev: MouseEvent) => {
-      const dy = ev.clientY - lastY;
-      lastY = ev.clientY;
-      setInspectorHeight((h) => Math.max(170, Math.min(520, h - dy)));
-    };
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
-  };
-
   const activeFiles = compareMode ? compareMode.files : detail?.files || [];
   const fileTree = useMemo(() => buildCompactFileTree(activeFiles), [activeFiles]);
 
@@ -404,6 +436,268 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
       );
     });
 
+  const selectedCommit = selectedHash ? commits.find((c) => c.hash === selectedHash) : undefined;
+  const selectedColor = layout.rows.find((r) => r.commit?.hash === selectedHash)?.circleColor;
+
+  const selectByOffset = (delta: number) => {
+    const list = layout.rows.filter((r) => r.kind !== 'working-tree').map((r) => r.commit!.hash);
+    if (list.length === 0) return;
+    const idx = selectedHash ? list.indexOf(selectedHash) : -1;
+    const from = idx === -1 ? (delta > 0 ? -1 : list.length) : idx;
+    const next = list[Math.max(0, Math.min(list.length - 1, from + delta))];
+    setCompareMode(null);
+    setSelectedHash(next);
+    requestAnimationFrame(() =>
+      document.querySelector(`[data-graph-hash="${next}"]`)?.scrollIntoView({ block: 'nearest' })
+    );
+  };
+
+  const actionBtn =
+    'h-[26px] px-2 text-[11.5px] rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] flex items-center gap-1.5 cursor-pointer';
+
+  const closeInspector = () => {
+    setSelectedHash(null);
+    setCompareMode(null);
+  };
+
+  const renderInspector = () => {
+    const d = detail && detail.hash === selectedHash ? detail : null;
+    const fileTotals = compareMode ? null : d ? { add: d.total_additions, del: d.total_deletions } : null;
+
+    return (
+      <div className="flex flex-col h-full min-h-0 min-w-0">
+        {/* Header */}
+        <div className="flex items-center gap-2 h-9 px-3 border-b border-[var(--border)] shrink-0">
+          {compareMode ? (
+            <>
+              <GitCompare size={14} className="text-[var(--accent)]" />
+              <span className="text-xs font-semibold truncate">
+                {compareMode.commit.short_hash} → Working Tree
+              </span>
+            </>
+          ) : (
+            <>
+              <GitCommitHorizontal size={14} className="text-[var(--accent)]" />
+              <button
+                onClick={() =>
+                  selectedHash && copyText(selectedHash, `SHA (${selectedHash.slice(0, 7)})`, selectedHash)
+                }
+                className="font-mono text-xs font-semibold text-[var(--accent)] hover:underline flex items-center gap-1 cursor-pointer"
+                title="Copy full SHA"
+              >
+                {selectedHash?.slice(0, 7)}
+                {copiedHash === selectedHash ? (
+                  <Check size={11} className="text-[var(--added-fg)]" />
+                ) : (
+                  <Copy size={11} className="opacity-60" />
+                )}
+              </button>
+              {selectedCommit && selectedCommit.refs.length > 0 && (
+                <span className="flex min-w-0 overflow-hidden">
+                  <RefBadges
+                    refs={selectedCommit.refs}
+                    color={selectedColor ?? 'var(--accent)'}
+                    labelled={3}
+                    maxWidth={120}
+                    tooltips={false}
+                  />
+                </span>
+              )}
+            </>
+          )}
+          <button
+            onClick={closeInspector}
+            className="ml-auto p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+            title="Close (Esc)"
+          >
+            <X size={13} />
+          </button>
+        </div>
+
+        {/* One scrolling column: what happened, what you can do, what changed */}
+        <div className="flex-1 min-h-0 overflow-y-auto select-text">
+          {!compareMode && (
+            <div className="px-3.5 pt-3 pb-2.5 space-y-2.5">
+              {!d ? (
+                <div className="space-y-2 py-1">
+                  {[75, 50, 35].map((w, i) => (
+                    <div
+                      key={i}
+                      className="h-3 rounded bg-[var(--bg-hover)] animate-pulse"
+                      style={{ width: `${w}%` }}
+                    />
+                  ))}
+                </div>
+              ) : (
+                <>
+                  <h3 className="text-[14px] font-semibold leading-snug text-[var(--text-primary)] break-words">
+                    {d.subject}
+                  </h3>
+
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11.5px] text-[var(--text-muted)]">
+                    <span
+                      className="w-[18px] h-[18px] rounded-full flex items-center justify-center text-[10px] font-semibold text-white shrink-0"
+                      style={{ background: authorColor(d.author) }}
+                      aria-hidden="true"
+                    >
+                      {d.author.trim().charAt(0).toUpperCase() || '?'}
+                    </span>
+                    <span className="text-[var(--text-primary)] font-medium" title={d.author_email}>
+                      {d.author}
+                    </span>
+                    <span className="text-[var(--text-dim)]">committed</span>
+                    <span title={new Date(d.iso_date).toLocaleString()}>{d.date}</span>
+                    {d.parents.length > 0 && (
+                      <span className="flex items-center gap-1 text-[var(--text-dim)]">
+                        · {d.parents.length > 1 ? 'parents' : 'parent'}
+                        {d.parents.map((pHash) => (
+                          <button
+                            key={pHash}
+                            onClick={() => {
+                              setCompareMode(null);
+                              setSelectedHash(pHash);
+                            }}
+                            className="font-mono text-[11px] text-[var(--accent)] hover:underline cursor-pointer"
+                            title="Go to parent commit"
+                          >
+                            {pHash.slice(0, 7)}
+                          </button>
+                        ))}
+                      </span>
+                    )}
+                  </div>
+
+                  {d.body && (
+                    <div className="text-[12px] leading-relaxed text-[var(--text-muted)] whitespace-pre-wrap break-words border-l-2 border-[var(--border)] pl-2.5 max-h-[220px] overflow-y-auto">
+                      {d.body}
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-1.5 pt-0.5 select-none">
+                    <button
+                      onClick={() => selectedCommit && setModal({ kind: 'cherry-pick', commit: selectedCommit })}
+                      className={actionBtn}
+                      title="Apply this commit onto the current branch"
+                    >
+                      <GitCommitHorizontal size={12} className="text-[var(--accent)]" />
+                      Cherry-Pick
+                    </button>
+                    <button
+                      onClick={() => selectedCommit && setModal({ kind: 'revert', commit: selectedCommit })}
+                      className={actionBtn}
+                      title="Create a commit that undoes this one"
+                    >
+                      <Undo2 size={12} />
+                      Revert
+                    </button>
+                    <button
+                      onClick={() => selectedCommit && setModal({ kind: 'create-branch', commit: selectedCommit })}
+                      className={actionBtn}
+                      title="Create a branch at this commit"
+                    >
+                      <GitBranchPlus size={12} />
+                      Branch
+                    </button>
+                    {remoteHost && (
+                      <button
+                        onClick={async () => {
+                          const url = remoteHost.commitUrl(d.hash);
+                          try {
+                            await api.openExternalUrl(url);
+                          } catch {
+                            window.open(url, '_blank', 'noopener');
+                          }
+                        }}
+                        className={`${actionBtn} text-[var(--accent-hover)]`}
+                        title={`Open on ${remoteHost.label}`}
+                      >
+                        <ExternalLink size={12} />
+                        {remoteHost.label}
+                      </button>
+                    )}
+                    <button
+                      onClick={(e) => selectedCommit && openCommitContextMenu(e, selectedCommit)}
+                      className={`${actionBtn} px-1.5`}
+                      title="More actions (reset, copy patch, tag, merge...)"
+                      aria-label="More commit actions"
+                    >
+                      <MoreHorizontal size={14} />
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+
+          {/* Files */}
+          <div className="sticky top-0 z-[1] flex items-center gap-2 h-8 px-3.5 border-y border-[var(--border)] bg-[var(--bg-sidebar)] text-[11px] select-none">
+            <span className="font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+              {activeFiles.length} changed file{activeFiles.length === 1 ? '' : 's'}
+            </span>
+            {fileTotals && (
+              <span className="font-mono tabular-nums">
+                <span className="text-[var(--added-fg)]">+{fileTotals.add}</span>{' '}
+                <span className="text-[var(--removed-fg)]">−{fileTotals.del}</span>
+              </span>
+            )}
+            <button
+              onClick={() => setTreeView((v) => !v)}
+              className="ml-auto p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+              title={treeView ? 'Switch to flat list' : 'Switch to folder tree'}
+            >
+              {treeView ? <List size={13.5} /> : <FolderTree size={13.5} />}
+            </button>
+          </div>
+          <div className="p-1.5">
+            {!compareMode && !d ? null : activeFiles.length === 0 ? (
+              <div className="p-4 text-xs text-[var(--text-dim)] text-center">No file changes.</div>
+            ) : treeView ? (
+              renderTreeNodes(fileTree, 0)
+            ) : (
+              activeFiles.map((f) => {
+                const name = f.path.split('/').pop() || f.path;
+                const dir = f.path.includes('/') ? f.path.slice(0, f.path.lastIndexOf('/')) : '';
+                return (
+                  <div
+                    key={f.path}
+                    onClick={() => handleOpenFileRow(f)}
+                    title={f.old_path ? `${f.old_path} → ${f.path}` : f.path}
+                    className="flex items-center justify-between gap-2 px-2 py-1 text-xs hover:bg-[var(--bg-hover)] rounded cursor-pointer"
+                  >
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <FileCode size={13} className="text-[var(--text-dim)] shrink-0" />
+                      <span
+                        className={`truncate shrink-0 max-w-[70%] ${f.status === 'D' ? 'line-through opacity-75' : ''}`}
+                        style={{ color: fileStatusColor(f.status) }}
+                      >
+                        {name}
+                      </span>
+                      {dir && <span className="truncate text-[11px] text-[var(--text-dim)]">{dir}</span>}
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0 font-mono text-[11px] tabular-nums">
+                      {f.additions > 0 && <span className="text-[var(--added-fg)]">+{f.additions}</span>}
+                      {f.deletions > 0 && <span className="text-[var(--removed-fg)]">-{f.deletions}</span>}
+                      <span className="w-3.5 text-center font-bold" style={{ color: fileStatusColor(f.status) }}>
+                        {f.status}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const hasInspector = !!(selectedHash || compareMode);
+  const dockSide = rootSize.w >= SIDE_DOCK_MIN_WIDTH;
+  const inspectorMaxW = Math.max(INSPECTOR_MIN.w, rootSize.w - LIST_MIN_WIDTH - 4);
+  const inspectorMaxH = Math.max(INSPECTOR_MIN.h, Math.min(rootSize.h - 150, rootSize.h * 0.6));
+  const inspectorW = Math.max(INSPECTOR_MIN.w, Math.min(inspectorMaxW, inspectorSize.w));
+  const inspectorH = Math.max(INSPECTOR_MIN.h, Math.min(inspectorMaxH, inspectorSize.h));
+
   const graphColWidth = Math.max(
     48,
     graphColumnWidth(layout.maxLanes, FULL_LANE_W, FULL_MAX_LANES) + 4
@@ -424,12 +718,18 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
   });
 
   return (
-    <div className="@container flex-1 flex flex-col min-h-0 bg-[var(--bg-base)] select-none">
+    <div
+      ref={setRootEl}
+      className="@container flex-1 flex flex-col min-h-0 min-w-0 bg-[var(--bg-base)] select-none"
+      onKeyDown={(e) => {
+        if (e.key === 'Escape' && hasInspector) closeInspector();
+      }}
+    >
       {/* Top Toolbar */}
-      <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0 flex-wrap">
-        <div className="flex items-center gap-2 min-w-0">
+      <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
+        <div className="flex items-center gap-2 min-w-0 shrink-0">
           <GitFork size={15} className="text-[var(--accent)] shrink-0" />
-          <span className="text-xs font-semibold tracking-wide text-[var(--text-primary)]">
+          <span className="hidden @lg:inline text-xs font-semibold tracking-wide text-[var(--text-primary)]">
             Git Commit Graph
           </span>
           {gitStatus?.branch && (
@@ -438,20 +738,20 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
               {gitStatus.branch}
             </span>
           )}
-          <span className="shrink-0 text-[11px] text-[var(--text-dim)] tabular-nums">
+          <span className="hidden @2xl:inline shrink-0 text-[11px] text-[var(--text-dim)] tabular-nums">
             {commits.length} commit{commits.length === 1 ? '' : 's'}
           </span>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 min-w-0 flex-1 justify-end">
           {/* Search input */}
-          <div className="relative flex items-center">
+          <div className="relative flex items-center min-w-[110px] flex-1 max-w-[260px]">
             <Search size={12.5} className="absolute left-2.5 text-[var(--text-dim)] pointer-events-none" />
             <input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="Filter commits, authors, SHAs, refs..."
-              className="w-56 pl-7 pr-6 py-1 text-xs rounded-md bg-[var(--bg-input)] border border-[var(--border)] text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none focus:border-[var(--accent)]"
+              placeholder="Filter commits, authors, SHAs..."
+              className="w-full pl-7 pr-6 py-1 text-xs rounded-md bg-[var(--bg-input)] border border-[var(--border)] text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none focus:border-[var(--accent)]"
             />
             {search && (
               <button
@@ -464,7 +764,7 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
           </div>
 
           {/* Scope toggle */}
-          <div className="flex rounded-md border border-[var(--border)] overflow-hidden text-xs">
+          <div className="flex shrink-0 rounded-md border border-[var(--border)] overflow-hidden text-xs">
             <button
               onClick={() => setAllBranches(true)}
               className={`px-2 py-1 cursor-pointer transition-colors ${
@@ -502,7 +802,7 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
             title="Git Fetch (--all --prune)"
           >
             <CloudDownload size={13} />
-            Fetch
+            <span className="hidden @xl:inline">Fetch</span>
           </button>
 
           <button
@@ -515,6 +815,8 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
         </div>
       </div>
 
+      <div className={`flex-1 min-h-0 min-w-0 flex ${dockSide ? 'flex-row' : 'flex-col'}`}>
+      <div className="@container flex-1 min-w-0 min-h-0 flex flex-col">
       {/* Column Headers */}
       <div className="flex items-center h-7 px-3 border-b border-[var(--border)] bg-[var(--bg-sidebar)]/60 text-[10.5px] font-semibold uppercase tracking-wider text-[var(--text-dim)] shrink-0">
         <div style={{ width: graphColWidth }} className="shrink-0">
@@ -528,7 +830,14 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
 
       {/* Commit Rows */}
       <div
-        className="flex-1 overflow-y-auto min-h-0 py-0.5"
+        className="flex-1 overflow-y-auto min-h-0 py-0.5 outline-none"
+        tabIndex={0}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+            e.preventDefault();
+            selectByOffset(e.key === 'ArrowDown' ? 1 : -1);
+          }
+        }}
         onScroll={(e) => {
           const el = e.currentTarget;
           if (hasMore && !loading && el.scrollTop + el.clientHeight > el.scrollHeight - 200) {
@@ -587,6 +896,7 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
           return (
             <div
               key={c.hash}
+              data-graph-hash={c.hash}
               {...hover.rowProps({
                 commit: c,
                 color: row.circleColor,
@@ -693,279 +1003,36 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
         )}
       </div>
 
-      {/* Bottom Commit Inspector Split Pane */}
-      {(selectedHash || compareMode) && (
+      </div>
+
+      {/* Commit detail: beside the list on wide pages, below it on narrow ones */}
+      {hasInspector && (
         <>
-          <div
-            onMouseDown={startInspectorResize}
-            className="h-1 cursor-row-resize bg-[var(--border)] hover:bg-[var(--accent)] shrink-0 transition-colors"
+          <ResizeHandle
+            orientation={dockSide ? 'vertical' : 'horizontal'}
+            direction={-1}
+            label="Resize commit details"
+            value={dockSide ? inspectorW : inspectorH}
+            min={dockSide ? INSPECTOR_MIN.w : INSPECTOR_MIN.h}
+            max={dockSide ? inspectorMaxW : inspectorMaxH}
+            onChange={(n) => setInspectorSize((p) => (dockSide ? { ...p, w: n } : { ...p, h: n }))}
+            onReset={() =>
+              setInspectorSize((p) =>
+                dockSide ? { ...p, w: INSPECTOR_DEFAULT.w } : { ...p, h: INSPECTOR_DEFAULT.h }
+              )
+            }
           />
           <div
-            style={{ height: inspectorHeight }}
-            className="shrink-0 flex flex-col @[620px]:flex-row min-h-0 bg-[var(--bg-sidebar)] border-t border-[var(--border)]"
+            style={dockSide ? { width: inspectorW } : { height: inspectorH }}
+            className={`shrink-0 min-h-0 min-w-0 overflow-hidden bg-[var(--bg-sidebar)] ${
+              dockSide ? 'border-l border-[var(--border)]' : 'border-t border-[var(--border)]'
+            }`}
           >
-            {/* Left: Commit Metadata & Quick Actions */}
-            <div className="w-full @[620px]:w-[44%] border-b @[620px]:border-b-0 @[620px]:border-r border-[var(--border)] flex flex-col min-h-0">
-              <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border)] shrink-0">
-                <div className="flex items-center gap-2 min-w-0">
-                  {compareMode ? (
-                    <>
-                      <GitCompare size={14} className="text-[var(--accent)] shrink-0" />
-                      <span className="text-xs font-semibold truncate">
-                        Comparing {compareMode.commit.short_hash} → Working Tree
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      <GitCommitHorizontal size={14} className="text-[var(--accent)] shrink-0" />
-                      <span className="font-mono text-xs font-semibold text-[var(--accent)]">
-                        {detail?.short_hash || selectedHash?.slice(0, 7)}
-                      </span>
-                    </>
-                  )}
-                </div>
-                <button
-                  onClick={() => {
-                    setSelectedHash(null);
-                    setCompareMode(null);
-                  }}
-                  className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-pointer"
-                  title="Close commit details"
-                >
-                  <X size={13} />
-                </button>
-              </div>
-
-              <div className="flex-1 overflow-y-auto p-3 space-y-2.5 text-xs select-text">
-                {detailLoading && !detail ? (
-                  <div className="text-[var(--text-dim)]">Loading commit details...</div>
-                ) : detail ? (
-                  <>
-                    <div className="text-[13.5px] font-semibold text-[var(--text-primary)] leading-snug">
-                      {detail.subject}
-                    </div>
-                    {detail.body && (
-                      <pre className="whitespace-pre-wrap font-sans text-xs text-[var(--text-muted)] bg-[var(--bg-input)] p-2 rounded border border-[var(--border)]/70 leading-relaxed">
-                        {detail.body}
-                      </pre>
-                    )}
-
-                    {/* Quick Action Bar */}
-                    <div className="flex flex-wrap items-center gap-1.5 pt-0.5 select-none">
-                      <button
-                        onClick={() => copyText(detail.hash, `SHA (${detail.short_hash})`, detail.hash)}
-                        className="px-2 py-1 text-[11px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] flex items-center gap-1 cursor-pointer"
-                        title="Copy full commit SHA"
-                      >
-                        <Copy size={11} />
-                        Copy SHA
-                      </button>
-                      <button
-                        onClick={() => {
-                          const found = commits.find((x) => x.hash === detail.hash);
-                          if (found) setModal({ kind: 'cherry-pick', commit: found });
-                        }}
-                        className="px-2 py-1 text-[11px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] flex items-center gap-1 cursor-pointer"
-                        title="Cherry-pick onto current branch"
-                      >
-                        <GitCommitHorizontal size={11} className="text-[var(--accent)]" />
-                        Cherry-Pick
-                      </button>
-                      <button
-                        onClick={() => {
-                          const found = commits.find((x) => x.hash === detail.hash);
-                          if (found) setModal({ kind: 'revert', commit: found });
-                        }}
-                        className="px-2 py-1 text-[11px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] flex items-center gap-1 cursor-pointer"
-                        title="Revert commit"
-                      >
-                        <Undo2 size={11} />
-                        Revert
-                      </button>
-                      <button
-                        onClick={() => {
-                          const found = commits.find((x) => x.hash === detail.hash);
-                          if (found)
-                            setModal({
-                              kind: 'reset',
-                              commit: found,
-                              currentBranch: gitStatus?.branch || 'HEAD',
-                            });
-                        }}
-                        className="px-2 py-1 text-[11px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--removed-fg)] flex items-center gap-1 cursor-pointer"
-                        title="Reset current branch to this commit"
-                      >
-                        <RotateCcw size={11} />
-                        Reset
-                      </button>
-                      <button
-                        onClick={() => {
-                          const found = commits.find((x) => x.hash === detail.hash);
-                          if (found) setModal({ kind: 'create-branch', commit: found });
-                        }}
-                        className="px-2 py-1 text-[11px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] flex items-center gap-1 cursor-pointer"
-                        title="Create branch at this commit"
-                      >
-                        <GitBranchPlus size={11} />
-                        Branch
-                      </button>
-                      <button
-                        onClick={async () => {
-                          try {
-                            const res = await api.gitCommitPatch(detail.hash);
-                            copyText(res.patch, `patch for ${detail.short_hash}`);
-                          } catch (e: unknown) {
-                            onToast(e instanceof Error ? e.message : 'Failed to copy patch', true);
-                          }
-                        }}
-                        className="px-2 py-1 text-[11px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] flex items-center gap-1 cursor-pointer"
-                        title="Copy commit diff patch"
-                      >
-                        <FileDiff size={11} />
-                        Copy Patch
-                      </button>
-                      {remoteHost && (
-                        <button
-                          onClick={async () => {
-                            const url = remoteHost.commitUrl(detail.hash);
-                            try {
-                              await api.openExternalUrl(url);
-                            } catch {
-                              window.open(url, '_blank', 'noopener');
-                            }
-                          }}
-                          className="px-2 py-1 text-[11px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--accent)] flex items-center gap-1 cursor-pointer"
-                        >
-                          <ExternalLink size={11} />
-                          {remoteHost.label}
-                        </button>
-                      )}
-                    </div>
-
-                    {/* Metadata grid */}
-                    <div className="grid grid-cols-[68px_1fr] gap-y-1 text-[11.5px] pt-1 border-t border-[var(--border)]/60">
-                      <span className="text-[var(--text-dim)]">Author</span>
-                      <span className="text-[var(--text-primary)] truncate">
-                        {detail.author}{' '}
-                        <span className="text-[var(--text-dim)]">&lt;{detail.author_email}&gt;</span>
-                      </span>
-                      <span className="text-[var(--text-dim)]">Date</span>
-                      <span className="text-[var(--text-primary)]">
-                        {detail.date}{' '}
-                        <span className="text-[var(--text-dim)]">
-                          ({new Date(detail.iso_date).toLocaleString()})
-                        </span>
-                      </span>
-                      <span className="text-[var(--text-dim)]">Commit</span>
-                      <span className="font-mono text-[11px] text-[var(--text-muted)] break-all">
-                        {detail.hash}
-                      </span>
-                      {detail.parents.length > 0 && (
-                        <>
-                          <span className="text-[var(--text-dim)]">
-                            Parent{detail.parents.length > 1 ? 's' : ''}
-                          </span>
-                          <div className="flex flex-wrap gap-1.5">
-                            {detail.parents.map((p) => (
-                              <button
-                                key={p}
-                                onClick={() => {
-                                  setCompareMode(null);
-                                  setSelectedHash(p);
-                                }}
-                                className="font-mono text-[11px] text-[var(--accent)] hover:underline cursor-pointer"
-                                title="Jump to parent commit"
-                              >
-                                {p.slice(0, 7)}
-                              </button>
-                            ))}
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  </>
-                ) : null}
-              </div>
-            </div>
-
-            {/* Right: Changed Files in Commit */}
-            <div className="flex-1 flex flex-col min-h-0 min-w-0">
-              <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border)] shrink-0">
-                <div className="flex items-center gap-2 text-xs">
-                  <span className="font-semibold text-[var(--text-muted)] uppercase text-[11px] tracking-wider">
-                    Changed Files ({activeFiles.length})
-                  </span>
-                  {!compareMode && detail && (
-                    <span className="font-mono text-[11px] tabular-nums">
-                      <span className="text-[var(--added-fg)]">+{detail.total_additions}</span>{' '}
-                      <span className="text-[var(--removed-fg)]">-{detail.total_deletions}</span>
-                    </span>
-                  )}
-                </div>
-                <button
-                  onClick={() => setTreeView((v) => !v)}
-                  className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
-                  title={treeView ? 'Switch to Flat List' : 'Switch to Folder Tree'}
-                >
-                  {treeView ? <List size={13.5} /> : <FolderTree size={13.5} />}
-                </button>
-              </div>
-              <div className="flex-1 overflow-y-auto p-1.5">
-                {activeFiles.length === 0 ? (
-                  <div className="p-4 text-xs text-[var(--text-dim)] text-center">
-                    No file changes.
-                  </div>
-                ) : treeView ? (
-                  renderTreeNodes(fileTree, 0)
-                ) : (
-                  activeFiles.map((f) => {
-                    const name = f.path.split('/').pop() || f.path;
-                    const dir = f.path.includes('/')
-                      ? f.path.slice(0, f.path.lastIndexOf('/'))
-                      : '';
-                    return (
-                      <div
-                        key={f.path}
-                        onClick={() => handleOpenFileRow(f)}
-                        className="flex items-center justify-between gap-2 px-2 py-1 text-xs hover:bg-[var(--bg-hover)] rounded cursor-pointer"
-                      >
-                        <div className="flex items-center gap-1.5 min-w-0">
-                          <FileCode size={13} className="text-[var(--text-dim)] shrink-0" />
-                          <span
-                            className={`truncate ${f.status === 'D' ? 'line-through opacity-75' : ''}`}
-                            style={{ color: fileStatusColor(f.status) }}
-                          >
-                            {name}
-                          </span>
-                          {dir && (
-                            <span className="truncate text-[11px] text-[var(--text-dim)]">
-                              {dir}
-                            </span>
-                          )}
-                        </div>
-                        <div className="flex items-center gap-2 shrink-0 font-mono text-[11px] tabular-nums">
-                          {f.additions > 0 && (
-                            <span className="text-[var(--added-fg)]">+{f.additions}</span>
-                          )}
-                          {f.deletions > 0 && (
-                            <span className="text-[var(--removed-fg)]">-{f.deletions}</span>
-                          )}
-                          <span
-                            className="w-3.5 text-center font-bold"
-                            style={{ color: fileStatusColor(f.status) }}
-                          >
-                            {f.status}
-                          </span>
-                        </div>
-                      </div>
-                    );
-                  })
-                )}
-              </div>
-            </div>
+            {renderInspector()}
           </div>
         </>
       )}
+      </div>
 
       {hover.card}
 
