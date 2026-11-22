@@ -195,9 +195,3 @@ Please follow the [Code of Conduct](CODE_OF_CONDUCT.md). Report security issues 
 ## License
 
 Vireo is released under the **[MIT License](LICENSE)**.
-
----
-
-<div align="center">
-<sub>If Vireo speeds up your agent coding workflow, a ⭐ on the repository helps others find it.</sub>
-</div>
