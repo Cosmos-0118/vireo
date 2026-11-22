@@ -49,6 +49,7 @@ import type {
 import { Sidebar, SidebarTab } from './components/Sidebar';
 import { AgentEditsStrip } from './components/AgentEditsStrip';
 import { FileIcon } from './components/FileIcon';
+import { FloatingContextMenu, type ContextMenuItem } from './components/CommitContextMenu';
 import { VireoLogo } from './components/VireoLogo';
 import ResizeHandle from './components/ResizeHandle';
 import {
@@ -206,6 +207,7 @@ export function App() {
   // Tabs & Active content
   const [tabs, setTabs] = useState<OpenTab[]>([]);
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const [tabMenu, setTabMenu] = useState<{ x: number; y: number; tabId: string } | null>(null);
   const [diffData, setDiffData] = useState<GitDiffRes | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [fileData, setFileData] = useState<{
@@ -1072,6 +1074,43 @@ export function App() {
     });
   };
 
+  // Close every tab for which `shouldClose` is true; keep the active tab if it survives,
+  // otherwise fall back to the last remaining tab.
+  const closeTabsWhere = (shouldClose: (t: OpenTab, index: number) => boolean) => {
+    const next = tabs.filter((t, i) => !shouldClose(t, i));
+    for (const t of tabs) if (!next.includes(t)) contentCacheRef.current.delete(t.id);
+    setTabs(next);
+    if (!next.some((t) => t.id === activeTabId)) {
+      setActiveTabId(next.length > 0 ? next[next.length - 1].id : null);
+    }
+  };
+
+  const buildTabMenuItems = (tabId: string): ContextMenuItem[] => {
+    const idx = tabs.findIndex((t) => t.id === tabId);
+    return [
+      { id: 'close', label: 'Close', icon: <X size={13} />, onClick: () => closeTab(tabId) },
+      {
+        id: 'close-others',
+        label: 'Close Others',
+        disabled: tabs.length < 2,
+        onClick: () => closeTabsWhere((t) => t.id !== tabId),
+      },
+      {
+        id: 'close-right',
+        label: 'Close to the Right',
+        disabled: idx < 0 || idx === tabs.length - 1,
+        onClick: () => closeTabsWhere((_t, i) => i > idx),
+      },
+      {
+        id: 'close-all',
+        label: 'Close All',
+        dividerBefore: true,
+        danger: true,
+        onClick: () => closeTabsWhere(() => true),
+      },
+    ];
+  };
+
   const handleRunTask = (task: TaskItem) => {
     setShowRunMenu(false);
     setShowTerminal(true);
@@ -1616,6 +1655,16 @@ export function App() {
                   <div
                     key={tab.id}
                     onClick={() => setActiveTabId(tab.id)}
+                    onAuxClick={(e) => {
+                      if (e.button === 1) {
+                        e.preventDefault();
+                        closeTab(tab.id);
+                      }
+                    }}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      setTabMenu({ x: e.clientX, y: e.clientY, tabId: tab.id });
+                    }}
                     className={`group flex items-center gap-2 px-3.5 h-full text-[13px] border-r border-[var(--border)] cursor-pointer select-none shrink-0 transition-colors ${
                       tabPulse[tab.path] !== undefined
                         ? `tab-pulse-${tabPulse[tab.path] % 2}`
@@ -1663,6 +1712,14 @@ export function App() {
                 );
               })}
             </div>
+          )}
+          {tabMenu && (
+            <FloatingContextMenu
+              x={tabMenu.x}
+              y={tabMenu.y}
+              items={buildTabMenuItems(tabMenu.tabId)}
+              onClose={() => setTabMenu(null)}
+            />
           )}
 
           {/* Main Viewer Stage */}

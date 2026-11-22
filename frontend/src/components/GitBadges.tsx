@@ -13,7 +13,7 @@ export const SyncMark: React.FC<{ dir: 'outgoing' | 'incoming'; size?: number }>
     <span
       role="img"
       aria-label={dir === 'outgoing' ? 'Not pushed' : 'Incoming, not pulled'}
-      className="inline-flex items-center justify-center shrink-0 rounded-[4px]"
+      className="inline-flex items-center justify-center shrink-0 rounded-[4px] relative top-px"
       style={{
         width: size,
         height: size,

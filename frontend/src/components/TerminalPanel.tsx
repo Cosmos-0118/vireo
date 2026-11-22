@@ -116,17 +116,31 @@ const LauncherMenu: React.FC<LauncherMenuProps> = ({ anchor, tools, onLaunch, on
   const [custom, setCustom] = useState('');
   const [copied, setCopied] = useState<string | null>(null);
   const ref = useRef<HTMLDivElement>(null);
-  const [pos, setPos] = useState<{ left: number; bottom: number }>({
+  const listRef = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState<{ left: number; top?: number; bottom?: number; maxHeight?: number }>({
     left: anchor.left,
     bottom: window.innerHeight - anchor.top + 4,
   });
 
+  // Open above the button when it fits, otherwise on whichever side has more
+  // room, and cap the height so the menu never runs off-screen.
   useLayoutEffect(() => {
-    const w = ref.current?.offsetWidth ?? 320;
-    setPos({
-      left: Math.max(8, Math.min(anchor.left, window.innerWidth - w - 8)),
-      bottom: window.innerHeight - anchor.top + 4,
-    });
+    const el = ref.current;
+    const list = listRef.current;
+    const w = el?.offsetWidth ?? 320;
+    const margin = 8;
+    const gap = 4;
+    const spaceAbove = anchor.top - gap - margin;
+    const spaceBelow = window.innerHeight - anchor.bottom - gap - margin;
+    // Natural (uncapped) height: chrome around the list + the list's full content
+    const natural = el && list ? el.offsetHeight - list.offsetHeight + list.scrollHeight : 0;
+    const above = natural <= spaceAbove || spaceAbove >= spaceBelow;
+    const left = Math.max(margin, Math.min(anchor.left, window.innerWidth - w - margin));
+    if (above) {
+      setPos({ left, bottom: window.innerHeight - anchor.top + gap, maxHeight: Math.max(120, spaceAbove) });
+    } else {
+      setPos({ left, top: anchor.bottom + gap, maxHeight: Math.max(120, spaceBelow) });
+    }
   }, [anchor]);
 
   useEffect(() => {
@@ -171,13 +185,21 @@ const LauncherMenu: React.FC<LauncherMenuProps> = ({ anchor, tools, onLaunch, on
   return (
     <div
       ref={ref}
-      style={{ position: 'fixed', left: pos.left, bottom: pos.bottom, zIndex: 60, width: 330 }}
-      className="rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl py-1 text-[12.5px]"
+      style={{
+        position: 'fixed',
+        left: pos.left,
+        top: pos.top,
+        bottom: pos.bottom,
+        maxHeight: pos.maxHeight,
+        zIndex: 60,
+        width: 330,
+      }}
+      className="flex flex-col rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl py-1 text-[12.5px]"
     >
       <div className="px-3 py-1.5 text-[10.5px] uppercase tracking-wider text-[var(--text-dim)]">
         Launch CLI agent
       </div>
-      <div className="max-h-[55vh] overflow-y-auto">
+      <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto">
         {entries.map((p) => {
           const installed = p.installed;
           return (
