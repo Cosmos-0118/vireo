@@ -43,6 +43,7 @@ import type {
   CommitLogItem,
   GitFileStatus,
   GitStatusRes,
+  ToastAction,
 } from '../types';
 import { buildCompactFileTree, type FileTreeNode } from '../utils/fileTree';
 import {
@@ -120,7 +121,7 @@ interface SourceControlPaneProps {
   ) => void;
   onOpenGraphTab: (selectedHash?: string) => void;
   onRefreshGit: () => Promise<void>;
-  onToast: (msg: string, isError?: boolean) => void;
+  onToast: (msg: string, isError?: boolean, action?: ToastAction) => void;
   /** path -> pulse key for files an agent just changed. */
   recentPaths?: Record<string, number>;
 }
@@ -2010,7 +2011,9 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                           className="flex items-center justify-between px-2.5 py-1 text-xs hover:bg-[var(--bg-hover)]"
                         >
                           <div className="min-w-0">
-                            <div className="truncate text-[var(--text-primary)]">{cp.label}</div>
+                            <div className="truncate text-[var(--text-primary)]">
+                              {cp.kind === 'turn' ? `${cp.label} · ${cp.files?.length ?? 0} file${(cp.files?.length ?? 0) === 1 ? '' : 's'}` : cp.label}
+                            </div>
                             <div className="text-[10px] text-[var(--text-dim)]">{cp.created_at}</div>
                           </div>
                           <button
@@ -2018,7 +2021,15 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                               runAction(async () => {
                                 const res = await api.gitRollback(cp.id);
                                 if (!res.ok) throw new Error(res.stderr || 'Rollback failed');
-                                onToast(`Rolled back to checkpoint (${cp.created_at})`);
+                                onToast(
+                                  cp.kind === 'manual'
+                                    ? `Restored checkpoint (${cp.created_at}); previous state saved as a checkpoint`
+                                    : `Reverted ${res.restored} file${res.restored === 1 ? '' : 's'}`,
+                                  false,
+                                  cp.kind === 'manual' || res.restored === 0
+                                    ? undefined
+                                    : { label: 'Redo', run: () => void api.gitRedo(cp.id).then(() => onToast('Re-applied')) }
+                                );
                               })
                             }
                             className="px-1.5 py-0.5 text-[10px] rounded border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer"

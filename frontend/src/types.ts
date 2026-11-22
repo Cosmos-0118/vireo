@@ -49,11 +49,41 @@ export interface TaskItem {
   source: string;
 }
 
+/** Optional button shown inside a toast (e.g. "Redo" after an undo). */
+export interface ToastAction {
+  label: string;
+  run: () => void;
+}
+
+export interface CheckpointFileDelta {
+  path: string;
+  before_blob: string | null;
+  after_blob: string | null;
+  additions: number;
+  deletions: number;
+}
+
 export interface Checkpoint {
   id: string;
   label: string;
   tree_sha: string;
   created_at: string;
+  /** "turn" is scoped to `files`; "manual" is a whole-workspace snapshot. */
+  kind: 'turn' | 'manual';
+  /** Only the files this turn changed. */
+  files: CheckpointFileDelta[];
+  /** Present once (part of) the turn was undone: what was replaced, so it can be redone. */
+  redo_files: CheckpointFileDelta[] | null;
+}
+
+export interface RollbackRes {
+  ok: boolean;
+  stdout: string;
+  stderr: string;
+  restored: number;
+  /** Files changed after the turn that were left alone. */
+  conflicts: string[];
+  checkpoint: Checkpoint | null;
 }
 
 export interface StashItem {

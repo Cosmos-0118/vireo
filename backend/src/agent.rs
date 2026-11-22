@@ -1,4 +1,4 @@
-use crate::git::create_checkpoint_internal;
+use crate::checkpoint::TurnTracker;
 use crate::state::{background_command, is_ignored_dir_name, resolve_safe_path, AppState};
 use axum::{
     extract::State,
@@ -260,21 +260,14 @@ async fn exec_tool(
     ws: &Path,
     name: &str,
     args: &Value,
-    checkpoint_done: &mut bool,
-    auto_checkpoint: bool,
-    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    turn: &mut TurnTracker,
 ) -> String {
     let is_mutation = matches!(name, "write_file" | "edit_file" | "run_command" | "symbol_edit")
         || (name == "ast" && args.get("rewrite").and_then(|v| v.as_str()).map_or(false, |r| !r.is_empty()));
-    if is_mutation && auto_checkpoint && !*checkpoint_done {
-        *checkpoint_done = true;
-        if let Ok(cp) = create_checkpoint_internal(state, "Before agent edit".to_string()).await {
-            let _ = tx
-                .send(Ok(Event::default()
-                    .event("checkpoint")
-                    .data(serde_json::to_string(&cp).unwrap_or_default())))
-                .await;
-        }
+    if is_mutation {
+        // Silent pre-turn snapshot; the checkpoint is only shown at the end if files changed.
+        turn.begin(state).await;
+        turn.note_tool(name, args);
     }
 
     match name {
@@ -525,7 +518,7 @@ pub async fn chat(
     tokio::spawn(async move {
         let ws = state.workspace_path().await;
         let auto_cp = req.auto_checkpoint.unwrap_or(true);
-        let mut checkpoint_done = false;
+        let mut turn = TurnTracker::new(auto_cp);
 
         let provider = req.provider.to_lowercase();
         let api_key = req.api_key.clone().unwrap_or_default();
@@ -557,8 +550,7 @@ pub async fn chat(
                     &ws,
                     &req,
                     &api_key,
-                    auto_cp,
-                    &mut checkpoint_done,
+                    &mut turn,
                     &tx,
                 )
                 .await;
@@ -569,8 +561,7 @@ pub async fn chat(
                     &ws,
                     &req,
                     &api_key,
-                    auto_cp,
-                    &mut checkpoint_done,
+                    &mut turn,
                     &tx,
                 )
                 .await;
@@ -582,14 +573,14 @@ pub async fn chat(
                     &ws,
                     &req,
                     &api_key,
-                    auto_cp,
-                    &mut checkpoint_done,
+                    &mut turn,
                     &tx,
                 )
                 .await;
             }
         }
 
+        turn.finish(&state, Some(&tx)).await;
         send_sse(&tx, "done", json!({})).await;
     });
 
@@ -601,8 +592,7 @@ async fn run_openai_loop(
     ws: &Path,
     req: &AgentChatReq,
     api_key: &str,
-    auto_cp: bool,
-    checkpoint_done: &mut bool,
+    turn: &mut TurnTracker,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) {
     let base = req
@@ -679,7 +669,7 @@ async fn run_openai_loop(
             let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
 
             send_sse(tx, "tool_call", json!({ "id": id, "name": name, "args": args })).await;
-            let result = exec_tool(state, ws, &name, &args, checkpoint_done, auto_cp, tx).await;
+            let result = exec_tool(state, ws, &name, &args, turn).await;
             send_sse(
                 tx,
                 "tool_result",
@@ -701,8 +691,7 @@ async fn run_anthropic_loop(
     ws: &Path,
     req: &AgentChatReq,
     api_key: &str,
-    auto_cp: bool,
-    checkpoint_done: &mut bool,
+    turn: &mut TurnTracker,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) {
     let base = req
@@ -771,7 +760,7 @@ async fn run_anthropic_loop(
                     let name = block["name"].as_str().unwrap_or("").to_string();
                     let input = block["input"].clone();
                     send_sse(tx, "tool_call", json!({ "id": id, "name": name, "args": input })).await;
-                    let result = exec_tool(state, ws, &name, &input, checkpoint_done, auto_cp, tx).await;
+                    let result = exec_tool(state, ws, &name, &input, turn).await;
                     send_sse(
                         tx,
                         "tool_result",
@@ -801,8 +790,7 @@ async fn run_gemini_loop(
     ws: &Path,
     req: &AgentChatReq,
     api_key: &str,
-    auto_cp: bool,
-    checkpoint_done: &mut bool,
+    turn: &mut TurnTracker,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) {
     let url = format!(
@@ -868,7 +856,7 @@ async fn run_gemini_loop(
                 let args = fc["args"].clone();
                 let id = uuid::Uuid::new_v4().to_string()[..8].to_string();
                 send_sse(tx, "tool_call", json!({ "id": id, "name": name, "args": args })).await;
-                let result = exec_tool(state, ws, &name, &args, checkpoint_done, auto_cp, tx).await;
+                let result = exec_tool(state, ws, &name, &args, turn).await;
                 send_sse(
                     tx,
                     "tool_result",

@@ -1,10 +1,9 @@
-use crate::state::{background_command, resolve_safe_path, AppState, Checkpoint, WorkspaceEvent};
+use crate::state::{background_command, resolve_safe_path, AppState, Checkpoint};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
     Json,
 };
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
@@ -350,16 +349,6 @@ pub struct ApplyPatchReq {
 #[derive(Deserialize)]
 pub struct OpenExternalReq {
     pub url: String,
-}
-
-#[derive(Deserialize)]
-pub struct CheckpointReq {
-    pub label: Option<String>,
-}
-
-#[derive(Deserialize)]
-pub struct RollbackReq {
-    pub id: String,
 }
 
 async fn run_git(ws: &Path, args: &[&str]) -> Result<(bool, String, String), String> {
@@ -2110,97 +2099,6 @@ pub async fn open_external(
         })),
         Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string())),
     }
-}
-
-/// Non-destructive git working-tree snapshot using a temporary GIT_INDEX_FILE.
-pub async fn create_checkpoint_internal(
-    state: &AppState,
-    label: String,
-) -> Result<Checkpoint, String> {
-    let ws = state.workspace_path().await;
-    let (is_repo, _, _) = run_git(&ws, &["rev-parse", "--is-inside-work-tree"]).await?;
-    if !is_repo {
-        return Err("Not a git repository".to_string());
-    }
-
-    let tmp_index = std::env::temp_dir().join(format!("vireo-idx-{}", uuid::Uuid::new_v4()));
-    let add_out = background_command("git")
-        .args(["add", "-A"])
-        .env("GIT_INDEX_FILE", &tmp_index)
-        .current_dir(&ws)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    if !add_out.status.success() {
-        let _ = std::fs::remove_file(&tmp_index);
-        return Err(String::from_utf8_lossy(&add_out.stderr).to_string());
-    }
-
-    let tree_out = background_command("git")
-        .args(["write-tree"])
-        .env("GIT_INDEX_FILE", &tmp_index)
-        .current_dir(&ws)
-        .output()
-        .await
-        .map_err(|e| e.to_string())?;
-    let _ = std::fs::remove_file(&tmp_index);
-
-    if !tree_out.status.success() {
-        return Err(String::from_utf8_lossy(&tree_out.stderr).to_string());
-    }
-    let tree_sha = String::from_utf8_lossy(&tree_out.stdout).trim().to_string();
-
-    let cp = Checkpoint {
-        id: uuid::Uuid::new_v4().to_string()[..8].to_string(),
-        label,
-        tree_sha,
-        created_at: Utc::now().format("%H:%M:%S").to_string(),
-    };
-
-    {
-        let mut cps = state.checkpoints.write().await;
-        cps.insert(0, cp.clone());
-        cps.truncate(20);
-    }
-    let _ = state.events_tx.send(WorkspaceEvent::CheckpointCreated {
-        checkpoint: cp.clone(),
-    });
-    Ok(cp)
-}
-
-pub async fn create_checkpoint(
-    State(state): State<AppState>,
-    Json(req): Json<CheckpointReq>,
-) -> Result<Json<Checkpoint>, (StatusCode, String)> {
-    let label = req
-        .label
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "Manual checkpoint".to_string());
-    create_checkpoint_internal(&state, label)
-        .await
-        .map(Json)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))
-}
-
-pub async fn rollback_checkpoint(
-    State(state): State<AppState>,
-    Json(req): Json<RollbackReq>,
-) -> Result<Json<CommandRes>, (StatusCode, String)> {
-    let ws = state.workspace_path().await;
-    let cp = {
-        let cps = state.checkpoints.read().await;
-        cps.iter().find(|c| c.id == req.id).cloned()
-    }
-    .ok_or_else(|| (StatusCode::NOT_FOUND, "Checkpoint not found".to_string()))?;
-
-    // Restore files from saved tree without changing HEAD commit
-    let (ok, stdout, stderr) = run_git(&ws, &["read-tree", "--reset", "-u", &cp.tree_sha])
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    // Reset index back to HEAD so working tree shows exact diff vs HEAD
-    let _ = run_git(&ws, &["reset", "HEAD"]).await;
-    state.notify_fs_changed(vec!["git:rollback".to_string()]);
-    Ok(Json(CommandRes { ok, stdout, stderr }))
 }
 
 #[cfg(test)]

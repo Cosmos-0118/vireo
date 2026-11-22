@@ -2,6 +2,7 @@ import type {
   AgentConfig,
   BranchesRes,
   Checkpoint,
+  RollbackRes,
   CliToolStatus,
   LocalModelsInfo,
   CommandRes,
@@ -249,10 +250,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ label }),
     }),
-  gitRollback: (id: string) =>
-    jsonFetch<CommandRes>('/api/git/rollback', {
+  gitRollback: (id: string, force = false) =>
+    jsonFetch<RollbackRes>('/api/git/rollback', {
       method: 'POST',
-      body: JSON.stringify({ id }),
+      body: JSON.stringify({ id, force }),
+    }),
+  gitRedo: (id: string, force = false) =>
+    jsonFetch<RollbackRes>('/api/git/redo', {
+      method: 'POST',
+      body: JSON.stringify({ id, force }),
     }),
   cliTools: () => jsonFetch<CliToolStatus[]>('/api/agent/cli-tools'),
   agentModels: (ollamaBase?: string) =>

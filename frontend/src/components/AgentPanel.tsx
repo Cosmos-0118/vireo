@@ -17,6 +17,7 @@ import {
   Loader2,
   Plus,
   RotateCcw,
+  Undo2,
   Search,
   Settings,
   Square,
@@ -30,8 +31,11 @@ import type { LiteTheme } from '../themes';
 import type {
   AgentConfig,
   CliToolStatus,
+  Checkpoint,
   GitFileStatus,
   LocalModelsInfo,
+  RollbackRes,
+  ToastAction,
   ToolCallTrace,
   UiChatMessage,
 } from '../types';
@@ -393,32 +397,68 @@ const ContextBadge: React.FC<{ icon: React.ReactNode; label: string; title?: str
   </span>
 );
 
-const CheckpointDivider: React.FC<{
-  label: string;
-  onUndo: () => void;
-}> = ({ label, onUndo }) => (
-  <div className="flex items-center gap-2 my-1 text-[11px] text-[var(--text-dim)]">
-    <div className="flex-1 h-px bg-[var(--border)]" />
-    <span className="flex items-center gap-1 shrink-0">
-      <RotateCcw size={10} />
-      Checkpoint · {label}
-    </span>
-    <button
-      onClick={onUndo}
-      className="shrink-0 px-1.5 py-0.5 rounded text-[var(--accent)] hover:bg-[var(--bg-hover)] cursor-pointer"
-    >
-      Undo turn
-    </button>
-    <div className="w-4 h-px bg-[var(--border)]" />
-  </div>
-);
+const plural = (n: number) => `${n} file${n === 1 ? '' : 's'}`;
 
-function formatCheckpointTime(raw: string): string {
-  const d = new Date(raw);
-  return Number.isNaN(d.getTime())
-    ? raw
-    : d.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
-}
+const CheckpointDivider: React.FC<{
+  checkpoint: Checkpoint;
+  onUndo: () => void;
+  onRedo: () => void;
+  onForce: () => void;
+}> = ({ checkpoint, onUndo, onRedo, onForce }) => {
+  const total = checkpoint.files?.length ?? 0;
+  const reverted = checkpoint.redo_files?.length ?? 0;
+  const pending = Math.max(0, total - reverted);
+  const adds = checkpoint.files?.reduce((n, f) => n + f.additions, 0) ?? 0;
+  const dels = checkpoint.files?.reduce((n, f) => n + f.deletions, 0) ?? 0;
+  const btn =
+    'shrink-0 px-1.5 py-0.5 rounded text-[var(--accent)] hover:bg-[var(--bg-hover)] cursor-pointer';
+  return (
+    <div className="flex items-center gap-2 my-1 text-[11px] text-[var(--text-dim)]">
+      <div className="flex-1 h-px bg-[var(--border)]" />
+      <span
+        className="flex items-center gap-1 min-w-0 truncate"
+        title={checkpoint.files?.map((f) => f.path).join('\n')}
+      >
+        {reverted > 0 ? <Undo2 size={10} className="shrink-0" /> : <RotateCcw size={10} className="shrink-0" />}
+        {reverted === 0 ? (
+          <>
+            Checkpoint · {plural(total)}{' '}
+            <span className="font-mono tabular-nums">
+              (<span className="text-[var(--added-fg)]">+{adds}</span>{' '}
+              <span className="text-[var(--removed-fg)]">-{dels}</span>)
+            </span>
+          </>
+        ) : pending === 0 ? (
+          <>Undone · {plural(reverted)} restored</>
+        ) : (
+          <>
+            Undone {reverted} · {pending} changed since
+          </>
+        )}
+      </span>
+      {reverted === 0 && (
+        <button onClick={onUndo} className={btn}>
+          Undo turn
+        </button>
+      )}
+      {pending > 0 && reverted > 0 && (
+        <button
+          onClick={onForce}
+          className={btn}
+          title="Overwrite the files that changed after this turn. Their current content stays redoable."
+        >
+          Force revert {pending}
+        </button>
+      )}
+      {reverted > 0 && (
+        <button onClick={onRedo} className={btn}>
+          Redo turn
+        </button>
+      )}
+      <div className="w-4 h-px bg-[var(--border)]" />
+    </div>
+  );
+};
 
 // ---------------------------------------------------------------------------------------------
 // Panel
@@ -437,7 +477,7 @@ interface AgentPanelProps {
   onLaunchCliAgent: () => void;
   onOpenDiff: (path: string) => void;
   onRefreshGit: () => Promise<void>;
-  onToast: (msg: string, isError?: boolean) => void;
+  onToast: (msg: string, isError?: boolean, action?: ToastAction) => void;
 }
 
 interface AtRange {
@@ -883,13 +923,42 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
-  const undoCheckpoint = async (id: string) => {
-    const res = await api.gitRollback(id);
-    if (res.ok) {
-      onToast('Rolled back agent changes!');
-      onRefreshGit();
-    } else {
-      onToast(res.stderr || 'Rollback failed', true);
+  const applyRollback = (res: RollbackRes) => {
+    const next = res.checkpoint;
+    if (next) setMessages((prev) => prev.map((m) => (m.checkpoint?.id === next.id ? { ...m, checkpoint: next } : m)));
+    onRefreshGit();
+  };
+
+  const redoCheckpoint = async (id: string) => {
+    try {
+      const res = await api.gitRedo(id);
+      applyRollback(res);
+      if (res.ok) onToast(`Re-applied ${plural(res.restored)}`);
+      else onToast(res.stderr || 'Redo failed', true);
+    } catch (e) {
+      onToast(e instanceof Error ? e.message : 'Redo failed', true);
+    }
+  };
+
+  const undoCheckpoint = async (id: string, force = false) => {
+    try {
+      const res = await api.gitRollback(id, force);
+      applyRollback(res);
+      const redo = res.restored > 0 ? { label: 'Redo', run: () => void redoCheckpoint(id) } : undefined;
+      if (res.conflicts.length > 0) {
+        onToast(
+          `${plural(res.conflicts.length)} changed since this turn and ${res.conflicts.length === 1 ? 'was' : 'were'} left alone` +
+            (res.restored > 0 ? ` · reverted ${res.restored}` : ''),
+          true,
+          redo
+        );
+      } else if (res.ok) {
+        onToast(res.restored > 0 ? `Reverted ${plural(res.restored)}` : 'Nothing to revert', false, redo);
+      } else {
+        onToast(res.stderr || 'Rollback failed', true);
+      }
+    } catch (e) {
+      onToast(e instanceof Error ? e.message : 'Rollback failed', true);
     }
   };
 
@@ -1242,8 +1311,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
                   {m.checkpoint && (
                     <CheckpointDivider
-                      label={formatCheckpointTime(m.checkpoint.created_at)}
-                      onUndo={() => undoCheckpoint(m.checkpoint!.id)}
+                      checkpoint={m.checkpoint}
+                      onUndo={() => void undoCheckpoint(m.checkpoint!.id)}
+                      onRedo={() => void redoCheckpoint(m.checkpoint!.id)}
+                      onForce={() => void undoCheckpoint(m.checkpoint!.id, true)}
                     />
                   )}
                 </div>
@@ -1272,11 +1343,11 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
           >
             Review Diffs
           </button>
-          {lastCheckpoint && (
+          {lastCheckpoint && !lastCheckpoint.redo_files?.length && (
             <button
-              onClick={() => undoCheckpoint(lastCheckpoint.id)}
+              onClick={() => void undoCheckpoint(lastCheckpoint.id)}
               className="shrink-0 px-1.5 h-5 rounded hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
-              title="Roll back to the latest checkpoint"
+              title="Undo the latest agent turn (only the files it changed)"
             >
               Undo
             </button>

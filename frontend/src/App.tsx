@@ -43,6 +43,7 @@ import type {
   GitStatusRes,
   OpenTab,
   TaskItem,
+  ToastAction,
   WorkspaceInfo,
 } from './types';
 import { Sidebar, SidebarTab } from './components/Sidebar';
@@ -184,7 +185,7 @@ export function App() {
   const [showThemeMenu, setShowThemeMenu] = useState(false);
   const [showRunMenu, setShowRunMenu] = useState(false);
   const [quickOpenVisible, setQuickOpenVisible] = useState(false);
-  const [toast, setToast] = useState<{ msg: string; isError?: boolean } | null>(null);
+  const [toast, setToast] = useState<{ msg: string; isError?: boolean; action?: ToastAction } | null>(null);
 
   // Tabs & Active content
   const [tabs, setTabs] = useState<OpenTab[]>([]);
@@ -271,9 +272,9 @@ export function App() {
 
   const themeFileInputRef = useRef<HTMLInputElement>(null);
 
-  const showToast = useCallback((msg: string, isError = false) => {
-    setToast({ msg, isError });
-    setTimeout(() => setToast((cur) => (cur?.msg === msg ? null : cur)), 3600);
+  const showToast = useCallback((msg: string, isError = false, action?: ToastAction) => {
+    setToast({ msg, isError, action });
+    setTimeout(() => setToast((cur) => (cur?.msg === msg ? null : cur)), action ? 10000 : 3600);
   }, []);
 
   const refreshGit = useCallback(async () => {
@@ -866,6 +867,14 @@ export function App() {
     });
   }, [gitStatus]);
 
+  const handleFileUndone = (path: string, before: string, base: string) => {
+    const prevLive = liveEditsRef.current.filter((e) => e.path === path);
+    showToast(`Reverted agent edits in ${path}`, false, {
+      label: 'Redo',
+      run: () => void redoReverted([{ path, content: before }], { [path]: base }, prevLive),
+    });
+  };
+
   const keepAll = () => {
     setReview({});
     setLiveEdits([]);
@@ -873,8 +882,45 @@ export function App() {
     setPausedJump(null);
   };
 
+  const liveEditsRef = useRef(liveEdits);
+  liveEditsRef.current = liveEdits;
+
+  /** Puts reverted files back exactly as they were, together with the agent-edits strip. */
+  const redoReverted = async (
+    saved: Array<{ path: string; content: string | null }>,
+    prevReview: Record<string, string>,
+    prevLive: typeof liveEdits
+  ) => {
+    try {
+      for (const { path, content } of saved) {
+        if (content === null) continue;
+        markSelfWrite(path);
+        await api.writeFile(path, content);
+      }
+      await refreshGit();
+      setReview((cur) => ({ ...prevReview, ...cur }));
+      setLiveEdits((cur) => [...prevLive.filter((e) => !cur.some((c) => c.path === e.path)), ...cur]);
+      reloadActiveContent();
+      showToast(`Re-applied agent edits in ${saved.length} file${saved.length === 1 ? '' : 's'}`);
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? e.message : 'Failed to redo agent edits', true);
+    }
+  };
+
   const undoAll = async () => {
     const entries = Object.entries(review);
+    const prevReview = review;
+    const prevLive = liveEdits;
+    // Keep what is on disk now so the revert can be redone without loss.
+    const saved: Array<{ path: string; content: string | null }> = [];
+    for (const [path] of entries) {
+      try {
+        const f = await api.readFile(path);
+        saved.push({ path, content: f.binary ? null : f.content });
+      } catch {
+        saved.push({ path, content: null });
+      }
+    }
     try {
       for (const [path, base] of entries) {
         markSelfWrite(path);
@@ -893,7 +939,10 @@ export function App() {
       setPausedJump(null);
       await refreshGit();
       reloadActiveContent();
-      showToast(`Reverted agent edits in ${entries.length} file${entries.length === 1 ? '' : 's'}`);
+      showToast(`Reverted agent edits in ${entries.length} file${entries.length === 1 ? '' : 's'}`, false, {
+        label: 'Redo',
+        run: () => void redoReverted(saved, prevReview, prevLive),
+      });
     } catch (e: unknown) {
       showToast(e instanceof Error ? e.message : 'Failed to undo agent edits', true);
     }
@@ -1706,6 +1755,7 @@ export function App() {
                   }}
                   reviewBase={review[activeTab.path] ?? null}
                   onReviewBaseChange={(b) => setReviewBaseFor(activeTab.path, b)}
+                  onFileUndone={(before, base) => handleFileUndone(activeTab.path, before, base)}
                   scrollTarget={
                     liveFlash && liveFlash.path === activeTab.path && liveFlash.ranges.length > 0
                       ? { key: liveFlash.key, line: liveFlash.ranges[0].from }
@@ -1784,10 +1834,12 @@ export function App() {
                             ? 'border-[var(--removed-fg)] bg-[var(--removed-bg)] text-[var(--removed-fg)]'
                             : 'border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--removed-fg)] hover:bg-[var(--removed-bg)]'
                         }`}
-                        title="Revert every file to how it was before the agent's edits"
+                        title={`Revert ${Object.keys(review).length} file${Object.keys(review).length === 1 ? '' : 's'} to before the agent's edits (you can redo):\n${Object.keys(review).join('\n')}`}
                       >
                         <RotateCcw size={12} />
-                        {undoConfirm ? 'Confirm undo' : 'Undo all'}
+                        {undoConfirm
+                          ? `Confirm undo (${Object.keys(review).length})`
+                          : 'Undo all'}
                       </button>
                       <button
                         onClick={keepAll}
@@ -2010,6 +2062,18 @@ export function App() {
           }}
         >
           {toast.msg}
+          {toast.action && (
+            <button
+              onClick={() => {
+                const run = toast.action!.run;
+                setToast(null);
+                run();
+              }}
+              className="ml-3 underline underline-offset-2 cursor-pointer"
+            >
+              {toast.action.label}
+            </button>
+          )}
         </div>
       )}
 

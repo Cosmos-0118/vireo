@@ -42,6 +42,8 @@ interface CodeEditorProps {
   reviewBase?: string | null;
   /** New baseline after Keep (string) or review finished (null). */
   onReviewBaseChange?: (base: string | null) => void;
+  /** "Undo file" ran: the content it replaced and the baseline it restored (for Redo). */
+  onFileUndone?: (before: string, base: string) => void;
   /** Scroll (without stealing focus) to this line when following an edit. */
   scrollTarget?: { key: number; line: number } | null;
 }
@@ -294,6 +296,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   onDirtyChange,
   reviewBase,
   onReviewBaseChange,
+  onFileUndone,
   scrollTarget,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -313,6 +316,8 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   reviewBaseRef.current = reviewBase;
   const onReviewBaseChangeRef = useRef(onReviewBaseChange);
   onReviewBaseChangeRef.current = onReviewBaseChange;
+  const onFileUndoneRef = useRef(onFileUndone);
+  onFileUndoneRef.current = onFileUndone;
   const [reviewCount, setReviewCount] = useState(0);
 
   useEffect(() => {
@@ -512,12 +517,14 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     const field = reviewFieldRef.current;
     const base = view && field ? view.state.field(field).base : null;
     if (!view || base === null) return;
+    const before = view.state.doc.toString();
     const wasDirty = dirtyRef.current;
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: base },
       annotations: externalChange.of(true),
     });
     if (!wasDirty) void handleSave();
+    onFileUndoneRef.current?.(before, base);
   };
 
   const reloadFromDisk = () => {

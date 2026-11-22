@@ -4,7 +4,7 @@
 //! flags on the command line and never reads or writes the CLI's auth files.
 
 use crate::agent::{send_sse, AgentChatReq, ChatMessage};
-use crate::git::create_checkpoint_internal;
+use crate::checkpoint::TurnTracker;
 use crate::state::{background_command, AppState};
 use axum::response::sse::Event;
 use serde_json::{json, Value};
@@ -506,12 +506,10 @@ pub async fn run(
         return;
     };
 
-    // The CLI edits files on its own, so snapshot once up front (per-edit hooks aren't available).
-    if auto_cp {
-        if let Ok(cp) = create_checkpoint_internal(state, "Before agent edit".to_string()).await {
-            send_sse(tx, "checkpoint", serde_json::to_value(&cp).unwrap_or(Value::Null)).await;
-        }
-    }
+    // The CLI edits files on its own: remember the pre-turn state silently, and only surface a
+    // checkpoint at the end if the turn actually changed files.
+    let mut turn = TurnTracker::new(auto_cp);
+    turn.begin(state).await;
 
     let mut command = background_command(&exe.to_string_lossy());
     command
@@ -570,6 +568,7 @@ pub async fn run(
                 // Client pressed Stop / went away: end the CLI and anything it spawned.
                 kill_tree(pid).await;
                 let _ = child.start_kill();
+                turn.finish(state, Some(tx)).await;
                 return;
             }
             line = lines.next_line() => {
@@ -578,6 +577,9 @@ pub async fn run(
                 if line.is_empty() { continue; }
                 let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
                 for ev in norm.feed(&v) {
+                    if let Out::ToolCall { name, args, .. } = &ev {
+                        turn.note_tool(name, args);
+                    }
                     emit(state, tx, ev).await;
                 }
             }
@@ -600,6 +602,7 @@ pub async fn run(
         };
         send_sse(tx, "error", json!({ "message": msg })).await;
     }
+    turn.finish(state, Some(tx)).await;
 }
 
 fn tail_chars(s: &str, n: usize) -> String {

@@ -12,11 +12,32 @@ pub enum WorkspaceEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointFileDelta {
+    pub path: String,
+    /// `None` if the file did not exist before the turn.
+    pub before_blob: Option<String>,
+    /// `None` if the turn deleted the file.
+    pub after_blob: Option<String>,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
     pub id: String,
     pub label: String,
+    /// Pre-turn tree for turn checkpoints; the saved snapshot for manual ones.
     pub tree_sha: String,
     pub created_at: String,
+    /// "turn" (scoped to `files`) or "manual" (whole-workspace snapshot).
+    #[serde(default)]
+    pub kind: String,
+    /// Only the files this turn changed.
+    #[serde(default)]
+    pub files: Vec<CheckpointFileDelta>,
+    /// Set once (part of) the turn has been undone: what was replaced, for 1-click redo.
+    #[serde(default)]
+    pub redo_files: Option<Vec<CheckpointFileDelta>>,
 }
 
 #[derive(Clone)]
@@ -24,6 +45,8 @@ pub struct AppState {
     pub workspace: Arc<RwLock<PathBuf>>,
     pub events_tx: broadcast::Sender<WorkspaceEvent>,
     pub checkpoints: Arc<RwLock<Vec<Checkpoint>>>,
+    /// Serializes undo/redo so a double click cannot apply a rollback twice.
+    pub checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
     pub watcher_retarget_tx: mpsc::Sender<PathBuf>,
     pub http_client: reqwest::Client,
     pub main_window: Arc<OnceLock<tauri::WebviewWindow>>,
@@ -36,6 +59,7 @@ impl AppState {
             workspace: Arc::new(RwLock::new(initial_workspace)),
             events_tx,
             checkpoints: Arc::new(RwLock::new(Vec::new())),
+            checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             watcher_retarget_tx,
             http_client: reqwest::Client::new(),
             main_window: Arc::new(OnceLock::new()),

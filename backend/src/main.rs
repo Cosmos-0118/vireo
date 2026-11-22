@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod checkpoint;
 mod cli_agent;
 mod code_intel;
 mod files;
@@ -300,8 +301,9 @@ fn build_router(
         .route("/api/git/operation", post(git::git_operation))
         .route("/api/git/apply-patch", post(git::apply_patch))
         .route("/api/git/open-external", post(git::open_external))
-        .route("/api/git/checkpoint", post(git::create_checkpoint))
-        .route("/api/git/rollback", post(git::rollback_checkpoint))
+        .route("/api/git/checkpoint", post(checkpoint::create_checkpoint))
+        .route("/api/git/rollback", post(checkpoint::rollback_checkpoint))
+        .route("/api/git/redo", post(checkpoint::redo_checkpoint))
         .route("/api/agent/chat", post(agent::chat))
         .route("/api/agent/cli-tools", get(pty::list_cli_tools))
         .route("/api/agent/models", get(agent::list_models))
