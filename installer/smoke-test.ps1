@@ -1,5 +1,5 @@
-# Installs Vireo-Setup silently into a scratch folder, checks that vireo.exe and vx.exe
-# arrived and respond properly, then uninstalls and verifies everything is cleaned up.
+# Installs Vireo-Setup silently into a scratch folder, checks that vireo.exe, vx.exe and the
+# bundled tools (git, rg, gh) arrived and respond properly, then uninstalls and verifies everything is cleaned up.
 #   pwsh installer/smoke-test.ps1 -Setup artifacts/Vireo-Setup-0.0.0.exe
 
 param(
@@ -49,6 +49,22 @@ try {
     }
     Write-Host "Installed to $dir"
 
+    # Bundled third-party tools must be present and runnable (a clean machine relies on them).
+    foreach ($tool in @(
+            @{ Path = 'tools\git\cmd\git.exe'; Expect = 'git version' },
+            @{ Path = 'tools\bin\rg.exe'; Expect = 'ripgrep' },
+            @{ Path = 'tools\bin\gh.exe'; Expect = 'gh version' }
+        )) {
+        $exe = Join-Path $dir $tool.Path
+        if (-not (Test-Path $exe)) { throw "Bundled tool not installed: $($tool.Path)" }
+        $ver = (& $exe --version 2>&1 | Select-Object -First 1)
+        if ($LASTEXITCODE -ne 0 -or "$ver" -notmatch [regex]::Escape($tool.Expect)) {
+            throw "Bundled tool $($tool.Path) failed to run: $ver"
+        }
+        Write-Host "  $($tool.Path): $ver"
+    }
+    if (-not (Test-Path (Join-Path $dir 'tools\THIRD-PARTY-NOTICES.md'))) { throw 'Not installed: tools\THIRD-PARTY-NOTICES.md' }
+
     # Verify vx.exe runs cleanly against a scratch workspace.
     $prevWs = $env:VIREO_WORKSPACE
     try {
@@ -65,6 +81,18 @@ try {
             throw "vx smoke check failed (exit $LASTEXITCODE): $($outline -join ' ')"
         }
         Write-Host "vx.exe outline check passed."
+
+        # Structural search runs in-process (no ast-grep CLI needed).
+        Push-Location $workspace
+        try {
+            $astOut = & $vxExe ast '"hi"' -l rust 2>&1
+        } finally {
+            Pop-Location
+        }
+        if ($LASTEXITCODE -ne 0 -or ($astOut -join "`n") -notmatch '1 match') {
+            throw "vx ast smoke check failed (exit $LASTEXITCODE): $($astOut -join ' ')"
+        }
+        Write-Host "vx.exe built-in ast check passed."
     } finally {
         if ($null -eq $prevWs) { Remove-Item Env:VIREO_WORKSPACE -ErrorAction SilentlyContinue }
         else { $env:VIREO_WORKSPACE = $prevWs }

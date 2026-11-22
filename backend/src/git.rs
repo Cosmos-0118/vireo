@@ -351,10 +351,37 @@ pub struct OpenExternalReq {
     pub url: String,
 }
 
-async fn run_git(ws: &Path, args: &[&str]) -> Result<(bool, String, String), String> {
-    let output = background_command("git")
+/// A `git` command for `ws` with the request-derived `args`, hardened against argument abuse:
+/// the `ext::` / `fd::` transports (which run arbitrary commands) are disabled even if a config
+/// file enables them, and option
+/// overrides that execute programs (`--upload-pack`, `--receive-pack`, `--exec`, `--config-env`)
+/// are refused. Handlers still validate refs and put paths after `--`; this is the last line of
+/// defense. The value after `-m` is a message and is never treated as an option.
+fn git_command(ws: &Path, args: &[&str]) -> Result<tokio::process::Command, String> {
+    let mut prev = "";
+    for a in args {
+        if a.contains('\0') {
+            return Err("Invalid git argument".to_string());
+        }
+        let lower = a.to_ascii_lowercase();
+        if prev != "-m"
+            && ["--upload-pack", "--receive-pack", "--exec", "--config-env"]
+                .iter()
+                .any(|bad| lower.starts_with(bad))
+        {
+            return Err(format!("Refusing unsafe git argument: {a}"));
+        }
+        prev = a;
+    }
+    let mut cmd = background_command("git");
+    cmd.args(["-c", "protocol.ext.allow=never", "-c", "protocol.fd.allow=never"])
         .args(args)
-        .current_dir(ws)
+        .current_dir(ws);
+    Ok(cmd)
+}
+
+async fn run_git(ws: &Path, args: &[&str]) -> Result<(bool, String, String), String> {
+    let output = git_command(ws, args)?
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .await
@@ -365,9 +392,7 @@ async fn run_git(ws: &Path, args: &[&str]) -> Result<(bool, String, String), Str
 }
 
 async fn run_git_bytes(ws: &Path, args: &[&str]) -> Result<(bool, Vec<u8>, String), String> {
-    let output = background_command("git")
-        .args(args)
-        .current_dir(ws)
+    let output = git_command(ws, args)?
         .output()
         .await
         .map_err(|e| format!("Failed to run git: {}", e))?;
@@ -380,9 +405,7 @@ async fn run_git_with_stdin(
     args: &[&str],
     stdin_data: &[u8],
 ) -> Result<(bool, String, String), String> {
-    let mut child = background_command("git")
-        .args(args)
-        .current_dir(ws)
+    let mut child = git_command(ws, args)?
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2118,12 +2141,15 @@ pub async fn publish_github(
 pub async fn open_external(
     Json(req): Json<OpenExternalReq>,
 ) -> Result<Json<CommandRes>, (StatusCode, String)> {
-    let url = req.url.trim();
-    if !(url.starts_with("https://") || url.starts_with("http://"))
-        || url.chars().any(|c| c.is_control() || matches!(c, '"' | '\'' | '`' | ';'))
-    {
-        return Err((StatusCode::BAD_REQUEST, "Invalid external URL".to_string()));
-    }
+    // Re-serialize through the URL parser: only http(s) with a host, and the string handed to the
+    // OS is the normalized, percent-encoded form (no quotes, spaces or shell metacharacters).
+    let raw = req.url.trim();
+    let parsed = url::Url::parse(raw)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty()))
+        .filter(|_| !raw.chars().any(|c| c.is_control() || matches!(c, '"' | '\'' | '`' | ';')))
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, "Invalid external URL".to_string()))?;
+    let url = parsed.as_str();
 
     #[cfg(target_os = "windows")]
     let res = background_command("rundll32")
@@ -2147,6 +2173,22 @@ pub async fn open_external(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_command_refuses_program_overrides() {
+        let ws = Path::new(".");
+        for bad in [
+            vec!["fetch", "--upload-pack=calc.exe", "origin"],
+            vec!["push", "--receive-pack", "x", "origin"],
+            vec!["log", "--config-env=core.pager=X"],
+            vec!["show", "HEAD\0--exec"],
+        ] {
+            assert!(git_command(ws, &bad).is_err(), "{bad:?}");
+        }
+        // A commit/tag/stash message is data, even when it looks like an option.
+        assert!(git_command(ws, &["commit", "-m", "--upload-pack is mentioned\nsecond line"]).is_ok());
+        assert!(git_command(ws, &["checkout", "--", "src/--exec.rs"]).is_ok());
+    }
 
     #[test]
     fn test_clean_commit_message() {

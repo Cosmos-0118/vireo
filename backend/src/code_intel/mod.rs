@@ -19,6 +19,7 @@ macro_rules! lazy_re {
     }};
 }
 
+mod astgrep;
 mod check;
 mod doc;
 mod edit;
@@ -36,6 +37,8 @@ mod tests;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
+#[allow(unused_imports)]
+pub use util::use_bundled_tools;
 #[allow(unused_imports)]
 pub use check::{check, check_failed, CheckOpts};
 #[allow(unused_imports)]

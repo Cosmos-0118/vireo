@@ -145,30 +145,104 @@ pub fn ast(
     if pattern.trim().is_empty() {
         return Err("empty pattern".into());
     }
-    if command("ast-grep")
+    let target = match path.filter(|p| !p.trim().is_empty()) {
+        Some(p) => resolve(ws, p)?,
+        None => ws.to_path_buf(),
+    };
+    let Some(langs) = super::astgrep::builtin_langs(lang) else {
+        // Not one of the built-in grammars: defer to an installed ast-grep CLI.
+        return ast_cli(ws, &rel_of(ws, &target), pattern, lang, rewrite, dry_run);
+    };
+    // A dry run only reports what would change, so never write.
+    let apply = rewrite.filter(|_| !dry_run);
+    let out = super::astgrep::run(ws, &target, &langs, pattern, apply)?;
+    if out.matches.is_empty() && lang.is_none_or(|l| l.trim().is_empty()) && cli_available() {
+        // No hit in the built-in languages; other languages may still match via the CLI.
+        return ast_cli(ws, &rel_of(ws, &target), pattern, lang, rewrite, dry_run);
+    }
+    if apply.is_some() && !out.rewritten.is_empty() {
+        return Ok(rewrite_report(ws, &out.rewritten, out.rewritten.iter().map(|r| r.1).sum()));
+    }
+    Ok(match_report(&out.matches, dry_run && rewrite.is_some()))
+}
+
+fn match_report(matches: &[(String, usize, String)], dry_run: bool) -> String {
+    if matches.is_empty() {
+        return "No matches.".into();
+    }
+    let mut res = if dry_run {
+        format!("{} match(es) (dry run, nothing written):\n", matches.len())
+    } else {
+        format!("{} match(es):\n", matches.len())
+    };
+    for (f, l, t) in matches.iter().take(60) {
+        let shown: String = t.trim().chars().take(160).collect();
+        res.push_str(&format!("{f}:{l}#{}| {shown}\n", line_hash(t)));
+    }
+    if matches.len() > 60 {
+        res.push_str(&format!("…[{} more]\n", matches.len() - 60));
+    }
+    res
+}
+
+fn rewrite_report(ws: &Path, per_file: &[(String, usize)], total: usize) -> String {
+    let mut res = format!("Rewrote {} match(es) in {} file(s):\n", total, per_file.len());
+    for (f, n) in per_file.iter().take(40) {
+        res.push_str(&format!("  {f} ({n})\n"));
+    }
+    for (f, _) in per_file.iter().take(40) {
+        if let Ok(text) = std::fs::read_to_string(ws.join(f)) {
+            if let Some(errs) = syntax_errors(lang_for(f), &text) {
+                if let Some((row, m)) = errs.first() {
+                    let line = text.lines().nth(*row).unwrap_or("");
+                    res.push_str(&format!(
+                        "⚠ {f} has a syntax error at {}#{}: {m}\n",
+                        row + 1,
+                        line_hash(line)
+                    ));
+                }
+            }
+        }
+    }
+    res
+}
+
+fn cli_available() -> bool {
+    command("ast-grep")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_err()
-    {
-        return Err(
-            "ast-grep is not installed (npm i -g @ast-grep/cli, or cargo install ast-grep --locked)"
-                .into(),
-        );
+        .is_ok_and(|s| s.success())
+}
+
+/// External `ast-grep` CLI, for languages without a built-in grammar.
+fn ast_cli(
+    ws: &Path,
+    target: &str,
+    pattern: &str,
+    lang: Option<&str>,
+    rewrite: Option<&str>,
+    dry_run: bool,
+) -> Result<String, String> {
+    if !cli_available() {
+        return Err(format!(
+            "language '{}' is not built in (built in: rust, typescript, tsx, javascript, python, go, json); \
+             install the ast-grep CLI for others (npm i -g @ast-grep/cli)",
+            lang.unwrap_or("?")
+        ));
     }
-    let target = match path.filter(|p| !p.trim().is_empty()) {
-        Some(p) => rel_of(ws, &resolve(ws, p)?),
-        None => ".".to_string(),
-    };
+    let target = if target.is_empty() { "." } else { target };
     let build = |json: bool, update: bool| {
         let mut c = command("ast-grep");
-        c.args(["run", "-p", pattern]);
+        // `--opt=value` and `--` keep a pattern, rewrite or path starting with `-` from being
+        // read as a flag.
+        c.arg("run").arg(format!("--pattern={pattern}"));
         if let Some(l) = lang.filter(|l| !l.is_empty()) {
-            c.args(["-l", l]);
+            c.arg(format!("--lang={l}"));
         }
         if let Some(r) = rewrite {
-            c.args(["-r", r]);
+            c.arg(format!("--rewrite={r}"));
         }
         if json {
             c.arg("--json=stream");
@@ -176,7 +250,7 @@ pub fn ast(
         if update {
             c.arg("-U");
         }
-        c.arg(&target).current_dir(ws);
+        c.arg("--").arg(target).current_dir(ws);
         c
     };
     let out = run_capture(build(true, false), Duration::from_secs(60))?;
@@ -207,23 +281,8 @@ pub fn ast(
             .to_string();
         matches.push((file, line, first));
     }
-    if matches.is_empty() {
-        return Ok("No matches.".into());
-    }
-    if rewrite.is_none() || dry_run {
-        let mut res = if dry_run && rewrite.is_some() {
-            format!("{} match(es) (dry run, nothing written):\n", matches.len())
-        } else {
-            format!("{} match(es):\n", matches.len())
-        };
-        for (f, l, t) in matches.iter().take(60) {
-            let shown: String = t.trim().chars().take(160).collect();
-            res.push_str(&format!("{f}:{l}#{}| {shown}\n", line_hash(t)));
-        }
-        if matches.len() > 60 {
-            res.push_str(&format!("…[{} more]\n", matches.len() - 60));
-        }
-        return Ok(res);
+    if matches.is_empty() || rewrite.is_none() || dry_run {
+        return Ok(match_report(&matches, dry_run && rewrite.is_some()));
     }
     let applied = run_capture(build(false, true), Duration::from_secs(120))?;
     if applied.code != 0 {
@@ -239,23 +298,5 @@ pub fn ast(
             None => per_file.push((f.clone(), 1)),
         }
     }
-    let mut res = format!("Rewrote {} match(es) in {} file(s):\n", matches.len(), per_file.len());
-    for (f, n) in per_file.iter().take(40) {
-        res.push_str(&format!("  {f} ({n})\n"));
-    }
-    for (f, _) in per_file.iter().take(40) {
-        if let Ok(text) = std::fs::read_to_string(ws.join(f)) {
-            if let Some(errs) = syntax_errors(lang_for(f), &text) {
-                if let Some((row, m)) = errs.first() {
-                    let line = text.lines().nth(*row).unwrap_or("");
-                    res.push_str(&format!(
-                        "⚠ {f} has a syntax error at {}#{}: {m}\n",
-                        row + 1,
-                        line_hash(line)
-                    ));
-                }
-            }
-        }
-    }
-    Ok(res)
+    Ok(rewrite_report(ws, &per_file, matches.len()))
 }

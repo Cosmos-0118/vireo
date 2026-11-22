@@ -42,6 +42,9 @@ tree-sitter-python = "0.25.0"
 tree-sitter-go = "0.25.0"
 tree-sitter-json = "0.24.8"
 xxhash-rust = { version = "0.8.21", features = ["xxh32"] }
+# In-process structural search/rewrite over the grammars above (replaces a 55 MB ast-grep.exe).
+ast-grep-core = { version = "0.51.1", default-features = false, features = ["tree-sitter"] }
+ignore = "0.4"
 
 [profile.release]
 lto = "fat"

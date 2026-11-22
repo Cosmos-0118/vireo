@@ -35,7 +35,7 @@ pub fn lang_for(path: &str) -> Option<Lang> {
     })
 }
 
-fn ts_language(l: Lang) -> Language {
+pub(crate) fn ts_language(l: Lang) -> Language {
     match l {
         Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
         Lang::Ts => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),

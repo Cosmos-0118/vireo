@@ -37,8 +37,12 @@ OutputBaseFilename=Vireo-Setup-{#MyAppVersion}
 SetupIconFile=..\backend\icons\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 LicenseFile=..\LICENSE
-Compression=lzma2
+; One solid LZMA2 stream with a 64 MB dictionary: the bundled MinGit is hundreds of small,
+; similar files, so this is markedly smaller than per-file compression.
+Compression=lzma2/ultra64
 SolidCompression=yes
+LZMAUseSeparateProcess=yes
+LZMANumBlockThreads=4
 WizardStyle=modern
 ; Per-user install by default (no UAC needed, like VS Code User Setup).
 ; Users or admins can still choose an all-users install from the dialog or with /ALLUSERS.

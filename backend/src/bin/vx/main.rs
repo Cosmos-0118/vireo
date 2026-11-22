@@ -164,6 +164,8 @@ fn flag_takes_value(cmd: &str, flag: &str) -> bool {
 }
 
 fn main() {
+    // `vx` also runs from plain terminals (installer PATH task), so find the bundled rg/git too.
+    code_intel::use_bundled_tools();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(String::as_str) else {
         println!("{HELP}");

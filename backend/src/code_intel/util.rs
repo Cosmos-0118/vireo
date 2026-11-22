@@ -22,6 +22,44 @@ fn path_env() -> Option<OsString> {
     PATH_PROVIDER.get().map(|f| f())
 }
 
+/// Third-party tools shipped next to the executable by the installer / portable ZIP
+/// (`tools/git/cmd` for MinGit, `tools/bin` for rg and gh); only the ones present.
+fn bundled_tool_dirs() -> Vec<PathBuf> {
+    let Some(root) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("tools"))) else {
+        return Vec::new();
+    };
+    [root.join("git").join("cmd"), root.join("bin")].into_iter().filter(|d| d.is_dir()).collect()
+}
+
+/// Append the bundled tool directories to this process's PATH so every child process (git, rg,
+/// gh, terminals, agent CLIs) can find them. They go last: a copy the user installed keeps
+/// precedence, along with its config and credential setup. Call first thing in `main`, before
+/// any other thread starts.
+pub fn use_bundled_tools() {
+    let dirs = bundled_tool_dirs();
+    if dirs.is_empty() {
+        return;
+    }
+    let current = std::env::var_os("PATH").unwrap_or_default();
+    let mut all: Vec<PathBuf> = std::env::split_paths(&current).collect();
+    let same = |a: &Path, b: &Path| {
+        let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+        norm(a) == norm(b)
+    };
+    let mut changed = false;
+    for d in dirs {
+        if !all.iter().any(|e| same(e, &d)) {
+            all.push(d);
+            changed = true;
+        }
+    }
+    if changed {
+        if let Ok(joined) = std::env::join_paths(all) {
+            std::env::set_var("PATH", joined);
+        }
+    }
+}
+
 #[cfg(windows)]
 static RESOLVE_CACHE: Mutex<Option<std::collections::HashMap<String, (Instant, OsString)>>> = Mutex::new(None);
 

@@ -43,12 +43,12 @@ Working with coding agents means spending most of your time reviewing diffs, ste
 
 ## Get started
 
-**Windows 10 (build 19041 / version 2004) or later · x64.** Uses the built-in WebView2 runtime; no Electron or extra runtime installation is required.
+**Windows 10 (build 19041 / version 2004) or later · x64.** Uses the built-in WebView2 runtime; no Electron or extra runtime installation is required. Git ([MinGit](https://github.com/git-for-windows/git), with Git Credential Manager), [ripgrep](https://github.com/BurntSushi/ripgrep) and the [GitHub CLI](https://cli.github.com/) ship inside the app (`tools\`), so nothing else needs installing; if you already have any of them on `PATH`, your installed copy is used instead. Only the external coding-agent CLIs you want to use (`claude`, `codex`, …) are installed separately.
 
 | | Download | How to use it |
 | :--- | :--- | :--- |
 | 💿 | **Installer**<br /><sub>`Vireo-Setup-<version>.exe`</sub> | Download from [the latest release](https://github.com/Cosmos-0118/vireo/releases/latest). Installs per-user by default (no administrator prompt required; all-users install is also available), adds a Start Menu entry, and optionally adds `vireo` and `vx` to your `PATH`. |
-| 🗂️ | **Portable**<br /><sub>`Vireo-<version>-win-x64.zip`</sub> | Extract the archive into a folder and run `vireo.exe`. Keep `vx.exe` in the same folder so agent shells find it automatically on `PATH`. |
+| 🗂️ | **Portable**<br /><sub>`Vireo-<version>-win-x64.zip`</sub> | Extract the archive into a folder and run `vireo.exe`. Keep `vx.exe` and the `tools\` folder next to it so agent shells find them automatically on `PATH`. |
 
 > [!TIP]
 > Vireo binaries are unsigned, so Windows SmartScreen may show a warning on first launch. Every release ships `SHA256SUMS.txt` and a GitHub build provenance attestation — see [Download integrity](#download-integrity-and-verification) to verify your copy.
@@ -74,7 +74,7 @@ vireo --dir "C:\path\to\your\repo" --server-only --port 4317
 | **Code editor** | CodeMirror 6 with multi-language syntax highlighting, `Ctrl+S` to save, and instant switching between code and diff views. |
 | **Agent Chat** | Built-in coding agent that reads, edits, searches, lists files, and runs commands. Supports OpenAI, OpenRouter, DeepSeek, Anthropic Claude, Google Gemini, Ollama, and OpenAI-compatible endpoints. Every turn creates a Git checkpoint for one-click undo/redo. |
 | **CLI Agent panel** | First-class integration and embedded PTY runners (Windows ConPTY) for `claude`, `codex`, `gemini`, `agy` (Antigravity), `opencode`, `cursor-agent`, `copilot`, `amp`, `qwen`, `aider`, `cline`, and `kilo`, with permission prompts and unified tool activity views. |
-| **`vx` code intelligence CLI** | Tree-sitter powered (`Rust`, `TypeScript`, `JavaScript`, `Python`, `Go`, `JSON`) token-lean CLI automatically placed on `PATH` for agents: `vx map`, `vx outline`, `vx view`, `vx edit` (hashline-anchored), `vx symbol`, `vx create`, `vx search`, `vx ast`, and `vx check`. |
+| **`vx` code intelligence CLI** | Tree-sitter powered (`Rust`, `TypeScript`, `JavaScript`, `Python`, `Go`, `JSON`) token-lean CLI automatically placed on `PATH` for agents: `vx map`, `vx outline`, `vx view`, `vx edit` (hashline-anchored), `vx symbol`, `vx create`, `vx search`, `vx ast` (built-in ast-grep engine; an installed `ast-grep` CLI is used only for other languages), and `vx check`. |
 | **Integrated terminal** | Multi-tab terminal powered by `xterm.js` (WebGL) and Rust `portable-pty`, with an instant switch to Ghostty (WASM). Shells stay alive when hidden or reloaded, project tasks (`package.json`, `Cargo.toml`, Python) are auto-detected, and output can be sent straight to the agent. |
 | **Git & Commit Graph** | Stage, unstage, discard, stash, commit, push, pull, fetch, switch/create/delete branches, cherry-pick, revert, merge, tag, browse commit history & commit graph, publish to GitHub, and roll back agent checkpoints. |
 | **Themes & Quick Open** | Six built-in themes (*VS Code Dark+*, *Tokyo Night*, *Catppuccin Mocha*, *One Dark Pro*, *GitHub Dark Dimmed*, *GitHub Light*) plus VS Code `.json` theme import. `Ctrl+P` opens files, themes, and tasks; `Ctrl+Shift+F` searches the workspace with ripgrep. |
@@ -99,7 +99,7 @@ flowchart LR
 | [`backend/`](backend/) | Rust + Tauri v2 app (`vireo`), embedded Axum API/WebSocket server, Git & checkpoint engine, agent/CLI runners, PTY manager, and `vx` code-intelligence CLI (`backend/src/bin/vx.rs`). |
 | [`frontend/`](frontend/) | React 19 + TypeScript + Vite + Tailwind CSS v4 UI: diff viewer, CodeMirror 6 editor, commit graph, agent activity panel, terminal tabs, themes. |
 | [`installer/`](installer/) | Inno Setup 6 installer definition (`Vireo.iss`), build script (`build.ps1`), and automated install/health/uninstall smoke test (`smoke-test.ps1`). |
-| [`scripts/`](scripts/) | Release staging (`stage-release.ps1`) and checksum/README integrity updater (`update-release-integrity.ps1`). |
+| [`scripts/`](scripts/) | Release staging (`stage-release.ps1`), pinned bundled-tool manifest and SHA256-verified downloader (`bundled-tools.json`, `fetch-tools.ps1`), and checksum/README integrity updater (`update-release-integrity.ps1`). |
 | [`.github/`](.github/) | CI, release, and CodeQL workflows, Dependabot config, and issue/PR templates. |
 
 ## Build from source
@@ -142,12 +142,18 @@ cargo run --release --manifest-path backend/Cargo.toml -- --dir "C:\path\to\your
 
 Add `--server-only --port 4317` to use Vireo in a browser at `http://127.0.0.1:4317`.
 
+Development builds use the Git/ripgrep/GitHub CLI already on your `PATH`. To exercise the bundled copies instead, stage them next to the binary (downloads are pinned and SHA256-verified, and cached in `artifacts/tools-cache`):
+
+```powershell
+pwsh scripts/fetch-tools.ps1 -Output backend/target/release
+```
+
 <details>
 <summary><b>Build the Windows installer and portable package locally</b></summary>
 
 <br />
 
-Install [Inno Setup 6](https://jrsoftware.org/isinfo.php) (CI pins `6.7.1`), build the frontend and Rust release binaries (`cargo build --release --bins --manifest-path backend/Cargo.toml --locked`), then stage and package:
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php) (CI pins `6.7.1`), build the frontend and Rust release binaries (`cargo build --release --bins --manifest-path backend/Cargo.toml --locked`), then stage and package (staging also downloads and verifies the bundled tools listed in [`scripts/bundled-tools.json`](scripts/bundled-tools.json)):
 
 ```powershell
 pwsh scripts/stage-release.ps1 -Output artifacts/publish

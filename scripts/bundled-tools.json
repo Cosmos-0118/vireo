@@ -1,0 +1,46 @@
+{
+  "$comment": "Third-party CLI tools shipped in <install>/tools so Vireo works on a clean Windows machine. Pinned by version and SHA256; scripts/fetch-tools.ps1 refuses any download whose hash differs. Installed copies of the same tools on PATH still take precedence at runtime. When bumping a version, update url, sha256 and any versioned paths together.",
+  "tools": [
+    {
+      "name": "git",
+      "title": "Git for Windows (MinGit)",
+      "version": "2.56.1.windows.1",
+      "license": "GPL-2.0-only (with components under other licenses; see LICENSE.txt)",
+      "source": "https://github.com/git-for-windows/git/tree/v2.56.1.windows.1",
+      "url": "https://github.com/git-for-windows/git/releases/download/v2.56.1.windows.1/MinGit-2.56.1-64-bit.zip",
+      "sha256": "4a92850b6e917da4fd010669b614b55dccf5b0ec333a534cc4be4700dfefdafd",
+      "tree": "git",
+      "remove": ["cmd/scalar.exe", "ucrt64/bin/scalar.exe", "ucrt64/share/doc"],
+      "licenses": ["LICENSE.txt"],
+      "check": ["git/cmd/git.exe", "--version"]
+    },
+    {
+      "name": "ripgrep",
+      "title": "ripgrep",
+      "version": "15.2.0",
+      "license": "MIT OR Unlicense",
+      "source": "https://github.com/BurntSushi/ripgrep/tree/15.2.0",
+      "url": "https://github.com/BurntSushi/ripgrep/releases/download/15.2.0/ripgrep-15.2.0-x86_64-pc-windows-msvc.zip",
+      "sha256": "71b2fef860abe467217a538ff31de02f5258807c0129f771846f87bd029aafc5",
+      "files": { "ripgrep-15.2.0-x86_64-pc-windows-msvc/rg.exe": "bin/rg.exe" },
+      "licenses": [
+        "ripgrep-15.2.0-x86_64-pc-windows-msvc/COPYING",
+        "ripgrep-15.2.0-x86_64-pc-windows-msvc/LICENSE-MIT",
+        "ripgrep-15.2.0-x86_64-pc-windows-msvc/UNLICENSE"
+      ],
+      "check": ["bin/rg.exe", "--version"]
+    },
+    {
+      "name": "gh",
+      "title": "GitHub CLI",
+      "version": "2.103.3",
+      "license": "MIT",
+      "source": "https://github.com/cli/cli/tree/v2.103.3",
+      "url": "https://github.com/cli/cli/releases/download/v2.103.3/gh_2.103.3_windows_amd64.zip",
+      "sha256": "98d0cfa794721665d7973dd728c78aff7bd836d58f10f6d7a03568eccb0a22e0",
+      "files": { "bin/gh.exe": "bin/gh.exe" },
+      "licenses": ["LICENSE"],
+      "check": ["bin/gh.exe", "--version"]
+    }
+  ]
+}

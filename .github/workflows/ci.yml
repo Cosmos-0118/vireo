@@ -90,6 +90,12 @@ jobs:
       - name: Build release binaries
         run: cargo build --profile ci --bins --manifest-path backend/Cargo.toml --locked
 
+      - name: Cache bundled tool downloads
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: artifacts/tools-cache
+          key: bundled-tools-${{ hashFiles('scripts/bundled-tools.json') }}
+
       - name: Stage release layout
         shell: pwsh
         run: ./scripts/stage-release.ps1 -ReleaseDir backend/target/ci -Output artifacts/publish

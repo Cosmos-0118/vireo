@@ -405,3 +405,39 @@ fn check_preserves_rustc_labels_notes_and_cargo_test_failures() {
         "{comp}"
     );
 }
+
+#[test]
+fn ast_builtin_search_rewrite_and_ignore() {
+    let ws = tmp("ast");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::create_dir_all(ws.join("gen")).unwrap();
+    std::fs::write(ws.join(".gitignore"), "gen/\n").unwrap();
+    std::fs::write(ws.join("src/a.rs"), "fn f() {\n    let v = foo(1, 2);\n    foo(3, bar(4));\n}\n").unwrap();
+    std::fs::write(ws.join("gen/b.rs"), "fn g() { foo(9, 9); }\n").unwrap();
+    std::fs::write(ws.join("src/c.py"), "def h():\n    return foo(5, 6)\n").unwrap();
+    std::fs::write(ws.join("src/d.ts"), "const x = foo(7, 8);\n").unwrap();
+
+    // Metavariables work in languages that need the expando placeholder (Rust, Python) and in
+    // ones that do not (TypeScript); .gitignore'd files are skipped.
+    let all = edit::ast(&ws, "foo($A, $B)", None, None, None, false).unwrap();
+    assert!(all.starts_with("4 match(es)"), "{all}");
+    assert!(all.contains("src/a.rs:2#") && all.contains("src/a.rs:3#"), "{all}");
+    assert!(all.contains("src/c.py:2#") && all.contains("src/d.ts:1#"), "{all}");
+    assert!(!all.contains("gen/b.rs"), "{all}");
+
+    let py = edit::ast(&ws, "foo($$$ARGS)", Some("python"), None, None, false).unwrap();
+    assert!(py.starts_with("1 match(es)") && py.contains("src/c.py"), "{py}");
+
+    let dry = edit::ast(&ws, "foo($A, $B)", Some("rust"), Some("src"), Some("baz($B, $A)"), true).unwrap();
+    assert!(dry.contains("dry run"), "{dry}");
+    assert!(std::fs::read_to_string(ws.join("src/a.rs")).unwrap().contains("foo(1, 2)"));
+
+    let done = edit::ast(&ws, "foo($A, $B)", Some("rs"), None, Some("baz($B, $A)"), false).unwrap();
+    assert!(done.starts_with("Rewrote 2 match(es) in 1 file(s)"), "{done}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("src/a.rs")).unwrap(),
+        "fn f() {\n    let v = baz(2, 1);\n    baz(bar(4), 3);\n}\n"
+    );
+    assert_eq!(std::fs::read_to_string(ws.join("gen/b.rs")).unwrap(), "fn g() { foo(9, 9); }\n");
+    assert_eq!(edit::ast(&ws, "nothing_here($A)", Some("go"), None, None, false).unwrap(), "No matches.");
+}

@@ -30,7 +30,7 @@ if (-not $iscc) {
 }
 
 $publish = (Resolve-Path $PublishDir).Path
-foreach ($path in 'vireo.exe', 'vx.exe', 'LICENSE') {
+foreach ($path in 'vireo.exe', 'vx.exe', 'LICENSE', 'tools\git\cmd\git.exe', 'tools\bin\rg.exe', 'tools\bin\gh.exe') {
     if (-not (Test-Path (Join-Path $publish $path))) {
         throw "The publish folder is missing $path."
     }

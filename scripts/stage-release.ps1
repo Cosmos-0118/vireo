@@ -3,7 +3,8 @@
 
 param(
     [string]$ReleaseDir = 'backend/target/release',
-    [string]$Output = 'artifacts/publish'
+    [string]$Output = 'artifacts/publish',
+    [string]$ToolsCache = 'artifacts/tools-cache'
 )
 
 Set-StrictMode -Version Latest
@@ -33,8 +34,11 @@ if (-not (Test-Path $license -PathType Leaf)) {
 }
 Copy-Item $license -Destination (Join-Path $outDir 'LICENSE') -Force
 
+# Bundled third-party tools (git, rg, gh) so a clean machine needs no extra installs.
+& (Join-Path $PSScriptRoot 'fetch-tools.ps1') -Output $outDir -Cache $ToolsCache
+
 # Validate staged layout
-foreach ($name in @('vireo.exe', 'vx.exe', 'LICENSE')) {
+foreach ($name in @('vireo.exe', 'vx.exe', 'LICENSE', 'tools/git/cmd/git.exe', 'tools/bin/rg.exe', 'tools/bin/gh.exe', 'tools/THIRD-PARTY-NOTICES.md')) {
     $staged = Join-Path $outDir $name
     if (-not (Test-Path $staged -PathType Leaf) -or (Get-Item $staged).Length -eq 0) {
         throw "Staged artifact is missing or empty: $staged"
@@ -42,4 +46,10 @@ foreach ($name in @('vireo.exe', 'vx.exe', 'LICENSE')) {
 }
 
 Write-Host "Staged release layout in ${outDir}:"
-Get-ChildItem $outDir | Select-Object Name, @{ Name = 'SizeMB'; Expression = { [math]::Round($_.Length / 1MB, 2) } } | Format-Table -AutoSize
+Get-ChildItem $outDir | Select-Object Name, @{
+    Name = 'SizeMB'
+    Expression = {
+        $bytes = if ($_.PSIsContainer) { (Get-ChildItem $_.FullName -Recurse -File | Measure-Object Length -Sum).Sum } else { $_.Length }
+        [math]::Round($bytes / 1MB, 2)
+    }
+} | Format-Table -AutoSize

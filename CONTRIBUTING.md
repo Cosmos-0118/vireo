@@ -18,7 +18,7 @@ You need:
 - **Visual Studio Build Tools** with the *Desktop development with C++* workload (for MSVC `cl.exe` / `link.exe`).
 - **[Rust toolchain](https://rustup.rs/)** (stable, `edition = 2021`).
 - **[Node.js](https://nodejs.org/)** 22 LTS or newer (with `npm`).
-- **Git** (and optionally [`ripgrep`](https://github.com/BurntSushi/ripgrep) and [`ast-grep`](https://ast-grep.github.io/) for workspace search and structural queries).
+- **Git** (and optionally [`ripgrep`](https://github.com/BurntSushi/ripgrep) for faster workspace search). Release builds bundle Git, ripgrep and the GitHub CLI (see `scripts/bundled-tools.json`); structural `ast` queries run in-process, so `ast-grep` is not needed.
 
 ### Build and run locally
 

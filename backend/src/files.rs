@@ -371,7 +371,7 @@ const SEARCH_MAX_ONLY_PATHS: usize = 800;
 fn split_globs(raw: &str) -> Vec<String> {
     raw.split(',')
         .map(|g| g.trim().replace('\\', "/"))
-        .filter(|g| !g.is_empty())
+        .filter(|g| !g.is_empty() && !g.chars().any(char::is_control))
         .collect()
 }
 
@@ -471,11 +471,20 @@ pub async fn search_files(
         let g = g.trim_start_matches('!');
         cmd.args(["--glob", &format!("!{}", g)]);
     }
-    cmd.args(["-e", &query, "--"]);
+    // `--regexp=` binds the query to the flag, and `--` ends options, so neither the query nor a
+    // path can be read as an rg option.
+    cmd.arg(format!("--regexp={query}"));
+    cmd.arg("--");
     if let Some(paths) = &req.only_paths {
+        // Pass the workspace-confined path we resolved, never the raw request string.
         for p in paths.iter().take(SEARCH_MAX_ONLY_PATHS) {
-            if resolve_safe_path(&ws, p).is_ok() {
-                cmd.arg(p);
+            if let Ok(full) = resolve_safe_path(&ws, p) {
+                // Relative to the workspace (rg's cwd) so result paths keep their usual form.
+                match full.strip_prefix(&ws) {
+                    Ok(rel) if rel.as_os_str().is_empty() => cmd.arg("."),
+                    Ok(rel) => cmd.arg(rel),
+                    Err(_) => cmd.arg(&full),
+                };
             }
         }
     }
