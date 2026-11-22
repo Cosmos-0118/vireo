@@ -53,7 +53,14 @@ try {
     $prevWs = $env:VIREO_WORKSPACE
     try {
         $env:VIREO_WORKSPACE = $workspace
-        $outline = & $vxExe outline (Join-Path $workspace 'hello.rs') 2>&1
+        # vx only honors VIREO_WORKSPACE when the shell is inside it (as in the real terminal);
+        # otherwise it falls back to the enclosing git repo (the CI checkout).
+        Push-Location $workspace
+        try {
+            $outline = & $vxExe outline 'hello.rs' 2>&1
+        } finally {
+            Pop-Location
+        }
         if ($LASTEXITCODE -ne 0 -or ($outline -join "`n") -notmatch 'fn greet') {
             throw "vx smoke check failed (exit $LASTEXITCODE): $($outline -join ' ')"
         }
