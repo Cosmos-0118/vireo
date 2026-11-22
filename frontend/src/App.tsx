@@ -35,6 +35,7 @@ import type {
 } from './types';
 import { Sidebar, SidebarTab } from './components/Sidebar';
 import { AgentPanel } from './components/AgentPanel';
+import { FileIcon } from './components/FileIcon';
 import { VireoLogo } from './components/VireoLogo';
 import ResizeHandle from './components/ResizeHandle';
 import {
@@ -99,6 +100,7 @@ export function App() {
   const [editingWs, setEditingWs] = useState(false);
   const [wsDraft, setWsDraft] = useState('');
   const [gitStatus, setGitStatus] = useState<GitStatusRes | null>(null);
+  const [fsVersion, setFsVersion] = useState(0);
   const [allFiles, setAllFiles] = useState<string[]>([]);
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [liveConnected, setLiveConnected] = useState(false);
@@ -375,6 +377,7 @@ export function App() {
         try {
           const data = JSON.parse(ev.data);
           if (data.type === 'fs_changed') {
+            setFsVersion((v) => v + 1);
             refreshGit();
             reloadActiveContentRef.current();
           } else if (data.type === 'workspace_switched') {
@@ -1026,6 +1029,8 @@ export function App() {
                 onOpenGraphTab={openGraphTab}
                 onRefreshGit={refreshGit}
                 onToast={showToast}
+                fsVersion={fsVersion}
+                onAskAgent={handleAskAgent}
               />
             </div>
             <ResizeHandle
@@ -1074,7 +1079,7 @@ export function App() {
                     ) : tab.mode === 'diff' || tab.mode === 'compare-diff' ? (
                       <GitCompare size={14} className="text-[var(--modified-fg)] shrink-0" />
                     ) : (
-                      <FileCode size={14} className="text-[var(--text-muted)] shrink-0" />
+                      <FileIcon path={tab.path} size={14} />
                     )}
                     <span>{label}</span>
                     <button

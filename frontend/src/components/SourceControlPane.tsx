@@ -96,6 +96,7 @@ const GRAPH_ROW_H = 24;
 const GRAPH_LANE_W = 12;
 const GRAPH_MAX_LANES = 6;
 import { GitActionModal, type GitModalState } from './GitActionModal';
+import { FileIcon } from './FileIcon';
 
 interface SourceControlPaneProps {
   gitStatus: GitStatusRes | null;
@@ -632,7 +633,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
         )}
 
         <div className="min-w-0 flex-1 flex items-center gap-1.5">
-          <FileCode size={13.5} className="shrink-0 text-[var(--text-dim)]" />
+          <FileIcon path={f.path} size={14} />
           <span
             className={`truncate ${badge === 'D' ? 'line-through opacity-75' : ''}`}
             style={{ color }}
@@ -1683,7 +1684,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                                           }`}
                                         >
                                           <div className="flex items-center gap-1.5 min-w-0">
-                                            <FileCode size={12} className="shrink-0 text-[var(--text-dim)]" />
+                                            <FileIcon path={f.path} size={13} />
                                             <span
                                               className={`truncate shrink-0 max-w-[70%] ${
                                                 f.status === 'D' ? 'line-through opacity-75' : ''

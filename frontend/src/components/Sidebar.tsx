@@ -1,17 +1,13 @@
 import React, { useEffect, useState } from 'react';
 import {
-  ChevronDown,
-  ChevronRight,
-  FileCode,
   Files,
-  Folder,
-  FolderOpen,
   GitBranch,
-  RefreshCw,
   Search,
 } from 'lucide-react';
 import { api } from '../api';
-import type { CommitFileChange, GitStatusRes, SearchMatch, TreeEntry } from '../types';
+import type { CommitFileChange, GitStatusRes, SearchMatch } from '../types';
+import { FileExplorer } from './FileExplorer';
+import { FileIcon } from './FileIcon';
 import { SourceControlPane } from './SourceControlPane';
 
 export type SidebarTab = 'changes' | 'explorer' | 'search';
@@ -38,88 +34,9 @@ interface SidebarProps {
   onOpenGraphTab: (selectedHash?: string) => void;
   onRefreshGit: () => Promise<void>;
   onToast: (msg: string, isError?: boolean) => void;
+  fsVersion: number;
+  onAskAgent: (text: string) => void;
 }
-
-const TreeNode: React.FC<{
-  entry: TreeEntry;
-  depth: number;
-  selectedPath: string | null;
-  modifiedSet: Set<string>;
-  onOpenFile: (path: string) => void;
-}> = ({ entry, depth, selectedPath, modifiedSet, onOpenFile }) => {
-  const [open, setOpen] = useState(false);
-  const [children, setChildren] = useState<TreeEntry[] | null>(null);
-
-  const toggle = async () => {
-    if (!entry.is_dir) {
-      onOpenFile(entry.path);
-      return;
-    }
-    if (!open && children === null) {
-      try {
-        const res = await api.getTree(entry.path);
-        setChildren(res);
-      } catch {
-        setChildren([]);
-      }
-    }
-    setOpen(!open);
-  };
-
-  const isModified = modifiedSet.has(entry.path);
-  const isSelected = selectedPath === entry.path;
-
-  return (
-    <div>
-      <div
-        onClick={toggle}
-        style={{ paddingLeft: `${10 + depth * 15}px` }}
-        className={`mx-1.5 flex items-center gap-2 py-1.5 pr-2.5 rounded-md text-[13px] cursor-pointer select-none transition-colors ${
-          isSelected
-            ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
-            : 'hover:bg-[var(--bg-hover)] text-[var(--text-primary)]'
-        }`}
-      >
-        {entry.is_dir ? (
-          <>
-            {open ? (
-              <ChevronDown size={14} className="shrink-0 text-[var(--text-muted)]" />
-            ) : (
-              <ChevronRight size={14} className="shrink-0 text-[var(--text-muted)]" />
-            )}
-            {open ? (
-              <FolderOpen size={15} className="text-[var(--accent)] shrink-0" />
-            ) : (
-              <Folder size={15} className="text-[var(--accent)] shrink-0" />
-            )}
-          </>
-        ) : (
-          <>
-            <span className="w-[14px] shrink-0" />
-            <FileCode size={15} className="text-[var(--text-muted)] shrink-0" />
-          </>
-        )}
-        <span
-          className="truncate"
-          style={isModified ? { color: 'var(--modified-fg)' } : undefined}
-        >
-          {entry.name}
-        </span>
-      </div>
-      {open &&
-        children?.map((c) => (
-          <TreeNode
-            key={c.path}
-            entry={c}
-            depth={depth + 1}
-            selectedPath={selectedPath}
-            modifiedSet={modifiedSet}
-            onOpenFile={onOpenFile}
-          />
-        ))}
-    </div>
-  );
-};
 
 export const Sidebar: React.FC<SidebarProps> = ({
   activeTab,
@@ -135,17 +52,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenGraphTab,
   onRefreshGit,
   onToast,
+  fsVersion,
+  onAskAgent,
 }) => {
-  const [rootTree, setRootTree] = useState<TreeEntry[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchMatch[]>([]);
   const [searching, setSearching] = useState(false);
-
-  useEffect(() => {
-    api.getTree('').then(setRootTree).catch(() => setRootTree([]));
-  }, [workspacePath, gitStatus?.branch]);
-
-  const modifiedSet = new Set((gitStatus?.files || []).map((f) => f.path));
 
   const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -234,34 +146,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
           />
         )}
 
-        {activeTab === 'explorer' && (
-          <div className="flex-1 flex flex-col min-h-0">
-            <div className="flex items-center justify-between h-10 px-3.5 border-b border-[var(--border)] shrink-0">
-              <span className="text-[11.5px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-                Explorer
-              </span>
-              <button
-                onClick={() => api.getTree('').then(setRootTree).catch(() => {})}
-                className="p-1.5 rounded-md hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
-                title="Refresh files"
-              >
-                <RefreshCw size={14} />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto py-1.5 space-y-0.5">
-              {rootTree.map((entry) => (
-                <TreeNode
-                  key={entry.path}
-                  entry={entry}
-                  depth={0}
-                  selectedPath={selectedPath}
-                  modifiedSet={modifiedSet}
-                  onOpenFile={(p) => onOpenFile(p)}
-                />
-              ))}
-            </div>
-          </div>
-        )}
+        <div className={activeTab === 'explorer' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
+          <FileExplorer
+            active={activeTab === 'explorer'}
+            gitStatus={gitStatus}
+            selectedPath={selectedPath}
+            workspacePath={workspacePath}
+            fsVersion={fsVersion}
+            onOpenFile={(p) => onOpenFile(p)}
+            onOpenDiff={onOpenDiff}
+            onAskAgent={onAskAgent}
+            onRefreshGit={onRefreshGit}
+            onToast={onToast}
+          />
+        </div>
 
         {activeTab === 'search' && (
           <div className="flex-1 flex flex-col min-h-0">
@@ -296,8 +194,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     onClick={() => onOpenFile(m.path, m.line)}
                     className="px-2.5 py-1.5 border-b border-[var(--border)]/40 hover:bg-[var(--bg-hover)] cursor-pointer"
                   >
-                    <div className="flex items-center justify-between text-[11px] font-mono">
-                      <span className="truncate text-[var(--accent)]">{m.path}</span>
+                    <div className="flex items-center justify-between gap-1.5 text-[11px] font-mono">
+                      <FileIcon path={m.path} size={13} />
+                      <span className="truncate flex-1 text-[var(--accent)]">{m.path}</span>
                       <span className="text-[var(--text-dim)] shrink-0">:{m.line}</span>
                     </div>
                     <div className="text-xs font-mono truncate text-[var(--text-primary)]">

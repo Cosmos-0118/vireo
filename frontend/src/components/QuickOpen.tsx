@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { FileCode, Palette, Play, Search } from 'lucide-react';
+import { Palette, Play, Search } from 'lucide-react';
+import { FileIcon } from './FileIcon';
 import type { LiteTheme } from '../themes';
 import type { TaskItem } from '../types';
 
@@ -137,7 +138,7 @@ export const QuickOpen: React.FC<QuickOpenProps> = ({
                 }`}
               >
                 <div className="flex items-center gap-2 min-w-0">
-                  {item.kind === 'file' && <FileCode size={13} className="shrink-0" />}
+                  {item.kind === 'file' && <FileIcon path={item.label} size={14} />}
                   {item.kind === 'theme' && <Palette size={13} className="shrink-0" />}
                   {item.kind === 'task' && <Play size={13} className="shrink-0" />}
                   <span className="font-mono truncate">{item.label}</span>
