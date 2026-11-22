@@ -122,10 +122,32 @@ export interface CommitDetailRes {
   total_deletions: number;
 }
 
+export interface BranchInfo {
+  name: string;
+  kind: 'local' | 'remote';
+  is_current: boolean;
+  upstream: string;
+  ahead: number;
+  behind: number;
+  upstream_gone: boolean;
+  timestamp: number;
+  relative_date: string;
+  subject: string;
+}
+
 export interface BranchesRes {
   current: string;
   branches: string[];
   remote_branches: string[];
+  /** Newer backends only; newest commit first */
+  details?: BranchInfo[];
+  upstream?: string;
+  upstream_gone?: boolean;
+  detached?: boolean;
+  head_short?: string;
+  default_branch?: string;
+  remotes?: string[];
+  last_fetched?: number | null;
 }
 
 export interface CommandRes {

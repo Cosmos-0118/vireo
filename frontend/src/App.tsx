@@ -36,6 +36,17 @@ import type {
 import { Sidebar, SidebarTab } from './components/Sidebar';
 import { AgentPanel } from './components/AgentPanel';
 import { VireoLogo } from './components/VireoLogo';
+import ResizeHandle from './components/ResizeHandle';
+import {
+  AGENT,
+  SIDEBAR,
+  TERMINAL,
+  loadLayout,
+  saveLayout,
+  solveTerminalHeight,
+  solveWidths,
+  type PanelSide,
+} from './layout';
 
 const DiffViewer = lazy(() =>
   import('./components/DiffViewer').then((m) => ({ default: m.DiffViewer }))
@@ -130,9 +141,15 @@ export function App() {
   const [showAgent, setShowAgent] = useState(true);
   const [showTerminal, setShowTerminal] = useState(true);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('changes');
-  const [sidebarWidth, setSidebarWidth] = useState(320);
-  const [agentWidth, setAgentWidth] = useState(400);
-  const [terminalHeight, setTerminalHeight] = useState(240);
+  // Preferred (user-chosen, persisted) sizes. What is rendered is derived below from the
+  // measured workbench so a small window never destroys the stored layout.
+  const [storedLayout] = useState(loadLayout);
+  const [sidebarWidth, setSidebarWidth] = useState(storedLayout.sidebarWidth);
+  const [agentWidth, setAgentWidth] = useState(storedLayout.agentWidth);
+  const [terminalHeight, setTerminalHeight] = useState(storedLayout.terminalHeight);
+  const [panelPriority, setPanelPriority] = useState<PanelSide>('sidebar');
+  const [workbenchSize, setWorkbenchSize] = useState({ w: 0, h: 0 });
+  const workbenchRef = useRef<HTMLDivElement>(null);
   const [graphSelectedHash, setGraphSelectedHash] = useState<string | null>(null);
 
   // Zoom (persisted, synced to native Tauri WebView2 zoom with CSS fallback)
@@ -602,24 +619,57 @@ export function App() {
     e.target.value = '';
   };
 
-  // Drag-resize helper
-  const startDrag = (
-    axis: 'x' | 'y',
-    onDelta: (delta: number) => void
-  ) => (e: React.MouseEvent) => {
-    e.preventDefault();
-    let last = axis === 'x' ? e.clientX : e.clientY;
-    const onMove = (ev: MouseEvent) => {
-      const cur = axis === 'x' ? ev.clientX : ev.clientY;
-      onDelta(cur - last);
-      last = cur;
-    };
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
+  // Measure the workbench itself (not the window): correct under CSS zoom, devtools docking, etc.
+  useEffect(() => {
+    const el = workbenchRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver((entries) => {
+      const r = entries[0].contentRect;
+      setWorkbenchSize((prev) =>
+        Math.round(prev.w) === Math.round(r.width) && Math.round(prev.h) === Math.round(r.height)
+          ? prev
+          : { w: r.width, h: r.height }
+      );
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Persist preferred sizes
+  useEffect(() => {
+    saveLayout({ sidebarWidth, agentWidth, terminalHeight });
+  }, [sidebarWidth, agentWidth, terminalHeight]);
+
+  // The panel the user most recently opened wins when both side panels cannot fit.
+  const prevShown = useRef({ sidebar: showSidebar, agent: showAgent });
+  useEffect(() => {
+    const prev = prevShown.current;
+    if (showSidebar && !prev.sidebar) setPanelPriority('sidebar');
+    else if (showAgent && !prev.agent) setPanelPriority('agent');
+    prevShown.current = { sidebar: showSidebar, agent: showAgent };
+  }, [showSidebar, showAgent]);
+
+  const widths = solveWidths({
+    total: workbenchSize.w,
+    wantSidebar: showSidebar,
+    wantAgent: showAgent,
+    sidebar: sidebarWidth,
+    agent: agentWidth,
+    priority: panelPriority,
+  });
+  const termLayout = solveTerminalHeight({
+    totalHeight: workbenchSize.h,
+    hasTabBar: tabs.length > 0,
+    preferred: terminalHeight,
+  });
+
+  const toggleSidebar = () => {
+    if (showSidebar && !widths.sidebarVisible) setPanelPriority('sidebar');
+    else setShowSidebar((v) => !v);
+  };
+  const toggleAgent = () => {
+    if (showAgent && !widths.agentVisible) setPanelPriority('agent');
+    else setShowAgent((v) => !v);
   };
 
   const activeFileStatus =
@@ -876,9 +926,9 @@ export function App() {
             {/* Layout Toggles */}
             {(
               [
-                { on: showSidebar, toggle: () => setShowSidebar((v) => !v), Icon: PanelLeft, label: 'Toggle Sidebar (Ctrl+B)' },
+                { on: widths.sidebarVisible, toggle: toggleSidebar, Icon: PanelLeft, label: 'Toggle Sidebar (Ctrl+B)' },
                 { on: showTerminal, toggle: () => setShowTerminal((v) => !v), Icon: PanelBottom, label: 'Toggle Terminal (Ctrl+`)' },
-                { on: showAgent, toggle: () => setShowAgent((v) => !v), Icon: PanelRight, label: 'Toggle Agent Panel' },
+                { on: widths.agentVisible, toggle: toggleAgent, Icon: PanelRight, label: 'Toggle Agent Panel' },
               ] as const
             ).map(({ on, toggle, Icon, label }) => (
               <button
@@ -944,11 +994,11 @@ export function App() {
       </header>
 
       {/* Main Workbench Area */}
-      <div className="flex-1 flex min-h-0 overflow-hidden">
+      <div ref={workbenchRef} className="flex-1 flex min-h-0 min-w-0 overflow-hidden">
         {/* Left Sidebar */}
-        {showSidebar && (
+        {widths.sidebarVisible && (
           <>
-            <div style={{ width: sidebarWidth }} className="shrink-0 h-full min-w-[240px]">
+            <div style={{ width: widths.sidebarWidth }} className="shrink-0 h-full overflow-hidden">
               <Sidebar
                 activeTab={sidebarTab}
                 onTabChange={setSidebarTab}
@@ -965,11 +1015,15 @@ export function App() {
                 onToast={showToast}
               />
             </div>
-            <div
-              onMouseDown={startDrag('x', (dx) =>
-                setSidebarWidth((w) => Math.max(240, Math.min(560, w + dx)))
-              )}
-              className="w-1 cursor-col-resize hover:bg-[var(--accent)]/60 shrink-0"
+            <ResizeHandle
+              orientation="vertical"
+              direction={1}
+              label="Resize sidebar"
+              value={widths.sidebarWidth}
+              min={SIDEBAR.min}
+              max={widths.sidebarMax}
+              onChange={setSidebarWidth}
+              onReset={() => setSidebarWidth(SIDEBAR.def)}
             />
           </>
         )}
@@ -1189,13 +1243,17 @@ export function App() {
           {/* Bottom Terminal */}
           {showTerminal && (
             <>
-              <div
-                onMouseDown={startDrag('y', (dy) =>
-                  setTerminalHeight((h) => Math.max(120, Math.min(520, h - dy)))
-                )}
-                className="h-1 cursor-row-resize hover:bg-[var(--accent)]/60 shrink-0"
+              <ResizeHandle
+                orientation="horizontal"
+                direction={-1}
+                label="Resize terminal"
+                value={termLayout.height}
+                min={TERMINAL.min}
+                max={termLayout.max}
+                onChange={setTerminalHeight}
+                onReset={() => setTerminalHeight(TERMINAL.def)}
               />
-              <div style={{ height: terminalHeight }} className="shrink-0">
+              <div style={{ height: termLayout.height }} className="shrink-0 min-h-0 overflow-hidden">
                 <Suspense
                   fallback={
                     <div className="h-full bg-[var(--bg-panel)] border-t border-[var(--border)] flex items-center justify-center text-xs text-[var(--text-dim)]">
@@ -1217,15 +1275,19 @@ export function App() {
         </div>
 
         {/* Right Agent Panel */}
-        {showAgent && (
+        {widths.agentVisible && (
           <>
-            <div
-              onMouseDown={startDrag('x', (dx) =>
-                setAgentWidth((w) => Math.max(260, Math.min(620, w - dx)))
-              )}
-              className="w-1 cursor-col-resize hover:bg-[var(--accent)]/60 shrink-0"
+            <ResizeHandle
+              orientation="vertical"
+              direction={-1}
+              label="Resize agent panel"
+              value={widths.agentWidth}
+              min={AGENT.min}
+              max={widths.agentMax}
+              onChange={setAgentWidth}
+              onReset={() => setAgentWidth(AGENT.def)}
             />
-            <div style={{ width: agentWidth }} className="shrink-0 h-full">
+            <div style={{ width: widths.agentWidth }} className="shrink-0 h-full overflow-hidden">
               <AgentPanel
                 theme={activeTheme}
                 workspacePath={workspace.path}

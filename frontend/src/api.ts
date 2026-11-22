@@ -100,10 +100,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ set_upstream }),
     }),
-  gitPull: () =>
+  gitPull: (mode?: 'merge' | 'rebase' | 'ff-only') =>
     jsonFetch<CommandRes>('/api/git/pull', {
       method: 'POST',
-      body: '{}',
+      body: JSON.stringify(mode ? { mode } : {}),
     }),
   gitFetch: () =>
     jsonFetch<CommandRes>('/api/git/fetch', {

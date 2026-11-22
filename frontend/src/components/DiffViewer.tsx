@@ -350,7 +350,21 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   onAskAgent,
   onToast,
 }) => {
-  const [viewMode, setViewMode] = useState<'split' | 'unified'>('split');
+  const [preferredViewMode, setPreferredViewMode] = useState<'split' | 'unified'>('split');
+  // Side-by-side needs room: below this container width fall back to unified automatically
+  // (container-based, not viewport-based, because panes are user-resizable).
+  const [rootEl, setRootEl] = useState<HTMLDivElement | null>(null);
+  const [narrow, setNarrow] = useState(false);
+  useEffect(() => {
+    if (!rootEl) return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0].contentRect.width;
+      setNarrow((prev) => (prev ? w < 600 : w < 560));
+    });
+    ro.observe(rootEl);
+    return () => ro.disconnect();
+  }, [rootEl]);
+  const viewMode: 'split' | 'unified' = narrow ? 'unified' : preferredViewMode;
   const [compactMode, setCompactMode] = useState<boolean>(true);
   const [wordWrap, setWordWrap] = useState<boolean>(false);
   const [ignoreWhitespace, setIgnoreWhitespace] = useState<boolean>(false);
@@ -878,7 +892,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   );
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 bg-[var(--bg-base)]">
+    <div ref={setRootEl} className="@container flex-1 flex flex-col min-h-0 min-w-0 bg-[var(--bg-base)]">
       {/* Optional Commit / Compare Context Banner */}
       {commitContext && (
         <div className="flex items-center justify-between gap-2 px-3 py-1.5 border-b border-[var(--border)] bg-[var(--accent)]/[0.08] text-xs shrink-0">
@@ -891,7 +905,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
               {commitContext.subject}
             </span>
             {commitContext.author && (
-              <span className="text-[11px] text-[var(--text-dim)] shrink-0 hidden md:inline">
+              <span className="text-[11px] text-[var(--text-dim)] shrink-0 hidden @xl:inline">
                 · {commitContext.author} {commitContext.date ? `(${commitContext.date})` : ''}
               </span>
             )}
@@ -954,7 +968,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0 flex-wrap">
+        <div className="flex items-center gap-1.5 flex-wrap min-w-0 ml-auto">
           {/* Prev / Next File navigation */}
           {fileNav && fileNav.total > 1 && (
             <div className="flex items-center rounded border border-[var(--border)] overflow-hidden bg-[var(--bg-elevated)]/40">
@@ -1048,25 +1062,26 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             }
           >
             {compactMode ? <FoldVertical size={13} /> : <UnfoldVertical size={13} />}
-            <span className="hidden xl:inline">{compactMode ? 'Compact' : 'Full'}</span>
+            <span className="hidden @3xl:inline">{compactMode ? 'Compact' : 'Full'}</span>
           </button>
 
           {/* Split vs Unified Toggle */}
           <div className="flex rounded border border-[var(--border)] overflow-hidden">
             <button
-              onClick={() => setViewMode('split')}
-              className={`px-2 py-1 text-xs flex items-center gap-1 cursor-pointer ${
+              onClick={() => setPreferredViewMode('split')}
+              disabled={narrow}
+              className={`px-2 py-1 text-xs flex items-center gap-1 cursor-pointer disabled:cursor-not-allowed ${
                 viewMode === 'split'
                   ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
                   : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
               }`}
-              title="Side-by-Side Diff"
+              title={narrow ? 'Side-by-side needs a wider pane' : 'Side-by-Side Diff'}
             >
               <Columns2 size={13} />
-              <span className="hidden lg:inline">Split</span>
+              <span className="hidden @2xl:inline">Split</span>
             </button>
             <button
-              onClick={() => setViewMode('unified')}
+              onClick={() => setPreferredViewMode('unified')}
               className={`px-2 py-1 text-xs flex items-center gap-1 cursor-pointer ${
                 viewMode === 'unified'
                   ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
@@ -1075,7 +1090,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
               title="Inline / Unified Diff"
             >
               <Rows3 size={13} />
-              <span className="hidden lg:inline">Unified</span>
+              <span className="hidden @2xl:inline">Unified</span>
             </button>
           </div>
 
@@ -1085,7 +1100,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             title="Send this diff to Agent Chat"
           >
             <MessageSquarePlus size={13} />
-            <span className="hidden xl:inline">Ask Agent</span>
+            <span className="hidden @3xl:inline">Ask Agent</span>
           </button>
 
           {!commitContext && fileStatus && !fileStatus.staged && onStage && (
@@ -1123,7 +1138,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             title={commitContext ? 'Open current working tree file in editor' : 'Open in editor'}
           >
             <Edit3 size={13} />
-            <span className="hidden lg:inline">{commitContext ? 'Current' : 'Edit'}</span>
+            <span className="hidden @2xl:inline">{commitContext ? 'Current' : 'Edit'}</span>
           </button>
         </div>
       </div>

@@ -2,19 +2,18 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   Archive,
+  BookmarkPlus,
   ArrowDown,
   ArrowUp,
   Check,
   ChevronDown,
   ChevronRight,
-  CloudDownload,
   Copy,
   ExternalLink,
   FileCode,
   Folder,
   FolderOpen,
   FolderTree,
-  GitBranch,
   GitCommitHorizontal,
   GitCompare,
   GitFork,
@@ -24,11 +23,11 @@ import {
   LocateFixed,
   Maximize2,
   Minus,
+  Pencil,
   MoreHorizontal,
   Plus,
   RefreshCw,
   RotateCcw,
-  Save,
   Search,
   Trash2,
   Undo2,
@@ -57,7 +56,41 @@ import {
 } from './CommitContextMenu';
 import { CommitGraphSvg, GraphRails, graphColumnWidth } from './CommitGraphSvg';
 import { useCommitHover } from './CommitHoverCard';
+import { BranchBar } from './BranchBar';
 import { fileStatusColor, RefBadges } from './GitBadges';
+
+function plural(n: number, word: string) {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+const CommitMenuItem: React.FC<{
+  icon: React.ReactNode;
+  label: string;
+  hint?: string;
+  warn?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+}> = ({ icon, label, hint, warn, disabled, onClick }) => (
+  <button
+    onClick={onClick}
+    disabled={disabled}
+    className="w-full flex items-start gap-2 px-3 py-1.5 text-left hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:hover:bg-transparent cursor-pointer disabled:cursor-default"
+  >
+    <span className="mt-[1px] text-[var(--text-muted)]">{icon}</span>
+    <span className="min-w-0">
+      <span className="block text-[var(--text-primary)]">{label}</span>
+      {hint && (
+        <span
+          className={`block text-[11px] truncate ${
+            warn ? 'text-[var(--modified-fg)]' : 'text-[var(--text-dim)]'
+          }`}
+        >
+          {hint}
+        </span>
+      )}
+    </span>
+  </button>
+);
 
 const GRAPH_ROW_H = 24;
 const GRAPH_LANE_W = 12;
@@ -110,9 +143,9 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
     branches: [],
     remote_branches: [],
   });
-  const [showBranchMenu, setShowBranchMenu] = useState(false);
-  const [branchFilter, setBranchFilter] = useState('');
-  const [newBranchName, setNewBranchName] = useState('');
+  const [amendPrefill, setAmendPrefill] = useState('');
+  const commitInputRef = useRef<HTMLTextAreaElement>(null);
+  const commitMenuRef = useRef<HTMLDivElement>(null);
 
   // Section layout & view modes
   const [treeView, setTreeView] = useState<boolean>(() => {
@@ -295,6 +328,27 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
   const stagedTree = useMemo(() => buildCompactFileTree(stagedFiles), [stagedFiles]);
   const unstagedTree = useMemo(() => buildCompactFileTree(unstagedFiles), [unstagedFiles]);
   const totalChanged = allFiles.length;
+  const allStagedCount = useMemo(() => allFiles.filter((f) => f.staged).length, [allFiles]);
+  const isDetached = branchInfo.detached ?? gitStatus?.branch === 'HEAD';
+  const hasRemote = (branchInfo.remotes?.length ?? 0) > 0 || !!gitStatus?.remote_url;
+  // HEAD is already on the remote: rewriting it (amend / undo) will need a force push.
+  const headPushed =
+    !!branchInfo.upstream && !branchInfo.upstream_gone && (gitStatus?.ahead ?? 0) === 0;
+  const canCommit = amendMode ? !!gitStatus?.head_hash : totalChanged > 0;
+
+  useEffect(() => {
+    if (!showCommitMenu) return;
+    const onDown = (e: MouseEvent) => {
+      if (!commitMenuRef.current?.contains(e.target as Node)) setShowCommitMenu(false);
+    };
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setShowCommitMenu(false);
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [showCommitMenu]);
 
   const graphFiltered = graphSearch.trim().length > 0;
   const graphLayout = useMemo(
@@ -348,12 +402,15 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
   const handleCommit = (andPush: boolean, forceAmend?: boolean) => {
     const useAmend = forceAmend ?? amendMode;
     if (!commitMsg.trim()) {
-      onToast('Enter a commit message first.', true);
+      setShowCommitMenu(false);
+      commitInputRef.current?.focus();
+      onToast('Write a commit message first.', true);
       return;
     }
     setShowCommitMenu(false);
     runAction(async () => {
-      const stageAll = stagedFiles.length === 0 && !useAmend;
+      // Staged counts come from ALL files, never the filtered Changes view.
+      const stageAll = allStagedCount === 0 && !useAmend;
       const res = await api.gitCommit(commitMsg.trim(), stageAll, useAmend);
       if (!res.ok) {
         throw new Error(res.stderr || res.stdout || 'Commit failed');
@@ -377,42 +434,40 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
     });
   };
 
-  const handlePush = () =>
-    runAction(async () => {
-      const res = await api.gitPush(false);
-      if (!res.ok) {
-        if (res.stderr.includes('has no upstream')) {
-          const retry = await api.gitPush(true);
-          if (!retry.ok) throw new Error(retry.stderr || 'Push failed');
-        } else {
-          throw new Error(res.stderr || res.stdout || 'Push failed');
-        }
-      }
-      onToast('Pushed to remote!');
-    });
+  /** Full message (subject + body) of the checked-out commit — not row 0 of the graph. */
+  const loadHeadMessage = async (): Promise<string> => {
+    if (!gitStatus?.head_hash) return '';
+    try {
+      const d = await api.gitCommitDetail(gitStatus.head_hash);
+      return d.body ? `${d.subject}\n\n${d.body}` : d.subject;
+    } catch {
+      return commits.find((c) => c.is_head)?.message ?? '';
+    }
+  };
 
-  const handlePull = () =>
-    runAction(async () => {
-      const res = await api.gitPull();
-      if (!res.ok) throw new Error(res.stderr || 'Pull failed');
-      onToast('Pulled latest changes.');
-    });
-
-  const handleFetch = () =>
-    runAction(async () => {
-      const res = await api.gitFetch();
-      if (!res.ok) throw new Error(res.stderr || 'Fetch failed');
-      onToast('Fetched latest remote refs.');
-    });
+  const toggleAmend = async () => {
+    setShowCommitMenu(false);
+    if (amendMode) {
+      setAmendMode(false);
+      if (commitMsg === amendPrefill) setCommitMsg('');
+      return;
+    }
+    setAmendMode(true);
+    if (!commitMsg.trim()) {
+      const msg = await loadHeadMessage();
+      setAmendPrefill(msg);
+      setCommitMsg(msg);
+    }
+    commitInputRef.current?.focus();
+  };
 
   const handleUndoLastCommit = () => {
     setShowCommitMenu(false);
     runAction(async () => {
+      const msg = await loadHeadMessage();
       const res = await api.gitReset('HEAD~1', 'soft');
       if (!res.ok) throw new Error(res.stderr || 'Undo last commit failed');
-      if (commits[0]?.message && !commitMsg.trim()) {
-        setCommitMsg(commits[0].message);
-      }
+      if (msg && !commitMsg.trim()) setCommitMsg(msg);
       onToast('Undid last commit (changes kept staged).');
     });
   };
@@ -716,19 +771,20 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
 
   const firstLineLen = commitMsg.split('\n')[0].length;
   const commitBtnLabel = amendMode
-    ? 'Amend Commit'
-    : stagedFiles.length > 0
-    ? `Commit (${stagedFiles.length} staged)`
-    : totalChanged > 0
-    ? `Commit All (${totalChanged})`
-    : 'Commit';
-
-  const filteredLocalBranches = branchInfo.branches.filter((b) =>
-    b.toLowerCase().includes(branchFilter.trim().toLowerCase())
-  );
-  const filteredRemoteBranches = branchInfo.remote_branches.filter((b) =>
-    b.toLowerCase().includes(branchFilter.trim().toLowerCase())
-  );
+    ? 'Amend Last Commit'
+    : allStagedCount > 0
+      ? `Commit ${plural(allStagedCount, 'staged file')}`
+      : totalChanged > 0
+        ? `Commit all ${plural(totalChanged, 'change')}`
+        : 'Nothing to commit';
+  const unstagedLeftOut = allFiles.filter((f) => f.unstaged || f.untracked).length;
+  const commitScopeHint = amendMode
+    ? allStagedCount > 0
+      ? `Adds ${plural(allStagedCount, 'staged file')} to the last commit`
+      : 'Only the message will change'
+    : allStagedCount > 0 && unstagedLeftOut > 0
+      ? `${plural(unstagedLeftOut, 'unstaged change')} won’t be included`
+      : '';
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden select-none">
@@ -753,14 +809,6 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
             <GitFork size={14} />
           </button>
           <button
-            onClick={handleFetch}
-            disabled={busy || !gitStatus?.is_repo}
-            className="p-1.5 rounded-md hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] disabled:opacity-40 cursor-pointer"
-            title="Git Fetch (--all --prune)"
-          >
-            <CloudDownload size={14} />
-          </button>
-          <button
             onClick={() =>
               runAction(async () => {
                 await api.gitCheckpoint('Manual snapshot');
@@ -769,13 +817,14 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
             }
             disabled={busy || !gitStatus?.is_repo}
             className="p-1.5 rounded-md hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] disabled:opacity-40 cursor-pointer"
-            title="Save instant checkpoint"
+            title="Save a checkpoint (snapshot of all files, without committing)"
           >
-            <Save size={14} />
+            <BookmarkPlus size={14} />
           </button>
           <button
             onClick={() => {
               onRefreshGit();
+              fetchBranches();
               fetchLog({ append: false, skip: 0 });
             }}
             className="p-1.5 rounded-md hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
@@ -833,178 +882,48 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
           )}
 
           {/* Branch Bar + Commit Box */}
-          <div className="px-2.5 py-2 border-b border-[var(--border)] space-y-2 shrink-0">
-            {/* Branch Selector + Pull / Push */}
-            <div className="relative flex items-center gap-1">
-              <button
-                onClick={() => {
-                  setShowBranchMenu((v) => !v);
-                  setShowCommitMenu(false);
-                }}
-                className="flex items-center gap-1.5 text-xs font-medium px-2 py-1.5 rounded-md bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)]/60 text-[var(--text-primary)] min-w-0 flex-1 cursor-pointer transition-colors"
-                title={`Branch: ${gitStatus.branch || 'HEAD'} (click to switch or create)`}
-              >
-                <GitBranch size={13} className="text-[var(--accent)] shrink-0" />
-                <span className="truncate">{gitStatus.branch || 'HEAD'}</span>
-                {(gitStatus.behind > 0 || gitStatus.ahead > 0) && (
-                  <span className="ml-auto flex items-center gap-1 text-[10.5px] font-mono tabular-nums text-[var(--text-muted)] shrink-0">
-                    {gitStatus.behind > 0 && <span>↓{gitStatus.behind}</span>}
-                    {gitStatus.ahead > 0 && <span>↑{gitStatus.ahead}</span>}
-                  </span>
-                )}
-                <ChevronDown size={12} className="shrink-0 opacity-70" />
-              </button>
+          <div className="px-2.5 pt-2 pb-2.5 border-b border-[var(--border)] shrink-0">
+            <BranchBar
+              gitStatus={gitStatus}
+              branchInfo={branchInfo}
+              busy={busy}
+              uncommittedCount={totalChanged}
+              runAction={runAction}
+              onToast={onToast}
+              onRefreshBranches={fetchBranches}
+            />
 
-              <button
-                onClick={handlePull}
-                disabled={busy}
-                className="px-2 py-1.5 text-xs rounded-md bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)]/60 text-[var(--text-primary)] flex items-center gap-0.5 cursor-pointer disabled:opacity-40"
-                title={gitStatus.behind > 0 ? `Git Pull (${gitStatus.behind} behind)` : 'Git Pull'}
-              >
-                <ArrowDown size={12.5} />
-                {gitStatus.behind > 0 && (
-                  <span className="text-[10.5px] font-mono tabular-nums">{gitStatus.behind}</span>
-                )}
-              </button>
-
-              <button
-                onClick={handlePush}
-                disabled={busy}
-                className={`px-2 py-1.5 text-xs rounded-md border flex items-center gap-0.5 cursor-pointer disabled:opacity-40 ${
-                  gitStatus.ahead > 0
-                    ? 'bg-[var(--accent)]/15 border-[var(--accent)]/50 text-[var(--accent)] hover:bg-[var(--accent)]/25'
-                    : 'bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border-[var(--border)]/60 text-[var(--text-primary)]'
+            {/* Amend mode banner: makes the mode obvious and easy to leave */}
+            {amendMode && (
+              <div
+                className={`mt-1.5 flex items-center gap-1.5 px-2 h-[24px] rounded-t-md border border-b-0 text-[11px] ${
+                  headPushed
+                    ? 'border-[var(--modified-fg)]/50 bg-[var(--modified-fg)]/10 text-[var(--modified-fg)]'
+                    : 'border-[var(--accent)]/50 bg-[var(--accent)]/10 text-[var(--accent-hover)]'
                 }`}
-                title={gitStatus.ahead > 0 ? `Git Push (${gitStatus.ahead} ahead)` : 'Git Push'}
               >
-                <ArrowUp size={12.5} />
-                {gitStatus.ahead > 0 && (
-                  <span className="text-[10.5px] font-mono tabular-nums">{gitStatus.ahead}</span>
-                )}
-              </button>
-            </div>
-
-            {/* Branch Switcher Popover */}
-            {showBranchMenu && (
-              <div className="p-2 rounded-lg bg-[var(--bg-elevated)] border border-[var(--border)] shadow-xl space-y-2">
-                <input
-                  value={branchFilter}
-                  onChange={(e) => setBranchFilter(e.target.value)}
-                  placeholder="Filter branches..."
-                  autoFocus
-                  className="w-full px-2 py-1 text-xs rounded bg-[var(--bg-input)] border border-[var(--border)] text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
-                />
-                <div className="max-h-40 overflow-y-auto space-y-0.5">
-                  <div className="px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">
-                    Local Branches
-                  </div>
-                  {filteredLocalBranches.map((b) => (
-                    <div
-                      key={b}
-                      className={`group flex items-center justify-between px-2 py-1 text-xs rounded ${
-                        b === gitStatus.branch
-                          ? 'bg-[var(--accent)] text-[var(--accent-fg)] font-medium'
-                          : 'hover:bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                      }`}
-                    >
-                      <button
-                        onClick={() => {
-                          setShowBranchMenu(false);
-                          setBranchFilter('');
-                          if (b === gitStatus.branch) return;
-                          runAction(async () => {
-                            const res = await api.gitCheckout(b, false);
-                            if (!res.ok) throw new Error(res.stderr || 'Checkout failed');
-                            onToast(`Switched to ${b}`);
-                          });
-                        }}
-                        className="flex-1 text-left truncate cursor-pointer flex items-center gap-1.5"
-                      >
-                        <GitBranch size={11.5} className="shrink-0" />
-                        <span className="truncate">{b}</span>
-                      </button>
-                      {b !== gitStatus.branch && (
-                        <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            runAction(async () => {
-                              const res = await api.gitDeleteBranch(b, false);
-                              if (!res.ok) throw new Error(res.stderr || 'Delete branch failed');
-                              onToast(`Deleted branch ${b}`);
-                            });
-                          }}
-                          className="opacity-0 group-hover:opacity-100 p-0.5 rounded hover:text-[var(--removed-fg)] cursor-pointer"
-                          title={`Delete branch ${b}`}
-                        >
-                          <Trash2 size={11} />
-                        </button>
-                      )}
-                    </div>
-                  ))}
-                  {filteredRemoteBranches.length > 0 && (
-                    <>
-                      <div className="px-1.5 pt-1.5 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">
-                        Remote Branches
-                      </div>
-                      {filteredRemoteBranches.slice(0, 20).map((rb) => (
-                        <button
-                          key={rb}
-                          onClick={() => {
-                            setShowBranchMenu(false);
-                            setBranchFilter('');
-                            const localName = rb.includes('/') ? rb.split('/').slice(1).join('/') : rb;
-                            runAction(async () => {
-                              const res = await api.gitCheckout(localName, false);
-                              if (!res.ok) {
-                                const retry = await api.gitCheckout(localName, true, rb);
-                                if (!retry.ok) throw new Error(retry.stderr || 'Checkout failed');
-                              }
-                              onToast(`Checked out ${localName}`);
-                            });
-                          }}
-                          className="w-full text-left px-2 py-1 text-xs rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] truncate cursor-pointer"
-                        >
-                          {rb}
-                        </button>
-                      ))}
-                    </>
-                  )}
-                </div>
-                <form
-                  onSubmit={(e) => {
-                    e.preventDefault();
-                    if (!newBranchName.trim()) return;
-                    const name = newBranchName.trim();
-                    setShowBranchMenu(false);
-                    setBranchFilter('');
-                    runAction(async () => {
-                      const res = await api.gitCheckout(name, true);
-                      if (!res.ok) throw new Error(res.stderr || 'Branch creation failed');
-                      setNewBranchName('');
-                      onToast(`Created branch ${name}`);
-                    });
+                {headPushed ? <AlertTriangle size={11} className="shrink-0" /> : <Pencil size={11} className="shrink-0" />}
+                <span className="truncate">
+                  {headPushed ? 'Amending a pushed commit — needs force push' : 'Amending the last commit'}
+                </span>
+                <button
+                  onClick={() => {
+                    setAmendMode(false);
+                    if (commitMsg === amendPrefill) setCommitMsg('');
                   }}
-                  className="flex gap-1 pt-1 border-t border-[var(--border)]"
+                  className="ml-auto shrink-0 p-0.5 rounded hover:bg-[var(--bg-hover)] cursor-pointer"
+                  aria-label="Stop amending"
+                  title="Stop amending"
                 >
-                  <input
-                    value={newBranchName}
-                    onChange={(e) => setNewBranchName(e.target.value)}
-                    placeholder="Create new branch..."
-                    className="flex-1 min-w-0 px-2 py-1 text-xs rounded bg-[var(--bg-input)] border border-[var(--border)] text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
-                  />
-                  <button
-                    type="submit"
-                    className="px-2 py-1 text-xs rounded bg-[var(--accent)] text-[var(--accent-fg)] font-medium cursor-pointer"
-                  >
-                    +
-                  </button>
-                </form>
+                  <X size={11} />
+                </button>
               </div>
             )}
 
             {/* Commit Message Box */}
-            <div className="relative">
+            <div className={`relative ${amendMode ? '' : 'mt-1.5'}`}>
               <textarea
+                ref={commitInputRef}
                 value={commitMsg}
                 onChange={(e) => setCommitMsg(e.target.value)}
                 onKeyDown={(e) => {
@@ -1013,16 +932,16 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                     handleCommit(false);
                   }
                 }}
-                rows={2}
+                rows={commitMsg.includes('\n') ? 4 : 2}
                 placeholder={
-                  amendMode
-                    ? 'Amended commit message (Ctrl+Enter)...'
-                    : 'Message (Ctrl+Enter to commit)'
+                  isDetached
+                    ? 'Message (Ctrl+Enter to commit on detached HEAD)'
+                    : `Message (Ctrl+Enter to commit on “${gitStatus.branch}”)`
                 }
-                className={`w-full px-2.5 py-1.5 text-xs rounded-md bg-[var(--bg-input)] border text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none leading-relaxed ${
+                className={`block w-full px-2.5 py-1.5 text-[12.5px] bg-[var(--bg-input)] border text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none leading-relaxed ${
                   amendMode
-                    ? 'border-[var(--modified-fg)]'
-                    : 'border-[var(--border)] focus:border-[var(--accent)]'
+                    ? `rounded-b-md ${headPushed ? 'border-[var(--modified-fg)]/50' : 'border-[var(--accent)]/50'} focus:border-[var(--accent)]`
+                    : 'rounded-md border-[var(--border)] focus:border-[var(--accent)]'
                 }`}
               />
               {firstLineLen > 50 && (
@@ -1030,88 +949,102 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                   className={`absolute right-2 bottom-1.5 text-[10px] font-mono tabular-nums pointer-events-none ${
                     firstLineLen > 72 ? 'text-[var(--removed-fg)]' : 'text-[var(--text-dim)]'
                   }`}
-                  title="Recommended commit subject length is <= 72 characters"
+                  title="Keep the first line (summary) under 72 characters"
                 >
                   {firstLineLen}/72
                 </span>
               )}
             </div>
 
-            {/* VS Code-style Split Commit Button */}
-            <div className="relative flex items-stretch">
+            {/* What will be committed */}
+            {commitScopeHint && (
+              <div className="mt-1 px-0.5 text-[11px] text-[var(--text-dim)] truncate" title={commitScopeHint}>
+                {commitScopeHint}
+              </div>
+            )}
+
+            {/* Split Commit Button */}
+            <div className="relative flex items-stretch h-[28px] mt-1.5" ref={commitMenuRef}>
               <button
                 onClick={() => handleCommit(false)}
-                disabled={busy || (!amendMode && totalChanged === 0)}
-                className="flex-1 py-1.5 px-2.5 text-xs font-medium rounded-l-md bg-[var(--accent)] text-[var(--accent-fg)] hover:opacity-95 disabled:opacity-40 cursor-pointer flex items-center justify-center gap-1.5 transition-opacity"
+                disabled={busy || !canCommit}
+                title={
+                  !canCommit
+                    ? 'Nothing to commit'
+                    : !commitMsg.trim()
+                      ? 'Write a commit message first'
+                      : `${commitBtnLabel} (Ctrl+Enter)`
+                }
+                className="flex-1 min-w-0 px-2.5 text-[12.5px] font-medium rounded-l-md bg-[var(--accent)] text-[var(--accent-fg)] hover:brightness-110 disabled:opacity-40 disabled:hover:brightness-100 cursor-pointer disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
               >
-                <GitCommitHorizontal size={13.5} />
+                {amendMode ? <Pencil size={12.5} className="shrink-0" /> : <Check size={13.5} className="shrink-0" />}
                 <span className="truncate">{commitBtnLabel}</span>
               </button>
               <button
-                onClick={() => {
-                  setShowCommitMenu((v) => !v);
-                  setShowBranchMenu(false);
-                }}
+                onClick={() => setShowCommitMenu((v) => !v)}
                 disabled={busy}
-                className="px-2 rounded-r-md bg-[var(--accent)] text-[var(--accent-fg)] border-l border-black/20 hover:opacity-95 disabled:opacity-40 cursor-pointer flex items-center justify-center"
-                title="More Commit Actions"
+                className="px-1.5 rounded-r-md bg-[var(--accent)] text-[var(--accent-fg)] shadow-[inset_1px_0_0_rgba(0,0,0,0.22)] hover:brightness-110 disabled:opacity-40 cursor-pointer flex items-center justify-center"
+                aria-label="More commit actions"
+                title="More commit actions"
               >
                 <ChevronDown size={13} />
               </button>
 
               {showCommitMenu && (
-                <div className="absolute right-0 top-full mt-1 w-52 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl z-30 py-1 text-xs">
-                  <button
-                    disabled={totalChanged === 0 && !amendMode}
+                <div className="absolute right-0 top-full mt-1 w-60 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-[0_12px_32px_-8px_rgba(0,0,0,0.6)] z-40 py-1 text-[12px]">
+                  <CommitMenuItem
+                    icon={<ArrowUp size={13} />}
+                    label={hasRemote ? 'Commit & Push' : 'Commit & Push (no remote)'}
+                    disabled={!canCommit || !hasRemote || isDetached}
                     onClick={() => handleCommit(true)}
-                    className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] disabled:opacity-40 cursor-pointer"
-                  >
-                    <ArrowUp size={13} />
-                    Commit & Push
-                  </button>
-                  <button
-                    onClick={() => {
-                      const next = !amendMode;
-                      setAmendMode(next);
-                      if (next && !commitMsg.trim() && commits[0]?.message) {
-                        setCommitMsg(commits[0].message);
-                      }
-                      setShowCommitMenu(false);
-                    }}
-                    className="w-full flex items-center justify-between px-3 py-1.5 text-left hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer"
-                  >
-                    <span className="flex items-center gap-2">
-                      <GitCommitHorizontal size={13} />
-                      Amend Last Commit
-                    </span>
-                    {amendMode && <Check size={12} />}
-                  </button>
-                  <button
-                    disabled={commits.length === 0}
+                  />
+                  <CommitMenuItem
+                    icon={<Pencil size={13} />}
+                    label={amendMode ? 'Stop Amending' : 'Amend Last Commit'}
+                    hint={
+                      amendMode
+                        ? undefined
+                        : headPushed
+                          ? 'Already pushed — will need force push'
+                          : 'Edit the message or add staged changes'
+                    }
+                    warn={!amendMode && headPushed}
+                    disabled={!gitStatus.head_hash}
+                    onClick={toggleAmend}
+                  />
+                  <CommitMenuItem
+                    icon={<Undo2 size={13} />}
+                    label="Undo Last Commit"
+                    hint={
+                      headPushed
+                        ? 'Already pushed — will need force push'
+                        : 'Keeps its changes staged'
+                    }
+                    warn={headPushed}
+                    disabled={!gitStatus.head_hash}
                     onClick={handleUndoLastCommit}
-                    className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] disabled:opacity-40 cursor-pointer"
-                  >
-                    <Undo2 size={13} />
-                    Undo Last Commit
-                  </button>
+                  />
                   <div className="my-1 border-t border-[var(--border)]" />
-                  <button
+                  <CommitMenuItem
+                    icon={<Archive size={13} />}
+                    label="Stash All Changes"
+                    hint="Includes untracked files"
                     disabled={totalChanged === 0}
                     onClick={() => {
                       setShowCommitMenu(false);
                       runAction(async () => {
-                        const res = await api.gitStash('push');
+                        const res = await api.gitStash('push', {
+                          message: `On ${isDetached ? 'detached HEAD' : gitStatus.branch}`,
+                        });
                         if (!res.ok) throw new Error(res.stderr || 'Stash failed');
                         onToast('Stashed working changes');
                       });
                     }}
-                    className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] disabled:opacity-40 cursor-pointer"
-                  >
-                    <Archive size={13} />
-                    Stash All Changes
-                  </button>
+                  />
                   {(gitStatus.stashes?.length ?? 0) > 0 && (
-                    <button
+                    <CommitMenuItem
+                      icon={<History size={13} />}
+                      label="Pop Latest Stash"
                       onClick={() => {
                         setShowCommitMenu(false);
                         runAction(async () => {
@@ -1120,11 +1053,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                           onToast('Popped latest stash');
                         });
                       }}
-                      className="w-full flex items-center gap-2 px-3 py-1.5 text-left hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer"
-                    >
-                      <History size={13} />
-                      Pop Latest Stash
-                    </button>
+                    />
                   )}
                 </div>
               )}
@@ -1374,25 +1303,6 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                   <span className="text-[10px] text-[var(--text-dim)] truncate ml-0.5">
                     {allBranches ? 'All' : gitStatus.branch}
                   </span>
-                  {(gitStatus.ahead > 0 || gitStatus.behind > 0) && (
-                    <span
-                      className="flex items-center gap-1 ml-1 text-[10.5px] tabular-nums text-[var(--text-muted)]"
-                      title={`${gitStatus.ahead} to push, ${gitStatus.behind} to pull`}
-                    >
-                      {gitStatus.ahead > 0 && (
-                        <span className="flex items-center">
-                          <ArrowUp size={10} />
-                          {gitStatus.ahead}
-                        </span>
-                      )}
-                      {gitStatus.behind > 0 && (
-                        <span className="flex items-center">
-                          <ArrowDown size={10} />
-                          {gitStatus.behind}
-                        </span>
-                      )}
-                    </span>
-                  )}
                 </div>
 
                 <div

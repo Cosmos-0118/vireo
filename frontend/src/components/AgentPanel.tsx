@@ -582,10 +582,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   };
 
   return (
-    <div className="flex flex-col h-full bg-[var(--bg-sidebar)] border-l border-[var(--border)]">
+    <div className="flex flex-col h-full min-w-0 overflow-hidden bg-[var(--bg-sidebar)] border-l border-[var(--border)]">
       {/* Header */}
-      <div className="flex items-center justify-between px-3 h-10 border-b border-[var(--border)] shrink-0">
-        <div className="flex items-center gap-1.5">
+      <div className="flex items-center justify-between gap-1 px-3 h-10 border-b border-[var(--border)] shrink-0">
+        <div className="flex items-center gap-1.5 min-w-0 overflow-hidden">
           <button
             onClick={() => setMode('chat')}
             className={`px-2.5 py-1 text-[12.5px] rounded-md flex items-center gap-1.5 cursor-pointer transition-colors ${

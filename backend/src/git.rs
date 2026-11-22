@@ -103,6 +103,90 @@ pub struct BranchesRes {
     pub current: String,
     pub branches: Vec<String>,
     pub remote_branches: Vec<String>,
+    /// Rich per-branch info, newest commit first.
+    pub details: Vec<BranchInfo>,
+    /// Upstream of the checked-out branch (e.g. "origin/main"), empty if none.
+    pub upstream: String,
+    /// True when the configured upstream no longer exists on the remote.
+    pub upstream_gone: bool,
+    /// HEAD is not on a branch.
+    pub detached: bool,
+    pub head_short: String,
+    /// Remote default branch (from refs/remotes/origin/HEAD), e.g. "main".
+    pub default_branch: String,
+    /// Configured remotes (e.g. ["origin"]).
+    pub remotes: Vec<String>,
+    /// Unix seconds of the last fetch (mtime of FETCH_HEAD), if any.
+    pub last_fetched: Option<i64>,
+}
+
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct BranchInfo {
+    pub name: String,
+    pub kind: String, // "local" | "remote"
+    pub is_current: bool,
+    pub upstream: String,
+    pub ahead: usize,
+    pub behind: usize,
+    pub upstream_gone: bool,
+    pub timestamp: i64,
+    pub relative_date: String,
+    pub subject: String,
+}
+
+/// Parses `git for-each-ref` output produced with BRANCH_REF_FORMAT.
+fn parse_branch_refs(raw: &str) -> Vec<BranchInfo> {
+    let mut out = Vec::new();
+    for line in raw.lines() {
+        let f: Vec<&str> = line.split('\u{1f}').collect();
+        if f.len() < 7 {
+            continue;
+        }
+        let full = f[0].trim();
+        let (kind, name) = if let Some(n) = full.strip_prefix("refs/heads/") {
+            ("local", n)
+        } else if let Some(n) = full.strip_prefix("refs/remotes/") {
+            ("remote", n)
+        } else {
+            continue;
+        };
+        if kind == "remote" && (name.ends_with("/HEAD") || !name.contains('/')) {
+            continue;
+        }
+        let track = f[2].trim();
+        let mut ahead = 0;
+        let mut behind = 0;
+        let upstream_gone = track == "gone";
+        for part in track.split(',') {
+            let p = part.trim();
+            if let Some(n) = p.strip_prefix("ahead ") {
+                ahead = n.trim().parse().unwrap_or(0);
+            } else if let Some(n) = p.strip_prefix("behind ") {
+                behind = n.trim().parse().unwrap_or(0);
+            }
+        }
+        out.push(BranchInfo {
+            name: name.to_string(),
+            kind: kind.to_string(),
+            is_current: f[3].trim() == "*",
+            upstream: f[1].trim().to_string(),
+            ahead,
+            behind,
+            upstream_gone,
+            timestamp: f[4].trim().parse().unwrap_or(0),
+            relative_date: f[5].trim().to_string(),
+            subject: f[6..].join("\u{1f}").trim().to_string(),
+        });
+    }
+    out
+}
+
+const BRANCH_REF_FORMAT: &str = "--format=%(refname)%1f%(upstream:short)%1f%(upstream:track,nobracket)%1f%(HEAD)%1f%(committerdate:unix)%1f%(committerdate:relative)%1f%(subject)";
+
+#[derive(Deserialize, Default)]
+pub struct PullReq {
+    /// "merge" | "rebase" | "ff-only"; omitted = git's configured default
+    pub mode: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -940,9 +1024,18 @@ pub async fn push_changes(
 
 pub async fn pull_changes(
     State(state): State<AppState>,
+    body: Option<Json<PullReq>>,
 ) -> Result<Json<CommandRes>, (StatusCode, String)> {
     let ws = state.workspace_path().await;
-    let (ok, stdout, stderr) = run_git(&ws, &["pull"])
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let mut args: Vec<&str> = vec!["pull"];
+    match req.mode.as_deref() {
+        Some("rebase") => args.push("--rebase"),
+        Some("merge") => args.push("--no-rebase"),
+        Some("ff-only") => args.push("--ff-only"),
+        _ => {}
+    }
+    let (ok, stdout, stderr) = run_git(&ws, &args)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     state.notify_fs_changed(vec!["git:pull".to_string()]);
@@ -983,10 +1076,82 @@ pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
         .filter(|s| !s.is_empty() && !s.ends_with("/HEAD"))
         .collect();
 
+    let (_, refs_out, _) = run_git(
+        &ws,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            BRANCH_REF_FORMAT,
+            "refs/heads",
+            "refs/remotes",
+        ],
+    )
+    .await
+    .unwrap_or((false, String::new(), String::new()));
+    let details = parse_branch_refs(&refs_out);
+
+    let current = cur.trim().to_string();
+    let detached = current == "HEAD";
+    let (upstream, upstream_gone) = details
+        .iter()
+        .find(|b| b.kind == "local" && b.is_current)
+        .map(|b| (b.upstream.clone(), b.upstream_gone))
+        .unwrap_or_default();
+
+    let (_, head_short, _) = run_git(&ws, &["rev-parse", "--short", "HEAD"])
+        .await
+        .unwrap_or((false, String::new(), String::new()));
+
+    let (_, remotes_out, _) = run_git(&ws, &["remote"])
+        .await
+        .unwrap_or((false, String::new(), String::new()));
+    let remotes: Vec<String> = remotes_out
+        .lines()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let (dh_ok, dh_out, _) =
+        run_git(&ws, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+            .await
+            .unwrap_or((false, String::new(), String::new()));
+    let default_branch = if dh_ok && !dh_out.trim().is_empty() {
+        dh_out.trim().trim_start_matches("origin/").to_string()
+    } else if details.iter().any(|b| b.kind == "local" && b.name == "main") {
+        "main".to_string()
+    } else if details.iter().any(|b| b.kind == "local" && b.name == "master") {
+        "master".to_string()
+    } else {
+        String::new()
+    };
+
+    let (fh_ok, fh_out, _) = run_git(&ws, &["rev-parse", "--git-path", "FETCH_HEAD"])
+        .await
+        .unwrap_or((false, String::new(), String::new()));
+    let last_fetched = if fh_ok {
+        let p = std::path::PathBuf::from(fh_out.trim());
+        let p = if p.is_absolute() { p } else { ws.join(p) };
+        std::fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+    } else {
+        None
+    };
+
     Json(BranchesRes {
-        current: cur.trim().to_string(),
+        current,
         branches,
         remote_branches,
+        details,
+        upstream,
+        upstream_gone,
+        detached,
+        head_short: head_short.trim().to_string(),
+        default_branch,
+        remotes,
+        last_fetched,
     })
 }
 
@@ -1063,9 +1228,12 @@ pub async fn get_log(
         if !b_trim.is_empty() && !b_trim.starts_with('-') {
             args.push(b_trim.to_string());
         } else if all {
+            // Stashes are not history; keep them out of the graph.
+            args.push("--exclude=refs/stash".to_string());
             args.push("--all".to_string());
         }
     } else if all {
+        args.push("--exclude=refs/stash".to_string());
         args.push("--all".to_string());
     }
 
@@ -1761,6 +1929,31 @@ pub async fn rollback_checkpoint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_branch_refs_tracking_gone_and_remote_head() {
+        let s = '\u{1f}';
+        let raw = [
+            format!("refs/heads/main{s}origin/main{s}ahead 2, behind 1{s}*{s}1700000300{s}2 minutes ago{s}Fix: a{s}b"),
+            format!("refs/heads/feat/x{s}origin/feat/x{s}gone{s} {s}1700000200{s}1 hour ago{s}Work"),
+            format!("refs/heads/local-only{s}{s}{s} {s}1700000100{s}2 days ago{s}Local"),
+            format!("refs/remotes/origin/HEAD{s}{s}{s} {s}1700000300{s}2 minutes ago{s}Fix"),
+            format!("refs/remotes/origin{s}{s}{s} {s}1700000300{s}2 minutes ago{s}Fix"),
+            format!("refs/remotes/origin/main{s}{s}{s} {s}1700000000{s}3 days ago{s}Old"),
+        ]
+        .join("\n");
+        let b = parse_branch_refs(&raw);
+        assert_eq!(b.len(), 4);
+        assert_eq!(b[0].name, "main");
+        assert!(b[0].is_current);
+        assert_eq!((b[0].ahead, b[0].behind), (2, 1));
+        assert_eq!(b[0].subject, format!("Fix: a{s}b"));
+        assert_eq!(b[1].name, "feat/x");
+        assert!(b[1].upstream_gone);
+        assert_eq!(b[2].upstream, "");
+        assert_eq!(b[3].kind, "remote");
+        assert_eq!(b[3].name, "origin/main");
+    }
 
     #[test]
     fn test_parse_refs_handles_local_slash_remote_and_tags() {
