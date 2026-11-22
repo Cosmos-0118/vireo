@@ -118,6 +118,13 @@ export interface GitStatusRes {
   stashes: StashItem[];
 }
 
+export interface GenerateMessageRes {
+  ok: boolean;
+  message: string;
+  code: 'gh_missing' | 'gh_unauthenticated' | 'no_changes' | 'failed' | '';
+  error: string;
+}
+
 export interface GithubStatusRes {
   installed: boolean;
   authenticated: boolean;

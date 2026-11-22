@@ -2106,6 +2106,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_clean_commit_message() {
+        assert_eq!(
+            clean_commit_message("```\nfeat(ui): add commit generator.\n\n- one\n```"),
+            "feat(ui): add commit generator\n\n- one"
+        );
+        assert_eq!(
+            clean_commit_message("Commit message: \"fix: handle empty diff\""),
+            "fix: handle empty diff"
+        );
+    }
+
+    #[test]
     fn test_parse_branch_refs_tracking_gone_and_remote_head() {
         let s = '\u{1f}';
         let raw = [
@@ -2169,4 +2181,282 @@ mod tests {
         assert_eq!(files[2].status, "A");
         assert!(files[2].binary);
     }
+}
+
+// ---------------------------------------------------------------------------
+// AI commit-message generation (GitHub CLI -> GitHub Models)
+// ---------------------------------------------------------------------------
+
+const COMMIT_MODEL: &str = "openai/gpt-4.1-mini";
+const COMMIT_DIFF_BUDGET: usize = 14_000;
+const COMMIT_SYSTEM_PROMPT: &str = "You write git commit messages. Reply with ONLY the commit message, no quotes, no code fences, no preamble.\n\
+Rules:\n\
+- Subject line: imperative mood, max 60 characters, no trailing period, says WHAT changed and the main WHY/area.\n\
+- Follow the style of the recent commit subjects given (Conventional Commits prefix like feat/fix/refactor(scope): if they use it, same casing otherwise). If there is no clear style, use Conventional Commits.\n\
+- Add a body ONLY when the change has several distinct parts: blank line, then at most 3 short '- ' bullets. Otherwise subject only.\n\
+- Be specific (name the feature/function/file area). Never write vague subjects like 'update code' or 'fix stuff'.\n\
+- Describe only what the diff shows. Do not invent details.";
+
+#[derive(Deserialize, Default)]
+pub struct GenerateMessageReq {
+    pub amend: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub struct GenerateMessageRes {
+    pub ok: bool,
+    pub message: String,
+    /// "gh_missing" | "gh_unauthenticated" | "no_changes" | "failed" when !ok.
+    pub code: String,
+    pub error: String,
+}
+
+fn gen_fail(code: &str, error: &str) -> Json<GenerateMessageRes> {
+    Json(GenerateMessageRes {
+        ok: false,
+        message: String::new(),
+        code: code.to_string(),
+        error: error.to_string(),
+    })
+}
+
+/// `gh` with a request body on stdin.
+async fn run_gh_stdin(
+    ws: &Path,
+    args: &[&str],
+    stdin_data: &[u8],
+) -> Result<(bool, String, String), String> {
+    let mut child = background_command("gh")
+        .args(args)
+        .current_dir(ws)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to run gh: {}", e))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(stdin_data)
+            .await
+            .map_err(|e| format!("Failed to write stdin to gh: {}", e))?;
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .map_err(|e| format!("Failed to wait for gh: {}", e))?;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+fn truncate_chars(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Tidy model output: strip fences/quotes/"Commit message:" labels and trailing whitespace.
+fn clean_commit_message(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    if s.starts_with("```") {
+        s = s
+            .trim_start_matches("```")
+            .trim_start_matches(|c: char| c.is_ascii_alphabetic())
+            .trim_start()
+            .to_string();
+        if let Some(i) = s.rfind("```") {
+            s.truncate(i);
+        }
+        s = s.trim().to_string();
+    }
+    let lower = s.to_lowercase();
+    for label in ["commit message:", "message:"] {
+        if lower.starts_with(label) {
+            s = s[label.len()..].trim_start().to_string();
+            break;
+        }
+    }
+    let s = s.trim().trim_matches(|c| c == '"' || c == '`').trim();
+    let mut lines: Vec<&str> = s.lines().map(|l| l.trim_end()).collect();
+    if let Some(first) = lines.first_mut() {
+        *first = first.trim_end_matches('.');
+    }
+    lines.join("\n").trim().to_string()
+}
+
+pub async fn generate_commit_message(
+    State(state): State<AppState>,
+    body: Option<Json<GenerateMessageReq>>,
+) -> Result<Json<GenerateMessageRes>, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let amend = body.and_then(|Json(r)| r.amend).unwrap_or(false);
+
+    let gh = github_status(State(state.clone())).await.0;
+    if !gh.installed {
+        return Ok(gen_fail(
+            "gh_missing",
+            "GitHub CLI (gh) is not installed. Install it from https://cli.github.com, then run `gh auth login`.",
+        ));
+    }
+    if !gh.authenticated {
+        return Ok(gen_fail(
+            "gh_unauthenticated",
+            "GitHub CLI is not signed in. Run `gh auth login` in the terminal, then try again.",
+        ));
+    }
+
+    // Mirror what the Commit button will commit: staged changes, or everything when nothing is staged.
+    let has_head = run_git(&ws, &["rev-parse", "--verify", "-q", "HEAD"])
+        .await
+        .map(|r| r.0)
+        .unwrap_or(false);
+    let staged_any = !run_git(&ws, &["diff", "--cached", "--quiet"])
+        .await
+        .map(|r| r.0)
+        .unwrap_or(true);
+    let excludes = [
+        ":(exclude)*.lock",
+        ":(exclude)package-lock.json",
+        ":(exclude)*.min.js",
+        ":(exclude)*.map",
+    ];
+    let base: Vec<&str> = if amend && has_head {
+        let has_parent = run_git(&ws, &["rev-parse", "--verify", "-q", "HEAD~1"])
+            .await
+            .map(|r| r.0)
+            .unwrap_or(false);
+        if has_parent {
+            vec!["diff", "--cached", "HEAD~1"]
+        } else {
+            vec!["diff", "--cached"]
+        }
+    } else if staged_any {
+        vec!["diff", "--cached"]
+    } else if has_head {
+        vec!["diff", "HEAD"]
+    } else {
+        vec!["diff", "--cached"]
+    };
+
+    let mut stat_args = base.clone();
+    stat_args.extend(["--stat", "--no-color"]);
+    let stat = run_git(&ws, &stat_args)
+        .await
+        .map(|r| r.1)
+        .unwrap_or_default();
+    let mut patch_args = base.clone();
+    patch_args.extend(["--no-color", "-U2", "--no-ext-diff", "--", "."]);
+    patch_args.extend(excludes);
+    let patch = run_git(&ws, &patch_args)
+        .await
+        .map(|r| r.1)
+        .unwrap_or_default();
+
+    let untracked = if staged_any || amend {
+        String::new()
+    } else {
+        run_git(&ws, &["ls-files", "--others", "--exclude-standard"])
+            .await
+            .map(|r| r.1)
+            .unwrap_or_default()
+    };
+
+    if stat.trim().is_empty() && patch.trim().is_empty() && untracked.trim().is_empty() {
+        return Ok(gen_fail("no_changes", "No changes to describe."));
+    }
+
+    let recent = if has_head {
+        run_git(&ws, &["log", "-8", "--no-merges", "--pretty=format:%s"])
+            .await
+            .map(|r| r.1)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let branch = current_branch(&ws).await;
+
+    let mut prompt = String::new();
+    prompt.push_str(&format!("Branch: {}\n", branch));
+    if !recent.trim().is_empty() {
+        prompt.push_str(&format!("Recent commit subjects:\n{}\n\n", recent.trim()));
+    }
+    prompt.push_str(&format!(
+        "Changed files:\n{}\n",
+        truncate_chars(stat.trim(), 3_000)
+    ));
+    if !untracked.trim().is_empty() {
+        let list: Vec<&str> = untracked.lines().take(30).collect();
+        prompt.push_str(&format!("New untracked files:\n{}\n", list.join("\n")));
+    }
+    let budget = COMMIT_DIFF_BUDGET.saturating_sub(prompt.len().min(6_000));
+    let clipped = truncate_chars(&patch, budget);
+    prompt.push_str("\nDiff");
+    if clipped.len() < patch.len() {
+        prompt.push_str(" (truncated)");
+    }
+    prompt.push_str(":\n");
+    prompt.push_str(clipped);
+
+    let req_body = serde_json::json!({
+        "model": COMMIT_MODEL,
+        "temperature": 0.2,
+        "max_tokens": 220,
+        "messages": [
+            { "role": "system", "content": COMMIT_SYSTEM_PROMPT },
+            { "role": "user", "content": prompt },
+        ],
+    });
+    let (ok, out, err) = run_gh_stdin(
+        &ws,
+        &[
+            "api",
+            "-X",
+            "POST",
+            "https://models.github.ai/inference/chat/completions",
+            "--input",
+            "-",
+        ],
+        req_body.to_string().as_bytes(),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let parsed: Option<serde_json::Value> = serde_json::from_str(&out).ok();
+    let content = parsed
+        .as_ref()
+        .and_then(|v| v["choices"][0]["message"]["content"].as_str())
+        .unwrap_or("");
+    if !ok || content.is_empty() {
+        let api_msg = parsed
+            .as_ref()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
+            .or_else(|| {
+                let t = if err.trim().is_empty() { out.trim() } else { err.trim() };
+                (!t.is_empty()).then(|| truncate_chars(t, 300).to_string())
+            })
+            .unwrap_or_else(|| "no response".to_string());
+        return Ok(gen_fail(
+            "failed",
+            &format!("GitHub Models request failed: {}", api_msg),
+        ));
+    }
+    let message = clean_commit_message(content);
+    if message.is_empty() {
+        return Ok(gen_fail("failed", "The model returned an empty message."));
+    }
+    Ok(Json(GenerateMessageRes {
+        ok: true,
+        message,
+        code: String::new(),
+        error: String::new(),
+    }))
 }

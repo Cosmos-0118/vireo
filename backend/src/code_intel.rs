@@ -32,7 +32,7 @@ vx map [query] - ranked repo symbol map\n\
 vx outline <file> - symbols as [start#hash..end#hash] ranges (markdown: headings)\n\
 vx view <file> [symbol|A..B] - lines as N#hash|code\n\
 vx search <regex> [--glob G] - grep; every hit carries an N#hash anchor\n\
-vx edit <file> A#h..B#h - replace those lines with new code from stdin or --text (no old text needed; anchors come from view/outline/search/check output). Also --insert-after, --insert-before, --delete (anchor A#h only)\n\
+vx edit <file> A#h..B#h - replace those lines with new code from stdin or --text (no old text needed; anchors come from view/outline/search/check output). Also --insert-after, --insert-before (add lines next to anchor A#h) and --delete (A#h or A#h..B#h); unknown flags are rejected, never treated as a replace\n\
 vx symbol <file> <name> [--replace|--insert-after|--delete] - read or change a whole function/class by name (code on stdin); the range includes its doc comments/attributes\n\
 vx create <file> - new file from stdin\n\
 vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] - structural search/codemod (-r edits files in place; preview with --dry-run)\n\

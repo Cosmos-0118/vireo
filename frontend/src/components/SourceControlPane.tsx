@@ -31,6 +31,8 @@ import {
   RefreshCw,
   RotateCcw,
   Search,
+  Sparkles,
+  Loader2,
   Trash2,
   Undo2,
   X,
@@ -144,6 +146,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
   const [amendMode, setAmendMode] = useState(false);
   const [showCommitMenu, setShowCommitMenu] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [generating, setGenerating] = useState(false);
   const [showMoreMenu, setShowMoreMenu] = useState(false);
   const [publishDialog, setPublishDialog] = useState<PublishMode | null>(null);
   const moreMenuRef = useRef<HTMLDivElement>(null);
@@ -453,6 +456,26 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       }
     },
   });
+
+  const handleGenerateMessage = async () => {
+    if (generating) return;
+    setGenerating(true);
+    try {
+      const res = await api.gitGenerateMessage(amendMode);
+      if (res.ok) {
+        setCommitMsg(res.message);
+        commitInputRef.current?.focus();
+      } else if (res.code === 'gh_missing' || res.code === 'gh_unauthenticated') {
+        onToast(`Connect GitHub CLI to generate messages. ${res.error}`, true);
+      } else {
+        onToast(res.error || 'Could not generate a commit message', true);
+      }
+    } catch (e) {
+      onToast(e instanceof Error ? e.message : 'Could not generate a commit message', true);
+    } finally {
+      setGenerating(false);
+    }
+  };
 
   const handleCommit = (andPush: boolean, forceAmend?: boolean) => {
     const useAmend = forceAmend ?? amendMode;
@@ -1121,12 +1144,21 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                     ? 'Message (Ctrl+Enter to commit on detached HEAD)'
                     : `Message (Ctrl+Enter to commit on “${gitStatus.branch}”)`
                 }
-                className={`block w-full px-2.5 py-1.5 text-[12.5px] bg-[var(--bg-input)] border text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none leading-relaxed ${
+                className={`block w-full pl-2.5 pr-8 py-1.5 text-[12.5px] bg-[var(--bg-input)] border text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none leading-relaxed ${
                   amendMode
                     ? `rounded-b-md ${headPushed ? 'border-[var(--modified-fg)]/50' : 'border-[var(--accent)]/50'} focus:border-[var(--accent)]`
                     : 'rounded-md border-[var(--border)] focus:border-[var(--accent)]'
                 }`}
               />
+              <button
+                onClick={handleGenerateMessage}
+                disabled={generating || busy || !canCommit}
+                className="absolute right-1.5 top-1.5 p-1 rounded text-[var(--text-dim)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-[var(--text-dim)] cursor-pointer disabled:cursor-not-allowed"
+                aria-label="Generate commit message"
+                title={generating ? 'Generating…' : 'Generate commit message with GitHub CLI'}
+              >
+                {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
+              </button>
               {firstLineLen > 50 && (
                 <span
                   className={`absolute right-2 bottom-1.5 text-[10px] font-mono tabular-nums pointer-events-none ${

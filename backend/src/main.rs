@@ -279,6 +279,7 @@ fn build_router(
         .route("/api/git/init", post(git::init_repo))
         .route("/api/git/github-status", get(git::github_status))
         .route("/api/git/publish-github", post(git::publish_github))
+        .route("/api/git/generate-message", post(git::generate_commit_message))
         .route("/api/git/remote-add", post(git::add_remote))
         .route("/api/git/push", post(git::push_changes))
         .route("/api/git/pull", post(git::pull_changes))

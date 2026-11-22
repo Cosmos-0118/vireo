@@ -27,7 +27,7 @@ const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, symbol 
   vx view <file> [symbol|A..B]    lines as N#hash|code; target is a function/class name or a line range\n\
   vx search <regex> [--glob G]    regex search, hits as file:N#hash| text (use `--` before a pattern starting with -)\n\
   vx edit <file> A#h[..B#h]       replace those lines with new code from stdin or --text\n\
-         [--insert-after|--insert-before|--delete]   (--delete and the inserts take the anchor only)\n\
+         [--insert-after|--insert-before|--delete]   (inserts add lines next to the anchor and keep it; --delete removes A#h or A#h..B#h; aliases --after/--before/--remove work; unknown flags are rejected)\n\
   vx symbol <file> <name>         print a whole function/class; add --replace|--insert-after|--delete to change it\n\
   vx create <file> [--force]      new file from stdin or --text (--force overwrites)\n\
   vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
@@ -154,6 +154,46 @@ fn main() {
             pos.push(a.clone());
             i += 1;
         }
+    }
+    // Friendly aliases for the mode flags.
+    for (name, _) in flags.iter_mut() {
+        let canon = match name.as_str() {
+            "--after" | "--append" | "--insert" => "--insert-after",
+            "--before" | "--prepend" => "--insert-before",
+            "--remove" | "--del" | "--rm" => "--delete",
+            "--overwrite" => "--force",
+            _ => continue,
+        };
+        *name = canon.to_string();
+    }
+    // Reject flags the command does not understand. A typo like `--after` used to fall through to
+    // a plain replace and silently overwrite the anchored line.
+    let allowed: &[&str] = match cmd {
+        "outline" | "view" => &[],
+        "map" => &["--dir"],
+        "search" => &["--glob"],
+        "edit" => &["--text", "--delete", "--insert-after", "--insert-before"],
+        "symbol" => &["--text", "--replace", "--insert-after", "--delete"],
+        "create" => &["--text", "--force"],
+        "ast" => &["-r", "--rewrite", "-l", "--lang", "--dry-run"],
+        "check" => &["--cmd", "--timeout"],
+        _ => &[],
+    };
+    for (name, _) in &flags {
+        if !allowed.contains(&name.as_str()) {
+            let hint = allowed.iter().copied().find(|a| a.trim_start_matches('-').starts_with(name.trim_start_matches('-')) && name.len() > 2);
+            let list = if allowed.is_empty() { "no flags".to_string() } else { allowed.join(" ") };
+            let did = hint.map(|h| format!(" Did you mean `{h}`?")).unwrap_or_default();
+            fail(&format!("Error: unknown flag `{name}` for `vx {cmd}` (accepts: {list}).{did} Nothing was changed.\n{USAGE}"));
+        }
+    }
+    // Mode flags are mutually exclusive.
+    let modes: Vec<&str> = ["--delete", "--insert-after", "--insert-before", "--replace"]
+        .into_iter()
+        .filter(|m| flags.iter().any(|(k, _)| k == m))
+        .collect();
+    if modes.len() > 1 {
+        fail(&format!("Error: conflicting flags {} - pick one. Nothing was changed.", modes.join(" + ")));
     }
     let flag = |names: &[&str]| -> Option<Option<String>> {
         flags.iter().find(|(k, _)| names.contains(&k.as_str())).map(|(_, v)| v.clone())

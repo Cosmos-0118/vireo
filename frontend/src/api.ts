@@ -12,6 +12,7 @@ import type {
   CommitLogRes,
   GitDiffRes,
   GitStatusRes,
+  GenerateMessageRes,
   GithubStatusRes,
   ReplaceRes,
   SearchOptions,
@@ -123,6 +124,11 @@ export const api = {
       body: JSON.stringify(branch ? { branch } : {}),
     }),
   githubStatus: () => jsonFetch<GithubStatusRes>('/api/git/github-status'),
+  gitGenerateMessage: (amend = false) =>
+    jsonFetch<GenerateMessageRes>('/api/git/generate-message', {
+      method: 'POST',
+      body: JSON.stringify({ amend }),
+    }),
   gitPublishGithub: (name: string, isPrivate: boolean, description?: string) =>
     jsonFetch<CommandRes>('/api/git/publish-github', {
       method: 'POST',
