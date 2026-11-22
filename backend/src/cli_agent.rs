@@ -1106,8 +1106,9 @@ fn map_vx_mcp_tool(tool: &str, input: &Value, ws: &Path) -> (String, Value) {
         }
         "search" => ("search_code".into(), json!({ "query": input["query"].as_str().unwrap_or("") })),
         "edit" => ("edit_file".into(), json!({ "path": p() })),
-        // Empty path marks the turn opaque for checkpoints so every file in a multi-file patch is captured.
+        // Empty path marks the turn opaque for checkpoints so every file in a multi-file patch/replace is captured.
         "apply" => ("edit_file".into(), json!({ "path": "" })),
+        "replace" => ("edit_file".into(), json!({ "path": "" })),
         "symbol" => {
             let mode = input["mode"].as_str().unwrap_or("read");
             let sym = input["symbol"].as_str().unwrap_or("");
@@ -1156,7 +1157,7 @@ fn map_vx(command: &str, ws: &Path) -> Option<(String, Value)> {
             ("read_file".into(), a)
         }
         "edit" => ("edit_file".into(), json!({ "path": path(0) })),
-        "apply" => ("edit_file".into(), json!({ "path": "" })),
+        "apply" | "replace" => ("edit_file".into(), json!({ "path": "" })),
         "symbol" if flag("--replace") || flag("--insert-after") || flag("--delete") => {
             let mode = if flag("--replace") { "replace" } else if flag("--delete") { "delete" } else { "insert_after" };
             ("symbol_edit".into(), json!({ "path": path(0), "symbol": pos.get(1).map(|s| s.as_str()).unwrap_or(""), "mode": mode }))

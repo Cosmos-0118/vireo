@@ -1,0 +1,65 @@
+//! CLI help and usage text for `vx`.
+
+pub const USAGE: &str = "vx <map|outline|view|search|apply|replace|edit|symbol|create|ast|check|mcp> ...   (vx help for details)\n\
+  vx map [query] [--dir D]\n\
+  vx outline <file>\n\
+  vx view <file> [symbol|A..B,C..D]  |  vx view <file:A..B> <file2:C..D> ...\n\
+  vx search <regex> [path] [-g G]... [-p P] [-C N] [-F] [-i] [-l] [--limit N]\n\
+  vx apply [--file F] [--dry-run]                                                    (V4A / anchored patch on stdin or --file)\n\
+  vx replace <old> <new> [path] [-g G]... [-r] [--dry-run] [--expected N] [--all-files]\n\
+  vx edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]\n\
+  vx symbol <file> <name> [--replace|--insert-after|--delete] [--text T|--file F]\n\
+  vx create <file> [--force] [--text T|--file F]\n\
+  vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
+  vx check [--raw] [--warnings] [--timeout S] [--cmd C | cmd args...]\n\
+  vx mcp [--workspace DIR] [--read-only]";
+
+pub const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, atomic patches & replace, smart search, symbol ops, repo map, build check, MCP server\n\
+\n\
+  vx map [query] [--dir D]        ranked file/symbol map; a query narrows by file or symbol name\n\
+  vx outline <file>               symbols as [start#hash..end#hash] ranges (markdown: headings; auto-resolves unique paths)\n\
+  vx view <file> [symbol|A..B,C..D]\n\
+                                  lines as N#hash|code; accepts comma-separated ranges/symbols or batch `file:A..B file2:C..D`\n\
+  vx search <regex> [path] [-g G]... [-C N] [-F] [-i] [-l] [--limit N]\n\
+                                  anchored search (`file:N#hash| text`); auto-recovers monorepo paths/globs (e.g. `src/**` -> `**/src/**`),\n\
+                                  `-C N` prints anchored context lines, `-F` literal search, `-l` files with hit counts\n\
+  vx apply [--file F] [--dry-run] atomic multi-file/multi-hunk V4A patch (anchored `@@ A#h..B#h` or context `@@` hunks; `vx help apply`)\n\
+  vx replace <old> <new> [path] [-g G]... [-r] [--dry-run] [--expected N] [--all-files]\n\
+                                  atomic literal (default) or regex (`-r`) replace across 1 or many files with syntax checks & CRLF preservation\n\
+  vx edit <file> A#h[..B#h]       replace those lines with new code from stdin, --file F, or --text\n\
+         [--insert-after|--insert-before|--delete]   (aliases --after/--before/--remove work; unknown flags are rejected)\n\
+  vx symbol <file> <name>         print a whole function/class; add --replace|--insert-after|--delete to change it\n\
+  vx create <file> [--force]      new file from stdin, --file F, or --text (--force overwrites)\n\
+  vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
+                                  ast-grep structural search; -r rewrites files IN PLACE, --dry-run only lists\n\
+  vx check [--raw] [--warnings] [--timeout S] [cmd ...]\n\
+                                  run cargo/tsc/go or any command (e.g. `vx check cargo test -p x`); deduplicated anchored errors, rustc notes/labels, failing test blocks; exits 1 on failure\n\
+  vx mcp [--workspace DIR] [--read-only]\n\
+                                  stdio MCP JSON-RPC 2.0 server exposing vx tools with zero shell quoting\n\
+\n\
+Workflow: map or search -> outline / view (copy N#hh anchors) -> apply / replace / edit / symbol -> check.\n\
+Prefer `vx apply` or `vx replace` over Python/sed scripts for multi-file changes. On Windows, prefer `vx mcp` or `--file F` over piping multi-line code.\n\
+Edits report new anchors and flag new syntax errors immediately; no need to re-read after editing.";
+
+pub const HELP_APPLY: &str = "vx apply [--file F] [--dry-run]  (reads patch from --file F or stdin)\n\
+\n\
+Applies many hunks across many files atomically (all validated in memory first; nothing written on error).\n\
+Uses the V4A patch envelope with hashline-anchored hunks (preferred) or classic context hunks:\n\
+\n\
+  *** Begin Patch                  (optional if starting directly with `*** Update File:` / `*** Add File:`)\n\
+  *** Update File: src/app.rs\n\
+  @@ 12#ab..15#cd                  # replace lines 12..15 with the `+` lines (no old text needed)\n\
+  +let x = 2;\n\
+  @@ after 40#ef                   # insert `+` lines after line 40 (also: `before 40#ef`)\n\
+  +log(\"ok\");\n\
+  @@ delete 50#aa..52#bb           # remove lines 50..52\n\
+  @@ fn helper() {                 # classic V4A context hunk: ' ' context, '-' remove, '+' add\n\
+   let a = 1;\n\
+  -let b = 2;\n\
+  +let b = 3;\n\
+  *** Add File: src/new.rs\n\
+  +pub fn hi() {}\n\
+  *** Delete File: src/old.rs\n\
+  *** End Patch\n\
+\n\
+All anchors in a patch refer to the file BEFORE the patch (so anchors from one `vx view` stay valid for every hunk).";

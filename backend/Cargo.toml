@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "vx"
-path = "src/bin/vx.rs"
+path = "src/bin/vx/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
