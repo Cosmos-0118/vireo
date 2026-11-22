@@ -27,17 +27,19 @@ use xxhash_rust::xxh32::xxh32;
 
 /// Short usage hint injected into external agent CLIs (kept tiny on purpose: this is the whole
 /// per-turn "schema" cost of the vx tools).
-pub const AGENT_HINT: &str = "Vireo `vx` is on PATH: token-cheap code tools. Prefer it over cat/grep/sed and full-file rewrites.\n\
-vx map [query] - ranked repo symbol map\n\
-vx outline <file> - symbols as [start#hash..end#hash] ranges (markdown: headings)\n\
-vx view <file> [symbol|A..B] - lines as N#hash|code\n\
-vx search <regex> [--glob G] - grep; every hit carries an N#hash anchor\n\
-vx edit <file> A#h..B#h - replace those lines with new code from stdin or --text (no old text needed; anchors come from view/outline/search/check output). Also --insert-after, --insert-before (add lines next to anchor A#h) and --delete (A#h or A#h..B#h); unknown flags are rejected, never treated as a replace\n\
-vx symbol <file> <name> [--replace|--insert-after|--delete] - read or change a whole function/class by name (code on stdin); the range includes its doc comments/attributes\n\
-vx create <file> - new file from stdin\n\
-vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] - structural search/codemod (-r edits files in place; preview with --dry-run)\n\
-vx check [--cmd C] - build/tests, only deduped errors with anchors\n\
-Edits print the new anchors and flag new syntax errors immediately, so do not re-read after editing. A stale anchor is re-located if still unique, else rejected with fresh lines. `vx help` has details.";
+pub const AGENT_HINT: &str = "Vireo `vx` is available (via MCP tools `vx_*` when registered, and as `vx` on PATH): token-lean code tools.\n\
+Prefer `vx` over cat/grep/full-file reads. For edits: use your native Edit tool for tiny single-spot tweaks; use `vx` (prefer MCP tools over shell piping) for multi-hunk/multi-file atomic patches, anchor edits, and whole-symbol edits.\n\
+- map [query] [--dir D]         ranked repo symbol map\n\
+- outline <file>                symbols as [start#hash..end#hash] ranges\n\
+- view <file> [symbol|A..B]     lines as N#hash|code\n\
+- search <regex> [--glob G]     grep with N#hash anchors\n\
+- apply [--file F] [--dry-run]  atomic multi-file V4A patch (`*** Begin Patch` / `*** Update File:` / `*** End Patch`); hunks may be anchored (`@@ 12#ab..15#cd`, `@@ after 12#ab`, `@@ before 12#ab`, `@@ delete 12#ab..15#cd` with `+` lines) or classic `@@` context (` `, `-`, `+`)\n\
+- edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]\n\
+- symbol <file> <name> [--replace|--insert-after|--delete] [--text T|--file F]\n\
+- create <file> [--force] [--text T|--file F]\n\
+- ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang]\n\
+- check [--raw] [--warnings] [--timeout S] [cmd ...]   build/test runner with anchored errors, rustc notes/labels, and failing test output (pass any command directly, e.g. `vx check cargo test -p pkg`)\n\
+From a shell on Windows, prefer `--file F` (or MCP) over piping multi-line code to avoid quoting/encoding pitfalls. Edits print new anchors and syntax errors immediately; no need to re-read. `vx help` has details.";
 
 // ---------------------------------------------------------------------------------------------
 // Process helpers
@@ -1075,6 +1077,7 @@ pub fn create(ws: &Path, path: &str, content: &str, force: bool) -> Result<Strin
     if let Some(parent) = full.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     std::fs::write(&full, content.as_bytes()).map_err(|e| format!("cannot write {rel}: {e}"))?;
     let mut msg = format!("Created {rel} ({} bytes).", content.len());
     if let Some(errs) = syntax_errors(lang_for(&rel), content) {
@@ -1426,6 +1429,754 @@ pub fn ast(ws: &Path, pattern: &str, lang: Option<&str>, path: Option<&str>, rew
     Ok(res)
 }
 
+// --------------------------------- apply (multi-file patch) -----------------------------------
+//
+// One atomic call for many hunks across many files. The envelope is OpenAI's V4A `apply_patch`
+// format (which models already know), extended with hashline-anchored hunks:
+//
+//   *** Begin Patch
+//   *** Update File: src/a.rs
+//   @@ 12#ab..15#cd            replace lines 12..15 with the + lines   (no old text needed)
+//   +new line
+//   @@ after 40#ef             insert the + lines after line 40 (also: `before 40#ef`)
+//   +inserted
+//   @@ delete 50#aa..52#bb     remove lines 50..52
+//   @@ fn helper() {           classic V4A context hunk: ' ' context, '-' remove, '+' add
+//    context line
+//   -old line
+//   +new line
+//   *** Add File: src/new.rs
+//   +content
+//   *** Delete File: src/old.rs
+//   *** End Patch
+//
+// Every hunk is resolved against the file as it was before the patch (so anchors from one `view`
+// stay valid for all hunks), all files are validated first, and nothing is written unless every
+// hunk applies.
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AnchorKind {
+    Replace,
+    Delete,
+    After,
+    Before,
+}
+
+#[derive(Debug)]
+enum Hunk {
+    Anchored { kind: AnchorKind, start: (usize, String), end: (usize, String), new: Vec<String>, header: String },
+    /// `body` keeps each line's V4A prefix (b' ', b'-', b'+') so context lines can be written back
+    /// exactly as they are in the file.
+    Context { ctx: Option<String>, body: Vec<(u8, String)>, eof: bool, header: String },
+}
+
+#[derive(Debug)]
+enum FileOp {
+    Add { path: String, lines: Vec<String> },
+    Delete { path: String },
+    Update { path: String, move_to: Option<String>, hunks: Vec<Hunk> },
+}
+
+/// Strip a `N#hh|` prefix copied from `view` output (never part of real code).
+fn strip_hashline_prefix(l: &str) -> &str {
+    match lazy_re!(r"^\d+#[0-9a-fA-F]{2}\|").find(l) {
+        Some(m) => &l[m.end()..],
+        None => l,
+    }
+}
+
+fn patch_header<'a>(l: &'a str, tag: &str) -> Option<&'a str> {
+    l.trim_end().strip_prefix(tag).map(str::trim)
+}
+
+fn is_file_header(l: &str) -> bool {
+    let t = l.trim_end();
+    t == "*** End Patch"
+        || t.starts_with("*** Add File:")
+        || t.starts_with("*** Delete File:")
+        || t.starts_with("*** Update File:")
+}
+
+fn parse_anchored_header(h: &str) -> Option<(AnchorKind, (usize, String), (usize, String))> {
+    let re = lazy_re!(r"^(?i:(after|before|replace|delete)\s+)?(\d+#[0-9A-Fa-f]{2})(?:\s*(?:\.\.|-)\s*(\d+#[0-9A-Fa-f]{2}))?$");
+    let c = re.captures(h.trim())?;
+    let kind = match c.get(1).map(|m| m.as_str().to_ascii_lowercase()).as_deref() {
+        Some("after") => AnchorKind::After,
+        Some("before") => AnchorKind::Before,
+        Some("delete") => AnchorKind::Delete,
+        _ => AnchorKind::Replace,
+    };
+    let s = parse_anchor(&c[2]).ok()?;
+    let e = match c.get(3) {
+        Some(m) => parse_anchor(m.as_str()).ok()?,
+        None => s.clone(),
+    };
+    Some((kind, s, e))
+}
+
+fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
+    let t = text.replace("\r\n", "\n");
+    let lines: Vec<&str> = t.split('\n').collect();
+    let begin = lines
+        .iter()
+        .position(|l| l.trim() == "*** Begin Patch")
+        .ok_or("not a patch: expected a `*** Begin Patch` line (see `vx help apply`)")?;
+    let mut ops = Vec::new();
+    let mut i = begin + 1;
+    let mut ended = false;
+    while i < lines.len() {
+        let l = lines[i];
+        if l.trim() == "*** End Patch" {
+            ended = true;
+            break;
+        }
+        if let Some(p) = patch_header(l, "*** Add File:") {
+            i += 1;
+            let mut body: Vec<String> = Vec::new();
+            let mut blanks = 0usize;
+            while i < lines.len() && !is_file_header(lines[i]) {
+                let b = lines[i];
+                if let Some(rest) = b.strip_prefix('+') {
+                    body.extend(std::iter::repeat(String::new()).take(blanks));
+                    blanks = 0;
+                    body.push(strip_hashline_prefix(rest).to_string());
+                } else if b.trim().is_empty() {
+                    blanks += 1; // a blank line that lost its `+`; kept only if more content follows
+                } else {
+                    return Err(format!("patch line {}: lines of `*** Add File: {p}` must start with `+` (got `{}`)", i + 1, clip(b, 60)));
+                }
+                i += 1;
+            }
+            ops.push(FileOp::Add { path: p.to_string(), lines: body });
+            continue;
+        }
+        if let Some(p) = patch_header(l, "*** Delete File:") {
+            ops.push(FileOp::Delete { path: p.to_string() });
+            i += 1;
+            continue;
+        }
+        if let Some(p) = patch_header(l, "*** Update File:") {
+            i += 1;
+            let mut move_to = None;
+            if i < lines.len() {
+                if let Some(m) = patch_header(lines[i], "*** Move to:") {
+                    move_to = Some(m.to_string());
+                    i += 1;
+                }
+            }
+            let mut hunks: Vec<Hunk> = Vec::new();
+            let mut pending_blanks = 0usize;
+            while i < lines.len() && !is_file_header(lines[i]) {
+                let b = lines[i];
+                let line_no = i + 1;
+                i += 1;
+                if let Some(h) = b.strip_prefix("@@") {
+                    pending_blanks = 0;
+                    let h = h.trim().trim_end_matches("@@").trim();
+                    if let Some((kind, start, end)) = parse_anchored_header(h) {
+                        hunks.push(Hunk::Anchored { kind, start, end, new: Vec::new(), header: format!("@@ {h}") });
+                    } else {
+                        let ctx = if h.is_empty() { None } else { Some(h.to_string()) };
+                        hunks.push(Hunk::Context { ctx, body: Vec::new(), eof: false, header: format!("@@ {h}").trim_end().to_string() });
+                    }
+                    continue;
+                }
+                if b.trim_end() == "*** End of File" {
+                    if let Some(Hunk::Context { eof, .. }) = hunks.last_mut() {
+                        *eof = true;
+                    }
+                    continue;
+                }
+                if hunks.is_empty() {
+                    // V4A allows the first hunk of a file without an `@@` line.
+                    hunks.push(Hunk::Context { ctx: None, body: Vec::new(), eof: false, header: "@@".into() });
+                }
+                let Some(cur) = hunks.last_mut() else { continue };
+                match cur {
+                    Hunk::Anchored { new, header, kind, .. } => {
+                        if let Some(rest) = b.strip_prefix('+') {
+                            new.extend(std::iter::repeat(String::new()).take(pending_blanks));
+                            pending_blanks = 0;
+                            new.push(strip_hashline_prefix(rest).to_string());
+                        } else if b.trim().is_empty() {
+                            pending_blanks += 1;
+                        } else {
+                            let what = if *kind == AnchorKind::Delete { "takes no body lines" } else { "takes only `+` lines (the anchors already say which lines change)" };
+                            return Err(format!("patch line {line_no}: anchored hunk `{header}` {what}; got `{}`", clip(b, 60)));
+                        }
+                    }
+                    Hunk::Context { body, .. } => {
+                        if let Some(rest) = b.strip_prefix('+') {
+                            body.push((b'+', strip_hashline_prefix(rest).to_string()));
+                        } else if let Some(rest) = b.strip_prefix('-') {
+                            body.push((b'-', strip_hashline_prefix(rest).to_string()));
+                        } else if let Some(rest) = b.strip_prefix(' ') {
+                            body.push((b' ', strip_hashline_prefix(rest).to_string()));
+                        } else if b.trim().is_empty() {
+                            body.push((b' ', String::new()));
+                        } else {
+                            return Err(format!(
+                                "patch line {line_no}: hunk lines must start with ' ' (context), '-' or '+'; got `{}`",
+                                clip(b, 60)
+                            ));
+                        }
+                    }
+                }
+            }
+            if hunks.is_empty() && move_to.is_none() {
+                return Err(format!("`*** Update File: {p}` has no hunks"));
+            }
+            ops.push(FileOp::Update { path: p.to_string(), move_to, hunks });
+            continue;
+        }
+        if l.trim().is_empty() {
+            i += 1;
+            continue;
+        }
+        return Err(format!(
+            "patch line {}: expected `*** Add File:`, `*** Update File:`, `*** Delete File:` or `*** End Patch`; got `{}`",
+            i + 1,
+            clip(l, 60)
+        ));
+    }
+    if !ended {
+        return Err("patch has no `*** End Patch` line (was it cut off?). Nothing was changed.".into());
+    }
+    if ops.is_empty() {
+        return Err("patch contains no file operations".into());
+    }
+    Ok(ops)
+}
+
+/// Fold typographic punctuation to ASCII (what models often type instead of the file's text).
+fn fold_punct(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| match c {
+            '\u{2010}'..='\u{2015}' | '\u{2212}' => '-',
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            '\u{00A0}' | '\u{2002}'..='\u{200A}' | '\u{202F}' | '\u{3000}' => ' ',
+            other => other,
+        })
+        .collect()
+}
+
+/// Last-resort line equality: folded punctuation, and a `?` in the pattern may stand for one
+/// non-ASCII character (Windows PowerShell 5.1 pipes text to native programs as ASCII).
+fn fuzzy_eq(file: &str, pat: &str, wild: &mut bool) -> bool {
+    if fold_punct(file) == fold_punct(pat) {
+        return true;
+    }
+    let (f, p) = (file.trim(), pat.trim());
+    if !p.contains('?') {
+        return false;
+    }
+    let (fc, pc): (Vec<char>, Vec<char>) = (f.chars().collect(), p.chars().collect());
+    if fc.len() != pc.len() {
+        return false;
+    }
+    let ok = fc.iter().zip(&pc).all(|(a, b)| a == b || (*b == '?' && !a.is_ascii()));
+    if ok {
+        *wild = true;
+    }
+    ok
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum MatchLevel {
+    Exact,
+    Rstrip,
+    Trim,
+    Fuzzy,
+}
+
+/// Find `pat` in `lines` at or after `from`. Exact/rstrip take the first hit (V4A semantics);
+/// the looser passes must be unique so they can never pick the wrong place.
+fn seek_lines(lines: &[String], pat: &[String], from: usize, eof: bool) -> Result<Option<(usize, MatchLevel, bool)>, String> {
+    if pat.is_empty() || pat.len() > lines.len() {
+        return Ok(None);
+    }
+    let last = lines.len() - pat.len();
+    let levels = [MatchLevel::Exact, MatchLevel::Rstrip, MatchLevel::Trim, MatchLevel::Fuzzy];
+    for level in levels {
+        // Some(used a `?` wildcard) when `pat` matches at `i`.
+        let at = |i: usize| -> Option<bool> {
+            let mut wild = false;
+            pat.iter()
+                .enumerate()
+                .all(|(k, p)| {
+                    let a = &lines[i + k];
+                    match level {
+                        MatchLevel::Exact => a == p,
+                        MatchLevel::Rstrip => a.trim_end() == p.trim_end(),
+                        MatchLevel::Trim => a.trim() == p.trim(),
+                        MatchLevel::Fuzzy => fuzzy_eq(a, p, &mut wild),
+                    }
+                })
+                .then_some(wild)
+        };
+        if eof && last >= from {
+            if let Some(w) = at(last) {
+                return Ok(Some((last, level, w)));
+            }
+        }
+        let hits: Vec<(usize, bool)> = (from.min(last + 1)..=last).filter_map(|i| at(i).map(|w| (i, w))).take(3).collect();
+        match (level, hits.len()) {
+            (_, 0) => continue,
+            (MatchLevel::Exact | MatchLevel::Rstrip, _) | (_, 1) => return Ok(Some((hits[0].0, level, hits[0].1))),
+            _ => {
+                return Err(format!(
+                    "the context matches {} places once whitespace is ignored (lines {}); add more context lines or use anchors",
+                    if hits.len() > 2 { "3+".to_string() } else { hits.len().to_string() },
+                    hits.iter().map(|h| (h.0 + 1).to_string()).collect::<Vec<_>>().join(", ")
+                ))
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn leading_ws(s: &str) -> &str {
+    &s[..s.len() - s.trim_start().len()]
+}
+
+enum Shift {
+    Add(String),
+    Cut(usize),
+}
+
+/// When a hunk only matched after ignoring indentation, its added lines need the same shift.
+fn indent_shift(old_first: &str, file_first: &str) -> Option<Shift> {
+    let (o, f) = (leading_ws(old_first), leading_ws(file_first));
+    if o == f {
+        None
+    } else if let Some(add) = f.strip_suffix(o) {
+        Some(Shift::Add(add.to_string()))
+    } else {
+        o.strip_suffix(f).map(|cut| Shift::Cut(cut.len()))
+    }
+}
+
+fn apply_shift(l: &str, s: &Shift) -> String {
+    match s {
+        _ if l.trim().is_empty() => l.to_string(),
+        Shift::Add(a) => format!("{a}{l}"),
+        Shift::Cut(n) if leading_ws(l).len() >= *n => l[*n..].to_string(),
+        Shift::Cut(_) => l.trim_start().to_string(),
+    }
+}
+
+/// Point at where the model probably meant, when a context hunk does not match.
+fn closest_hint(doc: &Doc, old: &[String]) -> String {
+    let Some(first) = old.iter().map(|l| l.trim()).find(|l| !l.is_empty()) else { return String::new() };
+    let mut hits: Vec<usize> = doc.lines.iter().enumerate().filter(|(_, l)| l.trim() == first).map(|(i, _)| i).take(2).collect();
+    if hits.is_empty() {
+        let words: HashSet<&str> = first.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| w.len() > 1).collect();
+        if words.is_empty() {
+            return String::new();
+        }
+        let best = doc
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let lw: HashSet<&str> = l.split(|c: char| !c.is_alphanumeric() && c != '_').filter(|w| w.len() > 1).collect();
+                let inter = words.intersection(&lw).count();
+                (i, inter as f64 / words.union(&lw).count().max(1) as f64)
+            })
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        match best {
+            Some((i, score)) if score >= 0.5 => hits.push(i),
+            _ => return String::new(),
+        }
+    }
+    let mut out = String::from("\n  closest current lines:");
+    for h in hits {
+        let (a, b) = (h.saturating_sub(1), (h + old.len().min(4)).min(doc.lines.len().saturating_sub(1)));
+        for l in doc.hashlines(a, b).lines() {
+            out.push_str(&format!("\n    {l}"));
+        }
+    }
+    out
+}
+
+struct PlannedFile {
+    full: PathBuf,
+    rel: String,
+    original: Option<Vec<u8>>,
+    /// `None` = delete.
+    new_text: Option<String>,
+    remove_after: Option<PathBuf>,
+    summary: String,
+    notes: Vec<String>,
+}
+
+/// Resolve a path from a patch: workspace-relative or absolute; `cwd`-relative when that exists.
+fn patch_path(ws: &Path, cwd: Option<&Path>, p: &str, must_exist: bool) -> Result<PathBuf, String> {
+    let from_ws = resolve(ws, p);
+    if let (Some(cwd), false) = (cwd, Path::new(p).is_absolute()) {
+        if let Ok(rel) = cwd.strip_prefix(ws) {
+            let joined = rel.join(p);
+            if let Ok(c) = resolve(ws, &joined.to_string_lossy()) {
+                let ws_ok = from_ws.as_ref().map(|f| if must_exist { f.exists() } else { f.parent().map_or(false, Path::exists) }).unwrap_or(false);
+                let cwd_ok = if must_exist { c.exists() } else { c.parent().map_or(false, Path::exists) };
+                if cwd_ok && !ws_ok {
+                    return Ok(c);
+                }
+            }
+        }
+    }
+    from_ws
+}
+
+fn plan_update(ws: &Path, cwd: Option<&Path>, path: &str, move_to: Option<&str>, hunks: &[Hunk], errors: &mut Vec<String>) -> Option<PlannedFile> {
+    let full = match patch_path(ws, cwd, path, true) {
+        Ok(f) => f,
+        Err(e) => {
+            errors.push(format!("{path}: {e}"));
+            return None;
+        }
+    };
+    let (full, rel, doc) = match read_doc(ws, &full.to_string_lossy()) {
+        Ok(x) => x,
+        Err(e) => {
+            errors.push(format!("{path}: {e}"));
+            return None;
+        }
+    };
+    let lang = lang_for(&rel);
+    let before_errs = syntax_errors(lang, &doc.to_text());
+    // (start, remove, new lines, hunk index)
+    let mut edits: Vec<(usize, usize, Vec<String>, usize)> = Vec::new();
+    let mut notes = Vec::new();
+    let mut cursor = 0usize;
+    let mut failed = false;
+    for (hi, h) in hunks.iter().enumerate() {
+        let tag = |header: &str| format!("{rel} hunk {} (`{header}`)", hi + 1);
+        match h {
+            Hunk::Anchored { kind, start, end, new, header } => {
+                let (r0, r1) = match locate(&doc, &rel, start, end) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", tag(header)));
+                        failed = true;
+                        continue;
+                    }
+                };
+                match kind {
+                    AnchorKind::Replace if new.is_empty() => {
+                        errors.push(format!("{}: no `+` lines. To remove lines say so: `@@ delete {}#{}..{}#{}`", tag(header), start.0, start.1, end.0, end.1));
+                        failed = true;
+                    }
+                    AnchorKind::Replace => edits.push((r0, r1 - r0 + 1, new.clone(), hi)),
+                    AnchorKind::Delete => edits.push((r0, r1 - r0 + 1, Vec::new(), hi)),
+                    AnchorKind::After | AnchorKind::Before if new.is_empty() => {
+                        errors.push(format!("{}: nothing to insert (no `+` lines)", tag(header)));
+                        failed = true;
+                    }
+                    AnchorKind::After => edits.push((r1 + 1, 0, new.clone(), hi)),
+                    AnchorKind::Before => edits.push((r0, 0, new.clone(), hi)),
+                }
+            }
+            Hunk::Context { ctx, body, eof, header } => {
+                let old: Vec<String> = body.iter().filter(|(k, _)| *k != b'+').map(|(_, l)| l.clone()).collect();
+                let mut hunk_cursor = cursor;
+                if let Some(c) = ctx {
+                    let pat = vec![c.clone()];
+                    match seek_lines(&doc.lines, &pat, hunk_cursor, false) {
+                        Ok(Some((idx, _, _))) => {
+                            hunk_cursor = if old.first().map_or(false, |o| o.trim() == c.trim()) { idx } else { idx + 1 };
+                        }
+                        Ok(None) => {
+                            // Models often put a line of the hunk itself in the `@@` header.
+                            if !old.iter().any(|o| o.trim() == c.trim()) {
+                                errors.push(format!("{}: the `@@` context line was not found{}", tag(header), closest_hint(&doc, &pat)));
+                                failed = true;
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            errors.push(format!("{}: {e}", tag(header)));
+                            failed = true;
+                            continue;
+                        }
+                    }
+                }
+                if old.is_empty() {
+                    let at = if ctx.is_some() && hunk_cursor > 0 { hunk_cursor } else { doc.lines.len() };
+                    edits.push((at, 0, body.iter().filter(|(k, _)| *k == b'+').map(|(_, l)| l.clone()).collect(), hi));
+                    continue;
+                }
+                let mut pat_len = old.len();
+                let mut found = seek_lines(&doc.lines, &old[..pat_len], hunk_cursor, *eof);
+                let mut dropped_trailing_blank = false;
+                if matches!(found, Ok(None)) && old.last().map_or(false, |l| l.trim().is_empty()) && pat_len > 1 {
+                    pat_len -= 1;
+                    dropped_trailing_blank = true;
+                    found = seek_lines(&doc.lines, &old[..pat_len], hunk_cursor, *eof);
+                }
+                if matches!(found, Ok(None)) && ctx.is_none() && hunk_cursor > 0 {
+                    // Out-of-order hunks: retry from top of file.
+                    found = seek_lines(&doc.lines, &old[..pat_len], 0, *eof);
+                }
+                match found {
+                    Ok(Some((idx, level, wild))) => {
+                        let pat = &old[..pat_len];
+                        let matched = &doc.lines[idx..idx + pat_len];
+                        let shift = if level == MatchLevel::Trim || level == MatchLevel::Fuzzy {
+                            pat.iter()
+                                .enumerate()
+                                .find(|(_, l)| !l.trim().is_empty())
+                                .and_then(|(k, l)| indent_shift(l, &matched[k]))
+                        } else {
+                            None
+                        };
+                        let mut new_lines = Vec::new();
+                        let mut old_pos = 0usize;
+                        let mut reindented = false;
+                        for (kind, line) in body {
+                            match *kind {
+                                b' ' => {
+                                    if old_pos < pat_len {
+                                        // Preserve the file's exact context line (whitespace & non-ASCII).
+                                        new_lines.push(matched[old_pos].clone());
+                                    } else if !dropped_trailing_blank {
+                                        new_lines.push(line.clone());
+                                    }
+                                    old_pos += 1;
+                                }
+                                b'-' => {
+                                    old_pos += 1;
+                                }
+                                b'+' => {
+                                    if let Some(ref s) = shift {
+                                        reindented = true;
+                                        new_lines.push(apply_shift(line, s));
+                                    } else {
+                                        new_lines.push(line.clone());
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        if reindented {
+                            notes.push(format!("{rel} hunk {} matched after ignoring indentation; re-indented its `+` lines", hi + 1));
+                        }
+                        if wild {
+                            notes.push(format!(
+                                "{rel} hunk {}: `?` stood in for non-ASCII characters - your shell re-encoded the patch as ASCII. Check the result, or pass the patch with --file / vx mcp",
+                                hi + 1
+                            ));
+                        }
+                        edits.push((idx, pat_len, new_lines, hi));
+                        cursor = idx + pat_len;
+                    }
+                    Ok(None) => {
+                        let shown: Vec<String> = old.iter().take(4).map(|l| format!("\n    -{l}")).collect();
+                        errors.push(format!(
+                            "{}: context not found{}. Expected:{}{}",
+                            tag(header),
+                            if cursor > 0 { format!(" after line {cursor}") } else { String::new() },
+                            shown.concat(),
+                            closest_hint(&doc, &old)
+                        ));
+                        failed = true;
+                    }
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", tag(header)));
+                        failed = true;
+                    }
+                }
+            }
+        }
+    }
+    if failed {
+        return None;
+    }
+    edits.sort_by_key(|e| (e.0, e.3));
+    for w in edits.windows(2) {
+        if w[0].0 + w[0].1 > w[1].0 {
+            errors.push(format!("{rel}: hunks {} and {} touch the same lines; merge them into one hunk", w[0].3 + 1, w[1].3 + 1));
+            return None;
+        }
+    }
+    let mut new_doc = Doc { lines: doc.lines.clone(), ends: doc.ends.clone(), eol: doc.eol, bom: doc.bom };
+    for (start, remove, new, _) in edits.iter().rev() {
+        splice(&mut new_doc, *start, *remove, new.clone());
+    }
+    // New anchors per hunk, in file order.
+    let (mut delta, mut ranges, mut plus, mut minus) = (0isize, Vec::new(), 0usize, 0usize);
+    for (start, remove, new, _) in &edits {
+        let s = (*start as isize + delta) as usize;
+        if !new.is_empty() {
+            ranges.push(format!("{}..{}", new_doc.anchor(s), new_doc.anchor(s + new.len() - 1)));
+        }
+        delta += new.len() as isize - *remove as isize;
+        plus += new.len();
+        minus += remove;
+    }
+    let text = new_doc.to_text();
+    let mut target_full = full.clone();
+    let mut target_rel = rel.clone();
+    let mut remove_after = None;
+    if let Some(m) = move_to {
+        match patch_path(ws, cwd, m, false) {
+            Ok(t) if t.exists() => {
+                errors.push(format!("{rel}: cannot move to {m}: it already exists"));
+                return None;
+            }
+            Ok(t) => {
+                target_rel = rel_of(ws, &t);
+                target_full = t;
+                remove_after = Some(full.clone());
+            }
+            Err(e) => {
+                errors.push(format!("{rel}: cannot move to {m}: {e}"));
+                return None;
+            }
+        }
+    }
+    if let (Some(before), Some(after)) = (before_errs, syntax_errors(lang_for(&target_rel), &text)) {
+        if after.len() > before.len() {
+            if let Some((row, m)) = after.iter().find(|(r, _)| !before.iter().any(|(b, _)| b == r)).or_else(|| after.first()) {
+                let row = (*row).min(new_doc.lines.len().saturating_sub(1));
+                notes.push(format!("⚠ {target_rel}: new syntax error at {}: {m}", new_doc.anchor(row)));
+            }
+        }
+    }
+    let moved = if remove_after.is_some() { format!(" -> {target_rel}") } else { String::new() };
+    let now = if ranges.is_empty() { String::new() } else { format!("  now {}", ranges.join(", ")) };
+    let summary = if edits.is_empty() {
+        format!("R {rel}{moved}")
+    } else {
+        format!("M {rel}{moved}  {} hunk(s) +{plus} -{minus}{now}", edits.len())
+    };
+    Some(PlannedFile {
+        original: std::fs::read(&full).ok(),
+        full: target_full,
+        rel: target_rel,
+        new_text: Some(text),
+        remove_after,
+        summary,
+        notes,
+    })
+}
+
+/// Apply a V4A patch (with hashline-anchored hunks) atomically.
+pub fn apply_patch(ws: &Path, patch: &str, cwd: Option<&Path>, dry_run: bool) -> Result<String, String> {
+    let ops = parse_patch(patch)?;
+    let mut errors: Vec<String> = Vec::new();
+    let mut plans: Vec<PlannedFile> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for op in &ops {
+        let key = match op {
+            FileOp::Add { path, .. } | FileOp::Delete { path } | FileOp::Update { path, .. } => path.replace('\\', "/").to_lowercase(),
+        };
+        if !seen.insert(key) {
+            errors.push(format!("{}: appears twice in the patch; put all its hunks under one `*** Update File:`", match op {
+                FileOp::Add { path, .. } | FileOp::Delete { path } | FileOp::Update { path, .. } => path,
+            }));
+            continue;
+        }
+        match op {
+            FileOp::Add { path, lines } => match patch_path(ws, cwd, path, false) {
+                Ok(full) if full.exists() => errors.push(format!("{path}: already exists; use `*** Update File:` (or delete it first)")),
+                Ok(full) => {
+                    let rel = rel_of(ws, &full);
+                    let mut text = lines.join("\n");
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    let mut notes = Vec::new();
+                    if let Some(errs) = syntax_errors(lang_for(&rel), &text) {
+                        if let Some((row, m)) = errs.first() {
+                            let line = text.lines().nth(*row).unwrap_or("");
+                            notes.push(format!("⚠ {rel}: syntax error at {}#{}: {m}", row + 1, line_hash(line)));
+                        }
+                    }
+                    plans.push(PlannedFile { full, summary: format!("A {rel}  ({} lines)", lines.len()), rel, original: None, new_text: Some(text), remove_after: None, notes });
+                }
+                Err(e) => errors.push(format!("{path}: {e}")),
+            },
+            FileOp::Delete { path } => match patch_path(ws, cwd, path, true) {
+                Ok(full) if full.is_file() => {
+                    let rel = rel_of(ws, &full);
+                    plans.push(PlannedFile { original: std::fs::read(&full).ok(), full, summary: format!("D {rel}"), rel, new_text: None, remove_after: None, notes: Vec::new() });
+                }
+                Ok(_) => errors.push(format!("{path}: not found (nothing to delete)")),
+                Err(e) => errors.push(format!("{path}: {e}")),
+            },
+            FileOp::Update { path, move_to, hunks } => {
+                if let Some(p) = plan_update(ws, cwd, path, move_to.as_deref(), hunks, &mut errors) {
+                    plans.push(p);
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        return Err(format!(
+            "patch not applied - nothing was written ({} problem(s)):\n{}\nFix those hunks and send the whole patch again.",
+            errors.len(),
+            errors.iter().map(|e| format!("✖ {e}")).collect::<Vec<_>>().join("\n")
+        ));
+    }
+    if !dry_run {
+        // Write everything; on failure restore what was already written.
+        let mut done: Vec<&PlannedFile> = Vec::new();
+        for p in &plans {
+            let res = match &p.new_text {
+                Some(t) => {
+                    if let Some(parent) = p.full.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&p.full, t.as_bytes()).and_then(|_| match &p.remove_after {
+                        Some(old) => std::fs::remove_file(old),
+                        None => Ok(()),
+                    })
+                }
+                None => std::fs::remove_file(&p.full),
+            };
+            if let Err(e) = res {
+                if p.remove_after.is_some() {
+                    let _ = std::fs::remove_file(&p.full);
+                }
+                for d in done.iter().rev() {
+                    if let Some(old) = &d.remove_after {
+                        if let Some(bytes) = &d.original {
+                            let _ = std::fs::write(old, bytes);
+                        }
+                        let _ = std::fs::remove_file(&d.full);
+                    } else if let Some(bytes) = &d.original {
+                        let _ = std::fs::write(&d.full, bytes);
+                    } else {
+                        let _ = std::fs::remove_file(&d.full);
+                    }
+                }
+                return Err(format!("cannot write {}: {e}. Rolled back the files written so far.", p.rel));
+            }
+            done.push(p);
+        }
+    }
+    let hunks: usize = ops.iter().map(|o| if let FileOp::Update { hunks, .. } = o { hunks.len() } else { 1 }).sum();
+    let mut out = format!(
+        "{} {} file(s), {hunks} change(s):\n",
+        if dry_run { "Dry run OK (nothing written):" } else { "Applied patch:" },
+        plans.len(),
+    );
+    for p in &plans {
+        out.push_str(&p.summary);
+        out.push('\n');
+    }
+    for p in &plans {
+        for n in &p.notes {
+            out.push_str(n);
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 // --------------------------------- check ------------------------------------------------------
 
 struct Diag {
@@ -1435,10 +2186,23 @@ struct Diag {
     error: bool,
     code: String,
     msg: String,
+    /// Primary span label (rustc: "expected `u32`, found `String`").
+    label: String,
+    /// help/note children, secondary span labels, tsc continuation lines.
+    notes: Vec<String>,
 }
 
 fn strip_ansi(s: &str) -> String {
     lazy_re!(r"\x1b\[[0-9;?]*[ -/]*[@-~]").replace_all(s, "").to_string()
+}
+
+fn clip(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
 }
 
 fn detect_checks(ws: &Path) -> Vec<(String, String, String)> {
@@ -1469,13 +2233,54 @@ fn detect_checks(ws: &Path) -> Vec<(String, String, String)> {
     out
 }
 
+/// Notes for a cargo JSON diagnostic: help/note children (with suggested code) and labels of
+/// secondary spans, which is what makes rustc's human output actionable.
+fn rustc_notes(m: &Value, primary_line: usize, prefix: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    if let Some(spans) = m["spans"].as_array() {
+        for s in spans.iter().filter(|s| s["is_primary"].as_bool() != Some(true)) {
+            if let Some(label) = s["label"].as_str().filter(|l| !l.trim().is_empty()) {
+                let line = s["line_start"].as_u64().unwrap_or(0) as usize;
+                let file = s["file_name"].as_str().unwrap_or("").replace('\\', "/");
+                let at = if line == primary_line { String::new() } else { format!(" ({prefix}{file}:{line})") };
+                notes.push(format!("note: {}{at}", clip(label, 140)));
+            }
+        }
+    }
+    if let Some(children) = m["children"].as_array() {
+        for c in children {
+            let level = c["level"].as_str().unwrap_or("note");
+            let msg = c["message"].as_str().unwrap_or("").lines().next().unwrap_or("").trim().to_string();
+            if msg.is_empty() {
+                continue;
+            }
+            let sugg: Vec<String> = c["spans"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s["suggested_replacement"].as_str())
+                        .map(|r| format!("`{}`", clip(r.lines().next().unwrap_or(""), 80)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tail = if sugg.is_empty() { String::new() } else { format!(": {}", sugg.join(", ")) };
+            notes.push(format!("{level}: {}{tail}", clip(&msg, 160)));
+        }
+    }
+    notes.truncate(4);
+    notes
+}
+
 fn parse_diags(raw: &str, prefix: &str) -> Vec<Diag> {
-    let mut out = Vec::new();
+    let mut out: Vec<Diag> = Vec::new();
     let generic = lazy_re!(r"(?i)^(?P<f>[^\s:()][^:()]*?)(?:[:(](?P<l>\d+)(?:[:,](?P<c>\d+))?\)?):?\s*-?\s*(?P<sev>error|warning|fatal error)\b[:\s]*(?P<m>.*)$");
     let code_re = lazy_re!(r"^(?P<c>[A-Z]{1,4}\d{3,5})\b:?\s*(?P<m>.*)$");
+    // tsc / gcc print a message's details on indented lines right after it.
+    let mut continuing = false;
     for l in raw.lines() {
         let l = l.trim_end();
         if l.starts_with('{') {
+            continuing = false;
             let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
             if v["reason"].as_str() != Some("compiler-message") {
                 continue;
@@ -1490,13 +2295,14 @@ fn parse_diags(raw: &str, prefix: &str) -> Vec<Diag> {
                 continue;
             }
             let span = m["spans"].as_array().and_then(|a| a.iter().find(|s| s["is_primary"].as_bool() == Some(true)));
-            let (file, line, col) = match span {
+            let (file, line, col, label) = match span {
                 Some(s) => (
                     s["file_name"].as_str().unwrap_or("").replace('\\', "/"),
                     s["line_start"].as_u64().unwrap_or(0) as usize,
                     s["column_start"].as_u64().unwrap_or(0) as usize,
+                    s["label"].as_str().unwrap_or("").to_string(),
                 ),
-                None => (String::new(), 0, 0),
+                None => (String::new(), 0, 0, String::new()),
             };
             out.push(Diag {
                 file: if file.is_empty() { file } else { format!("{prefix}{file}") },
@@ -1505,6 +2311,8 @@ fn parse_diags(raw: &str, prefix: &str) -> Vec<Diag> {
                 error: level == "error",
                 code: m["code"]["code"].as_str().unwrap_or("").to_string(),
                 msg,
+                label: clip(&label, 140),
+                notes: rustc_notes(m, line, prefix),
             });
         } else if let Some(c) = generic.captures(l) {
             let mut msg = c["m"].trim().to_string();
@@ -1521,7 +2329,18 @@ fn parse_diags(raw: &str, prefix: &str) -> Vec<Diag> {
                 error: !c["sev"].to_lowercase().starts_with("warn"),
                 code,
                 msg,
+                label: String::new(),
+                notes: Vec::new(),
             });
+            continuing = true;
+        } else if continuing && l.starts_with(char::is_whitespace) && !l.trim().is_empty() {
+            if let Some(d) = out.last_mut() {
+                if d.notes.len() < 4 {
+                    d.notes.push(clip(l, 200));
+                }
+            }
+        } else {
+            continuing = false;
         }
     }
     let mut seen = HashSet::new();
@@ -1529,17 +2348,8 @@ fn parse_diags(raw: &str, prefix: &str) -> Vec<Diag> {
     out
 }
 
-fn render_diags(ws: &Path, diags: &[Diag], label: &str, secs: f64) -> String {
-    let errors: Vec<&Diag> = diags.iter().filter(|d| d.error).collect();
-    let warns = diags.len() - errors.len();
-    let files: HashSet<&str> = errors.iter().map(|d| d.file.as_str()).collect();
-    let mut out = format!(
-        "✖ {} error(s){} in {} file(s) ({label}, {secs:.1}s):\n",
-        errors.len(),
-        if warns > 0 { format!(", {warns} warning(s)") } else { String::new() },
-        files.len()
-    );
-    for (i, d) in errors.iter().take(15).enumerate() {
+fn render_list(ws: &Path, out: &mut String, list: &[&Diag], cap: usize) {
+    for (i, d) in list.iter().take(cap).enumerate() {
         let loc = if d.file.is_empty() { "(no location)".to_string() } else { format!("{}:{}:{}", d.file, d.line, d.col) };
         let code = if d.code.is_empty() { String::new() } else { format!(" [{}]", d.code) };
         out.push_str(&format!("{}. {loc}{code} {}\n", i + 1, d.msg));
@@ -1549,38 +2359,148 @@ fn render_diags(ws: &Path, diags: &[Diag], label: &str, secs: f64) -> String {
                 for n in d.line.saturating_sub(1).max(1)..=(d.line + 1).min(lines.len()) {
                     let mark = if n == d.line { ">" } else { " " };
                     out.push_str(&format!(" {mark} {}\n", hl(n, lines[n - 1])));
+                    if n == d.line && !d.label.is_empty() {
+                        out.push_str(&format!("     ^ {}\n", d.label));
+                    }
                 }
+            } else if !d.label.is_empty() {
+                out.push_str(&format!("     ^ {}\n", d.label));
             }
         }
+        for n in &d.notes {
+            out.push_str(&format!("   = {n}\n"));
+        }
     }
-    if errors.len() > 15 {
-        out.push_str(&format!("…[{} more errors]\n", errors.len() - 15));
+    if list.len() > cap {
+        out.push_str(&format!("…[{} more]\n", list.len() - cap));
+    }
+}
+
+fn render_diags(ws: &Path, diags: &[Diag], label: &str, secs: f64, show_warnings: bool) -> String {
+    let errors: Vec<&Diag> = diags.iter().filter(|d| d.error).collect();
+    let warns: Vec<&Diag> = diags.iter().filter(|d| !d.error).collect();
+    let files: HashSet<&str> = errors.iter().map(|d| d.file.as_str()).collect();
+    let mut out = format!(
+        "✖ {} error(s){} in {} file(s) ({label}, {secs:.1}s):\n",
+        errors.len(),
+        if warns.is_empty() { String::new() } else { format!(", {} warning(s)", warns.len()) },
+        files.len()
+    );
+    render_list(ws, &mut out, &errors, 15);
+    if show_warnings && !warns.is_empty() {
+        out.push_str("warnings:\n");
+        render_list(ws, &mut out, &warns, 15);
     }
     out
 }
 
+fn progress_line(t: &str) -> bool {
+    lazy_re!(r"^\s*(Compiling|Downloading|Downloaded|Blocking|Fresh|Updating|Locking|Checking|Finished|Running|Doc-tests|running \d+ tests?|\.+$|test .* \.\.\. ok$|test .* \.\.\. ignored$)").is_match(t)
+}
+
+/// Failure output without the noise: cargo-test panic blocks and summaries when present,
+/// otherwise lines that look like failures (with a little context), otherwise the tail.
 fn compress_plain(raw: &str) -> String {
-    let progress = lazy_re!(r"^\s*(Compiling|Downloading|Downloaded|Blocking|Fresh|Updating|Locking|Checking|Finished|running \d+ tests?|\.+$|test .* \.\.\. ok$)");
     let mut lines: Vec<&str> = Vec::new();
     for l in raw.lines() {
         let t = l.trim_end();
-        if t.trim().is_empty() || progress.is_match(t) || lines.last() == Some(&t) {
+        if t.trim().is_empty() || progress_line(t) || lines.last() == Some(&t) || t.contains("run with `RUST_BACKTRACE=1`") {
             continue;
         }
         lines.push(t);
     }
-    let tail: Vec<&str> = lines.iter().rev().take(30).rev().copied().collect();
-    let out = tail.join("\n");
-    out.chars().take(4000).collect()
+    let fail_re = lazy_re!(r"(?i)(\bfail|\berror\b|panicked|assert|expected|received|\bleft\b|\bright\b|exception|traceback|✕|×|FAILED|test result:)");
+    let mut keep = vec![false; lines.len()];
+    let mut any = false;
+    // cargo test: keep each `---- name stdout ----` block whole.
+    let mut in_block = false;
+    for (i, l) in lines.iter().enumerate() {
+        if l.starts_with("---- ") && l.ends_with(" ----") {
+            in_block = true;
+        } else if *l == "failures:" || l.starts_with("test result:") {
+            in_block = false;
+        }
+        if in_block || fail_re.is_match(l) {
+            keep[i] = true;
+            any = true;
+            if !in_block {
+                for k in keep.iter_mut().skip(i + 1).take(2) {
+                    *k = true;
+                }
+            }
+        }
+    }
+    let picked: Vec<&str> = if any {
+        lines.iter().zip(&keep).filter(|(_, k)| **k).map(|(l, _)| *l).collect()
+    } else {
+        lines.clone()
+    };
+    let n = picked.len();
+    let mut out = picked.iter().skip(n.saturating_sub(60)).copied().collect::<Vec<_>>().join("\n");
+    if n > 60 {
+        out = format!("…[{} earlier lines]\n{out}", n - 60);
+    }
+    out.chars().take(6000).collect()
 }
 
-pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64) -> Result<String, String> {
+/// cargo test / libtest summaries, e.g. "45 passed, 2 ignored".
+fn test_summary(raw: &str) -> Option<String> {
+    let re = lazy_re!(r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored");
+    let (mut p, mut f, mut ig, mut any) = (0u64, 0u64, 0u64, false);
+    for c in re.captures_iter(raw) {
+        any = true;
+        p += c[1].parse::<u64>().unwrap_or(0);
+        f += c[2].parse::<u64>().unwrap_or(0);
+        ig += c[3].parse::<u64>().unwrap_or(0);
+    }
+    any.then(|| format!("{p} passed, {f} failed{}", if ig > 0 { format!(", {ig} ignored") } else { String::new() }))
+}
+
+/// Unfiltered output for `--raw`: cargo JSON lines are replaced by rustc's rendered text.
+fn raw_view(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for l in raw.lines() {
+        if l.starts_with('{') {
+            if let Ok(v) = serde_json::from_str::<Value>(l) {
+                if let Some(r) = v["message"]["rendered"].as_str() {
+                    out.push(r.trim_end().to_string());
+                }
+                continue;
+            }
+        }
+        if !l.trim().is_empty() {
+            out.push(l.trim_end().to_string());
+        }
+    }
+    let text = out.join("\n");
+    let lines: Vec<&str> = text.lines().collect();
+    let n = lines.len();
+    let mut s = lines[n.saturating_sub(200)..].join("\n");
+    if n > 200 {
+        s = format!("…[{} earlier lines]\n{s}", n - 200);
+    }
+    s.chars().take(20_000).collect()
+}
+
+#[derive(Default, Clone, Copy)]
+pub struct CheckOpts {
+    pub raw: bool,
+    pub warnings: bool,
+}
+
+/// True when a `check` report contains a failure (used for the `vx` exit code).
+#[allow(dead_code)]
+pub fn check_failed(report: &str) -> bool {
+    report.lines().any(|l| l.starts_with('✖'))
+}
+
+pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64, opts: CheckOpts) -> Result<String, String> {
     let jobs: Vec<(String, String, String)> = match cmd.map(str::trim).filter(|c| !c.is_empty()) {
         Some(c) => vec![(String::new(), c.to_string(), c.split_whitespace().take(2).collect::<Vec<_>>().join(" "))],
         None => detect_checks(ws),
     };
     if jobs.is_empty() {
-        return Err("no project detected (Cargo.toml / tsconfig.json / go.mod); pass a command".into());
+        return Err("no project detected (Cargo.toml / tsconfig.json / go.mod); pass a command, e.g. vx check npm test".into());
     }
     let mut report = String::new();
     for (prefix, command_line, label) in jobs {
@@ -1595,27 +2515,38 @@ pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64) -> Result<String, 
         };
         let raw = strip_ansi(&format!("{}\n{}", out.stdout, out.stderr));
         if out.timed_out {
-            report.push_str(&format!("✖ {label}: timed out after {timeout_secs}s\n"));
+            report.push_str(&format!("✖ {label}: timed out after {timeout_secs}s (raise with --timeout S)\n"));
+            continue;
+        }
+        if opts.raw {
+            let mark = if out.code == 0 { "✔" } else { "✖" };
+            report.push_str(&format!("{mark} {label} exit {} ({:.1}s):\n{}\n", out.code, out.secs, raw_view(&raw)));
             continue;
         }
         let diags = parse_diags(&raw, &prefix);
         let errors = diags.iter().filter(|d| d.error).count();
         let warns = diags.len() - errors;
+        let tests = test_summary(&raw).map(|t| format!(", tests: {t}")).unwrap_or_default();
         if out.code == 0 && errors == 0 {
             report.push_str(&format!(
-                "✔ {label} ok ({:.1}s){}\n",
+                "✔ {label} ok ({:.1}s{tests}){}\n",
                 out.secs,
-                if warns > 0 { format!(", {warns} warning(s)") } else { String::new() }
+                if warns > 0 { format!(", {warns} warning(s){}", if opts.warnings { ":" } else { " (list: --warnings)" }) } else { String::new() }
             ));
+            if opts.warnings && warns > 0 {
+                let w: Vec<&Diag> = diags.iter().filter(|d| !d.error).collect();
+                render_list(ws, &mut report, &w, 15);
+            }
         } else if errors > 0 {
-            report.push_str(&render_diags(ws, &diags, &label, out.secs));
+            report.push_str(&render_diags(ws, &diags, &label, out.secs, opts.warnings));
         } else {
             let tail = compress_plain(&raw);
             let tail = if tail.trim().is_empty() { "(no output)".to_string() } else { tail };
-            report.push_str(&format!("✖ {label} failed (exit {}, {:.1}s):\n{}\n", out.code, out.secs, tail));
+            report.push_str(&format!("✖ {label} failed (exit {}, {:.1}s{tests}):\n{}\n", out.code, out.secs, tail));
         }
     }
-    Ok(report.chars().take(8000).collect())
+    let max = if opts.raw { 24_000 } else { 12_000 };
+    Ok(report.chars().take(max).collect())
 }
 
 // --------------------------------- dispatcher -------------------------------------------------
@@ -1643,7 +2574,19 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
         "symbol" => symbol_op(ws, need("path")?, need("symbol")?, s(a, "mode").unwrap_or("read"), s(a, "new_code").unwrap_or("")),
         "create" => create(ws, need("path")?, s(a, "content").unwrap_or(""), a["force"].as_bool().unwrap_or(false)),
         "ast" => ast(ws, need("pattern")?, s(a, "lang"), s(a, "path"), s(a, "rewrite"), a["dry_run"].as_bool().unwrap_or(false)),
-        "check" => check(ws, s(a, "cmd"), a["timeout"].as_u64().unwrap_or(180)),
+        "apply" => {
+            let cwd = s(a, "cwd").map(PathBuf::from);
+            apply_patch(ws, need("patch")?, cwd.as_deref(), a["dry_run"].as_bool().unwrap_or(false))
+        }
+        "check" => check(
+            ws,
+            s(a, "cmd"),
+            a["timeout"].as_u64().unwrap_or(180),
+            CheckOpts {
+                raw: a["raw"].as_bool().unwrap_or(false),
+                warnings: a["warnings"].as_bool().unwrap_or(false),
+            },
+        ),
         other => Err(format!("unknown op `{other}`")),
     }
 }
@@ -1762,7 +2705,7 @@ mod tests {
         let raw = "a.ts(1,5): error TS2322: Type 'string' is not assignable to type 'number'.\na.ts(1,5): error TS2322: Type 'string' is not assignable to type 'number'.\n";
         let d = parse_diags(raw, "");
         assert_eq!(d.len(), 1, "deduped");
-        let r = render_diags(&ws, &d, "tsc", 0.5);
+        let r = render_diags(&ws, &d, "tsc", 0.5, false);
         assert!(r.contains("a.ts:1:5 [TS2322]") && r.contains(&format!(">  1#{}|", line_hash("let a: number = 'x';"))) || r.contains("1#"), "{r}");
     }
 
@@ -1797,5 +2740,118 @@ mod tests {
         assert!(view(&ws, "a.rs", Some("5..9")).unwrap_err().contains("past the end"));
         assert!(view(&ws, "nope.rs", None).unwrap_err().contains("not found"));
         assert!(view(&ws, "d", None).unwrap_err().contains("directory"));
+    }
+
+    #[test]
+    fn apply_patch_anchored_multi_hunk_and_atomic_failure() {
+        let ws = tmp("apply-anchored");
+        std::fs::write(ws.join("a.rs"), "fn one() -> i32 {\n    1\n}\n\nfn two() -> i32 {\n    2\n}\n").unwrap();
+        std::fs::write(ws.join("b.rs"), "const X: i32 = 0;\n").unwrap();
+        let l2 = format!("2#{}", line_hash("    1"));
+        let l6 = format!("6#{}", line_hash("    2"));
+        let b1 = format!("1#{}", line_hash("const X: i32 = 0;"));
+        // Atomic failure: second file has a bad anchor, so first file must stay untouched.
+        let bad_patch = format!(
+            "*** Begin Patch\n*** Update File: a.rs\n@@ {l2}\n+    10\n*** Update File: b.rs\n@@ 1#ff\n+const X: i32 = 9;\n*** End Patch\n"
+        );
+        let err = apply_patch(&ws, &bad_patch, None, false).unwrap_err();
+        assert!(err.contains("nothing was written"), "{err}");
+        assert!(std::fs::read_to_string(ws.join("a.rs")).unwrap().contains("    1\n"));
+
+        // Valid multi-hunk + multi-file + add + after + delete.
+        let good_patch = format!(
+            "*** Begin Patch\n\
+             *** Update File: a.rs\n\
+             @@ {l2}\n\
+             +    10\n\
+             +    + 1\n\
+             @@ after {l6}\n\
+             +    // added\n\
+             *** Update File: b.rs\n\
+             @@ {b1}\n\
+             +const X: i32 = 42;\n\
+             *** Add File: c.rs\n\
+             +pub fn c() {{}}\n\
+             *** End Patch\n"
+        );
+        // Dry run validates without writing.
+        let dry = apply_patch(&ws, &good_patch, None, true).unwrap();
+        assert!(dry.contains("Dry run OK"), "{dry}");
+        assert!(!ws.join("c.rs").exists());
+
+        let ok = apply_patch(&ws, &good_patch, None, false).unwrap();
+        assert!(ok.contains("Applied patch: 3 file(s)"), "{ok}");
+        assert!(ok.contains("M a.rs  2 hunk(s)"), "{ok}");
+        let a_after = std::fs::read_to_string(ws.join("a.rs")).unwrap();
+        assert!(a_after.contains("    10\n    + 1\n") && a_after.contains("    2\n    // added\n"), "{a_after}");
+        assert_eq!(std::fs::read_to_string(ws.join("b.rs")).unwrap(), "const X: i32 = 42;\n");
+        assert_eq!(std::fs::read_to_string(ws.join("c.rs")).unwrap(), "pub fn c() {}\n");
+    }
+
+    #[test]
+    fn apply_patch_context_reindents_and_preserves_unicode_context() {
+        let ws = tmp("apply-ctx");
+        std::fs::write(ws.join("a.py"), "def greet():\n    msg = \"hello — world\"\n    return msg\n").unwrap();
+        // Model sends wrong indentation (2 spaces instead of 4) and ASCII `?` for the em-dash on context line (like PS 5.1 pipe).
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "*** Update File: a.py\n",
+            "@@ def greet():\n",
+            "   msg = \"hello ? world\"\n",
+            "-  return msg\n",
+            "+  return msg.upper()\n",
+            "*** End Patch\n",
+        );
+        let out = apply_patch(&ws, patch, None, false).unwrap();
+        assert!(out.contains("re-indented") && out.contains("non-ASCII"), "{out}");
+        let after = std::fs::read_to_string(ws.join("a.py")).unwrap();
+        assert_eq!(after, "def greet():\n    msg = \"hello — world\"\n    return msg.upper()\n");
+    }
+
+    #[test]
+    fn apply_patch_rejects_overlapping_hunks() {
+        let ws = tmp("apply-overlap");
+        std::fs::write(ws.join("a.rs"), "a\nb\nc\n").unwrap();
+        let l1 = format!("1#{}", line_hash("a"));
+        let l2 = format!("2#{}", line_hash("b"));
+        let l3 = format!("3#{}", line_hash("c"));
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: a.rs\n@@ {l1}..{l2}\n+x\n@@ {l2}..{l3}\n+y\n*** End Patch\n"
+        );
+        let err = apply_patch(&ws, &patch, None, false).unwrap_err();
+        assert!(err.contains("touch the same lines"), "{err}");
+    }
+
+    #[test]
+    fn check_preserves_rustc_labels_notes_and_cargo_test_failures() {
+        let ws = tmp("check-rich");
+        std::fs::write(ws.join("a.rs"), "fn f() -> u32 {\n    \"nope\"\n}\n").unwrap();
+        let cargo_json = json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "code": { "code": "E0308" },
+                "message": "mismatched types",
+                "spans": [
+                    { "file_name": "a.rs", "line_start": 2, "column_start": 5, "is_primary": true, "label": "expected `u32`, found `&str`" },
+                    { "file_name": "a.rs", "line_start": 1, "column_start": 11, "is_primary": false, "label": "expected `u32` because of return type" }
+                ],
+                "children": [
+                    { "level": "help", "message": "try parsing", "spans": [{ "suggested_replacement": "\"nope\".parse()" }] }
+                ]
+            }
+        });
+        let diags = parse_diags(&cargo_json.to_string(), "");
+        assert_eq!(diags.len(), 1);
+        let rendered = render_diags(&ws, &diags, "cargo check", 0.4, false);
+        assert!(rendered.contains("expected `u32`, found `&str`"), "{rendered}");
+        assert!(rendered.contains("because of return type"), "{rendered}");
+        assert!(rendered.contains("help: try parsing"), "{rendered}");
+        assert!(check_failed(&rendered));
+
+        let test_out = "running 3 tests\ntest a ... ok\ntest b ... FAILED\n\nfailures:\n\n---- b stdout ----\nthread 'b' panicked at src/lib.rs:10:5:\nassertion `left == right` failed\n  left: 1\n right: 2\nnote: run with `RUST_BACKTRACE=1`\n\nfailures:\n    b\n\ntest result: FAILED. 2 passed; 1 failed; 0 ignored; 0 measured\n";
+        assert_eq!(test_summary(test_out).as_deref(), Some("2 passed, 1 failed"));
+        let comp = compress_plain(test_out);
+        assert!(comp.contains("---- b stdout ----") && comp.contains("left: 1") && !comp.contains("test a ... ok"), "{comp}");
     }
 }

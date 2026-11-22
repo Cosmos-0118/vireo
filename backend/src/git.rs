@@ -2184,10 +2184,9 @@ mod tests {
 }
 
 // ---------------------------------------------------------------------------
-// AI commit-message generation (GitHub CLI -> GitHub Models)
+// AI commit-message generation (GitHub Copilot CLI)
 // ---------------------------------------------------------------------------
 
-const COMMIT_MODEL: &str = "openai/gpt-4.1-mini";
 const COMMIT_DIFF_BUDGET: usize = 14_000;
 const COMMIT_SYSTEM_PROMPT: &str = "You write git commit messages. Reply with ONLY the commit message, no quotes, no code fences, no preamble.\n\
 Rules:\n\
@@ -2206,7 +2205,7 @@ pub struct GenerateMessageReq {
 pub struct GenerateMessageRes {
     pub ok: bool,
     pub message: String,
-    /// "gh_missing" | "gh_unauthenticated" | "no_changes" | "failed" when !ok.
+    /// "copilot_missing" | "copilot_unauthenticated" | "no_changes" | "failed" when !ok.
     pub code: String,
     pub error: String,
 }
@@ -2220,37 +2219,79 @@ fn gen_fail(code: &str, error: &str) -> Json<GenerateMessageRes> {
     })
 }
 
-/// `gh` with a request body on stdin.
-async fn run_gh_stdin(
-    ws: &Path,
-    args: &[&str],
-    stdin_data: &[u8],
-) -> Result<(bool, String, String), String> {
-    let mut child = background_command("gh")
-        .args(args)
+/// One-shot, tool-less GitHub Copilot CLI call (`copilot -p ... --output-format json`).
+/// Returns the assistant's text, or a user-facing error string ("MISSING" if not installed).
+async fn run_copilot_oneshot(ws: &Path, prompt: &str) -> Result<String, String> {
+    let Some(exe) = tokio::task::spawn_blocking(|| crate::pty::resolve_cli_tool_any(&["copilot"]))
+        .await
+        .ok()
+        .flatten()
+    else {
+        return Err("MISSING".to_string());
+    };
+    let child = background_command(&exe.to_string_lossy())
+        .args([
+            "-p",
+            prompt,
+            "--output-format",
+            "json",
+            // Pure text task: no tools, no MCP servers, no repo instructions.
+            "--available-tools",
+            "",
+            "--disable-builtin-mcps",
+            "--no-custom-instructions",
+            "--no-ask-user",
+            "--no-auto-update",
+            "--no-color",
+        ])
         .current_dir(ws)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("NO_COLOR", "1")
-        .stdin(Stdio::piped())
+        .env("PATH", crate::pty::augmented_path_env())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()
-        .map_err(|e| format!("Failed to run gh: {}", e))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(stdin_data)
-            .await
-            .map_err(|e| format!("Failed to write stdin to gh: {}", e))?;
+        .map_err(|e| format!("Failed to run GitHub Copilot CLI: {}", e))?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(90),
+        child.wait_with_output(),
+    )
+    .await
+    .map_err(|_| "GitHub Copilot CLI timed out after 90s.".to_string())?
+    .map_err(|e| format!("Failed to wait for GitHub Copilot CLI: {}", e))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut text = String::new();
+    let mut error = String::new();
+    for line in stdout.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        match v["type"].as_str() {
+            Some("assistant.message") => {
+                if let Some(c) = v["data"]["content"].as_str().filter(|c| !c.trim().is_empty()) {
+                    text = c.to_string();
+                }
+            }
+            Some("session.error") => {
+                if let Some(m) = v["data"]["message"].as_str() {
+                    error = m.to_string();
+                }
+            }
+            _ => {}
+        }
     }
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("Failed to wait for gh: {}", e))?;
-    Ok((
-        output.status.success(),
-        String::from_utf8_lossy(&output.stdout).to_string(),
-        String::from_utf8_lossy(&output.stderr).to_string(),
-    ))
+    if !text.trim().is_empty() {
+        return Ok(text);
+    }
+    if error.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let t = stderr.trim();
+        error = if t.is_empty() {
+            "GitHub Copilot CLI returned no message.".to_string()
+        } else {
+            truncate_chars(t, 300).to_string()
+        };
+    }
+    Err(error)
 }
 
 fn truncate_chars(s: &str, max: usize) -> &str {
@@ -2299,20 +2340,6 @@ pub async fn generate_commit_message(
 ) -> Result<Json<GenerateMessageRes>, (StatusCode, String)> {
     let ws = state.workspace_path().await;
     let amend = body.and_then(|Json(r)| r.amend).unwrap_or(false);
-
-    let gh = github_status(State(state.clone())).await.0;
-    if !gh.installed {
-        return Ok(gen_fail(
-            "gh_missing",
-            "GitHub CLI (gh) is not installed. Install it from https://cli.github.com, then run `gh auth login`.",
-        ));
-    }
-    if !gh.authenticated {
-        return Ok(gen_fail(
-            "gh_unauthenticated",
-            "GitHub CLI is not signed in. Run `gh auth login` in the terminal, then try again.",
-        ));
-    }
 
     // Mirror what the Commit button will commit: staged changes, or everything when nothing is staged.
     let has_head = run_git(&ws, &["rev-parse", "--verify", "-q", "HEAD"])
@@ -2406,50 +2433,33 @@ pub async fn generate_commit_message(
     prompt.push_str(":\n");
     prompt.push_str(clipped);
 
-    let req_body = serde_json::json!({
-        "model": COMMIT_MODEL,
-        "temperature": 0.2,
-        "max_tokens": 220,
-        "messages": [
-            { "role": "system", "content": COMMIT_SYSTEM_PROMPT },
-            { "role": "user", "content": prompt },
-        ],
-    });
-    let (ok, out, err) = run_gh_stdin(
-        &ws,
-        &[
-            "api",
-            "-X",
-            "POST",
-            "https://models.github.ai/inference/chat/completions",
-            "--input",
-            "-",
-        ],
-        req_body.to_string().as_bytes(),
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let full_prompt = format!("{}
 
-    let parsed: Option<serde_json::Value> = serde_json::from_str(&out).ok();
-    let content = parsed
-        .as_ref()
-        .and_then(|v| v["choices"][0]["message"]["content"].as_str())
-        .unwrap_or("");
-    if !ok || content.is_empty() {
-        let api_msg = parsed
-            .as_ref()
-            .and_then(|v| v["error"]["message"].as_str().map(str::to_string))
-            .or_else(|| {
-                let t = if err.trim().is_empty() { out.trim() } else { err.trim() };
-                (!t.is_empty()).then(|| truncate_chars(t, 300).to_string())
-            })
-            .unwrap_or_else(|| "no response".to_string());
-        return Ok(gen_fail(
-            "failed",
-            &format!("GitHub Models request failed: {}", api_msg),
-        ));
-    }
-    let message = clean_commit_message(content);
+---
+{}", COMMIT_SYSTEM_PROMPT, prompt);
+    let content = match run_copilot_oneshot(&ws, &full_prompt).await {
+        Ok(c) => c,
+        Err(e) if e == "MISSING" => {
+            return Ok(gen_fail(
+                "copilot_missing",
+                "GitHub Copilot CLI is not installed. Install it with `winget install GitHub.Copilot` (or `npm install -g @github/copilot`), then run `copilot` once to sign in.",
+            ));
+        }
+        Err(e) => {
+            let lower = e.to_lowercase();
+            let code = if lower.contains("log in")
+                || lower.contains("login")
+                || lower.contains("auth")
+                || lower.contains("sign in")
+            {
+                "copilot_unauthenticated"
+            } else {
+                "failed"
+            };
+            return Ok(gen_fail(code, &format!("GitHub Copilot CLI failed: {}", e)));
+        }
+    };
+    let message = clean_commit_message(&content);
     if message.is_empty() {
         return Ok(gen_fail("failed", "The model returned an empty message."));
     }

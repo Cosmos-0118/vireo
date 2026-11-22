@@ -465,8 +465,8 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       if (res.ok) {
         setCommitMsg(res.message);
         commitInputRef.current?.focus();
-      } else if (res.code === 'gh_missing' || res.code === 'gh_unauthenticated') {
-        onToast(`Connect GitHub CLI to generate messages. ${res.error}`, true);
+      } else if (res.code === 'copilot_missing' || res.code === 'copilot_unauthenticated') {
+        onToast(`Set up GitHub Copilot CLI to generate messages. ${res.error}`, true);
       } else {
         onToast(res.error || 'Could not generate a commit message', true);
       }
@@ -1155,7 +1155,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                 disabled={generating || busy || !canCommit}
                 className="absolute right-1.5 top-1.5 p-1 rounded text-[var(--text-dim)] hover:text-[var(--accent)] hover:bg-[var(--bg-hover)] disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-[var(--text-dim)] cursor-pointer disabled:cursor-not-allowed"
                 aria-label="Generate commit message"
-                title={generating ? 'Generating…' : 'Generate commit message with GitHub CLI'}
+                title={generating ? 'Generating…' : 'Generate commit message with GitHub Copilot CLI'}
               >
                 {generating ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />}
               </button>

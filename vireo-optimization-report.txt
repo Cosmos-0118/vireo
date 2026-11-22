@@ -1,0 +1,723 @@
+================================================================================
+VIREO PERFORMANCE, MEMORY, CPU & BINARY SIZE OPTIMIZATION REPORT
+================================================================================
+Date:       2026-11-22
+Workspace:  c:\Users\user\Documents\Developer\vireo
+Build:      vireo.exe v0.2.0 (25.28 MiB), vx.exe (7.16 MiB), frontend/dist (3.06 MiB)
+Scope:      Full static audit (Rust backend + React/TypeScript/Vite frontend)
+            + controlled empirical measurements on this Windows PC.
+Note:       Analysis only -- no code modifications were made.
+
+
+================================================================================
+1. EXECUTIVE SUMMARY & EMPIRICAL BENCHMARKS (MEASURED ON THIS PC)
+================================================================================
+
+Your snapshot conclusion is confirmed and can now be quantified precisely:
+the Rust backend itself is tiny, while WebView2 (Chromium) and spawned PowerShell
+PTY shells dominate runtime memory and idle CPU.
+
+1.1 Measured Runtime Process Breakdown (Live Vireo PID 17900, 3 open terminals)
+--------------------------------------------------------------------------------
+Process / Role                            WS (MB)  PrivWS  Commit   Thd  Hnd  Idle10s CPU
+----------------------------------------  -------  ------  ------  ---- ----  -----------
+webview2: gpu-process                      120.75   67.96  134.07    32 1302  0.812s (8.12% core)
+webview2: renderer                         148.32   72.59   83.89    26  389  0.172s (1.72% core)
+webview2: browser-main                     129.26   24.33   33.32    50 1448  0.000s
+webview2: utility (NetworkService)          43.98    7.50   12.57    21  381  0.000s
+rust-host (vireo.exe)                       33.57    6.31    8.21    25  388  0.000s
+webview2: utility (StorageService)          23.38    2.81    7.32    10  195  0.000s
+webview2: crashpad                          16.18    1.80    3.05     8  171  0.000s
+----------------------------------------  -------  ------  ------  ---- ----  -----------
+VIREO + WEBVIEW2 SUBTOTAL (7 procs)        515.44  183.30  282.43   172 4274  0.984s (9.84% core)
+
+pty-child: pwsh.exe (x3 shells)            315.94  104.87  119.59    43 1896  0.000s
+  (~105 MB WS / ~35 MB PrivWS / ~40 MB Commit per pwsh.exe shell)
+----------------------------------------  -------  ------  ------  ---- ----  -----------
+GRAND TOTAL WITH PTY SHELLS (10 procs)     831.38  288.17  402.02   215 6170  0.984s (9.84% core)
+
+1.2 Controlled A/B Trials on This PC (Isolated Temp WebView2 Profiles)
+--------------------------------------------------------------------------------
+Configuration                             Procs  WS (MB)  PrivWS  Commit   Idle CPU (% of 1 core)
+----------------------------------------  -----  -------  ------  ------   ----------------------
+vireo.exe --server-only (Rust ONLY)           1    16.38     N/A    3.27   0.00% (0.000s / 5s)
+Fresh desktop, 0 terminals (default)          7   509.39  191.20  277.06   2.35% (0.141s / 6s)
+Fresh desktop, 0 terminals (lean flags*)      7   479.57  167.87  254.41   0.80% (0.048s / 6s)
+Live desktop, 3 terminals (default)           7   515.44  183.30  282.43   9.84% (0.984s / 10s)
+Live desktop + 3 pwsh.exe PTY shells         10   831.38  288.17  402.02   9.84% (0.984s / 10s)
+
+*Lean WebView2 flags tested via WEBVIEW2_ADDITIONAL_BROWSER_ARGS:
+  --disable-background-networking --disable-component-update
+  --disable-domain-reliability --disable-sync --metrics-recording-only
+  --disable-default-apps --no-first-run --disable-extensions
+  --disable-speech-api --disable-features=Translate,OptimizationHints,MediaRouter,CalculateNativeWinOcclusion
+  --js-flags=--lite-mode
+  Result: -29.8 MB Working Set, -23.3 MB Private WS, -22.7 MB Private Commit,
+  and ~3x lower idle CPU (2.35% -> 0.80% of 1 core), primarily by trimming
+  gpu-process from 128 MB WS / 122 MB Commit down to 99.5 MB WS / 101.4 MB Commit.
+
+1.3 Measured Backend Latency & Startup Microbenchmarks (vireo.exe --server-only)
+--------------------------------------------------------------------------------
+Metric / Endpoint                                   Measured Latency    Notes
+--------------------------------------------------  ----------------    ---------------------------------
+Cold backend ready (/api/health)                         624.7 ms       ~370 ms is sync PATH/CLI scan!
+GET /api/git/status (call 1 / call 2)             420.6 / 460.0 ms      Spawns 9-10 sequential git.exe
+CLI: git status --porcelain=v2 --branch -uall             38.8 ms       ~11x faster single git command!
+GET /api/git/branches                                    380.9 ms       8 sequential git.exe (3 redundant)
+GET /api/git/log?limit=100                               160.5 ms       Sequential git.exe spawns
+GET /api/agent/cli-tools (call 1 / call 2)        372.5 / 363.4 ms      Uncached augmented_path_env() scan
+GET /api/files/tree                                        1.3 ms       Fast, but uses blocking std::fs
+GET /assets/vendor-langs-B77PYGUB.js (540 KB)             16.7 ms       No Cache-Control, no compression
+
+1.4 Key Takeaways at a Glance
+--------------------------------------------------------------------------------
+1. Rust backend is ~3.3 MB private commit (~1.1% of Vireo+WebView2). Over 97% of
+   RAM is WebView2 (6 processes), and with 3 open terminals, pwsh.exe adds
+   another ~316 MB WS / ~120 MB private commit on top.
+2. BIGGEST LIVE ANOMALY: With 3 terminals open, WebView2's gpu-process alone
+   burns 8.12% of a CPU core continuously at COMPLETE IDLE (plus 1.72% in
+   renderer = 9.84% total) and holds 134 MB private commit (47.5% of total).
+   With 0 terminals open, gpu-process idle CPU drops to 0.00%!
+3. BIGGEST LATENCY BOTTLENECKS:
+   - /api/git/status takes ~440 ms (10 sequential git.exe spawns) and fires
+     unbatched on every filesystem change event.
+   - augmented_path_env() takes ~370 ms of synchronous disk crawling, runs
+     synchronously on startup before the window opens, and is NEVER cached
+     (re-runs on every PTY spawn, CLI agent run, and agent run_command).
+4. BIGGEST BINARY BLOAT:
+   - frontend/dist (3.06 MiB) is embedded TWICE inside vireo.exe (once raw via
+     rust-embed, once brotli-compressed via tauri::generate_context!() even
+     though Tauri loads http://127.0.0.1:<port> and never uses tauri:// assets).
+   - Release profile lacks panic="abort", lto="fat", and opt-level="s"/"z".
+   - Total reducible binary size: vireo.exe 25.28 MiB -> ~14-16 MiB (-35-45%).
+
+
+================================================================================
+2. WHAT IS CURRENTLY HEAVY -- DETAILED FINDINGS & OPTIMIZATIONS
+================================================================================
+
+--------------------------------------------------------------------------------
+CATEGORY A: WEBVIEW2 GPU, RENDERER & TERMINAL MEMORY / IDLE CPU (HIGHEST IMPACT)
+--------------------------------------------------------------------------------
+
+[A1] Persistent WebGL2 Contexts & Blinking Cursors on Hidden Terminals (CRITICAL)
+  Where:
+    - frontend/src/components/usePtyTerminal.ts:129-138, 214-229, 366
+    - frontend/src/components/TerminalPanel.tsx:80, 91-101, 471-480
+    - frontend/src/App.tsx:1145, 1916-1949
+  What is happening:
+    - Once the terminal dock has been opened once (terminalMountedRef.current = true),
+      <TerminalPanel> stays mounted forever even when collapsed (className="hidden").
+    - Inactive terminal tabs are hidden with style={{ display: active ? 'block' : 'none' }},
+      keeping every tab's xterm Terminal instance and WebglAddon alive indefinitely.
+    - tryWebgl() attaches new WebglAddon() and NEVER disposes it when active === false
+      or when the terminal panel is hidden, with no cap on concurrent WebGL contexts.
+      Each WebGL2 context pins D3D11/ANGLE surfaces, glyph texture atlases, and
+      command buffers in msedgewebview2.exe gpu-process.
+    - cursorBlink: true is unconditionally enabled on ALL terminals (including hidden
+      tabs, collapsed terminal dock, and minimized/occluded windows), keeping
+      xterm's blink timer and WebGL compositor repaints active forever.
+    - This directly explains why live Vireo (3 terminals) burned 9.84% of a CPU core
+      at idle (8.12% in gpu-process + 1.72% in renderer) while fresh Vireo (0
+      terminals) had 0.00% gpu-process idle CPU.
+    - Scrollback is set to 5,000 lines for agent tabs and 3,000 lines for shell tabs
+      (large typed-array cell/attribute buffers per tab).
+    - Also in usePtyTerminal.ts:366: window.setTimeout(sendAck, 50) is scheduled on
+      EVERY binary WebSocket frame without coalescing or cancelling in teardown().
+  How to optimize:
+    1. Enforce at most 1 active WebglAddon across the app: dispose WebglAddon
+       whenever !active || !showTerminal || document.hidden, and re-attach on
+       activation.
+    2. Set term.options.cursorBlink = false whenever !active || !showTerminal ||
+       document.hidden.
+    3. Lower default scrollback (e.g., 1,000-1,500 for shells, 2,500 for agents)
+       or make it configurable.
+    4. Coalesce the 50 ms sendAck timer into a single ref and clear it in teardown().
+  Expected gain:
+    - Idle CPU: 9.84% of 1 core -> <0.5-1.0% of 1 core.
+    - GPU process RAM: -15 to -40+ MB when multiple terminal tabs are open.
+
+[A2] Spawned PowerShell 7 (pwsh.exe) Footprint & 30-Minute Detached PTY Retention
+  Where:
+    - backend/src/pty.rs:24, 32, 655-662, 722-725, 784-797, 839-845, 868-900
+    - frontend/src/components/TerminalPanel.tsx:271-293
+  What is happening:
+    - On Windows, pty.rs prefers pwsh.exe (PowerShell 7 / .NET Core runtime).
+      Measured on this PC: EACH idle pwsh.exe consumes ~105 MB Working Set,
+      ~35 MB Private WS, and ~40 MB Private Commit. 3 open/lingering shells =
+      316 MB WS / 120 MB Private Commit!
+    - DETACHED_TTL = 1800s (30 minutes) with NO maximum detached session cap in
+      SESSIONS. Detached terminals stay alive (keeping both pwsh.exe and its
+      replay buffer in RAM) for half an hour.
+    - Replay Ring buffer (pty.rs:24, 657): REPLAY_CAP is 2 MiB, but Ring::push
+      waits until data.len() > REPLAY_CAP * 2 (4 MiB) before calling Vec::drain.
+      Vec::drain never shrinks heap capacity, so every busy PTY pins >= 4 MiB in
+      Rust forever (10 sessions = 40+ MiB).
+    - Each PTY spawns 2 OS threads (~1-2 MiB thread stack reservation each).
+    - Switching workspacePath in TerminalPanel.tsx does not reset the tabs state.
+  How to optimize:
+    1. Offer a shell profile setting (defaulting or allowing cmd.exe ~5 MB,
+       or launching pwsh.exe with -NoProfile / lazy shell startup only when a
+       tab is actually viewed rather than pre-spawning hidden tabs).
+    2. Replace Vec + drain in Ring with a fixed-capacity ring buffer (VecDeque
+       or circular slice) capped at 512 KiB - 1 MiB (or shrink_to after drain).
+    3. Lower DETACHED_TTL (e.g. 2-5 minutes) and cap total detached PTY sessions
+       (e.g., max 4 detached or max 8 MiB total replay bytes).
+    4. Reset/reconcile TerminalPanel tabs cleanly on workspace switch.
+  Expected gain:
+    - -40 to -120+ MB Private Commit (and -100 to -300 MB WS) for shell processes
+      and detached PTY buffers.
+
+[A3] WebView2 Launch Arguments & Missing Window Configuration
+  Where:
+    - backend/src/main.rs:372-391
+    - backend/tauri.conf.json:9-14
+  What is happening:
+    - WebviewWindowBuilder passes NO .additional_browser_args(...), so WebView2
+      enables default Edge/Chromium background services (component updater,
+      background networking, domain reliability, sync, extensions, media router,
+      translation, speech API, full V8 JIT tiers, etc.).
+    - Measured on this PC: passing lean additional_browser_args saved ~30 MB
+      Working Set, ~23 MB Private WS, ~23 MB Private Commit, and reduced fresh
+      idle CPU from 2.35% to 0.80% of 1 core.
+    - No .background_color(...) is set (causes white flash on dark startup).
+    - Release build leaves WebView2 DevTools enabled via default tauri features.
+  How to optimize:
+    1. Pass vetted .additional_browser_args(...) on WebviewWindowBuilder
+       (benchmarking --js-flags=--lite-mode carefully for CodeMirror/diff
+       responsiveness before enabling --lite-mode in production; the non-V8
+       Chromium service flags alone are safe and zero-regression).
+    2. Set .background_color(...) matching the saved theme to avoid startup
+       repaint flashes.
+    3. Gate Tauri devtools behind debug builds (cfg(debug_assertions)).
+  Expected gain:
+    - -20 to -30 MB RAM across WebView2 processes and cleaner idle CPU.
+
+[A4] Continuous CSS Animations, HarfBuzz Text Shaping & Compositor Layers
+  Where:
+    - frontend/src/index.css:87, 251-255, 262-276
+    - frontend/src/components/GitActionModal.tsx:97
+    - frontend/src/components/PublishDialog.tsx:174
+    - frontend/src/components/AgentActivity.tsx:609
+    - frontend/src/components/AgentEditsStrip.tsx:129
+    - frontend/src/components/CodeEditor.tsx:599
+  What is happening:
+    - index.css:87 sets `text-rendering: optimizeLegibility` globally on
+      `html, body, #root`. In Chromium/WebView2 this forces the slower HarfBuzz
+      shaping/kerning path across every file-tree row, diff line, and commit
+      row, increasing layout CPU and glyph-cache RAM.
+    - Infinite CSS animations (.agent-shimmer animating background-position with
+      background-clip: text -> per-frame raster repaints; .live-dot; animate-ping)
+      keep Chromium's compositor ticking continuously while mounted, with ZERO
+      `document.hidden` pausing.
+    - Full-viewport `backdrop-blur` on modals forces a full-screen GPU backdrop
+      compositing pass over the entire workbench/WebGL terminal.
+  How to optimize:
+    1. Remove global `text-rendering: optimizeLegibility` (use default `auto`
+       or `optimizeSpeed` for dense lists/tables).
+    2. Pause CSS animations when `document.hidden` (toggle a `.app-hidden` class
+       on `<html>` via `visibilitychange`), and animate compositor-only
+       properties (`transform`/`opacity`) instead of `background-position`.
+    3. Replace full-screen `backdrop-blur` on modals with a slightly higher
+       opacity solid scrim.
+
+
+--------------------------------------------------------------------------------
+CATEGORY B: FRONTEND JS HEAP, DOM BLOAT & REACT RENDER PERFORMANCE
+--------------------------------------------------------------------------------
+
+[B1] Unbounded / Multi-Copy File & Diff Caches in JS Heap
+  Where:
+    - frontend/src/App.tsx:222, 227-232, 237, 345-350, 675, 696-699, 756-766
+    - frontend/src/components/CommitHoverCard.tsx:13-32
+    - frontend/src/components/SourceControlPane.tsx:194, 304-308
+    - frontend/src/components/AgentPanel.tsx:415, 437-446, 560-589
+  What is happening:
+    - contentCacheRef caches up to 30 tabs; each GitDiffRes stores 3 full file
+      strings (original + modified + patch) -> up to 90 full strings retained.
+    - snapshotsRef caches up to 40 raw file strings up to 1.5 MB each -> up to
+      ~60 MB of retained JS strings.
+    - review (Record<string, string>) stores full pre-agent baseline file strings
+      in React state with NO byte or entry limit.
+    - CommitHoverCard's module-level detailCache Map and SourceControlPane's
+      commitDetails object grow unboundedly and are NEVER cleared on workspace
+      switch.
+    - AgentPanel keeps up to 20 full threads in state and re-JSON.stringify's the
+      entire array to localStorage on every completed assistant turn; expandedTools,
+      groupOpen, and threadRulesRef are never pruned.
+  How to optimize:
+    1. Enforce a total byte budget (e.g., 8-12 MB LRU) on contentCacheRef and
+       snapshotsRef instead of entry counts; drop diff.patch when not displayed.
+    2. Clear detailCache and commitDetails on workspace switch and cap them with
+       a small LRU (e.g. 50 entries).
+    3. Store only active thread messages in hot React state and persist threads
+       individually by key instead of re-stringifying all 20 threads together.
+
+[B2] DiffViewer Render Bugs, Double Computation & Full-File Tokenization
+  Where:
+    - frontend/src/components/DiffViewer.tsx:222-330, 439-457, 538-558, 603-607,
+      645, 651, 664-673, 675-873, 893-897, 955-966, 1036-1045
+    - frontend/src/syntax.ts:398, 491
+  What is happening:
+    - TWO missing-dependency-array useEffect bugs:
+      * DiffViewer.tsx:955-966 runs sc.querySelector(...) + getBoundingClientRect()
+        (forced synchronous layout!) after EVERY render when virtual === true.
+      * DiffViewer.tsx:1036-1045 tears down and re-registers window keydown
+        listener on EVERY render.
+    - syntaxTokens highlights BOTH diff.original and diff.modified (up to 250 KB
+      each!) into massive TokenSpan[][] object arrays even for folded/offscreen
+      lines.
+    - computed, splitItems, unifiedItems, splitScopeTexts, unifiedScopeTexts
+      eagerly compute BOTH split and unified layouts regardless of active viewMode.
+    - Virtualization is disabled for 301-800 rows whenever wordWrap is true (the
+      default!), mounting hundreds of <tr>s and thousands of token <span>s.
+    - hoverHunk state re-renders the entire DiffViewer on mouse hover across hunks.
+  How to optimize:
+    1. Add proper dependency arrays to both useEffects immediately.
+    2. Compute only the active viewMode (split OR unified) and tokenize visible
+       / unfolded line ranges lazily.
+    3. Enable virtualization above ~150-200 rows regardless of wordWrap (with
+       measured/estimated row heights).
+    4. Move hunk hover styling to CSS (:hover on hunk wrapper) instead of React
+       state.
+
+[B3] CodeEditor Synchronous Full-Document Diff on Every Keystroke & View Thrashing
+  Where:
+    - frontend/src/components/CodeEditor.tsx:67-97, 168, 376-450
+  What is happening:
+    - When reviewBase is present, makeReviewField calls
+      computeReviewHunks(base, doc.toString()) (full diffLines up to 600 KB)
+      SYNCHRONOUSLY inside CodeMirror's StateField.update on EVERY keystroke,
+      flattening the entire CodeMirror text rope to a contiguous string each time.
+    - Switching theme destroys and recreates the entire EditorView/EditorState
+      from scratch instead of using a CodeMirror Compartment, and carryRef.current
+      retains the last edited file's full doc string after unmount.
+  How to optimize:
+    1. Move review hunk diffing to a debounced effect (150-300 ms) dispatched via
+       a StateEffect instead of synchronous StateField update on every keystroke.
+    2. Reconfigure theme/language via CodeMirror Compartment instead of
+       destroying EditorView; clear carryRef on cleanup.
+
+[B4] Unvirtualized Lists & Coarse-Grained App.tsx Re-Render Cascades
+  Where:
+    - frontend/src/App.tsx (2,130 lines, ~30 useState hooks, lines 1716-1983)
+    - frontend/src/components/FileExplorer.tsx:456, 488-511, 640
+    - frontend/src/components/CommitGraphView.tsx:843-985
+    - frontend/src/components/SourceControlPane.tsx:1428-1471, 1654-1927
+    - frontend/src/components/SearchPane.tsx:752-789, 1095
+    - frontend/src/components/AgentPanel.tsx:1228-1329
+    - frontend/src/components/AgentEditsStrip.tsx:178-184
+  What is happening:
+    - None of Sidebar, AgentPanel, TerminalPanel, DiffViewer, CodeEditor,
+      CommitGraphView, AgentEditsStrip, MarkdownMessage, or ToolStep are wrapped
+      in React.memo. Any toast, menu toggle, resize tick, or 1.6s flash expiry
+      in App.tsx re-renders the ENTIRE workbench tree (including hidden panels).
+    - CommitGraphView and SourceControlPane render unbounded commit lists with
+      per-row inline <CommitGraphSvg> multi-path SVGs and fresh rowProps closures.
+    - FileExplorer, SearchPane, and AgentPanel render unvirtualized DOM trees
+      (FileExplorer creates `depth` indent-guide <span>s + hidden hover buttons
+      per row; AgentEditsStrip duplicates all chips in a hidden DOM container
+      just to measure offsetWidth).
+  How to optimize:
+    1. Isolate high-churn UI state (toasts, menus, resize drag, flash indicators)
+       out of root App.tsx and wrap major panes + chat items in React.memo with
+       stable callbacks.
+    2. Virtualize FileExplorer, CommitGraphView, SourceControlPane commit list,
+       and SearchPane (even a simple fixed-height windowing helper cuts DOM nodes
+       from thousands to ~40).
+    3. Replace AgentEditsStrip's hidden duplicate DOM render with ResizeObserver
+       or canvas/estimated width measurement.
+
+[B5] Unbatched WebSocket fs_changed Storms & Zero document.hidden Handling
+  Where:
+    - frontend/src/App.tsx:489-543, 647-815
+    - frontend/src/components/FileExplorer.tsx:152-156
+    - frontend/src/components/SearchPane.tsx:232-238
+    - frontend/src/components/BranchBar.tsx:47-54, 129
+    - frontend/src/components/AgentActivity.tsx:317-324
+  What is happening:
+    - Zero files in frontend/src/ check document.hidden or listen to
+      visibilitychange. BranchBar's 30s interval and AgentActivity's 1s timer
+      run even while minimized/hidden.
+    - Every /ws/events `fs_changed` message immediately triggers:
+      (1) sequential api.readFile + api.gitDiff + diffLines on up to 8 files,
+      (2) refreshGit() (a 440 ms 10-process git.exe cascade!),
+      (3) reloadActiveContentRef() (another git diff / file read),
+      (4) fsVersion++, causing FileExplorer to re-fetch root + ALL expanded
+          folders AND SearchPane to re-run the full workspace search!
+    - Rapid file writes (e.g., cargo build / npm install / agent multi-file edits)
+      trigger cascading storms across frontend + backend + git.exe.
+  How to optimize:
+    1. Coalesce/debounce incoming fs_changed events (e.g. 250-400 ms) and cancel
+       in-flight refresh requests with AbortController when a newer event arrives.
+    2. Pause non-essential refreshes & intervals while document.hidden, and run
+       one coalesced catch-up refresh on visibility restore.
+    3. Only re-run SearchPane search on fs_changed when SearchPane is visible
+       and user-triggered or debounced >= 1s.
+
+
+--------------------------------------------------------------------------------
+CATEGORY C: RUST BACKEND CPU, LATENCY & MEMORY HOTSPOTS
+--------------------------------------------------------------------------------
+
+[C1] 9-10 Sequential git.exe Spawns Per Status Refresh (~440 ms) & 8 Per Branches
+  Where:
+    - backend/src/git.rs:497, 609-774 (get_status), 791-896 (get_diff),
+      1056-1140 (get_branches), 1191-1253 (get_log), 1325-1408 (get_commit_detail)
+    - backend/src/checkpoint.rs:81-111, 235-278, 425-432
+  What is happening:
+    - Measured: GET /api/git/status takes 420-460 ms because it awaits 9-10
+      sequential git.exe processes on Windows (where each CreateProcess + Git
+      startup costs ~35-50 ms).
+    - Measured: A single `git status --porcelain=v2 --branch -uall` on this exact
+      repo took only 38.8 ms (~11x faster) and already provides work-tree check,
+      branch name, HEAD OID, upstream ahead/behind counts, and all file statuses!
+    - Measured: GET /api/git/branches takes 381 ms across 8 sequential git.exe
+      spawns, 3 of which (current_branch, branch, branch -r) are 100% redundant
+      with for-each-ref.
+    - get_status also deep-clones the entire Vec<Checkpoint> (git.rs:632) and
+      calls blocking std::fs::read_to_string() on every untracked file (git.rs:737)
+      just to count lines, with no file-size cap!
+    - checkpoint::apply_change spawns 3-5 git processes per file sequentially.
+  How to optimize:
+    1. Replace steps 1, 2, 3, 5, 7 of get_status with ONE
+       `git status --porcelain=v2 --branch -uall` call, cache git_dir per
+       workspace, and run remaining independent calls (diff --numstat,
+       diff --cached --numstat, stash list, remote get-url) concurrently via
+       tokio::join!.
+    2. Delete the 3 redundant git spawns in get_branches and join! the rest.
+    3. Stream line counting for untracked files (skipping >1 MiB / binary files)
+       and return lightweight checkpoint summaries / Arc instead of deep cloning.
+    4. Parallelize independent git calls in get_log, get_commit_detail, get_diff,
+       and use `git cat-file --batch` / `hash-object --stdin-paths` in checkpoints.
+  Expected gain:
+    - /api/git/status: ~440 ms -> ~50-80 ms (6-8x faster, far less CPU spike).
+    - /api/git/branches: ~381 ms -> ~60-90 ms (4-6x faster).
+
+[C2] Uncached augmented_path_env() Crawling Disk (~370 ms Per Call + Startup Block)
+  Where:
+    - backend/src/main.rs:326 (blocks cold start before server/window starts!)
+    - backend/src/pty.rs:198-282, 308-455, 514, 780
+    - backend/src/agent.rs:412, 418, 481, 489
+    - backend/src/cli_agent.rs:1431, 1469
+    - backend/src/code_intel.rs:58-73 (resolve_program)
+  What is happening:
+    - augmented_path_env() synchronously checks ~25 dirs, probes 14 CLI tools x
+      5 extensions across PATH, and recursively reads/stats IDE extension dirs
+      (VS Code, Cursor, Insiders, Windsurf), WinGet Packages, Claude-Data, and
+      Codex dirs.
+    - Measured via /api/agent/cli-tools: 372.5 ms on call 1, 363.4 ms on call 2!
+    - It is NEVER cached: it blocks main() on cold start (~370 ms of the 625 ms
+      server-ready time!) and re-runs synchronously on every PTY spawn, TWICE on
+      every cli_agent::run, and on EVERY agent run_command tool invocation!
+  How to optimize:
+    1. Cache augmented_path_env() in a RwLock<(Instant, OsString)> with a 60s
+       TTL (plus manual refresh only when /api/agent/cli-tools?refresh=1 is hit).
+    2. Remove the blocking call from main.rs:326 and warm it lazily in a
+       background spawn_blocking task after the window is shown.
+    3. Cache code_intel::resolve_program lookups in a HashMap.
+  Expected gain:
+    - Cold startup time: ~625 ms -> ~250 ms (-370 ms immediately).
+    - PTY spawn / cli-tools / agent run_command: -360 ms per invocation.
+
+[C3] Continuous Backend Idle Polling Loops & File Watcher Event Storms
+  Where:
+    - backend/src/watcher.rs:9-33, 54, 62, 65, 72-95
+    - backend/src/state.rs:111-128
+    - backend/src/pty.rs:842-845, 868-900
+    - backend/src/code_intel.rs:122-142
+  What is happening:
+    - watcher.rs:72-95 wakes every 120 ms (8.33 Hz) FOREVER at idle via
+      fs_rx.recv_timeout(120ms) just to poll retarget_rx.try_recv().
+    - pty.rs:868-900 wakes every 400 ms (2.5 Hz) PER OPEN PTY forever to poll
+      child.try_wait() (3 tabs = 7.5 wakeups/sec).
+    - pty.rs:842-845 busy-sleeps every 5 ms (200 Hz) while backpressured,
+      locking ring + cursors mutexes each tick.
+    - code_intel.rs:122-142 polls child.try_wait() every 40 ms (25 Hz).
+    - watcher.rs:54 watches the entire workspace with RecursiveMode::Recursive,
+      so Windows ReadDirectoryChangesW floods Vireo during builds inside
+      node_modules/, target/, .git/objects/, dist/, .venv/ -- allocating a
+      replaced String for every .git/* event before discarding it.
+    - BUG in watcher.rs:81, 89-95: continuous writes reset `last_event`
+      (starving flushes indefinitely while `pending` grows unboundedly), and
+      `pending.drain().take(50).collect()` silently DROPS all paths beyond 50.
+  How to optimize:
+    1. Unify fs_rx + retarget_rx into a single channel so the watcher blocks in
+       recv() with ZERO wakeups/sec when idle, switching to recv_timeout only
+       while debouncing active events (with a max-flush deadline of ~500 ms).
+    2. Watch non-ignored top-level directories instead of blind root recursion
+       over node_modules/target/.git (or watch root non-recursively + each
+       non-ignored child recursively). Expand is_ignored_dir_name (.pnpm-store,
+       .yarn, .svelte-kit, .parcel-cache, .output, out, .gradle, vendor, .idea).
+    3. Replace PTY 5 ms busy-sleep with a Condvar, and wait on child exit via
+       OS handle/thread instead of 400 ms try_wait polling.
+    4. Fix `pending.drain().take(50)` bug (emit a coarse refresh sentinel when
+       overflowed).
+
+[C4] code_intel::repo_map Memory Spike (~65-100+ MiB) & Tree-sitter Parser Churn
+  Where:
+    - backend/src/code_intel.rs:309-320, 452-456, 862, 909, 948, 979, 1023,
+      1220-1250, 1308-1324
+  What is happening:
+    - repo_map buffers up to 2,500 files (<=300 KB each) simultaneously in
+      entries: Vec<Entry>, storing lines: Vec<String> (100% unused when query is
+      empty!) AND idents: HashSet<String> (every identifier >=3 chars as an
+      owned heap String). On a 1,500-file repo this spikes RAM by ~65-100+ MiB.
+    - parse_tree() calls tree_sitter::Parser::new() + set_language() on EVERY
+      file (up to 2,500 C parser alloc/free cycles per repo_map).
+    - read_doc() splits the file into Vec<String>, then outline/view/edit/symbol
+      immediately reconstruct the whole file back into a new String via
+      doc.to_text() just to pass &str to tree-sitter.
+  How to optimize:
+    1. Remove lines: Vec<String> from Entry (re-read only the final 5-20
+       selected files when query is non-empty).
+    2. Hash identifiers into u64/u32 (xxh32 is already in Cargo.toml!) instead
+       of storing HashSet<String>.
+    3. Reuse Parser instances per Lang (thread_local! or local map in repo_map).
+    4. Pass raw &str directly to tree-sitter before splitting into Doc lines.
+
+[C5] Blocking I/O on Tokio Worker Threads, Unbounded Reads & Minor Server Issues
+  Where:
+    - backend/src/files.rs:154-269, 320-335, 484-515
+    - backend/src/git.rs:510-516, 737, 800-885, 947, 1132, 1447-1602
+    - backend/src/checkpoint.rs:94-109
+    - backend/src/agent.rs:61-264, 412, 757-950
+    - backend/src/cli_agent.rs:1054, 1454-1469
+    - backend/src/main.rs:50-60, 75, 250-253, 318-321
+  What is happening:
+    - Blocking std::fs calls run directly inside async Axum handlers (get_tree,
+      get_status, snapshot_tree, set_workspace, exec_tool).
+    - files::read_file reads the entire file into Vec<u8> BEFORE checking the
+      2 MiB size limit (should check metadata().len() first).
+    - files::search_files buffers all of `rg --json` stdout into memory and
+      parses every JSON line before capping at 500 matches (should stream lines
+      and kill rg once 500 matches are hit).
+    - git::get_diff / get_commit_diff / compare_diff read unbounded file/blob
+      sizes into RAM.
+    - cli_agent.rs:1054 compiles a Regex on EVERY shell tool call event (move to
+      OnceLock<Regex>).
+    - agent.rs:61-264 rebuilds full JSON tool schemas on every agent loop round
+      (move to OnceLock<Value>); untruncated 30 KB tool outputs accumulate across
+      up to 12 rounds.
+    - main.rs:75 `while let Ok(ev) = rx.recv().await` disconnects `/ws/events`
+      on broadcast RecvError::Lagged instead of continuing with a refresh event.
+    - main.rs:50-60 serve_embedded copies `file.data.into_owned()` on every HTTP
+      request with NO Cache-Control header and NO compression.
+    - Tokio default multi-thread runtime spawns 1 worker thread per logical CPU
+      core (18-21 threads even when idle with 0 PTYs); capping worker_threads(2..4)
+      cuts per-thread stack/scheduler overhead for a local single-user app.
+    - Security note: main.rs:318-321 sets CorsLayer::allow_origin(Any) on
+      localhost endpoints (workspace/git/PTY/agent) -- should restrict to the
+      bound local origin in desktop mode.
+
+
+--------------------------------------------------------------------------------
+CATEGORY D: BINARY SIZE & FRONTEND BUNDLE / ASSET BLOAT
+--------------------------------------------------------------------------------
+
+Measured release binary composition:
+  vireo.exe: 25.28 MiB (26,505,216 B) = .text 11.80 MiB | .rdata 12.77 MiB | .pdata 0.52 MiB | .rsrc 0.14 MiB
+  vx.exe:     7.16 MiB ( 7,505,920 B) = .text  1.61 MiB | .rdata  5.34 MiB | .pdata 0.05 MiB | .rsrc 0.14 MiB
+
+Measured frontend/dist breakdown (3.06 MiB / 3,211,872 B across 38 files):
+  Category                                       Size (KiB)   Share   Files
+  ---------------------------------------------  ----------   -----   -----
+  codemirror + vendor-langs + syntax + editor         923.9   29.5%       4
+  app js/css/html + react + icons + diff              686.0   21.9%      11
+  ghostty-web (opt-in WASM terminal engine)           623.5   19.9%       1
+  xterm + xterm-webgl + css                           401.3   12.8%       3
+  duplicate/unused logos & icons (png/ico/svg)        206.2    6.6%       7
+  latin / latin-ext font subsets (.woff2)             184.5    5.9%       4
+  unused non-latin font subsets (.woff2)              111.1    3.5%       8
+
+[D1] CRITICAL: frontend/dist Is Embedded TWICE Inside vireo.exe
+  Where:
+    - backend/src/main.rs:33-35 (`#[derive(Embed)] #[folder = "../frontend/dist"]`)
+    - backend/tauri.conf.json:7 (`"frontendDist": "../frontend/dist"`) + main.rs:390
+  Verified directly inside backend/target/release/vireo.exe:
+    - rust-embed embeds all 3.06 MiB of frontend/dist UNCOMPRESSED.
+    - tauri::generate_context!() embeds all of frontend/dist A SECOND TIME
+      (brotli-compressed text + raw duplicate .woff2/.png files -- verified 2x
+      exact binary matches for all Latin woff2s, vireo-logo, favicons, plus
+      compressed JS/CSS in tauri-codegen-assets).
+    - Yet main.rs:377 opens WebviewUrl::External("http://127.0.0.1:<port>") and
+      NEVER serves Tauri's embedded tauri:// asset bundle!
+  How to optimize:
+    - Point tauri.conf.json `frontendDist` to an empty stub dir (keeping
+      rust-embed for both desktop + `--server-only`), AND enable pre-compressed
+      gzip/brotli assets in rust-embed (serving with Content-Encoding +
+      Cache-Control: public, max-age=31536000, immutable + zero-copy Bytes).
+  Expected gain:
+    - -3.2 to -3.7 MiB from vireo.exe immediately, plus faster HTTP asset loads.
+
+[D2] Rust Release Profile & Dependency Trimming (-5 to -8 MiB on vireo.exe)
+  Where:
+    - backend/Cargo.toml:18-50, backend/build.rs
+  Findings:
+    1. Release profile (Cargo.toml:47-50) lacks:
+       - `panic = "abort"` (saves 544 KB .pdata + unwinding code in .text)
+       - `lto = "fat"` (currently "thin")
+       - `opt-level = "s"` or `"z"` (currently default 3 -> 11.80 MiB .text!)
+       Estimated savings: ~3.0 - 5.0 MiB from vireo.exe, ~0.5 - 1.0 MiB from vx.exe.
+    2. `reqwest` uses `rustls-tls` (pulls rustls + ring 766 KB lib + webpki-roots
+       ~350 KB CA table) + unused `"stream"` feature. Switching to `native-tls`
+       (Windows SChannel) saves ~1.0 - 1.5 MiB.
+    3. Unused / replaceable crates:
+       - `axum` `"macros"` feature is 100% unused.
+       - `tokio` `"full"` -> narrow to `["rt-multi-thread","net","io-util","process","fs","sync","time","macros"]`.
+       - `futures-util` default features -> `default-features = false, features = ["sink","std"]`.
+       - `chrono` is used ONLY for `Utc::now().format("%H:%M:%S")` at 2 lines
+         in checkpoint.rs -> replace with std::time::SystemTime (~200-400 KB saved).
+       - `rfd` is used ONLY for pick_folder() at files.rs:193 and pulls a 4th
+         Windows binding crate (`windows-sys 0.59`); replace with ~30 lines of
+         IFileOpenDialog via `windows` already linked by Tauri.
+       - `tree-sitter-json` is used ONLY for JSON syntax validation -> replace
+         with `serde_json::from_str` (already linked).
+       - `regex` default features pull full Unicode property tables (~1+ MiB).
+    4. Split `vx` into a separate Cargo workspace member:
+       - Currently `vx.exe` runs `tauri_build::build()` and links Tauri's
+         138 KiB `.rsrc` icon blob.
+       - Note: tree-sitter static C libs total 5.92 MiB (`tree-sitter-typescript`
+         alone is 2.91 MiB for TS+TSX, `rust` 1.16 MiB, `core` 0.58 MiB,
+         `python` 0.52 MiB, `javascript` 0.47 MiB, `go` 0.27 MiB) -- this is
+         the bulk of `vx.exe`'s 5.34 MiB `.rdata` and is inherent if keeping
+         native tree-sitter parsing for those 5 languages.
+
+[D3] Frontend Bundle, Prefetch & Asset Waste (~1.0+ MiB from dist, ~1.2 MB Less Initial Parse)
+  Where:
+    - frontend/src/App.tsx:32, 49-50, 66-80, 428-435
+    - frontend/src/syntax.ts:1-22, 121-129 & frontend/vite.config.ts:42-50
+    - frontend/src/main.tsx:3-4 & frontend/src/index.css:11-35
+    - frontend/public/vireo-logo.png & frontend/src/assets/vireo-logo.png
+  Findings:
+    1. Blind 1.2s startup prefetch (App.tsx:428-435) unconditionally downloads,
+       parses, and compiles DiffViewer + CodeEditor + syntax + vendor-codemirror
+       (375 KB) + vendor-langs (528 KB) = ~953 KB of JS on EVERY startup even if
+       no file or diff is ever opened!
+    2. Monolithic `vendor-langs` (527.9 KB): syntax.ts statically imports all 13
+       @codemirror/lang-* and 10 @codemirror/legacy-modes grammars, and
+       vite.config.ts merges them into one chunk. Opening a single .ts file or
+       markdown code block loads all 23 languages permanently into V8 heap.
+       Fix: dynamic `() => import(...)` per language in syntax.ts + remove the
+       vendor-langs manualChunk rule.
+    3. Eagerly bundled hidden panels: `AgentPanel` (starts hidden: showAgent=false),
+       `FileExplorer`, and `SearchPane` (start inactive: sidebarTab='changes'),
+       plus `diff` (App.tsx:32), are all statically imported into the eager
+       272.9 KB `index` chunk and `vendor-icons` (46.9 KB). Lazy-load them.
+    4. Unused font subsets (~113 KB): main.tsx imports the full barrel packages
+       `@fontsource-variable/inter` and `@fontsource-variable/jetbrains-mono`,
+       emitting 8 unused Cyrillic/Greek/Vietnamese `.woff2` files (111.1 KB)
+       plus base64-inlining `jetbrains-mono-cyrillic-ext` (2 KB) into index.css,
+       and declaring Inter Latin twice ('Inter Variable' + 'Inter UI').
+       Fix: import only `/latin.css` (and `/latin-ext.css` if needed).
+    5. Unused & oversized logos (~145 KB): `frontend/public/vireo-logo.png`
+       (114.3 KB) is copied to dist and NEVER referenced anywhere;
+       `src/assets/vireo-logo.png` (37.2 KB) is only rendered at 18px and 56px
+       (could be a 3-5 KB WebP/SVG).
+    6. Opt-in `ghostty-web` (623.5 KB JS+WASM = 19.9% of dist): embedded raw in
+       rust-embed + compressed in Tauri (~875 KB in vireo.exe) even though
+       xterm.js is the default. Worth deciding whether to keep dual terminal
+       engines in the default build or standardize on one (or make ghostty an
+       optional build feature).
+
+
+================================================================================
+3. ARCHITECTURAL REALITY CHECK: WHY VIREO IS ~500 MB WS AND THE WEBVIEW2 FLOOR
+================================================================================
+
+Even after fixing EVERY item above, it is important to set realistic expectations
+for WebView2 on Windows:
+
+  Measured WebView2 baseline (fresh launch, 0 terminals, lean flags):
+    - Working Set:    ~480 MB (7 processes: Rust host + 6 msedgewebview2.exe)
+    - Private WS:     ~168 MB
+    - Private Commit: ~254 MB
+
+That ~170 MB Private WS / ~255 MB Private Commit floor is Chromium's multi-process
+architecture (Browser + GPU/ANGLE + V8/Blink Renderer + Network + Storage +
+Crashpad). You CANNOT shrink a WebView2 app to 30-50 MB RAM.
+
+What optimization WILL achieve realistically on WebView2:
+  - Idle CPU (with 3 terminals open):  ~9.8% of 1 core  -->  <0.5-1.0% of 1 core
+  - Active multi-terminal session RAM: ~831 MB WS / 402 MB Commit -->
+                                       ~480-550 MB WS / ~250-300 MB Commit
+                                       (bigger savings as session ages / tabs grow)
+  - Cold backend startup latency:      ~625 ms          -->  ~150-250 ms
+  - /api/git/status latency:           ~440 ms          -->  ~50-80 ms
+  - /api/git/branches latency:         ~381 ms          -->  ~60-90 ms
+  - /api/agent/cli-tools latency:      ~370 ms          -->  <1 ms (cached)
+  - vireo.exe binary size:             25.28 MiB        -->  ~14-16 MiB
+  - vx.exe binary size:                 7.16 MiB        -->  ~5.5-6.0 MiB
+  - frontend/dist asset size:           3.06 MiB        -->  ~1.6-2.0 MiB
+                                       (or ~1.0-1.4 MiB if single terminal engine)
+
+If the long-term goal were ever a truly "tiny" (<80 MB total RAM) desktop app,
+that would require replacing WebView2/Chromium with a native GPU UI toolkit
+(e.g. GPUI, Iced, Slint, or WinUI/DirectWrite) -- a full frontend rewrite rather
+than an optimization pass.
+
+
+================================================================================
+4. PRIORITIZED OPTIMIZATION ROADMAP (RECOMMENDED ORDER)
+================================================================================
+
+PHASE 1: HIGHEST-ROI QUICK WINS (1-2 DAYS, ZERO ARCHITECTURAL RISK)
+--------------------------------------------------------------------------------
+1. Dispose WebglAddon + disable cursorBlink on inactive/hidden terminals &
+   document.hidden; coalesce 50ms sendAck timer. (Fixes 9.8% idle CPU burn!)
+2. Cache augmented_path_env() (60s TTL) & remove synchronous call from main.rs:326.
+   (Saves ~370 ms cold start + ~370 ms on every PTY/CLI/agent tool call.)
+3. Consolidate git::get_status to `git status --porcelain=v2 --branch -uall` +
+   tokio::join! and remove 3 redundant git calls in get_branches.
+   (Cuts /api/git/status from ~440 ms -> ~60 ms.)
+4. Stop double-embedding frontend/dist in vireo.exe (stub tauri frontendDist +
+   pre-compress rust-embed assets + add Cache-Control: immutable).
+   (Saves ~3.2-3.7 MiB from vireo.exe.)
+5. Tune Cargo.toml [profile.release] (panic="abort", lto="fat", opt-level="s")
+   + drop unused features/crates (axum/macros, reqwest/stream, tree-sitter-json,
+   chrono). (Saves ~3.5-5.5 MiB from vireo.exe.)
+6. Fix DiffViewer's 2 dependency-less useEffect bugs (lines 955, 1036) + remove
+   global `text-rendering: optimizeLegibility` + pause infinite CSS animations
+   when document.hidden.
+7. Delete unused public/vireo-logo.png (-114 KB), import Latin-only fontsource
+   CSS (-113 KB), and remove blind 1.2s CodeMirror/DiffViewer startup prefetch
+   (-953 KB initial JS parse).
+8. Pass lean WebView2 additional_browser_args in main.rs + set background_color.
+   (Saves ~23 MB Private Commit / ~30 MB WS + lowers idle CPU.)
+
+PHASE 2: MEDIUM-EFFORT RUNTIME & SCALABILITY FIXES (3-5 DAYS)
+--------------------------------------------------------------------------------
+9. Debounce/coalesce /ws/events fs_changed handling in App.tsx + fix backend
+   watcher.rs (0 Hz idle blocking recv, max-flush deadline, fix drain().take(50)
+   bug, stop blind recursive watch over node_modules/target/.git).
+10. Bound JS heap caches by byte budget (contentCacheRef, snapshotsRef, review,
+    CommitHoverCard detailCache, SourceControlPane commitDetails) and clear on
+    workspace switch.
+11. Lazy-split CodeMirror languages per grammar in syntax.ts (eliminates 528 KB
+    monolithic vendor-langs chunk) and lazy-load AgentPanel / FileExplorer /
+    SearchPane.
+12. Wrap major panes + markdown/tool rows in React.memo; lift high-churn UI
+    state (toasts, menus, resize, flashes) out of App.tsx.
+13. Fix CodeEditor synchronous keystroke diffLines (debounce via StateEffect)
+    and use Compartment for theme switching; lazily compute only active viewMode
+    in DiffViewer and enable virtualization for 150+ wrapped rows.
+14. Fix pty.rs Ring buffer pinned 4 MiB capacity, lower DETACHED_TTL, replace
+    400ms try_wait and 5ms flood busy-sleep, and offer lightweight shell /
+    -NoProfile option for pwsh.exe (~105 MB WS per shell).
+15. Fix code_intel::repo_map RAM spike (drop unused lines Vec, hash idents as
+    u64/u32, reuse tree-sitter Parsers, stop doc.to_text() round-trips).
+
+PHASE 3: LARGER CLEANUPS & POLISH (OPTIONAL)
+--------------------------------------------------------------------------------
+16. Virtualize FileExplorer, CommitGraphView, SourceControlPane commit list,
+    SearchPane, and AgentPanel message timeline.
+17. Move blocking std::fs calls off Tokio async threads; cap worker_threads(2..4);
+    stream rg --json stdout & kill at 500 matches; check metadata len before
+    reading files; fix /ws/events RecvError::Lagged disconnect; restrict CORS.
+18. Switch reqwest from rustls-tls to native-tls (-1.0-1.5 MiB), replace rfd
+    with direct IFileOpenDialog, split vx into its own workspace crate, and
+    evaluate keeping vs removing the secondary 623 KB ghostty-web engine.
+
+================================================================================
+END OF REPORT
+================================================================================

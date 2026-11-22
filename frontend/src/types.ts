@@ -121,7 +121,7 @@ export interface GitStatusRes {
 export interface GenerateMessageRes {
   ok: boolean;
   message: string;
-  code: 'gh_missing' | 'gh_unauthenticated' | 'no_changes' | 'failed' | '';
+  code: 'copilot_missing' | 'copilot_unauthenticated' | 'no_changes' | 'failed' | '';
   error: string;
 }
 

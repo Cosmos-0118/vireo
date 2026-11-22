@@ -459,6 +459,35 @@ impl Normalizer {
                             out.push(Out::ToolResult { id, name, result });
                         }
                     }
+                    Some("mcp_tool_call") => {
+                        let server = item["server"].as_str().unwrap_or("");
+                        let tool = item["tool"].as_str().unwrap_or("");
+                        if self.started.insert(id.clone()) {
+                            let args_val = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                            let (name, args) = if server == "vx" {
+                                map_vx_mcp_tool(tool, &args_val, &self.ws)
+                            } else {
+                                (format!("mcp__{server}__{tool}"), args_val)
+                            };
+                            self.names.insert(id.clone(), name.clone());
+                            out.push(Out::ToolCall { id: id.clone(), name, args });
+                        }
+                        if completed {
+                            let name = self.names.get(&id).cloned().unwrap_or_else(|| format!("mcp__{server}__{tool}"));
+                            let result = if let Some(err) = item["error"]["message"].as_str() {
+                                format!("Error: {err}")
+                            } else if let Some(content) = item["result"]["content"].as_array() {
+                                content
+                                    .iter()
+                                    .filter_map(|c| c["text"].as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            } else {
+                                flatten_value(&item["result"])
+                            };
+                            out.push(Out::ToolResult { id, name, result });
+                        }
+                    }
                     Some("file_change") if completed => {
                         let ok = item["status"].as_str() != Some("failed");
                         for (i, ch) in item["changes"].as_array().into_iter().flatten().enumerate() {
@@ -868,6 +897,9 @@ fn first_path(input: &Value, keys: &[&str], ws: &Path) -> String {
 /// Map Claude Code (and Amp) tool vocabulary onto the names the chat UI already knows
 /// (`read_file`, `edit_file`, …) so "View diff" and file refresh keep working.
 fn map_claude_tool(name: &str, input: &Value, ws: &Path) -> (String, Value) {
+    if let Some(vx_tool) = name.strip_prefix("mcp__vx__") {
+        return map_vx_mcp_tool(vx_tool, input, ws);
+    }
     let path_of = |key: &str| input[key].as_str().map(|p| rel_path(ws, p)).unwrap_or_default();
     match name {
         "Read" | "read_file" => {
@@ -1049,6 +1081,47 @@ fn map_generic_tool(name: &str, params: &Value, ws: &Path) -> (String, Value) {
     }
 }
 
+/// Map a `vx mcp` tool call onto the chat UI's tool vocabulary (so file refresh, diff view, and
+/// checkpoints work identically to native tools).
+fn map_vx_mcp_tool(tool: &str, input: &Value, ws: &Path) -> (String, Value) {
+    let p = || first_path(input, &["path", "file_path"], ws);
+    match tool {
+        "map" => ("repo_map".into(), json!({ "query": input["query"].as_str().unwrap_or("") })),
+        "view" if input["outline"].as_bool() == Some(true) => ("outline".into(), json!({ "path": p() })),
+        "view" => {
+            let mut a = json!({ "path": p() });
+            if let Some(t) = input["target"].as_str().filter(|s| !s.is_empty()) {
+                if let Some((s, e)) = t.split_once("..") {
+                    if let Ok(s) = s.parse::<u64>() {
+                        a["start_line"] = json!(s);
+                    }
+                    if let Ok(e) = e.parse::<u64>() {
+                        a["end_line"] = json!(e);
+                    }
+                } else {
+                    a["symbol"] = json!(t);
+                }
+            }
+            ("read_file".into(), a)
+        }
+        "search" => ("search_code".into(), json!({ "query": input["query"].as_str().unwrap_or("") })),
+        "edit" => ("edit_file".into(), json!({ "path": p() })),
+        // Empty path marks the turn opaque for checkpoints so every file in a multi-file patch is captured.
+        "apply" => ("edit_file".into(), json!({ "path": "" })),
+        "symbol" => {
+            let mode = input["mode"].as_str().unwrap_or("read");
+            let sym = input["symbol"].as_str().unwrap_or("");
+            if matches!(mode, "replace" | "insert_after" | "delete") {
+                ("symbol_edit".into(), json!({ "path": p(), "symbol": sym, "mode": mode }))
+            } else {
+                ("read_file".into(), json!({ "path": p(), "symbol": sym }))
+            }
+        }
+        "check" => ("verify".into(), json!({ "command": input["cmd"].as_str().unwrap_or("") })),
+        other => (format!("mcp__vx__{other}"), input.clone()),
+    }
+}
+
 /// Recognise a `vx ...` shell call and present it with the chat UI's tool vocabulary.
 fn map_vx(command: &str, ws: &Path) -> Option<(String, Value)> {
     let re = regex::Regex::new(r"(?:^|\|\s*|&&\s*|;\s*)vx(?:\.exe)?\s+(\w+)([^\r\n]*)").ok()?;
@@ -1083,6 +1156,7 @@ fn map_vx(command: &str, ws: &Path) -> Option<(String, Value)> {
             ("read_file".into(), a)
         }
         "edit" => ("edit_file".into(), json!({ "path": path(0) })),
+        "apply" => ("edit_file".into(), json!({ "path": "" })),
         "symbol" if flag("--replace") || flag("--insert-after") || flag("--delete") => {
             let mode = if flag("--replace") { "replace" } else if flag("--delete") { "delete" } else { "insert_after" };
             ("symbol_edit".into(), json!({ "path": path(0), "symbol": pos.get(1).map(|s| s.as_str()).unwrap_or(""), "mode": mode }))
@@ -1097,7 +1171,7 @@ fn map_vx(command: &str, ws: &Path) -> Option<(String, Value)> {
             }
             ("ast".into(), a)
         }
-        "check" => ("verify".into(), json!({ "command": "" })),
+        "check" => ("verify".into(), json!({ "command": pos.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ") })),
         _ => return None,
     })
 }
@@ -1375,21 +1449,57 @@ fn cli_args(kind: CliKind, ws: &Path, model: &str, mode: PermMode) -> Vec<String
             a
         }
     };
-    // Give the CLI the `vx` tools (found on PATH) without touching its own config: Claude and
-    // Codex take the usage hint (and Claude's `vx` allow rule) via command-line flags;
-    // Antigravity (`agy`) has no system-prompt flag and receives it via `with_vx_hint` in `run`.
-    if crate::pty::vx_dir().is_some() {
+    // Give the CLI the `vx` tools (both on PATH and as an inline stdio MCP server so edits never
+    // have to fight PowerShell/Bash quoting or encoding). Antigravity (`agy`) has no inline MCP or
+    // system-prompt flag and receives the hint via `with_vx_hint` in `run`.
+    if let Some(dir) = crate::pty::vx_dir() {
+        let vx_exe = dir
+            .join(if cfg!(windows) { "vx.exe" } else { "vx" })
+            .to_string_lossy()
+            .replace('\\', "/");
+        let ws_slash = ws.to_string_lossy().replace('\\', "/");
         match kind {
             CliKind::Claude => {
+                let mcp_cfg = json!({
+                    "mcpServers": {
+                        "vx": {
+                            "command": vx_exe,
+                            "args": ["mcp", "--workspace", ws_slash]
+                        }
+                    }
+                });
+                args.push("--mcp-config".to_string());
+                args.push(mcp_cfg.to_string());
                 args.push("--append-system-prompt".to_string());
                 args.push(crate::code_intel::AGENT_HINT.to_string());
                 args.push("--allowedTools".to_string());
-                args.push("Bash(vx:*)".to_string());
+                args.push(match mode {
+                    PermMode::Ask => "Bash(vx:*),mcp__vx__map,mcp__vx__view,mcp__vx__search".to_string(),
+                    PermMode::AutoEdit | PermMode::FullAccess => "Bash(vx:*),mcp__vx__*".to_string(),
+                });
             }
             CliKind::Codex => {
                 args.push("-c".to_string());
                 let quoted = serde_json::to_string(crate::code_intel::AGENT_HINT).unwrap_or_default();
                 args.push(format!("developer_instructions={quoted}"));
+                let mut mcp_args = vec!["mcp".to_string(), "--workspace".to_string(), ws_slash];
+                if mode == PermMode::Ask {
+                    mcp_args.push("--read-only".to_string());
+                }
+                args.push("-c".to_string());
+                args.push(format!(
+                    "mcp_servers.vx.command={}",
+                    serde_json::to_string(&vx_exe).unwrap_or_default()
+                ));
+                args.push("-c".to_string());
+                args.push(format!(
+                    "mcp_servers.vx.args={}",
+                    serde_json::to_string(&mcp_args).unwrap_or_default()
+                ));
+                args.push("-c".to_string());
+                args.push("mcp_servers.vx.enabled=true".to_string());
+                args.push("-c".to_string());
+                args.push("mcp_servers.vx.required=false".to_string());
             }
             _ => {}
         }
@@ -1877,7 +1987,19 @@ x
         assert_eq!((n.as_str(), a["mode"].as_str()), ("symbol_edit", Some("replace")));
         let (n, a) = map_vx("vx view src/a.rs 10..20", ws).unwrap();
         assert_eq!((n.as_str(), a["start_line"].as_u64(), a["end_line"].as_u64()), ("read_file", Some(10), Some(20)));
+        let (n, a) = map_vx("vx apply --file patch.txt", ws).unwrap();
+        assert_eq!((n.as_str(), a["path"].as_str()), ("edit_file", Some("")));
+        let (n, a) = map_vx("vx check cargo test -p vireo", ws).unwrap();
+        assert_eq!((n.as_str(), a["command"].as_str()), ("verify", Some("cargo test vireo")));
         assert!(map_vx("cargo build", ws).is_none());
+
+        // MCP tool calls from Claude Code map onto the same UI vocabulary.
+        let (n, a) = map_claude_tool("mcp__vx__view", &json!({ "path": "C:/w/src/a.rs", "outline": true }), ws);
+        assert_eq!((n.as_str(), a["path"].as_str()), ("outline", Some("src/a.rs")));
+        let (n, a) = map_claude_tool("mcp__vx__apply", &json!({ "patch": "*** Begin Patch..." }), ws);
+        assert_eq!((n.as_str(), a["path"].as_str()), ("edit_file", Some("")));
+        let (n, a) = map_claude_tool("mcp__vx__check", &json!({ "cmd": "cargo test" }), ws);
+        assert_eq!((n.as_str(), a["command"].as_str()), ("verify", Some("cargo test")));
     }
 
     #[test]
