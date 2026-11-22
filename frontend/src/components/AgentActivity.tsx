@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { visibleInterval } from '../utils/visibleInterval';
 import {
   AlertCircle,
   Bot,
@@ -317,8 +318,7 @@ const CopyButton: React.FC<{ text: string }> = ({ text }) => {
 export const Elapsed: React.FC<{ since: number; className?: string }> = ({ since, className }) => {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
+    return visibleInterval(() => setNow(Date.now()), 1000);
   }, []);
   return <span className={`tabular-nums ${className ?? ''}`}>{formatDur(Math.max(0, now - since)).replace(/\.\ds$/, 's')}</span>;
 };

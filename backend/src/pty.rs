@@ -22,12 +22,16 @@ use tokio::sync::{watch, Notify};
 
 /// Output kept per session so a reconnecting client can rebuild its screen.
 const REPLAY_CAP: usize = 2 * 1024 * 1024;
+/// Extra bytes kept beyond `REPLAY_CAP` before the ring is trimmed (amortizes the trim copy).
+const REPLAY_SLACK: usize = 256 * 1024;
 /// Largest single WebSocket output frame.
 const MAX_FRAME: usize = 64 * 1024;
 /// Bytes a client may have in flight (sent but not yet written by xterm) before we pause.
 const ACK_WINDOW: u64 = 512 * 1024;
 /// The PTY reader pauses when the slowest attached client is this far behind.
 const FLOOD_LIMIT: u64 = 1536 * 1024;
+/// Most detached (no client attached) sessions kept alive at once.
+const MAX_DETACHED: usize = 8;
 /// Sessions with no attached client for this long are killed.
 const DETACHED_TTL: Duration = Duration::from_secs(30 * 60);
 
@@ -195,7 +199,31 @@ const KNOWN_CLI_TOOLS: &[CliToolSpec] = &[
     },
 ];
 
+const PATH_ENV_TTL: Duration = Duration::from_secs(60);
+
+static PATH_ENV_CACHE: Mutex<Option<(Instant, OsString)>> = Mutex::new(None);
+static CLI_TOOLS_CACHE: Mutex<Option<(Instant, Vec<CliToolStatus>)>> = Mutex::new(None);
+
+/// PATH extended with the usual CLI-tool install locations. The disk scan behind it is ~370 ms on
+/// Windows, so the result is cached for `PATH_ENV_TTL`.
 pub fn augmented_path_env() -> OsString {
+    if let Some((at, p)) = PATH_ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if at.elapsed() < PATH_ENV_TTL {
+            return p.clone();
+        }
+    }
+    let p = compute_augmented_path_env();
+    *PATH_ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), p.clone()));
+    p
+}
+
+/// Drop every cached PATH / CLI-tool lookup so the next call rescans the disk.
+pub fn invalidate_path_caches() {
+    *PATH_ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *CLI_TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn compute_augmented_path_env() -> OsString {
     let existing_raw = std::env::var_os("PATH").unwrap_or_default();
     let mut dirs: Vec<PathBuf> = std::env::split_paths(&existing_raw).collect();
 
@@ -509,7 +537,21 @@ fn find_known_tool(first_token: &str) -> Option<(&'static CliToolSpec, &'static 
     None
 }
 
-pub async fn list_cli_tools() -> Json<Vec<CliToolStatus>> {
+#[derive(Deserialize)]
+pub struct CliToolsQuery {
+    #[serde(default)]
+    refresh: Option<String>,
+}
+
+pub async fn list_cli_tools(Query(q): Query<CliToolsQuery>) -> Json<Vec<CliToolStatus>> {
+    let refresh = matches!(q.refresh.as_deref(), Some("1" | "true"));
+    if refresh {
+        invalidate_path_caches();
+    } else if let Some((at, items)) = CLI_TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if at.elapsed() < PATH_ENV_TTL {
+            return Json(items.clone());
+        }
+    }
     let items = tokio::task::spawn_blocking(|| {
         let path_env = augmented_path_env();
         KNOWN_CLI_TOOLS
@@ -540,6 +582,9 @@ pub async fn list_cli_tools() -> Json<Vec<CliToolStatus>> {
     .await
     .unwrap_or_default();
 
+    if !items.is_empty() {
+        *CLI_TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), items.clone()));
+    }
     Json(items)
 }
 
@@ -639,6 +684,8 @@ enum PtyCmd {
     Input(Vec<u8>),
     Resize(u16, u16),
     Kill,
+    /// The child process ended (sent by its waiter thread).
+    Exited,
 }
 
 struct Ring {
@@ -654,10 +701,12 @@ impl Ring {
 
     fn push(&mut self, bytes: &[u8]) {
         self.data.extend_from_slice(bytes);
-        if self.data.len() > REPLAY_CAP * 2 {
+        if self.data.len() > REPLAY_CAP + REPLAY_SLACK {
             let drop = self.data.len() - REPLAY_CAP;
             self.data.drain(..drop);
             self.base += drop as u64;
+            // `drain` keeps the old capacity: release it so a busy PTY does not pin the peak.
+            self.data.shrink_to(REPLAY_CAP + REPLAY_SLACK * 2);
         }
     }
 
@@ -739,7 +788,7 @@ fn ensure_reaper() {
                 tokio::time::sleep(Duration::from_secs(60)).await;
                 let stale: Vec<Arc<PtySession>> = {
                     let mut map = sessions().lock().unwrap();
-                    let ids: Vec<String> = map
+                    let mut ids: Vec<String> = map
                         .iter()
                         .filter(|(_, s)| {
                             s.cursors.lock().unwrap().is_empty()
@@ -750,6 +799,20 @@ fn ensure_reaper() {
                         })
                         .map(|(id, _)| id.clone())
                         .collect();
+                    // Also cap how many detached shells may linger (each pins a shell process
+                    // and a replay buffer): drop the longest-detached beyond the cap.
+                    let mut detached: Vec<(Instant, String)> = map
+                        .iter()
+                        .filter(|(id, s)| !ids.contains(id) && s.cursors.lock().unwrap().is_empty())
+                        .filter_map(|(id, s)| {
+                            s.detached_since.lock().unwrap().map(|t| (t, id.clone()))
+                        })
+                        .collect();
+                    if detached.len() > MAX_DETACHED {
+                        detached.sort();
+                        let excess = detached.len() - MAX_DETACHED;
+                        ids.extend(detached.into_iter().take(excess).map(|(_, id)| id));
+                    }
                     ids.iter().filter_map(|id| map.remove(id)).collect()
                 };
                 for s in stale {
@@ -804,7 +867,7 @@ fn spawn_session(
         pair.slave.spawn_command(cmd)
     };
 
-    let mut child = spawn_result.map_err(|e| format!("Failed to spawn shell: {}", e))?;
+    let child = spawn_result.map_err(|e| format!("Failed to spawn shell: {}", e))?;
     drop(pair.slave);
 
     let mut reader = pair
@@ -841,7 +904,7 @@ fn spawn_session(
             loop {
                 while !session.exited.load(Ordering::SeqCst) && session.slowest_lag() > FLOOD_LIMIT
                 {
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
@@ -865,10 +928,20 @@ fn spawn_session(
 
     // Control thread: input, resize, kill, and child-exit detection. ConPTY does not close
     // the output pipe when the child exits, so poll for it and then drop the master.
+    let mut killer = child.clone_killer();
+    {
+        // Block on the child's exit instead of polling `try_wait` every 400 ms.
+        let exit_tx = session.cmd_tx.clone();
+        let mut child = child;
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            let _ = exit_tx.send(PtyCmd::Exited);
+        });
+    }
     std::thread::spawn(move || {
         let mut last_size = (cols, rows);
         loop {
-            match cmd_rx.recv_timeout(Duration::from_millis(400)) {
+            match cmd_rx.recv() {
                 Ok(PtyCmd::Input(data)) => {
                     if writer.write_all(&data).is_err() {
                         break;
@@ -888,18 +961,15 @@ fn spawn_session(
                         });
                     }
                 }
-                Ok(PtyCmd::Kill) | Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
-                Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                    if matches!(child.try_wait(), Ok(Some(_))) {
-                        // let ConPTY flush the final output before closing it
-                        std::thread::sleep(Duration::from_millis(200));
-                        break;
-                    }
+                Ok(PtyCmd::Exited) => {
+                    // let ConPTY flush the final output before closing it
+                    std::thread::sleep(Duration::from_millis(200));
+                    break;
                 }
+                Ok(PtyCmd::Kill) | Err(_) => break,
             }
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = killer.kill();
         drop(writer);
         drop(master);
     });

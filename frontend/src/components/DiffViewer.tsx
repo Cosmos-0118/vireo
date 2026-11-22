@@ -848,36 +848,47 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diff?.original, diff?.modified, diff?.path, diff?.binary, ignoreWhitespace]);
 
+  // Only the active layout is folded/built; the other one costs nothing until it is selected.
   const splitItems = useMemo(
     () =>
-      buildFoldedItems(
-        computed.split,
-        computed.splitChanged,
-        computed.split.map((r) => r.cluster),
-        compactMode,
-        expandedRanges
-      ),
-    [computed.split, computed.splitChanged, compactMode, expandedRanges]
+      viewMode !== 'split'
+        ? []
+        : buildFoldedItems(
+            computed.split,
+            computed.splitChanged,
+            computed.split.map((r) => r.cluster),
+            compactMode,
+            expandedRanges
+          ),
+    [viewMode, computed.split, computed.splitChanged, compactMode, expandedRanges]
   );
 
   const unifiedItems = useMemo(
     () =>
-      buildFoldedItems(
-        computed.unified,
-        computed.unifiedChanged,
-        computed.unified.map((r) => r.cluster),
-        compactMode,
-        expandedRanges
-      ),
-    [computed.unified, computed.unifiedChanged, compactMode, expandedRanges]
+      viewMode !== 'unified'
+        ? []
+        : buildFoldedItems(
+            computed.unified,
+            computed.unifiedChanged,
+            computed.unified.map((r) => r.cluster),
+            compactMode,
+            expandedRanges
+          ),
+    [viewMode, computed.unified, computed.unifiedChanged, compactMode, expandedRanges]
   );
 
   // Plain-text lines (new side where present) used to label folds with their enclosing scope.
   const splitScopeTexts = useMemo(
-    () => computed.split.map((r) => (r.right.type !== 'empty' ? r.right.text : r.left.text)),
-    [computed.split]
+    () =>
+      viewMode !== 'split'
+        ? []
+        : computed.split.map((r) => (r.right.type !== 'empty' ? r.right.text : r.left.text)),
+    [viewMode, computed.split]
   );
-  const unifiedScopeTexts = useMemo(() => computed.unified.map((r) => r.text), [computed.unified]);
+  const unifiedScopeTexts = useMemo(
+    () => (viewMode !== 'unified' ? [] : computed.unified.map((r) => r.text)),
+    [viewMode, computed.unified]
+  );
 
   const activeItems = viewMode === 'split' ? splitItems : unifiedItems;
   // Windowing needs uniform row heights: true whenever nothing wraps. If every line fits its
@@ -963,7 +974,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       const nf = f ? f.getBoundingClientRect().height : p.fold;
       return Math.abs(nr - p.row) < 0.05 && Math.abs(nf - p.fold) < 0.05 ? p : { row: nr, fold: nf };
     });
-  });
+  }, [virtual, win.start, win.end, activeItems, effectiveWrap]);
 
   const scrollToItem = useCallback(
     (idx: number, smooth: boolean) => {
@@ -1033,16 +1044,20 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   };
 
   // VS Code F7 / Shift+F7 hunk navigation shortcut
+  const jumpHunkRef = useRef(jumpHunk);
+  jumpHunkRef.current = jumpHunk;
+  const totalHunksRef = useRef(totalHunks);
+  totalHunksRef.current = totalHunks;
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'F7' && totalHunks > 0) {
+      if (e.key === 'F7' && totalHunksRef.current > 0) {
         e.preventDefault();
-        jumpHunk(e.shiftKey ? -1 : 1);
+        jumpHunkRef.current(e.shiftKey ? -1 : 1);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  });
+  }, []);
 
   // Overview Ruler markers (proportional vertical tick marks like VS Code's diff minimap)
   const overviewMarkers = useMemo(() => {

@@ -22,6 +22,8 @@ function loadDetailSilently(hash: string): Promise<CommitDetailRes | null> {
       .gitCommitDetail(hash)
       .then((d) => {
         detailCache.set(hash, d);
+        // small LRU: commit details are only re-read while hovering recent rows
+        while (detailCache.size > 60) detailCache.delete(detailCache.keys().next().value as string);
         return d;
       })
       .catch(() => null)

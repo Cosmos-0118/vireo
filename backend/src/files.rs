@@ -317,31 +317,30 @@ pub async fn read_file(
 ) -> Result<Json<ReadFileRes>, (StatusCode, String)> {
     let ws = state.workspace_path().await;
     let full = resolve_safe_path(&ws, &q.path).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let bytes = tokio::fs::read(&full)
+    // Cap display size at 2MB to stay fast: never read more than that, even for huge files.
+    const CAP: u64 = 2 * 1024 * 1024;
+    let not_found = |e: std::io::Error| (StatusCode::NOT_FOUND, e.to_string());
+    let file = tokio::fs::File::open(&full).await.map_err(not_found)?;
+    let total = file.metadata().await.map_err(not_found)?.len() as usize;
+    let mut bytes = Vec::with_capacity((total as u64).min(CAP) as usize);
+    tokio::io::AsyncReadExt::read_to_end(&mut tokio::io::AsyncReadExt::take(file, CAP), &mut bytes)
         .await
-        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+        .map_err(not_found)?;
 
     let is_binary = bytes.iter().take(4096).any(|&b| b == 0);
     if is_binary {
         return Ok(Json(ReadFileRes {
             path: q.path,
             content: String::new(),
-            size: bytes.len(),
+            size: total,
             binary: true,
         }));
     }
 
-    // Cap display size at 2MB to stay fast
-    let truncated = if bytes.len() > 2 * 1024 * 1024 {
-        String::from_utf8_lossy(&bytes[..2 * 1024 * 1024]).to_string()
-    } else {
-        String::from_utf8_lossy(&bytes).to_string()
-    };
-
     Ok(Json(ReadFileRes {
         path: q.path,
-        content: truncated,
-        size: bytes.len(),
+        content: String::from_utf8_lossy(&bytes).to_string(),
+        size: total,
         binary: false,
     }))
 }

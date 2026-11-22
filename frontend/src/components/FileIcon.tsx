@@ -185,7 +185,7 @@ export const FileIcon: React.FC<{ path: string; size?: number; className?: strin
         textAnchor="middle"
         fontSize={spec.label.length > 1 ? 7.4 : 8.5}
         fontWeight="700"
-        fontFamily="Inter Variable, system-ui, sans-serif"
+        fontFamily="Inter UI, Inter Variable, system-ui, sans-serif"
         fill={spec.color}
       >
         {spec.label}

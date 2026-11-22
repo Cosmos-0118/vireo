@@ -1,12 +1,12 @@
-import React from 'react';
+import React, { Suspense, lazy, useRef } from 'react';
 import {
   Files,
   GitBranch,
   Search,
 } from 'lucide-react';
 import type { CommitFileChange, GitStatusRes } from '../types';
-import { FileExplorer } from './FileExplorer';
-import { SearchPane } from './SearchPane';
+const FileExplorer = lazy(() => import('./FileExplorer').then((m) => ({ default: m.FileExplorer })));
+const SearchPane = lazy(() => import('./SearchPane').then((m) => ({ default: m.SearchPane })));
 import { SourceControlPane } from './SourceControlPane';
 
 export type SidebarTab = 'changes' | 'explorer' | 'search';
@@ -61,6 +61,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   railOnly = false,
 }) => {
   const totalChanged = gitStatus?.files.length ?? 0;
+  const seen = useRef({ explorer: false, search: false });
+  if (activeTab === 'explorer') seen.current.explorer = true;
+  if (activeTab === 'search') seen.current.search = true;
 
   return (
     <div className="flex h-full bg-[var(--bg-sidebar)] border-r border-[var(--border)] select-none">
@@ -137,7 +140,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
           />
         )}
 
+        {/* Loaded on first visit, then kept mounted (hidden) so their state survives tab switches. */}
+        {seen.current.explorer && (
         <div className={activeTab === 'explorer' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
+          <Suspense fallback={null}>
           <FileExplorer
             active={activeTab === 'explorer'}
             gitStatus={gitStatus}
@@ -151,9 +157,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onRefreshGit={onRefreshGit}
             onToast={onToast}
           />
+          </Suspense>
         </div>
+        )}
 
+        {seen.current.search && (
         <div className={activeTab === 'search' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
+          <Suspense fallback={null}>
           <SearchPane
             active={activeTab === 'search'}
             gitStatus={gitStatus}
@@ -164,7 +174,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onRefreshGit={onRefreshGit}
             onToast={onToast}
           />
+          </Suspense>
         </div>
+        )}
       </div>
       )}
     </div>

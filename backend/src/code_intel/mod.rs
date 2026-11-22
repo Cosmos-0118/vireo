@@ -51,7 +51,7 @@ pub use search::{search, SearchOpts};
 #[allow(unused_imports)]
 pub use symbols::{lang_for, outline, repo_map, symbol_op, symbols, Lang, Sym};
 #[allow(unused_imports)]
-pub use util::{resolve, set_path_env};
+pub use util::{resolve, set_path_provider};
 #[allow(unused_imports)]
 pub use view::{split_view_spec, view, view_many};
 

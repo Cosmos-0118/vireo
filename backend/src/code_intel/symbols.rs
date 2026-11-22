@@ -48,9 +48,21 @@ fn ts_language(l: Lang) -> Language {
 }
 
 fn parse_tree(l: Lang, src: &str) -> Option<tree_sitter::Tree> {
-    let mut p = Parser::new();
-    p.set_language(&ts_language(l)).ok()?;
-    p.parse(src, None)
+    // One parser per language per thread: allocating + configuring a C parser for every file
+    // dominated repo_map on large repos.
+    thread_local! {
+        static PARSERS: std::cell::RefCell<[Option<Parser>; 7]> = const { std::cell::RefCell::new([None, None, None, None, None, None, None]) };
+    }
+    PARSERS.with(|cell| {
+        let mut parsers = cell.borrow_mut();
+        let slot = &mut parsers[l as usize];
+        if slot.is_none() {
+            let mut p = Parser::new();
+            p.set_language(&ts_language(l)).ok()?;
+            *slot = Some(p);
+        }
+        slot.as_mut()?.parse(src, None)
+    })
 }
 
 fn collect_errors(n: Node, src: &[u8], out: &mut Vec<(usize, String)>) {
@@ -549,8 +561,14 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
         rel: String,
         nlines: usize,
         syms: Vec<Sym>,
-        lines: Vec<String>,
-        idents: HashSet<String>,
+        /// Hashes of every identifier in the file (not the strings: keeps memory flat on big repos).
+        idents: HashSet<u64>,
+    }
+    fn hash_ident(s: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        s.hash(&mut h);
+        h.finish()
     }
     let mut entries: Vec<Entry> = Vec::new();
     let ident = lazy_re!(r"[A-Za-z_][A-Za-z0-9_]{2,}");
@@ -569,9 +587,8 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
         }
         let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
         let syms = symbols(lang, &text);
-        let idents: HashSet<String> = ident.find_iter(&text).map(|m| m.as_str().to_string()).collect();
-        let lines: Vec<String> = text.lines().map(str::to_string).collect();
-        entries.push(Entry { rel, nlines: lines.len(), syms, lines, idents });
+        let idents: HashSet<u64> = ident.find_iter(&text).map(|m| hash_ident(m.as_str())).collect();
+        entries.push(Entry { rel, nlines: text.lines().count(), syms, idents });
         if entries.len() >= 2500 {
             break;
         }
@@ -580,10 +597,10 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
         return Ok("No supported source files found (rs, ts, tsx, js, py, go).".into());
     }
     // Cheap "PageRank": a file matters if other files mention its top-level symbols.
-    let mut mentions: HashMap<&str, usize> = HashMap::new();
+    let mut mentions: HashMap<u64, usize> = HashMap::new();
     for e in &entries {
         for id in &e.idents {
-            *mentions.entry(id.as_str()).or_default() += 1;
+            *mentions.entry(*id).or_default() += 1;
         }
     }
     let rank: Vec<usize> = entries
@@ -592,7 +609,7 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
             e.syms
                 .iter()
                 .filter(|s| s.depth == 0)
-                .map(|s| mentions.get(s.name.as_str()).copied().unwrap_or(1).saturating_sub(1).min(10))
+                .map(|s| mentions.get(&hash_ident(&s.name)).copied().unwrap_or(1).saturating_sub(1).min(10))
                 .sum()
         })
         .collect();
@@ -638,7 +655,10 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
             let extra = names.len().saturating_sub(10);
             block = format!("{} ({}): {}{}\n", e.rel, e.nlines, names.iter().take(10).cloned().collect::<Vec<_>>().join(", "), if extra > 0 { format!(" +{extra}") } else { String::new() });
         } else {
-            let anchor = |row: usize| format!("{}#{}", row + 1, line_hash(e.lines.get(row).map(String::as_str).unwrap_or("")));
+            // Source lines are only needed for the few files actually shown: re-read them now.
+            let text = std::fs::read_to_string(ws.join(&e.rel)).unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            let anchor = |row: usize| format!("{}#{}", row + 1, line_hash(lines.get(row).copied().unwrap_or("")));
             let matched: Vec<&Sym> = e
                 .syms
                 .iter()

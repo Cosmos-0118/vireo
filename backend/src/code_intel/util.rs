@@ -8,14 +8,22 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use walkdir::WalkDir;
 
-static PATH_ENV: OnceLock<OsString> = OnceLock::new();
+static PATH_PROVIDER: OnceLock<fn() -> OsString> = OnceLock::new();
 
-/// PATH used when spawning helper tools (rg, ast-grep, build commands). Optional.
-/// Only the main app calls this; the `vx` bin includes this module but never calls it.
+/// Source of the PATH used when spawning helper tools (rg, ast-grep, build commands). Optional;
+/// the provider is expected to cache. Only the main app calls this; the `vx` bin includes this
+/// module but never calls it.
 #[allow(dead_code)]
-pub fn set_path_env(p: OsString) {
-    let _ = PATH_ENV.set(p);
+pub fn set_path_provider(f: fn() -> OsString) {
+    let _ = PATH_PROVIDER.set(f);
 }
+
+fn path_env() -> Option<OsString> {
+    PATH_PROVIDER.get().map(|f| f())
+}
+
+#[cfg(windows)]
+static RESOLVE_CACHE: Mutex<Option<std::collections::HashMap<String, (Instant, OsString)>>> = Mutex::new(None);
 
 /// Windows: `Command::new("foo")` only tries `foo.exe`, so npm/scoop shims (`foo.cmd`, `foo.bat`)
 /// look "not installed". Resolve extension-less names against PATH ourselves.
@@ -25,16 +33,33 @@ fn resolve_program(program: &str) -> OsString {
     if p.extension().is_some() || p.components().count() > 1 {
         return program.into();
     }
-    let path = PATH_ENV.get().cloned().or_else(|| std::env::var_os("PATH")).unwrap_or_default();
-    for dir in std::env::split_paths(&path) {
+    if let Some((at, hit)) = RESOLVE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(program))
+    {
+        if at.elapsed() < Duration::from_secs(60) {
+            return hit.clone();
+        }
+    }
+    let path = path_env().or_else(|| std::env::var_os("PATH")).unwrap_or_default();
+    let mut found: OsString = program.into();
+    'outer: for dir in std::env::split_paths(&path) {
         for ext in ["exe", "cmd", "bat"] {
             let cand = dir.join(format!("{program}.{ext}"));
             if cand.is_file() {
-                return cand.into_os_string();
+                found = cand.into_os_string();
+                break 'outer;
             }
         }
     }
-    program.into()
+    RESOLVE_CACHE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(Default::default)
+        .insert(program.to_string(), (Instant::now(), found.clone()));
+    found
 }
 
 pub(crate) fn command(program: &str) -> Command {
@@ -42,7 +67,7 @@ pub(crate) fn command(program: &str) -> Command {
     let mut c = Command::new(resolve_program(program));
     #[cfg(not(windows))]
     let mut c = Command::new(program);
-    if let Some(p) = PATH_ENV.get() {
+    if let Some(p) = path_env() {
         c.env("PATH", p);
     }
     #[cfg(windows)]

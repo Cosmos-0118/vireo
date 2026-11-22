@@ -79,6 +79,8 @@ export interface PtyTerminalOptions {
   sessionKey: string;
   cmd?: string;
   active: boolean;
+  /** False while the whole terminal dock is collapsed (tabs stay mounted but must go idle). */
+  visible?: boolean;
   theme: LiteTheme;
   fontSize: number;
   scrollback: number;
@@ -127,7 +129,7 @@ interface Built {
 
 function buildXterm(opts: PtyTerminalOptions, host: HTMLElement): Built {
   const term = new Terminal({
-    cursorBlink: true,
+    cursorBlink: false,
     fontSize: opts.fontSize,
     lineHeight: 1.38,
     fontFamily: FONT_FAMILY,
@@ -149,7 +151,7 @@ async function buildGhostty(opts: PtyTerminalOptions, host: HTMLElement): Promis
   const g = await import('ghostty-web');
   await g.init();
   const term = new g.Terminal({
-    cursorBlink: true,
+    cursorBlink: false,
     fontSize: opts.fontSize,
     fontFamily: FONT_FAMILY,
     theme: opts.theme.terminal,
@@ -174,7 +176,7 @@ export function usePtyTerminal(
 ) {
   const [engine] = useTerminalEngine();
   const termRef = useRef<Terminal | null>(null);
-  const controlRef = useRef<{ refit: () => void } | null>(null);
+  const controlRef = useRef<{ refit: () => void; sync: () => void } | null>(null);
   const optsRef = useRef(options);
   optsRef.current = options;
   const prevKeyRef = useRef<string | null>(null);
@@ -210,23 +212,55 @@ export function usePtyTerminal(
       // background), so for it "written" means "handed to write()".
       const syncWrites = built.engine === 'ghostty';
 
-      // WebGL once the host is actually laid out; falls back to the DOM renderer on context loss.
-      let webglTried = built.engine !== 'xterm';
+      // WebGL only while this tab is the visible one: every context pins GPU-process memory and
+      // keeps the compositor repainting. Disposed when hidden, re-attached on demand.
+      const wantLive = () => !document.hidden && optsRef.current.active && optsRef.current.visible !== false;
+      const wantWebgl = () => optsRef.current.active && optsRef.current.visible !== false;
+      let webglAddon: { dispose: () => void } | null = null;
+      let webglLoading = false;
+      let webglBroken = built.engine !== 'xterm';
       const tryWebgl = () => {
-        if (webglTried || disposed) return;
-        webglTried = true;
+        if (webglBroken || webglLoading || webglAddon || disposed || !wantWebgl()) return;
+        webglLoading = true;
         // Loaded on demand so the WebGL renderer is not part of the base terminal chunk.
         import('@xterm/addon-webgl')
           .then(({ WebglAddon }) => {
-            if (disposed) return;
+            webglLoading = false;
+            if (disposed || !wantWebgl()) return;
             const addon = new WebglAddon();
-            addon.onContextLoss(() => addon.dispose());
+            addon.onContextLoss(() => {
+              addon.dispose();
+              if (webglAddon === addon) webglAddon = null;
+              webglBroken = true;
+            });
             term.loadAddon(addon);
+            webglAddon = addon;
           })
           .catch(() => {
-            // WebGL unavailable: keep the DOM renderer
+            webglLoading = false;
+            webglBroken = true; // WebGL unavailable: keep the DOM renderer
           });
       };
+      /** Apply visibility-dependent settings: cursor blink timer + WebGL context. */
+      const sync = () => {
+        try {
+          term.options.cursorBlink = wantLive();
+        } catch {
+          // some engines cannot change options live
+        }
+        if (wantWebgl()) {
+          if (host.clientWidth >= 40) tryWebgl();
+        } else if (webglAddon) {
+          try {
+            webglAddon.dispose();
+          } catch {
+            // already disposed by context loss
+          }
+          webglAddon = null;
+        }
+      };
+      const onVisibility = () => sync();
+      document.addEventListener('visibilitychange', onVisibility);
 
       let sock: WebSocket | null = null;
       let lastSent = '';
@@ -257,12 +291,12 @@ export function usePtyTerminal(
         window.clearTimeout(resizeTimer);
         resizeTimer = window.setTimeout(() => {
           if (fitNow()) {
-            tryWebgl();
+            sync();
             sendResize();
           }
         }, RESIZE_DEBOUNCE_MS);
       };
-      controlRef.current = { refit };
+      controlRef.current = { refit, sync };
 
       // Return value means "let the terminal process this key" for xterm.js, but "I handled
       // it, skip default handling" for ghostty-web, so the two are inverted.
@@ -314,6 +348,7 @@ export function usePtyTerminal(
 
       let attempt = 0;
       let reconnectTimer = 0;
+      let ackTimer = 0;
       const connect = () => {
         const cols = Math.max(20, term.cols);
         const rows = Math.max(5, term.rows);
@@ -373,7 +408,12 @@ export function usePtyTerminal(
             });
           }
           // small bursts never reach ACK_STEP; flush them shortly so the server window reopens
-          window.setTimeout(sendAck, 50);
+          if (!ackTimer) {
+            ackTimer = window.setTimeout(() => {
+              ackTimer = 0;
+              sendAck();
+            }, 50);
+          }
         };
         s.onclose = (ev) => {
           if (disposed || sock !== s) return;
@@ -396,6 +436,8 @@ export function usePtyTerminal(
       teardown = () => {
         window.clearTimeout(resizeTimer);
         window.clearTimeout(reconnectTimer);
+        window.clearTimeout(ackTimer);
+        document.removeEventListener('visibilitychange', onVisibility);
         ro.disconnect();
         dataSub.dispose();
         if (sock) sock.close();
@@ -407,7 +449,8 @@ export function usePtyTerminal(
       // Measure with the real font and connect only once the grid size is known.
       await waitForFont(fontSize);
       if (disposed) return;
-      if (fitNow()) tryWebgl();
+      fitNow();
+      sync();
       connect();
     };
 
@@ -435,6 +478,12 @@ export function usePtyTerminal(
     const t = window.setTimeout(() => termRef.current?.focus(), 30);
     return () => window.clearTimeout(t);
   }, [options.active]);
+
+  const live = options.active && options.visible !== false;
+  useEffect(() => {
+    controlRef.current?.sync();
+    if (live) controlRef.current?.refit();
+  }, [live]);
 
   return { termRef };
 }

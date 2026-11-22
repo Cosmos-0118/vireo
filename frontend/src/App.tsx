@@ -47,7 +47,6 @@ import type {
   WorkspaceInfo,
 } from './types';
 import { Sidebar, SidebarTab } from './components/Sidebar';
-import { AgentPanel } from './components/AgentPanel';
 import { AgentEditsStrip } from './components/AgentEditsStrip';
 import { FileIcon } from './components/FileIcon';
 import { VireoLogo } from './components/VireoLogo';
@@ -75,9 +74,26 @@ const CodeEditor = lazy(() =>
 const TerminalPanel = lazy(() =>
   import('./components/TerminalPanel').then((m) => ({ default: m.TerminalPanel }))
 );
+const AgentPanel = lazy(() =>
+  import('./components/AgentPanel').then((m) => ({ default: m.AgentPanel }))
+);
 const QuickOpen = lazy(() =>
   import('./components/QuickOpen').then((m) => ({ default: m.QuickOpen }))
 );
+
+/** Cap on cached file/diff text held in JS memory (chars, roughly bytes for source code). */
+const CACHE_BYTE_BUDGET = 12 * 1024 * 1024;
+
+/** Evict least-recently-inserted entries until the total size fits the budget (keeps the newest). */
+function trimToBudget<V>(map: Map<string, V>, sizeOf: (v: V) => number, budget = CACHE_BYTE_BUDGET) {
+  let total = 0;
+  for (const v of map.values()) total += sizeOf(v);
+  while (total > budget && map.size > 1) {
+    const oldest = map.keys().next().value as string;
+    total -= sizeOf(map.get(oldest) as V);
+    map.delete(oldest);
+  }
+}
 
 const ZOOM_MIN = 0.7;
 const ZOOM_MAX = 2.0;
@@ -347,6 +363,12 @@ export function App() {
       cache.delete(id);
       cache.set(id, { ...prev, ...patch });
       while (cache.size > 30) cache.delete(cache.keys().next().value as string);
+      trimToBudget(
+        cache,
+        (c) =>
+          (c.diff ? c.diff.original.length + c.diff.modified.length + (c.diff.patch?.length ?? 0) : 0) +
+          (c.file?.content.length ?? 0)
+      );
     };
     const sameDiff = (a: GitDiffRes | null, b: GitDiffRes) =>
       !!a &&
@@ -425,15 +447,6 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeTabId, activeTab?.mode]);
 
-  // Warm the viewer chunks so the first switch to a diff / editor tab does not wait on a download.
-  useEffect(() => {
-    const t = window.setTimeout(() => {
-      void import('./components/DiffViewer');
-      void import('./components/CodeEditor');
-    }, 1200);
-    return () => window.clearTimeout(t);
-  }, []);
-
   useEffect(() => {
     reloadActiveContent();
   }, [reloadActiveContent]);
@@ -491,6 +504,39 @@ export function App() {
     let sock: WebSocket | null = null;
     let timer: number | undefined;
 
+    // Bursts of file events (builds, installs, multi-file agent edits) are coalesced into one
+    // refresh, and a hidden window defers it until it is visible again.
+    const pendingPaths = new Set<string>();
+    let coarse = false; // some batch said "something changed" without listing paths
+    let dirty = false;
+    let flushTimer = 0;
+    let firstAt = 0;
+    const flush = () => {
+      flushTimer = 0;
+      firstAt = 0;
+      if (!dirty || closed) return;
+      if (document.hidden) return; // resumed by onVisible
+      dirty = false;
+      const paths = coarse ? [] : Array.from(pendingPaths);
+      pendingPaths.clear();
+      coarse = false;
+      fsChangedRef.current(paths, new Set(gitStatusRef.current?.files.map((f) => f.path) ?? []));
+      setFsVersion((v) => v + 1);
+      refreshGit();
+      reloadActiveContentRef.current();
+    };
+    const scheduleFlush = () => {
+      const now = Date.now();
+      if (!firstAt) firstAt = now;
+      window.clearTimeout(flushTimer);
+      // trailing 250 ms debounce, but never later than 1 s after the first event of the burst
+      flushTimer = window.setTimeout(flush, Math.max(0, Math.min(250, firstAt + 1000 - now)));
+    };
+    const onVisible = () => {
+      if (!document.hidden && dirty) scheduleFlush();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
     const connect = () => {
       if (closed) return;
       sock = new WebSocket(wsUrl('/ws/events'));
@@ -505,13 +551,11 @@ export function App() {
         try {
           const data = JSON.parse(ev.data);
           if (data.type === 'fs_changed') {
-            fsChangedRef.current(
-              Array.isArray(data.paths) ? data.paths : [],
-              new Set(gitStatusRef.current?.files.map((f) => f.path) ?? [])
-            );
-            setFsVersion((v) => v + 1);
-            refreshGit();
-            reloadActiveContentRef.current();
+            const paths: string[] = Array.isArray(data.paths) ? data.paths : [];
+            if (paths.length === 0) coarse = true;
+            else for (const p of paths) pendingPaths.add(p);
+            dirty = true;
+            scheduleFlush();
           } else if (data.type === 'workspace_switched') {
             snapshotsRef.current.clear();
             contentCacheRef.current.clear();
@@ -538,6 +582,8 @@ export function App() {
     return () => {
       closed = true;
       if (timer) clearTimeout(timer);
+      window.clearTimeout(flushTimer);
+      document.removeEventListener('visibilitychange', onVisible);
       sock?.close();
     };
   }, [refreshGit, loadWorkspaceData]);
@@ -697,6 +743,7 @@ export function App() {
         snaps.delete(path);
         snaps.set(path, cur);
         while (snaps.size > 40) snaps.delete(snaps.keys().next().value as string);
+        trimToBudget(snaps, (t) => t.length);
         if (prev === undefined || prev === cur) continue;
 
         // CRLF vs LF must not look like a whole-file rewrite (git stores LF, the working tree is CRLF).
@@ -1942,6 +1989,7 @@ export function App() {
                     onToggleMaximize={() => setTerminalMaximized((v) => !v)}
                     onSendOutputToAgent={handleAskAgent}
                     onClosePanel={() => setShowTerminal(false)}
+                    visible={showTerminal}
                   />
                 </Suspense>
               </div>
@@ -1963,6 +2011,7 @@ export function App() {
               onReset={() => setAgentWidth(AGENT.def)}
             />
             <div style={{ width: widths.agentWidth }} className="shrink-0 h-full overflow-hidden">
+              <Suspense fallback={null}>
               <AgentPanel
                 theme={activeTheme}
                 workspacePath={workspace.path}
@@ -1984,6 +2033,7 @@ export function App() {
                 onRefreshGit={refreshGit}
                 onToast={showToast}
               />
+              </Suspense>
             </div>
           </div>
         )}

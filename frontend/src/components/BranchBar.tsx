@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { visibleInterval } from '../utils/visibleInterval';
 import {
   AlertTriangle,
   ArrowDown,
@@ -48,8 +49,7 @@ function compactAgo(unixSeconds: number, now: number): string {
 function useNow(intervalMs = 30_000) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const t = window.setInterval(() => setNow(Date.now()), intervalMs);
-    return () => window.clearInterval(t);
+    return visibleInterval(() => setNow(Date.now()), intervalMs);
   }, [intervalMs]);
   return now;
 }

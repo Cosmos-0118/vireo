@@ -1125,7 +1125,12 @@ fn map_vx_mcp_tool(tool: &str, input: &Value, ws: &Path) -> (String, Value) {
 
 /// Recognise a `vx ...` shell call and present it with the chat UI's tool vocabulary.
 fn map_vx(command: &str, ws: &Path) -> Option<(String, Value)> {
-    let re = regex::Regex::new(r"(?:^|\|\s*|&&\s*|;\s*)vx(?:\.exe)?\s+(\w+)([^\r\n]*)").ok()?;
+    static VX_CALL: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
+    let re = VX_CALL
+        .get_or_init(|| {
+            regex::Regex::new(r"(?:^|\|\s*|&&\s*|;\s*)vx(?:\.exe)?\s+(\w+)([^\r\n]*)").ok()
+        })
+        .as_ref()?;
     let c = re.captures(command)?;
     let sub = c.get(1)?.as_str();
     let rest = c.get(2)?.as_str();

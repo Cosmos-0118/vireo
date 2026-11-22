@@ -57,6 +57,7 @@ const FALLBACK_AGENT_PRESETS: { id: string; label: string; cmd: string }[] = [
 interface SingleTerminalProps {
   tab: TermTabSpec;
   active: boolean;
+  visible: boolean;
   theme: LiteTheme;
   workspaceKey: string;
   registerReader: (id: string, reader: (() => string) | null) => void;
@@ -65,6 +66,7 @@ interface SingleTerminalProps {
 const SingleTerminal: React.FC<SingleTerminalProps> = ({
   tab,
   active,
+  visible,
   theme,
   workspaceKey,
   registerReader,
@@ -75,9 +77,10 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
     sessionKey: ptySid(workspaceKey, tab),
     cmd: tab.cmd,
     active,
+    visible,
     theme,
     fontSize: 14,
-    scrollback: isAgent ? 5000 : 3000,
+    scrollback: isAgent ? 3000 : 1500,
     exitMessage: isAgent ? '[Agent session ended]' : '[Process exited]',
     focusOnOpen: isAgent,
   });
@@ -256,6 +259,8 @@ interface TerminalPanelProps {
   onToggleMaximize?: () => void;
   onSendOutputToAgent: (output: string) => void;
   onClosePanel?: () => void;
+  /** False while the dock is collapsed: tabs stay alive but drop GPU/blink work. */
+  visible?: boolean;
 }
 
 export const TerminalPanel: React.FC<TerminalPanelProps> = ({
@@ -267,6 +272,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   onToggleMaximize,
   onSendOutputToAgent,
   onClosePanel,
+  visible = true,
 }) => {
   const [tabs, setTabs] = useState<TermTabSpec[]>([
     { id: 'shell-1', title: 'PowerShell', kind: 'shell' },
@@ -473,6 +479,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
             key={`${workspacePath}::${tab.id}::${tab.runKey ?? 0}`}
             tab={tab}
             active={tab.id === activeId}
+            visible={visible}
             theme={theme}
             workspaceKey={workspacePath}
             registerReader={registerReader}

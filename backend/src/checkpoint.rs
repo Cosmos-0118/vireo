@@ -12,7 +12,6 @@ use crate::state::{
     background_command, resolve_safe_path, AppState, Checkpoint, CheckpointFileDelta, WorkspaceEvent,
 };
 use axum::{extract::State, http::StatusCode, Json};
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -309,7 +308,7 @@ pub async fn create_checkpoint_internal(state: &AppState, label: String) -> Resu
         id: new_id(),
         label,
         tree_sha,
-        created_at: Utc::now().format("%H:%M:%S").to_string(),
+        created_at: utc_hms(),
         kind: "manual".to_string(),
         files: vec![],
         redo_files: None,
@@ -440,7 +439,7 @@ impl TurnTracker {
             id: new_id(),
             label: "Agent turn".to_string(),
             tree_sha: pre,
-            created_at: Utc::now().format("%H:%M:%S").to_string(),
+            created_at: utc_hms(),
             kind: "turn".to_string(),
             files,
             redo_files: None,
@@ -614,7 +613,7 @@ async fn restore_manual(state: &AppState, cx: &Cx, cp: &Checkpoint) -> Result<Ro
         id: new_id(),
         label: "Before restore".to_string(),
         tree_sha: current.clone(),
-        created_at: Utc::now().format("%H:%M:%S").to_string(),
+        created_at: utc_hms(),
         kind: "manual".to_string(),
         files: vec![],
         redo_files: None,
@@ -643,3 +642,13 @@ async fn restore_manual(state: &AppState, cx: &Cx, cp: &Checkpoint) -> Result<Ro
 
 #[cfg(test)]
 mod tests;
+
+/// Current UTC time of day as `HH:MM:SS` (what the checkpoint list shows).
+fn utc_hms() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        % 86_400;
+    format!("{:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60)
+}

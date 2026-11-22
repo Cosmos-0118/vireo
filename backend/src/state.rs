@@ -124,6 +124,11 @@ pub fn is_ignored_dir_name(name: &str) -> bool {
             | ".turbo"
             | ".cache"
             | "coverage"
+            | ".pnpm-store"
+            | ".yarn"
+            | ".svelte-kit"
+            | ".parcel-cache"
+            | ".gradle"
     )
 }
 

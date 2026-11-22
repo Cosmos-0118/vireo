@@ -28,11 +28,19 @@ use state::AppState;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
 #[derive(Embed)]
 #[folder = "../frontend/dist"]
 struct FrontendAssets;
+
+/// Release builds embed the assets in the binary (`Cow::Borrowed`): serve them without copying.
+fn embedded_body(data: std::borrow::Cow<'static, [u8]>) -> Body {
+    match data {
+        std::borrow::Cow::Borrowed(b) => Body::from(axum::body::Bytes::from_static(b)),
+        std::borrow::Cow::Owned(v) => Body::from(v),
+    }
+}
 
 async fn serve_embedded(uri: Uri) -> Response {
     let raw_path = uri.path().trim_start_matches('/');
@@ -44,10 +52,18 @@ async fn serve_embedded(uri: Uri) -> Response {
 
     if let Some(file) = FrontendAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
+        // Vite emits content-hashed files under assets/: safe to cache forever. Everything else
+        // (index.html, icons) must revalidate or a new build would never load.
+        let cache = if path.starts_with("assets/") {
+            "public, max-age=31536000, immutable"
+        } else {
+            "no-cache"
+        };
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, mime.as_ref())
-            .body(Body::from(file.data.into_owned()))
+            .header(header::CACHE_CONTROL, cache)
+            .body(embedded_body(file.data))
             .unwrap();
     }
 
@@ -56,7 +72,8 @@ async fn serve_embedded(uri: Uri) -> Response {
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .body(Body::from(index.data.into_owned()))
+            .header(header::CACHE_CONTROL, "no-cache")
+            .body(embedded_body(index.data))
             .unwrap();
     }
 
@@ -72,7 +89,16 @@ async fn handle_events_socket(socket: WebSocket, state: AppState) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
     let send_task = tokio::spawn(async move {
-        while let Ok(ev) = rx.recv().await {
+        loop {
+            let ev = match rx.recv().await {
+                Ok(ev) => ev,
+                // A burst overran the channel: tell the client to do one full refresh instead of
+                // silently dropping the connection.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    state::WorkspaceEvent::FsChanged { paths: Vec::new() }
+                }
+                Err(_) => break,
+            };
             if let Ok(json) = serde_json::to_string(&ev) {
                 if ws_tx.send(Message::Text(json.into())).await.is_err() {
                     break;
@@ -316,19 +342,40 @@ fn build_router(
         .fallback(serve_embedded)
         .layer(
             CorsLayer::new()
-                .allow_origin(Any)
+                // Only pages served from this machine (the app itself, or a local dev server) may
+                // call the workspace / git / PTY / agent API from a browser context.
+                .allow_origin(AllowOrigin::predicate(|origin, _| {
+                    origin
+                        .to_str()
+                        .ok()
+                        .and_then(|o| url::Url::parse(o).ok())
+                        .is_some_and(|u| matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")))
+                }))
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
 }
 
+/// WebView2 launch flags: switch off Edge's background services (updater, sync, telemetry,
+/// translate, media router...) that a local workbench never uses. This replaces wry's default
+/// `--disable-features` list, so that list is repeated here. Occlusion detection stays on so a
+/// covered window still throttles.
+const WEBVIEW2_ARGS: &str = "--disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --metrics-recording-only --disable-default-apps --no-first-run --disable-speech-api --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,Translate,OptimizationHints,MediaRouter";
+
 fn main() {
-    code_intel::set_path_env(pty::augmented_path_env());
+    // Registered lazily: the (cached) PATH scan must not delay startup.
+    code_intel::set_path_provider(pty::augmented_path_env);
+    std::thread::spawn(|| {
+        let _ = pty::augmented_path_env();
+    });
     let cli = parse_args();
     let main_window: Arc<OnceLock<tauri::WebviewWindow>> = Arc::new(OnceLock::new());
     let app_router = build_router(cli.workspace.clone(), main_window.clone());
 
+    // A single-user local app: a handful of workers is plenty (blocking work has its own pool).
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 4);
     let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
         .enable_all()
         .build()
         .expect("Failed to initialize Tokio runtime");
@@ -382,6 +429,8 @@ fn main() {
             .decorations(false)
             .shadow(true)
             .zoom_hotkeys_enabled(false)
+            .background_color(tauri::window::Color(27, 28, 31, 255))
+            .additional_browser_args(WEBVIEW2_ARGS)
             .center()
             .build()?;
             let _ = win_slot.set(win);

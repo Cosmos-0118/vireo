@@ -493,32 +493,6 @@ async fn get_remotes(ws: &Path) -> Vec<String> {
         .collect()
 }
 
-async fn detect_git_state(ws: &Path) -> Option<String> {
-    let (ok, git_dir_out, _) = run_git(ws, &["rev-parse", "--git-dir"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
-    if !ok {
-        return None;
-    }
-    let git_dir_raw = git_dir_out.trim();
-    let git_dir = if Path::new(git_dir_raw).is_absolute() {
-        std::path::PathBuf::from(git_dir_raw)
-    } else {
-        ws.join(git_dir_raw)
-    };
-
-    if git_dir.join("CHERRY_PICK_HEAD").exists() {
-        Some("cherry-pick".to_string())
-    } else if git_dir.join("MERGE_HEAD").exists() {
-        Some("merge".to_string())
-    } else if git_dir.join("REVERT_HEAD").exists() {
-        Some("revert".to_string())
-    } else if git_dir.join("rebase-merge").exists() || git_dir.join("rebase-apply").exists() {
-        Some("rebase".to_string())
-    } else {
-        None
-    }
-}
 
 /// Parse NUL-delimited `--name-status -M -z` and `--numstat -M -z` outputs into CommitFileChange list.
 fn parse_z_diff_files(name_status_bytes: &[u8], numstat_bytes: &[u8]) -> Vec<CommitFileChange> {
@@ -627,121 +601,204 @@ fn validate_git_ref_arg(s: &str) -> Result<&str, (StatusCode, String)> {
     Ok(t)
 }
 
+/// Untracked files above this size are not read just to count their lines.
+const MAX_UNTRACKED_COUNT_BYTES: u64 = 1024 * 1024;
+
+#[derive(Default)]
+struct StatusV2 {
+    branch: String,
+    head_hash: String,
+    ahead: usize,
+    behind: usize,
+    /// (index_status, worktree_status, path) with ' ' for "unchanged".
+    entries: Vec<(char, char, String)>,
+}
+
+/// Parse `git status --porcelain=v2 --branch -z -uall` output.
+fn parse_status_v2(bytes: &[u8]) -> StatusV2 {
+    let mut out = StatusV2::default();
+    let mut detached = false;
+    let mut toks = bytes.split(|&b| b == 0).map(|t| String::from_utf8_lossy(t).into_owned());
+    let xy = |s: &str| {
+        let mut c = s.chars();
+        let m = |ch: Option<char>| match ch {
+            Some('.') | None => ' ',
+            Some(c) => c,
+        };
+        (m(c.next()), m(c.next()))
+    };
+    while let Some(tok) = toks.next() {
+        if tok.is_empty() {
+            continue;
+        }
+        if let Some(rest) = tok.strip_prefix("# ") {
+            if let Some(v) = rest.strip_prefix("branch.oid ") {
+                if v != "(initial)" {
+                    out.head_hash = v.trim().to_string();
+                }
+            } else if let Some(v) = rest.strip_prefix("branch.head ") {
+                if v == "(detached)" {
+                    detached = true;
+                } else {
+                    out.branch = v.trim().to_string();
+                }
+            } else if let Some(v) = rest.strip_prefix("branch.ab ") {
+                let mut it = v.split_whitespace();
+                out.ahead = it.next().and_then(|s| s.trim_start_matches('+').parse().ok()).unwrap_or(0);
+                out.behind = it.next().and_then(|s| s.trim_start_matches('-').parse().ok()).unwrap_or(0);
+            }
+            continue;
+        }
+        match tok.as_bytes()[0] {
+            b'1' => {
+                let f: Vec<&str> = tok.splitn(9, ' ').collect();
+                if f.len() == 9 {
+                    let (x, y) = xy(f[1]);
+                    out.entries.push((x, y, f[8].to_string()));
+                }
+            }
+            b'2' => {
+                let f: Vec<&str> = tok.splitn(10, ' ').collect();
+                let _orig = toks.next(); // original path follows as its own NUL-terminated token
+                if f.len() == 10 {
+                    let (x, y) = xy(f[1]);
+                    out.entries.push((x, y, f[9].to_string()));
+                }
+            }
+            b'u' => {
+                let f: Vec<&str> = tok.splitn(11, ' ').collect();
+                if f.len() == 11 {
+                    let (x, y) = xy(f[1]);
+                    out.entries.push((x, y, f[10].to_string()));
+                }
+            }
+            b'?' => {
+                if let Some(p) = tok.strip_prefix("? ") {
+                    out.entries.push(('?', '?', p.to_string()));
+                }
+            }
+            _ => {}
+        }
+    }
+    if detached || out.branch.is_empty() {
+        out.branch = "HEAD".to_string();
+    }
+    out
+}
+
+/// Line counts for untracked files (skips large / binary / non-UTF-8 files).
+fn count_untracked_lines(ws: &Path, paths: Vec<String>) -> HashMap<String, usize> {
+    let mut m = HashMap::new();
+    for p in paths {
+        let Ok(full) = resolve_safe_path(ws, &p) else { continue };
+        match std::fs::metadata(&full) {
+            Ok(md) if md.is_file() && md.len() <= MAX_UNTRACKED_COUNT_BYTES => {}
+            _ => continue,
+        }
+        if let Ok(content) = std::fs::read_to_string(&full) {
+            m.insert(p, content.lines().count());
+        }
+    }
+    m
+}
+
 pub async fn get_status(State(state): State<AppState>) -> Json<GitStatusRes> {
     let ws = state.workspace_path().await;
     let checkpoints = state.checkpoints.read().await.clone();
 
-    let (is_repo, _, _) = run_git(&ws, &["rev-parse", "--is-inside-work-tree"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
+    // One porcelain-v2 call replaces work-tree check, branch, HEAD, ahead/behind and file status;
+    // the remaining independent queries run concurrently.
+    let (status, unstaged_stat, staged_stat, stash, remote, git_dir) = tokio::join!(
+        run_git_bytes(&ws, &["status", "--porcelain=v2", "--branch", "-z", "-uall"]),
+        run_git(&ws, &["diff", "--numstat"]),
+        run_git(&ws, &["diff", "--cached", "--numstat"]),
+        run_git(&ws, &["stash", "list", "--format=%gd%x1f%gs%x1f%ar"]),
+        run_git(&ws, &["remote", "get-url", "origin"]),
+        run_git(&ws, &["rev-parse", "--git-dir"]),
+    );
 
-    if !is_repo {
-        return Json(GitStatusRes {
-            is_repo: false,
-            branch: String::new(),
-            head_hash: String::new(),
-            ahead: 0,
-            behind: 0,
-            remote_url: String::new(),
-            state: None,
-            files: Vec::new(),
-            total_additions: 0,
-            total_deletions: 0,
-            checkpoints,
-            stashes: Vec::new(),
-        });
-    }
-
-    let branch = current_branch(&ws).await;
-
-    let (head_ok, head_out, _) = run_git(&ws, &["rev-parse", "HEAD"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
-    let head_hash = if head_ok {
-        head_out.trim().to_string()
-    } else {
-        String::new()
-    };
-
-    let git_state = detect_git_state(&ws).await;
-
-    let (ab_ok, ab_out, _) = run_git(
-        &ws,
-        &["rev-list", "--left-right", "--count", "@{upstream}...HEAD"],
-    )
-    .await
-    .unwrap_or((false, String::new(), String::new()));
-    let (behind, ahead) = if ab_ok {
-        let parts: Vec<&str> = ab_out.trim().split_whitespace().collect();
-        if parts.len() == 2 {
-            (
-                parts[0].parse::<usize>().unwrap_or(0),
-                parts[1].parse::<usize>().unwrap_or(0),
-            )
-        } else {
-            (0, 0)
+    let status_bytes = match status {
+        Ok((true, out, _)) => out,
+        _ => {
+            return Json(GitStatusRes {
+                is_repo: false,
+                branch: String::new(),
+                head_hash: String::new(),
+                ahead: 0,
+                behind: 0,
+                remote_url: String::new(),
+                state: None,
+                files: Vec::new(),
+                total_additions: 0,
+                total_deletions: 0,
+                checkpoints,
+                stashes: Vec::new(),
+            });
         }
-    } else {
-        (0, 0)
+    };
+    let parsed = parse_status_v2(&status_bytes);
+
+    let remote_url = remote.map(|(_, o, _)| o.trim().to_string()).unwrap_or_default();
+
+    let git_state = match git_dir {
+        Ok((true, out, _)) => {
+            let raw = out.trim();
+            let dir = if Path::new(raw).is_absolute() {
+                std::path::PathBuf::from(raw)
+            } else {
+                ws.join(raw)
+            };
+            if dir.join("CHERRY_PICK_HEAD").exists() {
+                Some("cherry-pick".to_string())
+            } else if dir.join("MERGE_HEAD").exists() {
+                Some("merge".to_string())
+            } else if dir.join("REVERT_HEAD").exists() {
+                Some("revert".to_string())
+            } else if dir.join("rebase-merge").exists() || dir.join("rebase-apply").exists() {
+                Some("rebase".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
     };
 
-    let (_, remote_out, _) = run_git(&ws, &["remote", "get-url", "origin"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
-    let remote_url = remote_out.trim().to_string();
-
-    let (_, porcelain, _) = run_git(&ws, &["status", "--porcelain=v1", "-uall"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
-
-    let (_, unstaged_stat, _) = run_git(&ws, &["diff", "--numstat"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
-    let (_, staged_stat, _) = run_git(&ws, &["diff", "--cached", "--numstat"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
-
-    let mut stats = parse_numstat(&unstaged_stat);
-    for (k, (a, d)) in parse_numstat(&staged_stat) {
+    let mut stats = parse_numstat(&unstaged_stat.map(|r| r.1).unwrap_or_default());
+    for (k, (a, d)) in parse_numstat(&staged_stat.map(|r| r.1).unwrap_or_default()) {
         let e = stats.entry(k).or_insert((0, 0));
         e.0 += a;
         e.1 += d;
     }
 
-    let mut files = Vec::new();
+    let untracked_paths: Vec<String> = parsed
+        .entries
+        .iter()
+        .filter(|(x, y, _)| *x == '?' && *y == '?')
+        .map(|(_, _, p)| p.clone())
+        .collect();
+    let untracked_lines = if untracked_paths.is_empty() {
+        HashMap::new()
+    } else {
+        let ws2 = ws.clone();
+        tokio::task::spawn_blocking(move || count_untracked_lines(&ws2, untracked_paths))
+            .await
+            .unwrap_or_default()
+    };
+
+    let mut files = Vec::with_capacity(parsed.entries.len());
     let mut total_additions = 0usize;
     let mut total_deletions = 0usize;
-
-    for line in porcelain.lines() {
-        if line.len() < 4 {
-            continue;
-        }
-        let x = &line[0..1];
-        let y = &line[1..2];
-        let mut raw_path = line[3..].trim().to_string();
-        if raw_path.starts_with('"') && raw_path.ends_with('"') && raw_path.len() >= 2 {
-            raw_path = raw_path[1..raw_path.len() - 1].to_string();
-        }
-        if let Some((_, new_part)) = raw_path.split_once(" -> ") {
-            raw_path = new_part.trim().trim_matches('"').to_string();
-        }
-        raw_path = raw_path.replace('\\', "/");
-
-        let untracked = x == "?" && y == "?";
-        let staged = !untracked && x != " ";
-        let unstaged = !untracked && y != " ";
-
+    for (x, y, path) in parsed.entries {
+        let raw_path = path.replace('\\', "/");
+        let untracked = x == '?' && y == '?';
+        let staged = !untracked && x != ' ';
+        let unstaged = !untracked && y != ' ';
         let (mut adds, dels) = stats.get(&raw_path).copied().unwrap_or((0, 0));
         if untracked {
-            if let Ok(full) = resolve_safe_path(&ws, &raw_path) {
-                if let Ok(content) = std::fs::read_to_string(&full) {
-                    adds = content.lines().count();
-                }
-            }
+            adds = untracked_lines.get(&path).copied().unwrap_or(0);
         }
         total_additions += adds;
         total_deletions += dels;
-
         files.push(GitFileStatus {
             path: raw_path,
             index_status: x.to_string(),
@@ -754,12 +811,8 @@ pub async fn get_status(State(state): State<AppState>) -> Json<GitStatusRes> {
         });
     }
 
-    // Stashes list
-    let (st_ok, st_out, _) = run_git(&ws, &["stash", "list", "--format=%gd%x1f%gs%x1f%ar"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
     let mut stashes = Vec::new();
-    if st_ok {
+    if let Ok((true, st_out, _)) = stash {
         for line in st_out.lines() {
             let p: Vec<&str> = line.split('\x1f').collect();
             if p.len() >= 3 {
@@ -774,10 +827,10 @@ pub async fn get_status(State(state): State<AppState>) -> Json<GitStatusRes> {
 
     Json(GitStatusRes {
         is_repo: true,
-        branch,
-        head_hash,
-        ahead,
-        behind,
+        branch: parsed.branch,
+        head_hash: parsed.head_hash,
+        ahead: parsed.ahead,
+        behind: parsed.behind,
         remote_url,
         state: git_state,
         files,
@@ -1055,37 +1108,36 @@ pub async fn fetch_changes(
 
 pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
     let ws = state.workspace_path().await;
-    let cur = current_branch(&ws).await;
-    let (_, list, _) = run_git(&ws, &["branch", "--format=%(refname:short)"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
+    // All of these are independent: run them concurrently instead of one git.exe at a time.
+    let none = || (false, String::new(), String::new());
+    let (cur, list, rlist, refs_out, head_short, remotes_out, dh, fh) = tokio::join!(
+        current_branch(&ws),
+        run_git(&ws, &["branch", "--format=%(refname:short)"]),
+        run_git(&ws, &["branch", "-r", "--format=%(refname:short)"]),
+        run_git(
+            &ws,
+            &["for-each-ref", "--sort=-committerdate", BRANCH_REF_FORMAT, "refs/heads", "refs/remotes"],
+        ),
+        run_git(&ws, &["rev-parse", "--short", "HEAD"]),
+        run_git(&ws, &["remote"]),
+        run_git(&ws, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]),
+        run_git(&ws, &["rev-parse", "--git-path", "FETCH_HEAD"]),
+    );
+    let (_, list, _) = list.unwrap_or_else(|_| none());
     let branches = list
         .lines()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    let (_, rlist, _) = run_git(&ws, &["branch", "-r", "--format=%(refname:short)"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
+    let (_, rlist, _) = rlist.unwrap_or_else(|_| none());
     let remote_branches = rlist
         .lines()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty() && !s.ends_with("/HEAD"))
         .collect();
 
-    let (_, refs_out, _) = run_git(
-        &ws,
-        &[
-            "for-each-ref",
-            "--sort=-committerdate",
-            BRANCH_REF_FORMAT,
-            "refs/heads",
-            "refs/remotes",
-        ],
-    )
-    .await
-    .unwrap_or((false, String::new(), String::new()));
+    let (_, refs_out, _) = refs_out.unwrap_or_else(|_| none());
     let details = parse_branch_refs(&refs_out);
 
     let current = cur;
@@ -1096,23 +1148,16 @@ pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
         .map(|b| (b.upstream.clone(), b.upstream_gone))
         .unwrap_or_default();
 
-    let (_, head_short, _) = run_git(&ws, &["rev-parse", "--short", "HEAD"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
+    let (_, head_short, _) = head_short.unwrap_or_else(|_| none());
 
-    let (_, remotes_out, _) = run_git(&ws, &["remote"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
+    let (_, remotes_out, _) = remotes_out.unwrap_or_else(|_| none());
     let remotes: Vec<String> = remotes_out
         .lines()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    let (dh_ok, dh_out, _) =
-        run_git(&ws, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-            .await
-            .unwrap_or((false, String::new(), String::new()));
+    let (dh_ok, dh_out, _) = dh.unwrap_or_else(|_| none());
     let default_branch = if dh_ok && !dh_out.trim().is_empty() {
         dh_out.trim().trim_start_matches("origin/").to_string()
     } else if details.iter().any(|b| b.kind == "local" && b.name == "main") {
@@ -1123,9 +1168,7 @@ pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
         String::new()
     };
 
-    let (fh_ok, fh_out, _) = run_git(&ws, &["rev-parse", "--git-path", "FETCH_HEAD"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
+    let (fh_ok, fh_out, _) = fh.unwrap_or_else(|_| none());
     let last_fetched = if fh_ok {
         let p = std::path::PathBuf::from(fh_out.trim());
         let p = if p.is_absolute() { p } else { ws.join(p) };

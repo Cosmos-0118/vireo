@@ -4,6 +4,7 @@ import {
   Decoration,
   DecorationSet,
   EditorView,
+  ViewPlugin,
   WidgetType,
   keymap,
   lineNumbers,
@@ -63,6 +64,10 @@ interface ReviewHandlers {
 }
 
 const setReviewBase = StateEffect.define<string | null>();
+/** Debounced "re-diff against the base now" for big documents (see makeReviewField). */
+const recomputeReview = StateEffect.define<null>();
+/** Above this combined size a keystroke must not trigger a synchronous full-document diff. */
+const SYNC_REVIEW_DIFF_LIMIT = 60_000;
 
 function computeReviewHunks(base: string, doc: string): ReviewHunk[] {
   if (base.length + doc.length > 600000) return [];
@@ -156,15 +161,30 @@ function makeReviewField(handlers: { current: ReviewHandlers | null }) {
     update(v, tr) {
       let base = v.base;
       let changed = tr.docChanged;
+      let forced = false; // base changed or a debounced recompute landed
       for (const e of tr.effects) {
         if (e.is(setReviewBase)) {
           base = e.value === null ? null : e.value.replace(/\r\n?/g, '\n');
           changed = true;
+          forced = true;
+        } else if (e.is(recomputeReview)) {
+          changed = true;
+          forced = true;
         }
       }
       if (!changed) return v;
       if (base === null) return { base, hunks: [], deco: Decoration.none };
       const doc = tr.state.doc;
+      if (!forced && base.length + doc.length > SYNC_REVIEW_DIFF_LIMIT) {
+        // Big file while typing: keep the previous hunks (re-anchored) until the debounced
+        // recompute runs, instead of diffing the whole document on every keystroke.
+        const map = (pos: number, assoc: -1 | 1) => tr.changes.mapPos(pos, assoc);
+        return {
+          base,
+          hunks: v.hunks.map((h) => ({ ...h, newFrom: map(h.newFrom, -1), newTo: map(h.newTo, 1) })),
+          deco: v.deco.map(tr.changes),
+        };
+      }
       const hunks = computeReviewHunks(base, doc.toString());
       const ranges = [];
       for (const h of hunks) {
@@ -387,6 +407,24 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
     const reviewField = makeReviewField(reviewHandlersRef);
     reviewFieldRef.current = reviewField;
+    const reviewDebounce = ViewPlugin.fromClass(
+      class {
+        timer = 0;
+        constructor(readonly view: EditorView) {}
+        update(u: { docChanged: boolean }) {
+          if (!u.docChanged) return;
+          const rv = this.view.state.field(reviewField, false);
+          if (!rv || rv.base === null) return;
+          window.clearTimeout(this.timer);
+          this.timer = window.setTimeout(() => {
+            this.view.dispatch({ effects: recomputeReview.of(null) });
+          }, 200);
+        }
+        destroy() {
+          window.clearTimeout(this.timer);
+        }
+      }
+    );
 
     const state = EditorState.create({
       doc: carried ? carried.doc : normalizeNewlines(contentRef.current),
@@ -394,6 +432,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       extensions: [
         flashField,
         reviewField,
+        reviewDebounce,
         lineNumbers(),
         highlightActiveLine(),
         highlightActiveLineGutter(),
@@ -412,7 +451,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           const rv = u.state.field(reviewField);
           if (
             u.docChanged ||
-            u.transactions.some((t) => t.effects.some((e) => e.is(setReviewBase)))
+            u.transactions.some((t) => t.effects.some((e) => e.is(setReviewBase) || e.is(recomputeReview)))
           ) {
             setReviewCount(rv.hunks.length);
             if (rv.base !== null && rv.hunks.length === 0) {
