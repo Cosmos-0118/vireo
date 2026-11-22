@@ -18,6 +18,9 @@ export default defineConfig({
     outDir: 'dist',
     sourcemap: false,
     target: 'es2022',
+    // ghostty-web inlines its WASM binary (~640 kB) and is only fetched when the user switches
+    // terminal engines, so it is the one chunk intentionally above the default 500 kB limit.
+    chunkSizeWarningLimit: 700,
     rollupOptions: {
       output: {
         manualChunks(id) {
@@ -29,6 +32,9 @@ export default defineConfig({
             norm.includes('/scheduler/')
           ) {
             return 'vendor-react';
+          }
+          if (norm.includes('/@xterm/addon-webgl/')) {
+            return 'vendor-xterm-webgl';
           }
           if (norm.includes('/@xterm/')) {
             return 'vendor-xterm';

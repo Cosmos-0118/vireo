@@ -4,7 +4,6 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
-import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import { wsUrl } from '../api';
 import type { LiteTheme } from '../themes';
@@ -216,13 +215,17 @@ export function usePtyTerminal(
       const tryWebgl = () => {
         if (webglTried || disposed) return;
         webglTried = true;
-        try {
-          const addon = new WebglAddon();
-          addon.onContextLoss(() => addon.dispose());
-          term.loadAddon(addon);
-        } catch {
-          // WebGL unavailable: keep the DOM renderer
-        }
+        // Loaded on demand so the WebGL renderer is not part of the base terminal chunk.
+        import('@xterm/addon-webgl')
+          .then(({ WebglAddon }) => {
+            if (disposed) return;
+            const addon = new WebglAddon();
+            addon.onContextLoss(() => addon.dispose());
+            term.loadAddon(addon);
+          })
+          .catch(() => {
+            // WebGL unavailable: keep the DOM renderer
+          });
       };
 
       let sock: WebSocket | null = null;
