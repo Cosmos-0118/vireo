@@ -61,7 +61,7 @@ async fn health() -> &'static str {
 
 fn parse_args() -> (u16, PathBuf, Option<PathBuf>) {
     let args: Vec<String> = std::env::args().collect();
-    let mut port: u16 = std::env::var("LITECODE_PORT")
+    let mut port: u16 = std::env::var("VIREO_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4317);
@@ -172,7 +172,7 @@ async fn main() {
     .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    println!("LiteCode server running at http://{}", addr);
+    println!("Vireo server running at http://{}", addr);
     println!("Workspace: {}", initial_workspace.display());
 
     let listener = tokio::net::TcpListener::bind(addr)

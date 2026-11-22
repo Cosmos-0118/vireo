@@ -136,7 +136,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
   const [config, setConfig] = useState<AgentConfig>(() => {
     try {
-      const saved = localStorage.getItem('litecode-agent-config');
+      const saved = localStorage.getItem('vireo-agent-config');
       if (saved) return { ...DEFAULT_CONFIG, ...JSON.parse(saved) };
     } catch {
       // ignore
@@ -153,7 +153,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
   useEffect(() => {
     try {
-      localStorage.setItem('litecode-agent-config', JSON.stringify(config));
+      localStorage.setItem('vireo-agent-config', JSON.stringify(config));
     } catch {
       // ignore
     }
@@ -437,7 +437,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             {messages.length === 0 ? (
               <div className="space-y-3 pt-4 text-xs text-[var(--text-muted)]">
                 <div className="text-sm font-medium text-[var(--text-primary)]">
-                  LiteCode Agent
+                  Vireo Agent
                 </div>
                 <p className="leading-relaxed">
                   Ask the agent to inspect files, implement features, or fix terminal errors. Every

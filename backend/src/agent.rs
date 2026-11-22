@@ -34,7 +34,7 @@ pub struct AgentChatReq {
     pub auto_checkpoint: Option<bool>,
 }
 
-const SYSTEM_PROMPT: &str = r#"You are LiteCode Agent, a concise, practical AI software engineer working directly inside the user's local repository.
+const SYSTEM_PROMPT: &str = r#"You are Vireo Agent, a concise, practical AI software engineer working directly inside the user's local repository.
 You have tools to inspect and modify files and run commands:
 - list_files(dir?)
 - read_file(path, start_line?, end_line?)

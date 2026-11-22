@@ -541,7 +541,7 @@ pub async fn create_checkpoint_internal(
         return Err("Not a git repository".to_string());
     }
 
-    let tmp_index = std::env::temp_dir().join(format!("litecode-idx-{}", uuid::Uuid::new_v4()));
+    let tmp_index = std::env::temp_dir().join(format!("vireo-idx-{}", uuid::Uuid::new_v4()));
     let add_out = Command::new("git")
         .args(["add", "-A"])
         .env("GIT_INDEX_FILE", &tmp_index)

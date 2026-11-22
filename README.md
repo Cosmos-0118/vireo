@@ -1,4 +1,4 @@
-# LiteCode
+# Vireo
 
 A lightweight, agent-first code workbench inspired by VS Code — without Electron or heavy language-server overhead.
 
@@ -17,7 +17,7 @@ A lightweight, agent-first code workbench inspired by VS Code — without Electr
 
 ```powershell
 # Run as a standalone desktop-style window (opens in Edge App Mode)
-.\litecode.ps1 -Dir "C:\path\to\your\repo"
+.\vireo.ps1 -Dir "C:\path\to\your\repo"
 ```
 
 Or run manually:

@@ -6,8 +6,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$ReleaseExe = Join-Path $Root "backend\target\release\litecode-server.exe"
-$DebugExe = Join-Path $Root "backend\target\debug\litecode-server.exe"
+$ReleaseExe = Join-Path $Root "backend\target\release\vireo-server.exe"
+$DebugExe = Join-Path $Root "backend\target\debug\vireo-server.exe"
 $DistDir = Join-Path $Root "frontend\dist"
 
 if (Test-Path $ReleaseExe) {
@@ -15,7 +15,7 @@ if (Test-Path $ReleaseExe) {
 } elseif (Test-Path $DebugExe) {
     $Exe = $DebugExe
 } else {
-    Write-Host "Building LiteCode server..." -ForegroundColor Cyan
+    Write-Host "Building Vireo server..." -ForegroundColor Cyan
     $vcvars = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Auxiliary\Build\vcvars64.bat"
     $manifest = Join-Path $Root "backend\Cargo.toml"
     if (-not (Get-Command link.exe -ErrorAction SilentlyContinue) -and (Test-Path $vcvars)) {
@@ -27,7 +27,7 @@ if (Test-Path $ReleaseExe) {
 }
 
 $Url = "http://127.0.0.1:$Port"
-Write-Host "Starting LiteCode at $Url for workspace: $Dir" -ForegroundColor Green
+Write-Host "Starting Vireo at $Url for workspace: $Dir" -ForegroundColor Green
 
 if (-not $NoBrowser) {
     $edge = Get-Command msedge.exe -ErrorAction SilentlyContinue

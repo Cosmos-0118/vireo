@@ -40,7 +40,7 @@ export function App() {
   // Themes (built-in + custom imported VS Code themes)
   const [themes, setThemes] = useState<LiteTheme[]>(() => {
     try {
-      const extra = localStorage.getItem('litecode-custom-themes');
+      const extra = localStorage.getItem('vireo-custom-themes');
       if (extra) return [...BUILTIN_THEMES, ...JSON.parse(extra)];
     } catch {
       // ignore
@@ -48,17 +48,17 @@ export function App() {
     return BUILTIN_THEMES;
   });
   const [themeId, setThemeId] = useState<string>(
-    () => localStorage.getItem('litecode-theme') || BUILTIN_THEMES[0].id
+    () => localStorage.getItem('vireo-theme') || BUILTIN_THEMES[0].id
   );
   const activeTheme = themes.find((t) => t.id === themeId) || BUILTIN_THEMES[0];
 
   useEffect(() => {
     applyTheme(activeTheme);
-    localStorage.setItem('litecode-theme', activeTheme.id);
+    localStorage.setItem('vireo-theme', activeTheme.id);
   }, [activeTheme]);
 
   // Workspace & Git state
-  const [workspace, setWorkspace] = useState<WorkspaceInfo>({ path: '', name: 'LiteCode' });
+  const [workspace, setWorkspace] = useState<WorkspaceInfo>({ path: '', name: 'Vireo' });
   const [editingWs, setEditingWs] = useState(false);
   const [wsDraft, setWsDraft] = useState('');
   const [gitStatus, setGitStatus] = useState<GitStatusRes | null>(null);
@@ -315,7 +315,7 @@ export function App() {
         const customOnly = next.filter(
           (t) => !BUILTIN_THEMES.some((b) => b.id === t.id)
         );
-        localStorage.setItem('litecode-custom-themes', JSON.stringify(customOnly));
+        localStorage.setItem('vireo-custom-themes', JSON.stringify(customOnly));
         return next;
       });
       setThemeId(parsed.id);
@@ -359,9 +359,9 @@ export function App() {
         <div className="flex items-center gap-2 min-w-0">
           <div className="flex items-center gap-1.5 font-semibold text-xs text-[var(--text-primary)] shrink-0">
             <span className="w-5 h-5 rounded bg-[var(--accent)] text-[var(--accent-fg)] flex items-center justify-center font-bold text-[11px]">
-              L
+              V
             </span>
-            <span>LiteCode</span>
+            <span>Vireo</span>
           </div>
 
           <span className="text-[var(--text-dim)]">/</span>
@@ -620,7 +620,7 @@ export function App() {
                 </div>
                 <div className="space-y-1 max-w-md">
                   <h2 className="text-base font-semibold text-[var(--text-primary)]">
-                    LiteCode — Agent Review Workbench
+                    Vireo — Agent Review Workbench
                   </h2>
                   <p className="text-xs text-[var(--text-muted)] leading-relaxed">
                     Ultra-lightweight workspace for reviewing live agent diffs, running commands,
