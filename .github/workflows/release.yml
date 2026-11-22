@@ -146,6 +146,9 @@ jobs:
                 $custom = $existing.Trim()
               }
             } catch { }
+            # The probe above exits non-zero when the release does not exist yet; do not let that
+            # leftover code become this step's exit code.
+            $global:LASTEXITCODE = 0
           }
 
           $integrity = @(
