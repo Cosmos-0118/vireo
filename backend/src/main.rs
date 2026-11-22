@@ -298,6 +298,7 @@ fn build_router(
         .route("/api/agent/chat", post(agent::chat))
         .route("/api/agent/cli-tools", get(pty::list_cli_tools))
         .route("/ws/pty", get(pty::ws_pty))
+        .route("/api/pty/kill", post(pty::kill_pty))
         .route("/ws/events", get(ws_events))
         .with_state(app_state)
         .fallback(serve_embedded)

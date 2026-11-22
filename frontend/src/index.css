@@ -158,7 +158,6 @@ svg.lucide {
 /* xterm sizing */
 .xterm {
   height: 100%;
-  padding: 8px 10px;
 }
 
 .xterm-viewport {

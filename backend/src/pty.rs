@@ -1,25 +1,43 @@
 use crate::state::AppState;
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
+    http::StatusCode,
     response::IntoResponse,
     Json,
 };
 use futures_util::{SinkExt, StreamExt};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use tokio::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, Once, OnceLock};
+use std::time::{Duration, Instant};
+use tokio::sync::{watch, Notify};
+
+/// Output kept per session so a reconnecting client can rebuild its screen.
+const REPLAY_CAP: usize = 2 * 1024 * 1024;
+/// Largest single WebSocket output frame.
+const MAX_FRAME: usize = 64 * 1024;
+/// Bytes a client may have in flight (sent but not yet written by xterm) before we pause.
+const ACK_WINDOW: u64 = 512 * 1024;
+/// The PTY reader pauses when the slowest attached client is this far behind.
+const FLOOD_LIMIT: u64 = 1536 * 1024;
+/// Sessions with no attached client for this long are killed.
+const DETACHED_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Deserialize)]
 pub struct PtyQuery {
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub cmd: Option<String>,
+    /// Stable client-chosen session id; reconnecting with the same id re-attaches to the shell.
+    pub sid: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -27,6 +45,14 @@ pub struct PtyQuery {
 enum ClientPtyMsg {
     Input { data: String },
     Resize { cols: u16, rows: u16 },
+    /// Cumulative bytes of output this connection has finished writing into xterm.
+    Ack { bytes: u64 },
+    Kill,
+}
+
+#[derive(Deserialize)]
+pub struct KillQuery {
+    pub sid: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -307,6 +333,341 @@ fn build_unix_shell(
     c
 }
 
+// ---------------------------------------------------------------------------
+// Persistent PTY sessions
+//
+// A shell lives in a `PtySession` keyed by a client-chosen `sid`. WebSockets attach to and
+// detach from it; the process only dies on an explicit kill, when it exits, or when it has
+// been detached for `DETACHED_TTL`. Output is kept in a bounded ring so a re-attaching client
+// can rebuild its screen, and delivery is flow-controlled with client ACKs.
+// ---------------------------------------------------------------------------
+
+enum PtyCmd {
+    Input(Vec<u8>),
+    Resize(u16, u16),
+    Kill,
+}
+
+struct Ring {
+    data: Vec<u8>,
+    /// Absolute stream offset of `data[0]`.
+    base: u64,
+}
+
+impl Ring {
+    fn end(&self) -> u64 {
+        self.base + self.data.len() as u64
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        self.data.extend_from_slice(bytes);
+        if self.data.len() > REPLAY_CAP * 2 {
+            let drop = self.data.len() - REPLAY_CAP;
+            self.data.drain(..drop);
+            self.base += drop as u64;
+        }
+    }
+
+    /// Up to `max` bytes starting at absolute offset `from` (clamped to what is still held).
+    fn read(&self, from: u64, max: usize) -> (Vec<u8>, u64) {
+        let from = from.max(self.base);
+        let start = (from - self.base) as usize;
+        if start >= self.data.len() {
+            return (Vec::new(), from);
+        }
+        let end = (start + max).min(self.data.len());
+        (self.data[start..end].to_vec(), self.base + end as u64)
+    }
+
+    /// Where a new subscriber should start replaying. If the ring has wrapped, begin after
+    /// the next newline so the replay does not open in the middle of an escape sequence.
+    fn replay_start(&self) -> u64 {
+        if self.base == 0 {
+            return 0;
+        }
+        let scan = self.data.len().min(4096);
+        match self.data[..scan].iter().position(|b| *b == b'\n') {
+            Some(i) => self.base + i as u64 + 1,
+            None => self.base,
+        }
+    }
+}
+
+struct PtySession {
+    id: String,
+    cmd_tx: std_mpsc::Sender<PtyCmd>,
+    ring: Mutex<Ring>,
+    /// Bumped (to the ring end) whenever output arrives or the process exits.
+    updates: watch::Sender<u64>,
+    exited: AtomicBool,
+    /// Read cursor of every attached client (conn id -> absolute offset).
+    cursors: Mutex<HashMap<u64, Arc<AtomicU64>>>,
+    detached_since: Mutex<Option<Instant>>,
+}
+
+impl PtySession {
+    fn send(&self, cmd: PtyCmd) {
+        let _ = self.cmd_tx.send(cmd);
+    }
+
+    fn kill(&self) {
+        self.send(PtyCmd::Kill);
+    }
+
+    /// How far the slowest attached client trails the newest output.
+    fn slowest_lag(&self) -> u64 {
+        let end = self.ring.lock().unwrap().end();
+        let cursors = self.cursors.lock().unwrap();
+        cursors
+            .values()
+            .map(|c| end.saturating_sub(c.load(Ordering::Relaxed)))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+fn sessions() -> &'static Mutex<HashMap<String, Arc<PtySession>>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, Arc<PtySession>>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn remove_session(session: &Arc<PtySession>) {
+    let mut map = sessions().lock().unwrap();
+    if map.get(&session.id).is_some_and(|s| Arc::ptr_eq(s, session)) {
+        map.remove(&session.id);
+    }
+}
+
+fn ensure_reaper() {
+    static START: Once = Once::new();
+    START.call_once(|| {
+        tokio::spawn(async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let stale: Vec<Arc<PtySession>> = {
+                    let mut map = sessions().lock().unwrap();
+                    let ids: Vec<String> = map
+                        .iter()
+                        .filter(|(_, s)| {
+                            s.cursors.lock().unwrap().is_empty()
+                                && s.detached_since
+                                    .lock()
+                                    .unwrap()
+                                    .is_some_and(|t| t.elapsed() > DETACHED_TTL)
+                        })
+                        .map(|(id, _)| id.clone())
+                        .collect();
+                    ids.iter().filter_map(|id| map.remove(id)).collect()
+                };
+                for s in stale {
+                    s.kill();
+                }
+            }
+        });
+    });
+}
+
+fn spawn_session(
+    id: &str,
+    cols: u16,
+    rows: u16,
+    workspace: &Path,
+    custom_cmd: Option<&str>,
+) -> Result<Arc<PtySession>, String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("PTY error: {}", e))?;
+
+    let path_env = augmented_path_env();
+
+    #[cfg(windows)]
+    let spawn_result = {
+        let has_pwsh = find_command_in_path("pwsh.exe", &path_env).is_some();
+        if has_pwsh {
+            let pwsh_cmd = build_windows_shell("pwsh.exe", workspace, &path_env, custom_cmd);
+            match pair.slave.spawn_command(pwsh_cmd) {
+                Ok(child) => Ok(child),
+                Err(_) => {
+                    let ps_cmd =
+                        build_windows_shell("powershell.exe", workspace, &path_env, custom_cmd);
+                    pair.slave.spawn_command(ps_cmd)
+                }
+            }
+        } else {
+            let ps_cmd = build_windows_shell("powershell.exe", workspace, &path_env, custom_cmd);
+            pair.slave.spawn_command(ps_cmd)
+        }
+    };
+
+    #[cfg(not(windows))]
+    let spawn_result = {
+        let cmd = build_unix_shell(workspace, &path_env, custom_cmd);
+        pair.slave.spawn_command(cmd)
+    };
+
+    let mut child = spawn_result.map_err(|e| format!("Failed to spawn shell: {}", e))?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("PTY reader error: {}", e))?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("PTY writer error: {}", e))?;
+    let master = pair.master;
+
+    let (cmd_tx, cmd_rx) = std_mpsc::channel::<PtyCmd>();
+    let (updates, _) = watch::channel(0u64);
+    let session = Arc::new(PtySession {
+        id: id.to_string(),
+        cmd_tx,
+        ring: Mutex::new(Ring {
+            data: Vec::new(),
+            base: 0,
+        }),
+        updates,
+        exited: AtomicBool::new(false),
+        cursors: Mutex::new(HashMap::new()),
+        detached_since: Mutex::new(Some(Instant::now())),
+    });
+
+    // Reader: PTY -> ring. Pauses (back-pressuring the child) while the slowest attached
+    // client is too far behind, so a runaway `cat` cannot flood the browser.
+    {
+        let session = session.clone();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 32 * 1024];
+            loop {
+                while !session.exited.load(Ordering::SeqCst) && session.slowest_lag() > FLOOD_LIMIT
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let end = {
+                            let mut ring = session.ring.lock().unwrap();
+                            ring.push(&buf[..n]);
+                            ring.end()
+                        };
+                        session.updates.send_replace(end);
+                    }
+                }
+            }
+            session.exited.store(true, Ordering::SeqCst);
+            remove_session(&session);
+            session.kill(); // make sure the control thread reaps the child
+            let end = session.ring.lock().unwrap().end();
+            session.updates.send_replace(end);
+        });
+    }
+
+    // Control thread: input, resize, kill, and child-exit detection. ConPTY does not close
+    // the output pipe when the child exits, so poll for it and then drop the master.
+    std::thread::spawn(move || {
+        let mut last_size = (cols, rows);
+        loop {
+            match cmd_rx.recv_timeout(Duration::from_millis(400)) {
+                Ok(PtyCmd::Input(data)) => {
+                    if writer.write_all(&data).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
+                }
+                Ok(PtyCmd::Resize(c, r)) => {
+                    let size = (c.max(10), r.max(4));
+                    // Redundant resizes make ConPTY redraw the prompt; skip them.
+                    if size != last_size {
+                        last_size = size;
+                        let _ = master.resize(PtySize {
+                            rows: size.1,
+                            cols: size.0,
+                            pixel_width: 0,
+                            pixel_height: 0,
+                        });
+                    }
+                }
+                Ok(PtyCmd::Kill) | Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        // let ConPTY flush the final output before closing it
+                        std::thread::sleep(Duration::from_millis(200));
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        drop(writer);
+        drop(master);
+    });
+
+    Ok(session)
+}
+
+fn get_or_create(
+    sid: &str,
+    cols: u16,
+    rows: u16,
+    workspace: &Path,
+    custom_cmd: Option<&str>,
+) -> Result<Arc<PtySession>, String> {
+    let mut map = sessions().lock().unwrap();
+    if let Some(existing) = map.get(sid) {
+        if !existing.exited.load(Ordering::SeqCst) {
+            return Ok(existing.clone());
+        }
+    }
+    let session = spawn_session(sid, cols, rows, workspace, custom_cmd)?;
+    map.insert(sid.to_string(), session.clone());
+    Ok(session)
+}
+
+/// Registers an attached client's cursor and unregisters it on drop.
+struct Attachment {
+    session: Arc<PtySession>,
+    conn_id: u64,
+    cursor: Arc<AtomicU64>,
+}
+
+impl Attachment {
+    fn new(session: Arc<PtySession>, start: u64) -> Self {
+        static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
+        let conn_id = NEXT_CONN.fetch_add(1, Ordering::Relaxed);
+        let cursor = Arc::new(AtomicU64::new(start));
+        session
+            .cursors
+            .lock()
+            .unwrap()
+            .insert(conn_id, cursor.clone());
+        *session.detached_since.lock().unwrap() = None;
+        Self {
+            session,
+            conn_id,
+            cursor,
+        }
+    }
+}
+
+impl Drop for Attachment {
+    fn drop(&mut self) {
+        let mut cursors = self.session.cursors.lock().unwrap();
+        cursors.remove(&self.conn_id);
+        if cursors.is_empty() {
+            *self.session.detached_since.lock().unwrap() = Some(Instant::now());
+        }
+    }
+}
+
 pub async fn ws_pty(
     ws: WebSocketUpgrade,
     Query(q): Query<PtyQuery>,
@@ -315,181 +676,146 @@ pub async fn ws_pty(
     ws.on_upgrade(move |socket| handle_pty_socket(socket, q, state))
 }
 
+/// Explicitly end a session (tab closed, agent relaunched, workspace changed).
+pub async fn kill_pty(Query(q): Query<KillQuery>) -> StatusCode {
+    let session = sessions().lock().unwrap().remove(&q.sid);
+    if let Some(s) = session {
+        s.kill();
+    }
+    StatusCode::NO_CONTENT
+}
+
 async fn handle_pty_socket(socket: WebSocket, q: PtyQuery, state: AppState) {
+    static NEXT_ANON: AtomicUsize = AtomicUsize::new(1);
+    ensure_reaper();
+
     let workspace = state.workspace_path().await;
     let cols = q.cols.unwrap_or(110).max(20);
     let rows = q.rows.unwrap_or(28).max(5);
 
-    let pty_system = native_pty_system();
-    let pair = match pty_system.openpty(PtySize {
-        rows,
-        cols,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(p) => p,
-        Err(e) => {
+    // Without a sid the shell is private to this socket and dies with it.
+    let ephemeral = q.sid.as_deref().map_or(true, str::is_empty);
+    let sid = match q.sid.clone().filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => format!("anon-{}", NEXT_ANON.fetch_add(1, Ordering::Relaxed)),
+    };
+    let custom_cmd = q.cmd.clone();
+
+    let created = tokio::task::spawn_blocking({
+        let sid = sid.clone();
+        move || get_or_create(&sid, cols, rows, &workspace, custom_cmd.as_deref())
+    })
+    .await;
+
+    let session = match created {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             let (mut tx, _) = socket.split();
             let _ = tx
-                .send(Message::Text(format!("\r\n[PTY error: {}]\r\n", e).into()))
+                .send(Message::Text(format!("\r\n[{}]\r\n", e).into()))
                 .await;
+            let _ = tx.close().await;
             return;
         }
-    };
-
-    let path_env = augmented_path_env();
-    let custom_cmd = q.cmd.as_deref();
-
-    #[cfg(windows)]
-    let spawn_result = {
-        let has_pwsh = find_command_in_path("pwsh.exe", &path_env).is_some();
-        if has_pwsh {
-            let pwsh_cmd = build_windows_shell("pwsh.exe", &workspace, &path_env, custom_cmd);
-            match pair.slave.spawn_command(pwsh_cmd) {
-                Ok(child) => Ok(child),
-                Err(_) => {
-                    let ps_cmd =
-                        build_windows_shell("powershell.exe", &workspace, &path_env, custom_cmd);
-                    pair.slave.spawn_command(ps_cmd)
-                }
-            }
-        } else {
-            let ps_cmd = build_windows_shell("powershell.exe", &workspace, &path_env, custom_cmd);
-            pair.slave.spawn_command(ps_cmd)
-        }
-    };
-
-    #[cfg(not(windows))]
-    let spawn_result = {
-        let cmd = build_unix_shell(&workspace, &path_env, custom_cmd);
-        pair.slave.spawn_command(cmd)
-    };
-
-    let mut child = match spawn_result {
-        Ok(c) => c,
-        Err(e) => {
-            let (mut tx, _) = socket.split();
-            let _ = tx
-                .send(Message::Text(
-                    format!("\r\n[Failed to spawn shell: {}]\r\n", e).into(),
-                ))
-                .await;
-            return;
-        }
-    };
-    drop(pair.slave);
-
-    let mut reader = match pair.master.try_clone_reader() {
-        Ok(r) => r,
         Err(_) => return,
     };
-    let mut writer = match pair.master.take_writer() {
-        Ok(w) => w,
-        Err(_) => return,
+
+    let (replay_start, replay_end) = {
+        let ring = session.ring.lock().unwrap();
+        (ring.replay_start(), ring.end())
     };
-    let master = pair.master;
+    let attachment = Attachment::new(session.clone(), replay_start);
+    let cursor = attachment.cursor.clone();
+    let mut updates = session.updates.subscribe();
 
-    let (out_tx, mut out_rx) = mpsc::channel::<String>(256);
-    let (in_tx, mut in_rx) = mpsc::channel::<ClientPtyMsg>(256);
-
-    // Blocking reader thread -> async channel (preserves split multi-byte UTF-8 sequences)
-    std::thread::spawn(move || {
-        let mut pending: Vec<u8> = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => {
-                    if !pending.is_empty() {
-                        let tail = String::from_utf8_lossy(&pending).to_string();
-                        let _ = out_tx.blocking_send(tail);
-                    }
-                    break;
-                }
-                Ok(n) => {
-                    pending.extend_from_slice(&buf[..n]);
-                    let mut out = String::new();
-                    loop {
-                        match std::str::from_utf8(&pending) {
-                            Ok(valid) => {
-                                out.push_str(valid);
-                                pending.clear();
-                                break;
-                            }
-                            Err(err) => {
-                                let valid_up_to = err.valid_up_to();
-                                if valid_up_to > 0 {
-                                    out.push_str(
-                                        std::str::from_utf8(&pending[..valid_up_to]).unwrap(),
-                                    );
-                                }
-                                if let Some(error_len) = err.error_len() {
-                                    out.push('\u{FFFD}');
-                                    pending.drain(..valid_up_to + error_len);
-                                } else {
-                                    pending.drain(..valid_up_to);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    if !out.is_empty() && out_tx.blocking_send(out).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Blocking writer / resizer thread
-    std::thread::spawn(move || {
-        while let Some(msg) = in_rx.blocking_recv() {
-            match msg {
-                ClientPtyMsg::Input { data } => {
-                    if writer.write_all(data.as_bytes()).is_err() {
-                        break;
-                    }
-                    let _ = writer.flush();
-                }
-                ClientPtyMsg::Resize { cols, rows } => {
-                    let _ = master.resize(PtySize {
-                        rows: rows.max(4),
-                        cols: cols.max(10),
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    });
-                }
-            }
-        }
-        let _ = child.kill();
-    });
-
+    let acked = Arc::new(AtomicU64::new(0));
+    let ack_notify = Arc::new(Notify::new());
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    let mut send_task = tokio::spawn(async move {
-        while let Some(chunk) = out_rx.recv().await {
-            if ws_tx.send(Message::Text(chunk.into())).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    let mut recv_task = tokio::spawn(async move {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                Message::Text(txt) => {
-                    let s = txt.to_string();
-                    let parsed = serde_json::from_str::<ClientPtyMsg>(&s)
-                        .unwrap_or(ClientPtyMsg::Input { data: s });
-                    if in_tx.send(parsed).await.is_err() {
-                        break;
+    let mut send_task = {
+        let session = session.clone();
+        let acked = acked.clone();
+        let ack_notify = ack_notify.clone();
+        tokio::spawn(async move {
+            let mut pos = replay_start;
+            let mut sent_bytes: u64 = 0;
+            let mut ready_sent = false;
+            loop {
+                // Marks the end of the replay so the client can stop muting terminal replies.
+                if !ready_sent && pos >= replay_end {
+                    ready_sent = true;
+                    if ws_tx
+                        .send(Message::Text(r#"{"type":"ready"}"#.into()))
+                        .await
+                        .is_err()
+                    {
+                        return;
                     }
                 }
-                Message::Close(_) => break,
-                _ => {}
+
+                // Flow control: wait for the client to catch up on what is already in flight.
+                while sent_bytes.saturating_sub(acked.load(Ordering::Relaxed)) > ACK_WINDOW {
+                    let _ =
+                        tokio::time::timeout(Duration::from_millis(250), ack_notify.notified())
+                            .await;
+                }
+
+                // Read `exited` before the ring so output written just before exit is not lost.
+                let exited = session.exited.load(Ordering::SeqCst);
+                let (chunk, next) = session.ring.lock().unwrap().read(pos, MAX_FRAME);
+                if chunk.is_empty() {
+                    if exited {
+                        break;
+                    }
+                    if updates.changed().await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Output that wrapped out of the ring while we were stalled is simply skipped.
+                sent_bytes += chunk.len() as u64;
+                pos = next;
+                cursor.store(pos, Ordering::Relaxed);
+                if ws_tx.send(Message::Binary(chunk.into())).await.is_err() {
+                    return;
+                }
             }
-        }
-    });
+            let _ = ws_tx
+                .send(Message::Close(Some(CloseFrame {
+                    code: 1000,
+                    reason: "exited".into(),
+                })))
+                .await;
+        })
+    };
+
+    let mut recv_task = {
+        let session = session.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = ws_rx.next().await {
+                match msg {
+                    Message::Text(txt) => match serde_json::from_str::<ClientPtyMsg>(&txt) {
+                        Ok(ClientPtyMsg::Input { data }) => {
+                            session.send(PtyCmd::Input(data.into_bytes()))
+                        }
+                        Ok(ClientPtyMsg::Resize { cols, rows }) => {
+                            session.send(PtyCmd::Resize(cols, rows))
+                        }
+                        Ok(ClientPtyMsg::Ack { bytes }) => {
+                            acked.fetch_max(bytes, Ordering::Relaxed);
+                            ack_notify.notify_one();
+                        }
+                        Ok(ClientPtyMsg::Kill) => session.kill(),
+                        Err(_) => session.send(PtyCmd::Input(txt.as_str().as_bytes().to_vec())),
+                    },
+                    Message::Binary(bytes) => session.send(PtyCmd::Input(bytes.to_vec())),
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+        })
+    };
 
     tokio::select! {
         _ = &mut send_task => {
@@ -498,5 +824,11 @@ async fn handle_pty_socket(socket: WebSocket, q: PtyQuery, state: AppState) {
         _ = &mut recv_task => {
             send_task.abort();
         },
+    }
+
+    drop(attachment);
+    if ephemeral {
+        remove_session(&session);
+        session.kill();
     }
 }

@@ -147,6 +147,8 @@ export function App() {
   const [sidebarWidth, setSidebarWidth] = useState(storedLayout.sidebarWidth);
   const [agentWidth, setAgentWidth] = useState(storedLayout.agentWidth);
   const [terminalHeight, setTerminalHeight] = useState(storedLayout.terminalHeight);
+  const [terminalMaximized, setTerminalMaximized] = useState(false);
+  const [launcherSignal, setLauncherSignal] = useState(0);
   const [panelPriority, setPanelPriority] = useState<PanelSide>('sidebar');
   const [workbenchSize, setWorkbenchSize] = useState({ w: 0, h: 0 });
   const workbenchRef = useRef<HTMLDivElement>(null);
@@ -662,6 +664,17 @@ export function App() {
     hasTabBar: tabs.length > 0,
     preferred: terminalHeight,
   });
+  // Maximized dock: tall enough for full-screen TUIs while keeping the editor/diff visible.
+  const termHeight = terminalMaximized
+    ? Math.max(termLayout.height, Math.min(termLayout.max, Math.round(workbenchSize.h * 0.75)))
+    : termLayout.height;
+
+  // Once shown, the terminal and agent panels stay mounted (hidden via CSS) so hiding
+  // them never kills running shells or CLI agent sessions.
+  const terminalMountedRef = useRef(false);
+  if (showTerminal) terminalMountedRef.current = true;
+  const agentMountedRef = useRef(false);
+  if (widths.agentVisible) agentMountedRef.current = true;
 
   const toggleSidebar = () => {
     if (showSidebar && !widths.sidebarVisible) setPanelPriority('sidebar');
@@ -1241,8 +1254,8 @@ export function App() {
           </div>
 
           {/* Bottom Terminal */}
-          {showTerminal && (
-            <>
+          {(showTerminal || terminalMountedRef.current) && (
+            <div className={showTerminal ? 'contents' : 'hidden'}>
               <ResizeHandle
                 orientation="horizontal"
                 direction={-1}
@@ -1253,7 +1266,7 @@ export function App() {
                 onChange={setTerminalHeight}
                 onReset={() => setTerminalHeight(TERMINAL.def)}
               />
-              <div style={{ height: termLayout.height }} className="shrink-0 min-h-0 overflow-hidden">
+              <div style={{ height: termHeight }} className="shrink-0 min-h-0 overflow-hidden">
                 <Suspense
                   fallback={
                     <div className="h-full bg-[var(--bg-panel)] border-t border-[var(--border)] flex items-center justify-center text-xs text-[var(--text-dim)]">
@@ -1265,18 +1278,21 @@ export function App() {
                     theme={activeTheme}
                     workspacePath={workspace.path}
                     pendingCommand={pendingCmd}
+                    launcherSignal={launcherSignal}
+                    maximized={terminalMaximized}
+                    onToggleMaximize={() => setTerminalMaximized((v) => !v)}
                     onSendOutputToAgent={handleAskAgent}
                     onClosePanel={() => setShowTerminal(false)}
                   />
                 </Suspense>
               </div>
-            </>
+            </div>
           )}
         </div>
 
-        {/* Right Agent Panel */}
-        {widths.agentVisible && (
-          <>
+        {/* Right Agent Panel (stays mounted while hidden so CLI agents and chats survive) */}
+        {(widths.agentVisible || agentMountedRef.current) && (
+          <div className={widths.agentVisible ? 'contents' : 'hidden'}>
             <ResizeHandle
               orientation="vertical"
               direction={-1}
@@ -1292,12 +1308,23 @@ export function App() {
                 theme={activeTheme}
                 workspacePath={workspace.path}
                 draftAppend={agentDraftAppend}
+                activeFilePath={
+                  activeTab && (activeTab.mode === 'code' || activeTab.mode === 'diff')
+                    ? activeTab.path
+                    : null
+                }
+                changedFileCount={gitStatus?.files.length ?? 0}
+                allFiles={allFiles}
+                onLaunchCliAgent={() => {
+                  setShowTerminal(true);
+                  setLauncherSignal((n) => n + 1);
+                }}
                 onOpenDiff={(p) => openDiff(p)}
                 onRefreshGit={refreshGit}
                 onToast={showToast}
               />
             </div>
-          </>
+          </div>
         )}
       </div>
 

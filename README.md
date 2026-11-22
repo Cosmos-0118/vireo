@@ -9,7 +9,7 @@ A lightweight code workbench built around coding agents. It borrows the feel of 
 - **Agent panel** with two modes:
   - **Agent Chat** is a built-in coding agent that can read, edit, and write files, search code, list files, and run commands. It works with OpenAI, OpenRouter, DeepSeek, Ollama, Anthropic Claude, and Google Gemini. Every turn creates a Git checkpoint, so you can roll a turn back in one click.
   - **CLI Agent** is an embedded terminal (Windows ConPTY) with launchers for `claude`, `codex`, `gemini`, `aider`, and `opencode`, sitting right beside the diff viewer.
-- **Integrated terminal.** Multiple tabs powered by `xterm.js` and Rust `portable-pty`. Project tasks are detected from `package.json`, `Cargo.toml`, and Python projects and can be run in one click. Terminal output can be sent straight to the agent.
+- **Integrated terminal.** Multiple tabs powered by `xterm.js` (WebGL) and Rust `portable-pty`. Shells keep running while the panel is hidden or the page reloads, and the terminal bar can switch the engine to Ghostty (WASM). Project tasks are detected from `package.json`, `Cargo.toml`, and Python projects and can be run in one click. Terminal output can be sent straight to the agent.
 - **Git and GitHub.** Stage, unstage, and discard changes, switch or create branches, commit, commit and push, pull, browse recent commits, and create checkpoints.
 - **Themes.** Six built-in themes (VS Code Dark+, Tokyo Night, Catppuccin Mocha, One Dark Pro, GitHub Dark Dimmed, and GitHub Light). You can also import any VS Code `.json` theme.
 - **Quick Open and search.** `Ctrl+P` opens files, themes, and tasks. `Ctrl+Shift+F` searches the workspace with ripgrep.
@@ -21,6 +21,8 @@ A lightweight code workbench built around coding agents. It borrows the feel of 
 .\build-and-run.ps1 "C:\path\to\your\repo"
 ```
 Optional flags: `-CleanAll` runs a full `cargo clean` first, and `-BuildOnly` builds without launching.
+
+The script finds the Visual Studio C++ build tools itself (via `msvc-env.ps1`), so it works from a plain PowerShell window. To run `cargo` by hand on Windows, load the same environment first: `. .\msvc-env.ps1; Enter-MsvcEnv`.
 
 **Launch an existing build:**
 ```powershell
