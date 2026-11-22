@@ -29,6 +29,8 @@ interface FileExplorerProps {
   workspacePath: string;
   /** Bumped whenever the backend reports filesystem changes. */
   fsVersion: number;
+  /** path -> pulse key for files an agent just changed. */
+  recentPaths?: Record<string, number>;
   onOpenFile: (path: string) => void;
   onOpenDiff: (path: string, staged?: boolean) => void;
   onAskAgent: (text: string) => void;
@@ -76,6 +78,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
   selectedPath,
   workspacePath,
   fsVersion,
+  recentPaths,
   onOpenFile,
   onOpenDiff,
   onAskAgent,
@@ -447,7 +450,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
           isSelected
             ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
             : 'hover:bg-[var(--bg-hover)] text-[var(--text-primary)]'
-        }`}
+        } ${recentPaths?.[entry.path] !== undefined ? `row-pulse-${recentPaths[entry.path] % 2}` : ''}`}
         title={entry.path}
       >
         {Array.from({ length: depth }, (_, i) => (

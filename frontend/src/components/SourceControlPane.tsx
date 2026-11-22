@@ -121,6 +121,8 @@ interface SourceControlPaneProps {
   onOpenGraphTab: (selectedHash?: string) => void;
   onRefreshGit: () => Promise<void>;
   onToast: (msg: string, isError?: boolean) => void;
+  /** path -> pulse key for files an agent just changed. */
+  recentPaths?: Record<string, number>;
 }
 
 export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
@@ -135,6 +137,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
   onOpenGraphTab,
   onRefreshGit,
   onToast,
+  recentPaths,
 }) => {
   const [commitMsg, setCommitMsg] = useState('');
   const [amendMode, setAmendMode] = useState(false);
@@ -676,7 +679,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
           isSelected
             ? 'bg-[var(--bg-active)] font-medium'
             : 'hover:bg-[var(--bg-hover)]'
-        }`}
+        } ${recentPaths?.[f.path] !== undefined ? `row-pulse-${recentPaths[f.path] % 2}` : ''}`}
       >
         {isSelected && (
           <span className="absolute left-0 top-0.5 bottom-0.5 w-[2.5px] bg-[var(--accent)] rounded-r" />

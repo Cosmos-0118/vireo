@@ -54,6 +54,12 @@ interface DiffViewerProps {
   onSwitchToCode: () => void;
   onAskAgent: (snippet: string) => void;
   onToast?: (msg: string, isError?: boolean) => void;
+  /** Lines just changed on disk (by an agent / external tool); glow + scroll to them. */
+  liveFlash?: LiveFlash | null;
+  /** Scroll to live edits automatically (paused while the user is interacting). */
+  followEdits?: boolean;
+  /** Timestamp (ms) of the user's last scroll / key / pointer activity. */
+  userActivityRef?: React.MutableRefObject<number>;
 }
 
 interface UnifiedRow {
@@ -62,14 +68,17 @@ interface UnifiedRow {
   newLine: number | null;
   text: string;
   pairedText?: string;
+  cluster: number;
 }
 
 interface SplitRow {
   left: { line: number | null; text: string; type: 'context' | 'remove' | 'empty' };
   right: { line: number | null; text: string; type: 'context' | 'add' | 'empty' };
   pairHighlight?: boolean;
+  cluster: number;
 }
 
+/** A cluster of nearby changes shown (and staged / reverted) as one unit. */
 interface HunkMeta {
   index: number;
   oldStart: number;
@@ -77,16 +86,94 @@ interface HunkMeta {
   newStart: number;
   newCount: number;
   patch: string;
+  /** Unified-row range of this cluster (inclusive). */
+  firstRow: number;
+  lastRow: number;
+  /** Text of the whole cluster as a diff, for "Ask". */
+  excerpt: string;
 }
 
 type FoldedItem<T> =
-  | { kind: 'hunk-header'; hunk: HunkMeta }
-  | { kind: 'row'; row: T; index: number; hunkIndex?: number }
+  | { kind: 'row'; row: T; index: number; cluster: number; clusterStart: boolean }
   | { kind: 'fold'; id: string; startIndex: number; endIndex: number; count: number };
+
+export interface LiveFlash {
+  key: number;
+  /** 1-based inclusive line ranges on the new (right) side. */
+  ranges: Array<{ from: number; to: number }>;
+}
 
 const CONTEXT_LINES = 3;
 const MIN_FOLD_LINES = 4;
+/** Changes whose unchanged gap is below this stay in one visual cluster (no fold between them). */
+const CLUSTER_GAP = 2 * CONTEXT_LINES + MIN_FOLD_LINES;
 const EXPAND_STEP = 12;
+
+/** Assign a cluster id to every row from first to last change of a cluster; -1 elsewhere. */
+function assignClusters(changed: boolean[]): { ids: number[]; count: number } {
+  const n = changed.length;
+  const ids = new Array<number>(n).fill(-1);
+  let count = 0;
+  let i = 0;
+  while (i < n) {
+    if (!changed[i]) {
+      i++;
+      continue;
+    }
+    const start = i;
+    let end = i;
+    let j = i;
+    while (j < n) {
+      if (changed[j]) {
+        end = j;
+        j++;
+        continue;
+      }
+      let k = j;
+      while (k < n && !changed[k]) k++;
+      if (k < n && k - j < CLUSTER_GAP) {
+        j = k;
+        continue;
+      }
+      break;
+    }
+    for (let r = start; r <= end; r++) ids[r] = count;
+    count++;
+    i = end + 1;
+  }
+  return { ids, count };
+}
+
+/** Nearest enclosing scope header: closest preceding line with less indentation than the fold's resume line. */
+function findScopeLabel(texts: string[], foldEnd: number): string {
+  const indentOf = (s: string) => {
+    let w = 0;
+    for (const ch of s) {
+      if (ch === ' ') w++;
+      else if (ch === '\t') w += 2;
+      else break;
+    }
+    return w;
+  };
+  let base = -1;
+  for (let k = foldEnd; k < Math.min(texts.length, foldEnd + 4); k++) {
+    if (texts[k].trim()) {
+      base = indentOf(texts[k]);
+      break;
+    }
+  }
+  if (base <= 0) return '';
+  for (let k = foldEnd - 1; k >= 0; k--) {
+    const t = texts[k];
+    const trimmed = t.trim();
+    if (!trimmed || /^[}\])>,;]+$/.test(trimmed)) continue;
+    if (indentOf(t) < base) {
+      const label = trimmed.replace(/\s*[{[(]\s*$/, '');
+      return label.length > 64 ? `${label.slice(0, 63)}…` : label;
+    }
+  }
+  return '';
+}
 
 function splitLinesPreserve(val: string): string[] {
   if (!val) return [];
@@ -263,29 +350,12 @@ function buildHunkPatch(
 
 function buildFoldedItems<T>(
   rows: T[],
-  isChanged: (row: T) => boolean,
-  hunkByStartRow: Map<number, HunkMeta>,
+  changed: boolean[],
+  clusterIds: number[],
   compact: boolean,
   expandedRanges: Array<{ from: number; to: number }>
-): { items: FoldedItem<T>[]; hunkCount: number } {
+): FoldedItem<T>[] {
   const n = rows.length;
-  const changed = rows.map(isChanged);
-
-  const hunkStarts = new Map<number, number>();
-  let hunkCount = 0;
-  for (let i = 0; i < n; i++) {
-    if (changed[i] && (i === 0 || !changed[i - 1])) {
-      hunkStarts.set(i, hunkCount++);
-    }
-  }
-
-  const isRowVisible = (idx: number): boolean => {
-    if (!compact) return true;
-    for (const r of expandedRanges) {
-      if (idx >= r.from && idx < r.to) return true;
-    }
-    return false;
-  };
 
   const visible = new Array<boolean>(n).fill(!compact);
   if (compact) {
@@ -294,49 +364,43 @@ function buildFoldedItems<T>(
         const lo = Math.max(0, i - CONTEXT_LINES);
         const hi = Math.min(n - 1, i + CONTEXT_LINES);
         for (let k = lo; k <= hi; k++) visible[k] = true;
-      } else if (isRowVisible(i)) {
-        visible[i] = true;
       }
     }
+    for (const r of expandedRanges) {
+      for (let k = Math.max(0, r.from); k < Math.min(n, r.to); k++) visible[k] = true;
+    }
   }
+
+  const pushRow = (items: FoldedItem<T>[], k: number) => {
+    const cluster = clusterIds[k];
+    items.push({
+      kind: 'row',
+      row: rows[k],
+      index: k,
+      cluster,
+      clusterStart: cluster >= 0 && (k === 0 || clusterIds[k - 1] !== cluster),
+    });
+  };
 
   const items: FoldedItem<T>[] = [];
   let i = 0;
   while (i < n) {
     if (visible[i]) {
-      const hunk = hunkByStartRow.get(i);
-      if (hunk) {
-        items.push({ kind: 'hunk-header', hunk });
-      }
-      items.push({
-        kind: 'row',
-        row: rows[i],
-        index: i,
-        hunkIndex: hunkStarts.get(i),
-      });
+      pushRow(items, i);
       i++;
     } else {
       const start = i;
       while (i < n && !visible[i]) i++;
       const count = i - start;
       if (count < MIN_FOLD_LINES) {
-        for (let k = start; k < i; k++) {
-          const hunk = hunkByStartRow.get(k);
-          if (hunk) items.push({ kind: 'hunk-header', hunk });
-          items.push({
-            kind: 'row',
-            row: rows[k],
-            index: k,
-            hunkIndex: hunkStarts.get(k),
-          });
-        }
+        for (let k = start; k < i; k++) pushRow(items, k);
       } else {
         items.push({ kind: 'fold', id: `fold-${start}-${i}`, startIndex: start, endIndex: i, count });
       }
     }
   }
 
-  return { items, hunkCount };
+  return items;
 }
 
 export const DiffViewer: React.FC<DiffViewerProps> = ({
@@ -353,6 +417,9 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   onSwitchToCode,
   onAskAgent,
   onToast,
+  liveFlash,
+  followEdits,
+  userActivityRef,
 }) => {
   const [preferredViewMode, setPreferredViewMode] = useState<'split' | 'unified'>('split');
   // Side-by-side needs room: below this container width fall back to unified automatically
@@ -376,6 +443,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   const [activeHunk, setActiveHunk] = useState<number>(-1);
   const [copiedPath, setCopiedPath] = useState(false);
   const [hunkBusy, setHunkBusy] = useState<number | null>(null);
+  const [hoverHunk, setHoverHunk] = useState<number>(-1);
 
   const hunkRefs = useRef<Record<number, HTMLTableRowElement | null>>({});
   const scrollContainerRef = useRef<HTMLDivElement>(null);
@@ -401,8 +469,9 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       return {
         unified: [] as UnifiedRow[],
         split: [] as SplitRow[],
-        unifiedHunkMap: new Map<number, HunkMeta>(),
-        splitHunkMap: new Map<number, HunkMeta>(),
+        unifiedChanged: [] as boolean[],
+        splitChanged: [] as boolean[],
+        hunks: [] as HunkMeta[],
         adds: 0,
         dels: 0,
       };
@@ -413,14 +482,11 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     });
     const unified: UnifiedRow[] = [];
     const split: SplitRow[] = [];
-    const unifiedHunkMap = new Map<number, HunkMeta>();
-    const splitHunkMap = new Map<number, HunkMeta>();
 
     let oldNo = 1;
     let newNo = 1;
     let adds = 0;
     let dels = 0;
-    let hunkIdx = 0;
 
     let i = 0;
     while (i < changes.length) {
@@ -428,41 +494,25 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       if (!part.added && !part.removed) {
         const lines = splitLinesPreserve(part.value);
         for (const text of lines) {
-          unified.push({ type: 'context', oldLine: oldNo, newLine: newNo, text });
+          unified.push({ type: 'context', oldLine: oldNo, newLine: newNo, text, cluster: -1 });
           split.push({
             left: { line: oldNo, text, type: 'context' },
             right: { line: newNo, text, type: 'context' },
+            cluster: -1,
           });
           oldNo++;
           newNo++;
         }
         i++;
-      } else if (part.removed && i + 1 < changes.length && changes[i + 1].added) {
+      } else if (part.removed) {
         const remLines = splitLinesPreserve(part.value);
-        const addLines = splitLinesPreserve(changes[i + 1].value);
+        const hasPair = i + 1 < changes.length && changes[i + 1].added;
+        const addLines = hasPair ? splitLinesPreserve(changes[i + 1].value) : [];
         dels += remLines.length;
         adds += addLines.length;
 
-        const uStartRow = unified.length;
-        const sStartRow = split.length;
         const startOld = oldNo;
         const startNew = newNo;
-
-        const patch = buildHunkPatch(diff.path, startOld, remLines.length, startNew, addLines.length, [
-          ...remLines.map((l) => `-${l}`),
-          ...addLines.map((l) => `+${l}`),
-        ]);
-        const meta: HunkMeta = {
-          index: hunkIdx++,
-          oldStart: startOld,
-          oldCount: remLines.length,
-          newStart: startNew,
-          newCount: addLines.length,
-          patch,
-        };
-        unifiedHunkMap.set(uStartRow, meta);
-        splitHunkMap.set(sStartRow, meta);
-
         const pairCount = Math.min(remLines.length, addLines.length);
         for (let k = 0; k < remLines.length; k++) {
           unified.push({
@@ -471,6 +521,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             newLine: null,
             text: remLines[k],
             pairedText: k < pairCount ? addLines[k] : undefined,
+            cluster: -1,
           });
         }
         for (let k = 0; k < addLines.length; k++) {
@@ -480,6 +531,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             newLine: newNo++,
             text: addLines[k],
             pairedText: k < pairCount ? remLines[k] : undefined,
+            cluster: -1,
           });
         }
 
@@ -495,113 +547,123 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
               ? { line: startNew + k, text: addLines[k], type: 'add' }
               : { line: null, text: '', type: 'empty' },
             pairHighlight: hasL && hasR,
+            cluster: -1,
           });
         }
-        i += 2;
-      } else if (part.removed) {
-        const lines = splitLinesPreserve(part.value);
-        dels += lines.length;
-        const uStartRow = unified.length;
-        const sStartRow = split.length;
-        const startOld = oldNo;
-        const startNew = newNo;
-
-        const patch = buildHunkPatch(
-          diff.path,
-          startOld,
-          lines.length,
-          startNew,
-          0,
-          lines.map((l) => `-${l}`)
-        );
-        const meta: HunkMeta = {
-          index: hunkIdx++,
-          oldStart: startOld,
-          oldCount: lines.length,
-          newStart: startNew,
-          newCount: 0,
-          patch,
-        };
-        unifiedHunkMap.set(uStartRow, meta);
-        splitHunkMap.set(sStartRow, meta);
-
-        for (const text of lines) {
-          unified.push({ type: 'remove', oldLine: oldNo, newLine: null, text });
-          split.push({
-            left: { line: oldNo, text, type: 'remove' },
-            right: { line: null, text: '', type: 'empty' },
-          });
-          oldNo++;
-        }
-        i++;
+        i += hasPair ? 2 : 1;
       } else {
         const lines = splitLinesPreserve(part.value);
         adds += lines.length;
-        const uStartRow = unified.length;
-        const sStartRow = split.length;
-        const startOld = oldNo;
         const startNew = newNo;
-
-        const patch = buildHunkPatch(
-          diff.path,
-          startOld,
-          0,
-          startNew,
-          lines.length,
-          lines.map((l) => `+${l}`)
-        );
-        const meta: HunkMeta = {
-          index: hunkIdx++,
-          oldStart: startOld,
-          oldCount: 0,
-          newStart: startNew,
-          newCount: lines.length,
-          patch,
-        };
-        unifiedHunkMap.set(uStartRow, meta);
-        splitHunkMap.set(sStartRow, meta);
-
         for (const text of lines) {
-          unified.push({ type: 'add', oldLine: null, newLine: newNo, text });
+          unified.push({ type: 'add', oldLine: null, newLine: newNo++, text, cluster: -1 });
+        }
+        for (let k = 0; k < lines.length; k++) {
           split.push({
             left: { line: null, text: '', type: 'empty' },
-            right: { line: newNo, text, type: 'add' },
+            right: { line: startNew + k, text: lines[k], type: 'add' },
+            cluster: -1,
           });
-          newNo++;
         }
         i++;
       }
     }
 
-    return { unified, split, unifiedHunkMap, splitHunkMap, adds, dels };
+    const unifiedChanged = unified.map((r) => r.type !== 'context');
+    const splitChanged = split.map((r) => r.left.type !== 'context' || r.right.type !== 'context');
+    const uc = assignClusters(unifiedChanged);
+    const sc = assignClusters(splitChanged);
+    unified.forEach((r, idx) => (r.cluster = uc.ids[idx]));
+    split.forEach((r, idx) => (r.cluster = sc.ids[idx]));
+
+    // One patch per cluster, built from the unified rows (interior context included).
+    const hunks: HunkMeta[] = [];
+    let o = 1;
+    let nw = 1;
+    let cur: { start: number; oldStart: number; newStart: number } | null = null;
+    const finish = (endRow: number, id: number) => {
+      if (!cur) return;
+      const lines: string[] = [];
+      const excerpt: string[] = [];
+      let oldCount = 0;
+      let newCount = 0;
+      for (let k = cur.start; k <= endRow; k++) {
+        const r = unified[k];
+        if (r.type === 'context') {
+          lines.push(` ${r.text}`);
+          oldCount++;
+          newCount++;
+        } else if (r.type === 'remove') {
+          lines.push(`-${r.text}`);
+          excerpt.push(`-${r.text}`);
+          oldCount++;
+        } else {
+          lines.push(`+${r.text}`);
+          excerpt.push(`+${r.text}`);
+          newCount++;
+        }
+      }
+      hunks.push({
+        index: id,
+        oldStart: cur.oldStart,
+        oldCount,
+        newStart: cur.newStart,
+        newCount,
+        patch: buildHunkPatch(diff.path, cur.oldStart, oldCount, cur.newStart, newCount, lines),
+        firstRow: cur.start,
+        lastRow: endRow,
+        excerpt: excerpt.join('\n'),
+      });
+      cur = null;
+    };
+    for (let k = 0; k < unified.length; k++) {
+      const r = unified[k];
+      const id = r.cluster;
+      if (id >= 0 && !cur) cur = { start: k, oldStart: o, newStart: nw };
+      if (cur && id < 0) finish(k - 1, hunks.length);
+      if (r.type === 'context') {
+        o++;
+        nw++;
+      } else if (r.type === 'remove') o++;
+      else nw++;
+    }
+    if (cur) finish(unified.length - 1, hunks.length);
+
+    return { unified, split, unifiedChanged, splitChanged, hunks, adds, dels };
   }, [diff, ignoreWhitespace]);
 
-  const splitFolded = useMemo(
+  const splitItems = useMemo(
     () =>
       buildFoldedItems(
         computed.split,
-        (r) => r.left.type !== 'context' || r.right.type !== 'context',
-        computed.splitHunkMap,
+        computed.splitChanged,
+        computed.split.map((r) => r.cluster),
         compactMode,
         expandedRanges
       ),
-    [computed.split, computed.splitHunkMap, compactMode, expandedRanges]
+    [computed.split, computed.splitChanged, compactMode, expandedRanges]
   );
 
-  const unifiedFolded = useMemo(
+  const unifiedItems = useMemo(
     () =>
       buildFoldedItems(
         computed.unified,
-        (r) => r.type !== 'context',
-        computed.unifiedHunkMap,
+        computed.unifiedChanged,
+        computed.unified.map((r) => r.cluster),
         compactMode,
         expandedRanges
       ),
-    [computed.unified, computed.unifiedHunkMap, compactMode, expandedRanges]
+    [computed.unified, computed.unifiedChanged, compactMode, expandedRanges]
   );
 
-  const totalHunks =
-    viewMode === 'split' ? splitFolded.hunkCount : unifiedFolded.hunkCount;
+  // Plain-text lines (new side where present) used to label folds with their enclosing scope.
+  const splitScopeTexts = useMemo(
+    () => computed.split.map((r) => (r.right.type !== 'empty' ? r.right.text : r.left.text)),
+    [computed.split]
+  );
+  const unifiedScopeTexts = useMemo(() => computed.unified.map((r) => r.text), [computed.unified]);
+
+  const totalHunks = computed.hunks.length;
 
   const jumpHunk = (dir: -1 | 1) => {
     if (totalHunks === 0) return;
@@ -618,6 +680,17 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     }
   };
 
+  // Live edits: scroll to the lines an agent just wrote (unless the user is busy scrolling/typing).
+  const handledFlashRef = useRef(0);
+  useEffect(() => {
+    if (!liveFlash || !followEdits || handledFlashRef.current === liveFlash.key) return;
+    const el = scrollContainerRef.current?.querySelector('[data-live="1"]');
+    if (!el) return;
+    handledFlashRef.current = liveFlash.key;
+    if (userActivityRef && Date.now() - userActivityRef.current < 4000) return;
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }, [liveFlash, followEdits, diff, viewMode, userActivityRef]);
+
   // VS Code F7 / Shift+F7 hunk navigation shortcut
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -632,7 +705,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
 
   // Overview Ruler markers (proportional vertical tick marks like VS Code's diff minimap)
   const overviewMarkers = useMemo(() => {
-    const list = viewMode === 'split' ? splitFolded.items : unifiedFolded.items;
+    const list = viewMode === 'split' ? splitItems : unifiedItems;
     const total = list.length;
     if (total === 0) return [] as Array<{ topPct: number; heightPct: number; kind: 'add' | 'del' | 'mod' }>;
 
@@ -686,34 +759,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       });
     }
     return markers;
-  }, [viewMode, splitFolded.items, unifiedFolded.items]);
-
-  // Proportional 5-block mini diff stat bar
-  const statBlocks = useMemo(() => {
-    const total = computed.adds + computed.dels;
-    if (total === 0) return [] as Array<'add' | 'del' | 'neutral'>;
-    const blocks = 5;
-    let addBlocks = Math.round((computed.adds / total) * blocks);
-    let delBlocks = Math.round((computed.dels / total) * blocks);
-    if (computed.adds > 0 && addBlocks === 0) {
-      addBlocks = 1;
-      if (delBlocks >= blocks) delBlocks = blocks - 1;
-    }
-    if (computed.dels > 0 && delBlocks === 0) {
-      delBlocks = 1;
-      if (addBlocks >= blocks) addBlocks = blocks - 1;
-    }
-    while (addBlocks + delBlocks > blocks) {
-      if (addBlocks >= delBlocks) addBlocks--;
-      else delBlocks--;
-    }
-    const neutralBlocks = Math.max(0, blocks - addBlocks - delBlocks);
-    return [
-      ...Array<'add'>(addBlocks).fill('add'),
-      ...Array<'del'>(delBlocks).fill('del'),
-      ...Array<'neutral'>(neutralBlocks).fill('neutral'),
-    ];
-  }, [computed.adds, computed.dels]);
+  }, [viewMode, splitItems, unifiedItems]);
 
   const expandRange = (from: number, to: number) => {
     setExpandedRanges((prev) => [...prev, { from, to }]);
@@ -766,6 +812,18 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     );
   };
 
+  const askAboutHunk = (hunk: HunkMeta) => {
+    const first = computed.unified[hunk.firstRow];
+    const lineNum = first ? first.newLine ?? first.oldLine : null;
+    onAskAgent(
+      `Regarding the change in \`${diff.path}${lineNum ? `:${lineNum}` : ''}\`:
+\`\`\`diff
+${hunk.excerpt.slice(0, 3500)}
+\`\`\`
+`
+    );
+  };
+
   const copyPath = async () => {
     try {
       await navigator.clipboard.writeText(diff.path);
@@ -777,123 +835,129 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     }
   };
 
-  const emptyCellBg =
-    theme.type === 'dark'
-      ? 'repeating-linear-gradient(-45deg, transparent, transparent 5px, rgba(255,255,255,0.028) 5px, rgba(255,255,255,0.028) 6px)'
-      : 'repeating-linear-gradient(-45deg, transparent, transparent 5px, rgba(15,23,42,0.04) 5px, rgba(15,23,42,0.04) 6px)';
+  // Flat recessed fill for the empty side of a split diff (no busy diagonal hatching).
+  const emptyCellBg = theme.type === 'dark' ? 'rgba(0, 0, 0, 0.16)' : 'rgba(15, 23, 42, 0.035)';
 
-  const leftPaneLabel = commitContext
+  const contextBadge = commitContext
     ? commitContext.mode === 'commit'
-      ? `Parent (${commitContext.shortHash}^)`
-      : `Commit (${commitContext.shortHash})`
+      ? `${commitContext.shortHash}^ → ${commitContext.shortHash}`
+      : `${commitContext.shortHash} → Working Tree`
     : diff.staged
-    ? 'HEAD (Original)'
-    : 'Index / HEAD (Original)';
+    ? 'HEAD → Staged'
+    : 'Index → Working Tree';
 
-  const rightPaneLabel = commitContext
-    ? commitContext.mode === 'commit'
-      ? `Commit (${commitContext.shortHash})`
-      : 'Working Tree (Current)'
-    : diff.staged
-    ? 'Staged (Index)'
-    : 'Working Tree (Modified)';
+  const pathSlash = diff.path.lastIndexOf('/');
+  const pathDir = pathSlash >= 0 ? diff.path.slice(0, pathSlash + 1) : '';
+  const pathName = pathSlash >= 0 ? diff.path.slice(pathSlash + 1) : diff.path;
 
   const cellWrapClass = wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre';
 
   const renderFoldRow = (
     item: { id: string; startIndex: number; endIndex: number; count: number },
-    colSpan: number
-  ) => (
-    <tr
-      key={item.id}
-      className="bg-[var(--bg-sidebar)]/85 border-y border-[var(--border)]/70 select-none"
-    >
-      <td colSpan={colSpan} className="py-1 px-3 text-[11px] font-sans text-[var(--text-muted)]">
-        <div className="flex items-center justify-center gap-2">
-          {item.count > EXPAND_STEP && (
+    colSpan: number,
+    scopeTexts: string[]
+  ) => {
+    const scope = findScopeLabel(scopeTexts, item.endIndex);
+    return (
+      <tr key={item.id} className="select-none">
+        <td
+          colSpan={colSpan}
+          className="h-6 px-3 text-[11px] font-sans text-[var(--text-muted)] border-y border-dashed border-[var(--border)]/60 bg-[var(--bg-sidebar)]/50"
+        >
+          <div className="flex items-center justify-center gap-1.5 min-w-0">
+            {item.count > EXPAND_STEP && (
+              <button
+                onClick={() => expandRange(item.endIndex - EXPAND_STEP, item.endIndex)}
+                className="px-1.5 rounded hover:bg-[var(--bg-hover)] text-[var(--accent)] flex items-center gap-0.5 cursor-pointer"
+                title={`Show ${EXPAND_STEP} lines above`}
+              >
+                <ChevronUp size={11.5} />+{EXPAND_STEP}
+              </button>
+            )}
             <button
-              onClick={() => expandRange(item.startIndex, item.startIndex + EXPAND_STEP)}
-              className="px-1.5 py-0.5 rounded hover:bg-[var(--bg-hover)] text-[var(--accent)] flex items-center gap-0.5 cursor-pointer"
-              title={`Expand ${EXPAND_STEP} lines below`}
+              onClick={() => expandRange(item.startIndex, item.endIndex)}
+              className="px-2 rounded hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] inline-flex items-center gap-1.5 min-w-0 cursor-pointer transition-colors"
+              title={`Expand ${item.count} unchanged lines`}
             >
-              <ChevronDown size={11.5} />
-              +{EXPAND_STEP}
-            </button>
-          )}
-          <button
-            onClick={() => expandRange(item.startIndex, item.endIndex)}
-            className="px-2 py-0.5 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] inline-flex items-center gap-1.5 cursor-pointer transition-colors"
-          >
-            <UnfoldVertical size={12} className="text-[var(--accent)]" />
-            Expand {item.count} unchanged lines
-          </button>
-          {item.count > EXPAND_STEP && (
-            <button
-              onClick={() => expandRange(item.endIndex - EXPAND_STEP, item.endIndex)}
-              className="px-1.5 py-0.5 rounded hover:bg-[var(--bg-hover)] text-[var(--accent)] flex items-center gap-0.5 cursor-pointer"
-              title={`Expand ${EXPAND_STEP} lines above`}
-            >
-              <ChevronUp size={11.5} />
-              +{EXPAND_STEP}
-            </button>
-          )}
-        </div>
-      </td>
-    </tr>
-  );
-
-  const renderHunkHeaderRow = (hunk: HunkMeta, colSpan: number) => (
-    <tr
-      key={`hunk-${hunk.index}`}
-      className="bg-[var(--accent)]/[0.07] border-y border-[var(--border)]/60 select-none"
-    >
-      <td colSpan={colSpan} className="px-3 py-[3px] font-mono text-[11px]">
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-[var(--text-muted)]">
-            @@ -{hunk.oldCount === 0 ? Math.max(0, hunk.oldStart - 1) : hunk.oldStart},
-            {hunk.oldCount} +{hunk.newCount === 0 ? Math.max(0, hunk.newStart - 1) : hunk.newStart},
-            {hunk.newCount} @@
-          </span>
-          {canApplyHunks && (
-            <div className="flex items-center gap-1 font-sans">
-              {diff.staged ? (
-                <button
-                  disabled={hunkBusy === hunk.index}
-                  onClick={() => triggerHunkAction(hunk, 'unstage')}
-                  className="px-2 py-0.5 text-[10.5px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] flex items-center gap-1 cursor-pointer disabled:opacity-40"
-                  title="Unstage only this hunk"
-                >
-                  <Minus size={10.5} />
-                  Unstage Hunk
-                </button>
-              ) : (
-                <>
-                  <button
-                    disabled={hunkBusy === hunk.index}
-                    onClick={() => triggerHunkAction(hunk, 'stage')}
-                    className="px-2 py-0.5 text-[10.5px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] text-[var(--text-primary)] flex items-center gap-1 cursor-pointer disabled:opacity-40"
-                    title="Stage only this hunk"
-                  >
-                    <Plus size={10.5} />
-                    Stage Hunk
-                  </button>
-                  <button
-                    disabled={hunkBusy === hunk.index}
-                    onClick={() => triggerHunkAction(hunk, 'revert')}
-                    className="px-2 py-0.5 text-[10.5px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--removed-bg)] text-[var(--removed-fg)] flex items-center gap-1 cursor-pointer disabled:opacity-40"
-                    title="Revert only this hunk"
-                  >
-                    <RotateCcw size={10.5} />
-                    Revert Hunk
-                  </button>
-                </>
+              <UnfoldVertical size={12} className="text-[var(--accent)] shrink-0" />
+              <span className="shrink-0">{item.count} unchanged lines</span>
+              {scope && (
+                <span className="font-mono text-[10.5px] text-[var(--text-dim)] truncate">
+                  · {scope}
+                </span>
               )}
-            </div>
-          )}
-        </div>
-      </td>
-    </tr>
-  );
+            </button>
+            {item.count > EXPAND_STEP && (
+              <button
+                onClick={() => expandRange(item.startIndex, item.startIndex + EXPAND_STEP)}
+                className="px-1.5 rounded hover:bg-[var(--bg-hover)] text-[var(--accent)] flex items-center gap-0.5 cursor-pointer"
+                title={`Show ${EXPAND_STEP} lines below`}
+              >
+                <ChevronDown size={11.5} />+{EXPAND_STEP}
+              </button>
+            )}
+          </div>
+        </td>
+      </tr>
+    );
+  };
+
+  /** Floating pill pinned to the top-right of a change cluster (no dedicated row). */
+  const renderHunkPill = (cluster: number) => {
+    const hunk = computed.hunks[cluster];
+    if (!hunk) return null;
+    const busy = hunkBusy === hunk.index;
+    const btn =
+      'px-1.5 h-[22px] text-[10.5px] font-sans flex items-center gap-1 cursor-pointer disabled:opacity-40 hover:bg-[var(--bg-hover)] text-[var(--text-primary)]';
+    return (
+      <div
+        className="absolute right-2 top-0.5 z-10 flex items-stretch rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] shadow-md overflow-hidden divide-x divide-[var(--border)]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        {canApplyHunks &&
+          (diff.staged ? (
+            <button
+              disabled={busy}
+              onClick={() => triggerHunkAction(hunk, 'unstage')}
+              className={btn}
+              title="Unstage this change"
+            >
+              <Minus size={10.5} />
+              Unstage
+            </button>
+          ) : (
+            <>
+              <button
+                disabled={busy}
+                onClick={() => triggerHunkAction(hunk, 'stage')}
+                className={btn}
+                title="Stage this change"
+              >
+                <Plus size={10.5} />
+                Stage
+              </button>
+              <button
+                disabled={busy}
+                onClick={() => triggerHunkAction(hunk, 'revert')}
+                className={`${btn} text-[var(--removed-fg)]`}
+                title="Revert this change"
+              >
+                <RotateCcw size={10.5} />
+                Revert
+              </button>
+            </>
+          ))}
+        <button onClick={() => askAboutHunk(hunk)} className={btn} title="Quote this change to Agent Chat">
+          <MessageSquarePlus size={10.5} />
+          Ask
+        </button>
+      </div>
+    );
+  };
+
+  const isLiveLine = (line: number | null): boolean =>
+    !!liveFlash && line !== null && liveFlash.ranges.some((r) => line >= r.from && line <= r.to);
+  const liveClass = liveFlash ? `live-flash-${liveFlash.key % 2}` : '';
 
   return (
     <div ref={setRootEl} className="@container flex-1 flex flex-col min-h-0 min-w-0 bg-[var(--bg-base)]">
@@ -923,11 +987,9 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       {/* Diff Toolbar */}
       <div className="flex items-center justify-between px-3 py-1.5 border-b border-[var(--border)] bg-[var(--bg-sidebar)] gap-2 shrink-0 flex-wrap">
         <div className="flex items-center gap-2 min-w-0">
-          <span
-            className="font-mono text-xs font-medium truncate text-[var(--text-primary)]"
-            title={diff.path}
-          >
-            {diff.path}
+          <span className="font-mono text-xs truncate" title={diff.path}>
+            <span className="text-[var(--text-dim)]">{pathDir}</span>
+            <span className="font-medium text-[var(--text-primary)]">{pathName}</span>
           </span>
           <button
             onClick={copyPath}
@@ -936,11 +998,16 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           >
             {copiedPath ? <Check size={12} className="text-[var(--added-fg)]" /> : <Copy size={12} />}
           </button>
-          {!commitContext && diff.staged && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--accent)] text-[var(--accent-fg)] font-semibold tracking-wide shrink-0">
-              STAGED
-            </span>
-          )}
+          <span
+            className={`text-[10.5px] px-1.5 py-0.5 rounded border font-mono shrink-0 ${
+              !commitContext && diff.staged
+                ? 'bg-[var(--accent)] text-[var(--accent-fg)] border-transparent font-semibold'
+                : 'bg-[var(--bg-elevated)] text-[var(--text-muted)] border-[var(--border)]'
+            }`}
+            title={commitContext ? commitContext.subject : 'Comparison shown'}
+          >
+            {contextBadge}
+          </span>
           <div className="flex items-center gap-1.5 shrink-0 tabular-nums">
             <span className="text-xs font-mono font-medium text-[var(--added-fg)]">
               +{computed.adds}
@@ -948,27 +1015,6 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             <span className="text-xs font-mono font-medium text-[var(--removed-fg)]">
               -{computed.dels}
             </span>
-            {statBlocks.length > 0 && (
-              <span
-                className="inline-flex items-center gap-[2px] ml-0.5"
-                title={`+${computed.adds} additions, -${computed.dels} deletions`}
-              >
-                {statBlocks.map((b, idx) => (
-                  <span
-                    key={idx}
-                    className="w-1.5 h-1.5 rounded-[1.5px]"
-                    style={{
-                      background:
-                        b === 'add'
-                          ? 'var(--added-fg)'
-                          : b === 'del'
-                          ? 'var(--removed-fg)'
-                          : 'var(--border)',
-                    }}
-                  />
-                ))}
-              </span>
-            )}
           </div>
         </div>
 
@@ -1147,28 +1193,6 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         </div>
       </div>
 
-      {/* Split Pane Sub-Headers (Original vs Modified) */}
-      {!diff.binary && (computed.adds > 0 || computed.dels > 0) && viewMode === 'split' && (
-        <div className="grid grid-cols-2 border-b border-[var(--border)] bg-[var(--bg-sidebar)]/55 text-[11px] font-medium text-[var(--text-muted)] shrink-0 select-none pr-[10px]">
-          <div className="px-3 py-1 border-r border-[var(--border)] flex items-center justify-between">
-            <span className="truncate">{leftPaneLabel}</span>
-            {computed.dels > 0 && (
-              <span className="font-mono text-[10.5px] text-[var(--removed-fg)]">
-                -{computed.dels}
-              </span>
-            )}
-          </div>
-          <div className="px-3 py-1 flex items-center justify-between">
-            <span className="truncate">{rightPaneLabel}</span>
-            {computed.adds > 0 && (
-              <span className="font-mono text-[10.5px] text-[var(--added-fg)]">
-                +{computed.adds}
-              </span>
-            )}
-          </div>
-        </div>
-      )}
-
       {/* Diff Body + VS Code Overview Ruler */}
       {diff.binary ? (
         <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-muted)]">
@@ -1193,6 +1217,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         <div className="flex-1 flex min-h-0 relative overflow-hidden">
           <div
             ref={scrollContainerRef}
+            onMouseLeave={() => setHoverHunk(-1)}
             className="flex-1 overflow-auto font-mono text-[13px] leading-[1.6]"
           >
             {viewMode === 'split' ? (
@@ -1204,15 +1229,12 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                   <col className="w-1/2" />
                 </colgroup>
                 <tbody>
-                  {splitFolded.items.map((item) => {
+                  {splitItems.map((item) => {
                     if (item.kind === 'fold') {
-                      return renderFoldRow(item, 4);
-                    }
-                    if (item.kind === 'hunk-header') {
-                      return renderHunkHeaderRow(item.hunk, 4);
+                      return renderFoldRow(item, 4, splitScopeTexts);
                     }
 
-                    const { row, index, hunkIndex } = item;
+                    const { row, index, cluster, clusterStart } = item;
                     const leftRanges = row.pairHighlight
                       ? computeChangedRanges(row.left.text, row.right.text, 'left')
                       : [];
@@ -1227,17 +1249,19 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                       row.right.line !== null
                         ? syntaxTokens.newLines[row.right.line - 1]
                         : undefined;
-                    const isActiveHunk = hunkIndex !== undefined && hunkIndex === activeHunk;
+                    const isActiveHunk = clusterStart && cluster === activeHunk;
+                    const showPill = clusterStart && (hoverHunk === cluster || activeHunk === cluster);
+                    const live = isLiveLine(row.right.line) && row.right.type === 'add';
 
                     return (
                       <tr
                         key={index}
                         ref={(el) => {
-                          if (hunkIndex !== undefined) {
-                            hunkRefs.current[hunkIndex] = el;
-                          }
+                          if (clusterStart) hunkRefs.current[cluster] = el;
                         }}
-                        className={`group ${
+                        data-live={live ? '1' : undefined}
+                        onMouseEnter={cluster >= 0 ? () => setHoverHunk(cluster) : undefined}
+                        className={`group ${live ? liveClass : ''} ${
                           isActiveHunk ? 'outline outline-1 outline-[var(--accent)]/60' : ''
                         }`}
                       >
@@ -1262,7 +1286,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
 
                         {/* Left content */}
                         <td
-                          className={`px-2.5 border-r border-[var(--border)] align-top ${cellWrapClass}`}
+                          className={`px-2.5 border-r border-[var(--border)] align-top relative ${cellWrapClass}`}
                           style={{
                             background:
                               row.left.type === 'remove'
@@ -1284,6 +1308,15 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                               leftRanges,
                               'var(--removed-word)'
                             )}
+                          {row.left.type === 'remove' && (
+                            <button
+                              onClick={() => askAboutLine(row.left.line, row.left.text)}
+                              className="opacity-0 group-hover:opacity-100 absolute right-1.5 top-0.5 px-1.5 py-0.5 text-[10px] font-sans rounded bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer transition-opacity"
+                              title="Quote this deleted line to Agent Chat"
+                            >
+                              Ask
+                            </button>
+                          )}
                         </td>
 
                         {/* Right gutter */}
@@ -1329,7 +1362,8 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                               rightRanges,
                               'var(--added-word)'
                             )}
-                          {row.right.line !== null && (
+                          {showPill && renderHunkPill(cluster)}
+                          {row.right.line !== null && !showPill && (
                             <button
                               onClick={() => askAboutLine(row.right.line, row.right.text)}
                               className="opacity-0 group-hover:opacity-100 absolute right-1.5 top-0.5 px-1.5 py-0.5 text-[10px] font-sans rounded bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer transition-opacity"
@@ -1347,15 +1381,12 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             ) : (
               <table className="w-full border-collapse">
                 <tbody>
-                  {unifiedFolded.items.map((item) => {
+                  {unifiedItems.map((item) => {
                     if (item.kind === 'fold') {
-                      return renderFoldRow(item, 4);
-                    }
-                    if (item.kind === 'hunk-header') {
-                      return renderHunkHeaderRow(item.hunk, 4);
+                      return renderFoldRow(item, 4, unifiedScopeTexts);
                     }
 
-                    const { row, index, hunkIndex } = item;
+                    const { row, index, cluster, clusterStart } = item;
                     const spans =
                       row.type === 'remove'
                         ? row.oldLine !== null
@@ -1382,17 +1413,19 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                         ? 'inset 3px 0 0 var(--removed-fg)'
                         : undefined;
 
-                    const isActiveHunk = hunkIndex !== undefined && hunkIndex === activeHunk;
+                    const isActiveHunk = clusterStart && cluster === activeHunk;
+                    const showPill = clusterStart && (hoverHunk === cluster || activeHunk === cluster);
+                    const live = isLiveLine(row.newLine) && row.type === 'add';
 
                     return (
                       <tr
                         key={index}
                         ref={(el) => {
-                          if (hunkIndex !== undefined) {
-                            hunkRefs.current[hunkIndex] = el;
-                          }
+                          if (clusterStart) hunkRefs.current[cluster] = el;
                         }}
-                        className={`group ${
+                        data-live={live ? '1' : undefined}
+                        onMouseEnter={cluster >= 0 ? () => setHoverHunk(cluster) : undefined}
+                        className={`group ${live ? liveClass : ''} ${
                           isActiveHunk ? 'outline outline-1 outline-[var(--accent)]/60' : ''
                         }`}
                         style={{
@@ -1424,6 +1457,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
                         </td>
                         <td className={`px-2.5 relative align-top ${cellWrapClass}`}>
                           {renderSyntaxSpans(row.text, spans, changedRanges, wordBg)}
+                          {showPill && renderHunkPill(cluster)}
                           <button
                             onClick={() => askAboutLine(row.newLine ?? row.oldLine, row.text)}
                             className="opacity-0 group-hover:opacity-100 absolute right-2 top-0.5 px-1.5 py-0.5 text-[10px] font-sans rounded bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer transition-opacity"

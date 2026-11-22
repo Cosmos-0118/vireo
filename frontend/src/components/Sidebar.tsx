@@ -35,6 +35,8 @@ interface SidebarProps {
   onToast: (msg: string, isError?: boolean) => void;
   fsVersion: number;
   onAskAgent: (text: string) => void;
+  /** path -> pulse key for files an agent just changed. */
+  recentPaths?: Record<string, number>;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -53,6 +55,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToast,
   fsVersion,
   onAskAgent,
+  recentPaths,
 }) => {
   const totalChanged = gitStatus?.files.length ?? 0;
 
@@ -126,6 +129,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onOpenGraphTab={onOpenGraphTab}
             onRefreshGit={onRefreshGit}
             onToast={onToast}
+            recentPaths={recentPaths}
           />
         )}
 
@@ -136,6 +140,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             selectedPath={selectedPath}
             workspacePath={workspacePath}
             fsVersion={fsVersion}
+            recentPaths={recentPaths}
             onOpenFile={(p) => onOpenFile(p)}
             onOpenDiff={onOpenDiff}
             onAskAgent={onAskAgent}
