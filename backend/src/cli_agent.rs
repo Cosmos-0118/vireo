@@ -178,21 +178,24 @@ impl Normalizer {
                     Some("command_execution") => {
                         if self.started.insert(id.clone()) {
                             let command = simplify_command(item["command"].as_str().unwrap_or(""));
-                            self.names.insert(id.clone(), "run_command".to_string());
-                            out.push(Out::ToolCall {
-                                id: id.clone(),
-                                name: "run_command".to_string(),
-                                args: json!({ "command": command }),
-                            });
+                            let (name, args) = map_vx(&command, &self.ws)
+                                .unwrap_or_else(|| ("run_command".to_string(), json!({ "command": command })));
+                            self.names.insert(id.clone(), name.clone());
+                            out.push(Out::ToolCall { id: id.clone(), name, args });
                         }
                         if completed {
                             let code = item["exit_code"].as_i64().unwrap_or(-1);
                             let output = item["aggregated_output"].as_str().unwrap_or("");
-                            out.push(Out::ToolResult {
-                                id,
-                                name: "run_command".to_string(),
-                                result: format!("exit={code}\n{output}"),
-                            });
+                            let name = self.names.get(&id).cloned().unwrap_or_else(|| "run_command".to_string());
+                            let result = if name == "run_command" {
+                                format!("exit={code}
+{output}")
+                            } else if code != 0 && !output.starts_with("Error") {
+                                format!("Error: {output}")
+                            } else {
+                                output.to_string()
+                            };
+                            out.push(Out::ToolResult { id, name, result });
                         }
                     }
                     Some("file_change") if completed => {
@@ -290,10 +293,10 @@ fn map_claude_tool(name: &str, input: &Value, ws: &Path) -> (String, Value) {
         "Edit" | "MultiEdit" => ("edit_file".to_string(), json!({ "path": path_of("file_path") })),
         "NotebookEdit" => ("edit_file".to_string(), json!({ "path": path_of("notebook_path") })),
         "Write" => ("write_file".to_string(), json!({ "path": path_of("file_path") })),
-        "Bash" => (
-            "run_command".to_string(),
-            json!({ "command": input["command"].as_str().unwrap_or("") }),
-        ),
+        "Bash" => {
+            let cmd = input["command"].as_str().unwrap_or("");
+            map_vx(cmd, ws).unwrap_or_else(|| ("run_command".to_string(), json!({ "command": cmd })))
+        }
         "Grep" => (
             "search_code".to_string(),
             json!({ "query": input["pattern"].as_str().unwrap_or("") }),
@@ -312,6 +315,59 @@ fn map_claude_tool(name: &str, input: &Value, ws: &Path) -> (String, Value) {
             (other.to_string(), args)
         }
     }
+}
+
+/// Recognise a `vx ...` shell call and present it with the chat UI's tool vocabulary.
+fn map_vx(command: &str, ws: &Path) -> Option<(String, Value)> {
+    let re = regex::Regex::new(r"(?:^|\|\s*|&&\s*|;\s*)vx(?:\.exe)?\s+(\w+)([^\r\n]*)").ok()?;
+    let c = re.captures(command)?;
+    let sub = c.get(1)?.as_str();
+    let rest = c.get(2)?.as_str();
+    let toks: Vec<String> = rest
+        .split_whitespace()
+        .map(|t| t.trim_matches(|ch| ch == '"' || ch == '\'').to_string())
+        .take_while(|t| !t.starts_with("<<"))
+        .collect();
+    let pos: Vec<&String> = toks.iter().filter(|t| !t.starts_with('-')).collect();
+    let flag = |f: &str| toks.iter().any(|t| t == f);
+    let path = |i: usize| pos.get(i).map(|p| rel_path(ws, p)).unwrap_or_default();
+    Some(match sub {
+        "map" => ("repo_map".into(), json!({ "query": pos.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ") })),
+        "outline" => ("outline".into(), json!({ "path": path(0) })),
+        "view" => {
+            let mut a = json!({ "path": path(0) });
+            if let Some(t) = pos.get(1) {
+                if let Some((s, e)) = t.split_once("..") {
+                    if let Ok(s) = s.parse::<u64>() {
+                        a["start_line"] = json!(s);
+                    }
+                    if let Ok(e) = e.parse::<u64>() {
+                        a["end_line"] = json!(e);
+                    }
+                } else {
+                    a["symbol"] = json!(t);
+                }
+            }
+            ("read_file".into(), a)
+        }
+        "edit" => ("edit_file".into(), json!({ "path": path(0) })),
+        "symbol" if flag("--replace") || flag("--insert-after") || flag("--delete") => {
+            let mode = if flag("--replace") { "replace" } else if flag("--delete") { "delete" } else { "insert_after" };
+            ("symbol_edit".into(), json!({ "path": path(0), "symbol": pos.get(1).map(|s| s.as_str()).unwrap_or(""), "mode": mode }))
+        }
+        "symbol" => ("read_file".into(), json!({ "path": path(0), "symbol": pos.get(1).map(|s| s.as_str()).unwrap_or("") })),
+        "create" => ("write_file".into(), json!({ "path": path(0) })),
+        "search" => ("search_code".into(), json!({ "query": pos.first().map(|s| s.as_str()).unwrap_or("") })),
+        "ast" => {
+            let mut a = json!({ "pattern": pos.first().map(|s| s.as_str()).unwrap_or("") });
+            if flag("-r") || flag("--rewrite") {
+                a["rewrite"] = json!("…");
+            }
+            ("ast".into(), a)
+        }
+        "check" => ("verify".into(), json!({ "command": "" })),
+        _ => return None,
+    })
 }
 
 /// Codex reports the full shell invocation (`pwsh.exe -Command "<script>"`); show just the script.
@@ -386,6 +442,23 @@ fn cli_args(kind: CliKind, ws: &Path, model: &str) -> Vec<String> {
         .chain(std::iter::once(ws.to_string_lossy().to_string()))
         .collect(),
     };
+    // Give the CLI the `vx` tools (found on PATH) without touching its own config: the usage
+    // hint and, for Claude's headless mode, permission to run `vx` come from command-line flags.
+    if crate::pty::vx_dir().is_some() {
+        match kind {
+            CliKind::Claude => {
+                args.push("--append-system-prompt".to_string());
+                args.push(crate::code_intel::AGENT_HINT.to_string());
+                args.push("--allowedTools".to_string());
+                args.push("Bash(vx:*)".to_string());
+            }
+            CliKind::Codex => {
+                args.push("-c".to_string());
+                let quoted = serde_json::to_string(crate::code_intel::AGENT_HINT).unwrap_or_default();
+                args.push(format!("developer_instructions={quoted}"));
+            }
+        }
+    }
     if want_model {
         args.push(if kind == CliKind::Codex { "-m" } else { "--model" }.to_string());
         args.push(model.to_string());
@@ -445,6 +518,7 @@ pub async fn run(
         .args(cli_args(kind, ws, &req.model))
         .current_dir(ws)
         .env("PATH", crate::pty::augmented_path_env())
+        .env("VIREO_WORKSPACE", ws)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -662,5 +736,21 @@ mod tests {
         assert!(!cli_args(CliKind::Codex, ws, "default").contains(&"-m".to_string()));
         assert!(cli_args(CliKind::Codex, ws, "gpt-5.6-luna").contains(&"-m".to_string()));
         assert!(cli_args(CliKind::Claude, ws, "sonnet").contains(&"--model".to_string()));
+    }
+
+    #[test]
+    fn vx_shell_calls_map_to_chat_tools() {
+        let ws = Path::new("C:/w");
+        let (n, a) = map_vx("vx edit C:/w/src/a.rs 5#ab..9#cd <<'EOF'
+new
+EOF", ws).unwrap();
+        assert_eq!((n.as_str(), a["path"].as_str()), ("edit_file", Some("src/a.rs")));
+        let (n, a) = map_vx("@'
+x
+'@ | vx symbol src/a.rs Foo::bar --replace", ws).unwrap();
+        assert_eq!((n.as_str(), a["mode"].as_str()), ("symbol_edit", Some("replace")));
+        let (n, a) = map_vx("vx view src/a.rs 10..20", ws).unwrap();
+        assert_eq!((n.as_str(), a["start_line"].as_u64(), a["end_line"].as_u64()), ("read_file", Some(10), Some(20)));
+        assert!(map_vx("cargo build", ws).is_none());
     }
 }

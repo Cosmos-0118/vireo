@@ -112,11 +112,24 @@ function describeTool(t: ToolCallTrace): ToolView {
         Icon: FileCode,
         verb: 'Read',
         subject: path,
-        meta: s || e ? `L${s ?? 1}–${e ?? ''}` : undefined,
+        meta: str('symbol') || (s || e ? `L${s ?? 1}–${e ?? ''}` : undefined),
         path,
         edits: false,
       };
     }
+    case 'outline':
+      return { Icon: FileCode, verb: 'Outlined', subject: str('path'), path: str('path'), edits: false };
+    case 'repo_map':
+      return { Icon: FolderOpen, verb: 'Mapped', subject: str('query') || str('dir') || 'repo', edits: false };
+    case 'symbol_edit': {
+      const mode = str('mode');
+      const mut = mode === 'replace' || mode === 'insert_after' || mode === 'delete';
+      return { Icon: mut ? GitCompare : FileCode, verb: mut ? 'Edited' : 'Read', subject: str('path'), meta: str('symbol'), path: str('path'), edits: mut };
+    }
+    case 'ast':
+      return { Icon: Search, verb: str('rewrite') ? 'Rewrote' : 'AST search', subject: str('pattern'), edits: !!str('rewrite') };
+    case 'verify':
+      return { Icon: TerminalIcon, verb: 'Verified', subject: str('command') || 'build', edits: false };
     case 'search_code':
       return { Icon: Search, verb: 'Searched', subject: `"${str('query')}"`, edits: false };
     case 'list_files':
@@ -436,7 +449,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                   : m
               )
             );
-            if (res.name === 'write_file' || res.name === 'edit_file') {
+            if (['write_file', 'edit_file', 'symbol_edit', 'ast'].includes(res.name)) {
               onRefreshGit();
             }
           },

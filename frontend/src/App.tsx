@@ -777,7 +777,7 @@ export function App() {
             at: Date.now(),
           });
         }
-        return [...m.values()].slice(-6);
+        return [...m.values()].slice(-100);
       });
       setPillVisible(true);
       window.clearTimeout(pillTimerRef.current);
@@ -844,6 +844,27 @@ export function App() {
       return { ...prev, [path]: b.replace(/\r\n?/g, '\n').replace(/\n/g, eol) };
     });
   }, []);
+
+  // Committed, stashed or reverted files have no pending changes left: drop them from the
+  // agent-edits bar and from the review baselines (so "Undo all" can't roll back committed work).
+  useEffect(() => {
+    if (!gitStatus?.is_repo) return;
+    const dirty = gitStatus.files.map((f) => f.path.replace(/\\/g, '/'));
+    const exact = new Set(dirty);
+    const dirs = dirty.filter((d) => d.endsWith('/'));
+    const stillChanged = (p: string) => exact.has(p) || dirs.some((d) => p.startsWith(d));
+    setLiveEdits((prev) => {
+      const next = prev.filter((e) => stillChanged(e.path));
+      return next.length === prev.length ? prev : next;
+    });
+    setReview((prev) => {
+      const gone = Object.keys(prev).filter((p) => !stillChanged(p));
+      if (!gone.length) return prev;
+      const next = { ...prev };
+      for (const p of gone) delete next[p];
+      return next;
+    });
+  }, [gitStatus]);
 
   const keepAll = () => {
     setReview({});

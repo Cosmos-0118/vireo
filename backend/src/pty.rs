@@ -177,7 +177,19 @@ pub fn augmented_path_env() -> OsString {
         }
     }
 
+    // `vx` (Vireo's token-lean code tools) ships next to the main executable.
+    if let Some(dir) = vx_dir() {
+        push_unique_dir(&mut dirs, dir);
+    }
+
     std::env::join_paths(dirs).unwrap_or(existing_raw)
+}
+
+/// Directory holding the `vx` helper binary (next to this executable), if it was built.
+pub fn vx_dir() -> Option<PathBuf> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let name = if cfg!(windows) { "vx.exe" } else { "vx" };
+    dir.join(name).is_file().then_some(dir)
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -419,6 +431,7 @@ fn build_windows_shell(
 
     c.cwd(workspace);
     c.env("PATH", path_env);
+    c.env("VIREO_WORKSPACE", workspace);
     c.env("TERM", "xterm-256color");
     c.env("COLORTERM", "truecolor");
     c.env("FORCE_COLOR", "1");
@@ -453,6 +466,7 @@ fn build_unix_shell(
     }
     c.cwd(workspace);
     c.env("PATH", path_env);
+    c.env("VIREO_WORKSPACE", workspace);
     c.env("TERM", "xterm-256color");
     c.env("COLORTERM", "truecolor");
     c.env("FORCE_COLOR", "1");

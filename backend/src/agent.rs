@@ -34,18 +34,20 @@ pub struct AgentChatReq {
 }
 
 const SYSTEM_PROMPT: &str = r#"You are Vireo Agent, a concise, practical AI software engineer working directly inside the user's local repository.
-You have tools to inspect and modify files and run commands:
-- list_files(dir?)
-- read_file(path, start_line?, end_line?)
-- search_code(query)
-- write_file(path, content)
-- edit_file(path, old_text, new_text)
-- run_command(command)
+You have token-efficient tools to inspect and modify files and run commands:
+- repo_map(query?, dir?) ranked symbol map; outline(path) symbols with [start#hash..end#hash] ranges
+- read_file(path, start_line?, end_line?, symbol?) returns lines as `N#hash|code`
+- search_code(query) returns `file:line#hash| text`
+- edit_file(path, start, end?, new_text) replaces lines by their `N#hash` anchors (copy them from read_file/outline/search/verify output); no old text needed. Use op=insert_after/insert_before/delete for those cases.
+- symbol_edit(path, symbol, mode, new_code?) reads or changes a whole function/struct/class by name
+- ast(pattern, lang?, rewrite?) structural search / multi-file codemod (ast-grep)
+- verify(command?) runs build/tests and returns only deduplicated errors with anchors
+- write_file(path, content) for new files; run_command(command) for anything else
 
 Guidelines:
-- Always read relevant files before editing them.
-- Make minimal, clean, well-tested changes.
-- Prefer edit_file for targeted edits; use write_file for new files.
+- Orient with repo_map/outline, then read only the needed symbol or range, not whole files.
+- Edits report new syntax errors immediately; you do not need to re-read after editing. If an edit is rejected for stale anchors, use the fresh snippet it returns.
+- Make minimal, clean, well-tested changes; run verify after changing code.
 - After making edits, summarize what changed and mention any commands or tests to run."#;
 
 fn openai_tools_schema() -> Value {
@@ -66,14 +68,41 @@ fn openai_tools_schema() -> Value {
         {
             "type": "function",
             "function": {
+                "name": "repo_map",
+                "description": "Ranked map of source files and symbol signatures. Pass query to focus; far cheaper than reading files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string", "description": "Keywords (symbol or file names)." },
+                        "dir": { "type": "string", "description": "Optional subdirectory." }
+                    }
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "outline",
+                "description": "Symbols of a source file as [start#hash..end#hash] ranges (usable as edit_file anchors).",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "read_file",
-                "description": "Read a text file in the workspace (optionally a line range).",
+                "description": "Read lines as `N#hash|code` (optionally a line range or one symbol). Large files are capped; prefer outline + symbol/range.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
                         "start_line": { "type": "integer" },
-                        "end_line": { "type": "integer" }
+                        "end_line": { "type": "integer" },
+                        "symbol": { "type": "string", "description": "Read just this function/class, e.g. `run_loop` or `Type::method`." }
                     },
                     "required": ["path"]
                 }
@@ -83,11 +112,12 @@ fn openai_tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "search_code",
-                "description": "Search text/regex across the workspace using ripgrep.",
+                "description": "Regex search across the workspace; results are `file:line#hash| text`.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string" }
+                        "query": { "type": "string" },
+                        "glob": { "type": "string", "description": "Optional file glob, e.g. *.rs" }
                     },
                     "required": ["query"]
                 }
@@ -112,15 +142,63 @@ fn openai_tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace an exact substring in an existing file.",
+                "description": "Edit by line anchors: start/end are `N#hash` from read_file/outline/search/verify output; the lines start..end are replaced by new_text (no old text needed; stale line numbers are re-located automatically). op: replace (default), insert_after, insert_before, delete. Fallback: old_text+new_text exact substring replace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "old_text": { "type": "string" },
-                        "new_text": { "type": "string" }
+                        "start": { "type": "string", "description": "Anchor like 189#a4." },
+                        "end": { "type": "string", "description": "Optional end anchor (inclusive); defaults to start." },
+                        "new_text": { "type": "string", "description": "Replacement code without the N#hash| prefixes." },
+                        "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"] },
+                        "old_text": { "type": "string", "description": "Fallback only." }
                     },
-                    "required": ["path", "old_text", "new_text"]
+                    "required": ["path", "new_text"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "symbol_edit",
+                "description": "Read or change a whole function/struct/class/interface by name (range includes its doc comments/attributes). mode: read (default), replace, insert_after, delete.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "symbol": { "type": "string", "description": "Name, or Container::name for methods." },
+                        "mode": { "type": "string", "enum": ["read", "replace", "insert_after", "delete"] },
+                        "new_code": { "type": "string" }
+                    },
+                    "required": ["path", "symbol"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "ast",
+                "description": "Structural code search (ast-grep patterns like `foo($A, $B)`); with rewrite it applies a codemod across files.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string" },
+                        "lang": { "type": "string", "description": "e.g. rust, ts, tsx, python, go" },
+                        "rewrite": { "type": "string" },
+                        "path": { "type": "string" }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "verify",
+                "description": "Run the project's build/type-check (auto-detected) or a given command and return only deduplicated errors with line anchors.",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "command": { "type": "string" } }
                 }
             }
         },
@@ -186,7 +264,8 @@ async fn exec_tool(
     auto_checkpoint: bool,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) -> String {
-    let is_mutation = matches!(name, "write_file" | "edit_file" | "run_command");
+    let is_mutation = matches!(name, "write_file" | "edit_file" | "run_command" | "symbol_edit")
+        || (name == "ast" && args.get("rewrite").and_then(|v| v.as_str()).map_or(false, |r| !r.is_empty()));
     if is_mutation && auto_checkpoint && !*checkpoint_done {
         *checkpoint_done = true;
         if let Ok(cp) = create_checkpoint_internal(state, "Before agent edit".to_string()).await {
@@ -239,71 +318,45 @@ async fn exec_tool(
             .await
             .unwrap_or_else(|_| "Failed to list files".to_string())
         }
-        "read_file" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let full = match resolve_safe_path(ws, path) {
-                Ok(p) => p,
-                Err(e) => return format!("Error: {}", e),
-            };
-            let text = match tokio::fs::read_to_string(&full).await {
-                Ok(t) => t,
-                Err(e) => return format!("Error reading {}: {}", path, e),
-            };
-            let start = args
-                .get("start_line")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1)
-                .max(1) as usize;
-            let end = args
-                .get("end_line")
-                .and_then(|v| v.as_u64())
-                .map(|n| n as usize);
-            let lines: Vec<&str> = text.lines().collect();
-            let stop = end.unwrap_or(lines.len()).min(lines.len());
-            let mut out = String::new();
-            for i in (start - 1)..stop {
-                out.push_str(&format!("{:>4} | {}\n", i + 1, lines[i]));
-                if out.len() > 24_000 {
-                    out.push_str("...[truncated]\n");
-                    break;
-                }
-            }
-            out
-        }
-        "search_code" => {
-            let q = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-            if q.is_empty() {
-                return "Empty query".to_string();
-            }
-            let out = background_command("rg")
-                .args([
-                    "-n",
-                    "--smart-case",
-                    "--max-count",
-                    "10",
-                    "--glob",
-                    "!.git",
-                    "--glob",
-                    "!node_modules",
-                    "--glob",
-                    "!target",
-                    "--",
-                    q,
-                ])
-                .current_dir(ws)
-                .output()
-                .await;
-            match out {
-                Ok(o) => {
-                    let s = String::from_utf8_lossy(&o.stdout);
-                    if s.trim().is_empty() {
-                        "No matches found.".to_string()
+        "repo_map" | "outline" | "read_file" | "search_code" | "ast" | "verify" | "symbol_edit" | "edit_file"
+            if name != "edit_file" || args.get("old_text").and_then(|v| v.as_str()).is_none() =>
+        {
+            let (op, a) = match name {
+                "repo_map" => ("map", args.clone()),
+                "outline" => ("outline", args.clone()),
+                "search_code" => ("search", json!({ "query": args["query"], "glob": args["glob"] })),
+                "ast" => ("ast", args.clone()),
+                "verify" => ("check", json!({ "cmd": args["command"] })),
+                "symbol_edit" => (
+                    "symbol",
+                    json!({ "path": args["path"], "symbol": args["symbol"], "mode": args["mode"], "new_code": args["new_code"] }),
+                ),
+                "edit_file" => ("edit", args.clone()),
+                _ => {
+                    // read_file
+                    let target = if let Some(sym) = args.get("symbol").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                        Some(sym.to_string())
                     } else {
-                        s.chars().take(12_000).collect()
-                    }
+                        let st = args.get("start_line").and_then(|v| v.as_u64());
+                        let en = args.get("end_line").and_then(|v| v.as_u64());
+                        match (st, en) {
+                            (None, None) => None,
+                            (s, e) => Some(format!("{}..{}", s.unwrap_or(1), e.map(|e| e.to_string()).unwrap_or_default())),
+                        }
+                    };
+                    ("view", json!({ "path": args["path"], "target": target }))
                 }
-                Err(e) => format!("Search error: {}", e),
+            };
+            let ws_owned = ws.to_path_buf();
+            let op_owned = op.to_string();
+            let res = tokio::task::spawn_blocking(move || crate::code_intel::run_op_string(&ws_owned, &op_owned, &a))
+                .await
+                .unwrap_or_else(|_| "Error: tool crashed".to_string());
+            if matches!(name, "edit_file" | "symbol_edit" | "ast") && !res.starts_with("Error") {
+                let touched = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                state.notify_fs_changed(vec![if touched.is_empty() { "ast".to_string() } else { touched }]);
             }
+            res
         }
         "write_file" => {
             let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");

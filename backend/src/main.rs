@@ -2,6 +2,7 @@
 
 mod agent;
 mod cli_agent;
+mod code_intel;
 mod files;
 mod git;
 mod pty;
@@ -318,6 +319,7 @@ fn build_router(
 }
 
 fn main() {
+    code_intel::set_path_env(pty::augmented_path_env());
     let cli = parse_args();
     let main_window: Arc<OnceLock<tauri::WebviewWindow>> = Arc::new(OnceLock::new());
     let app_router = build_router(cli.workspace.clone(), main_window.clone());
