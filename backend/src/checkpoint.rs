@@ -354,6 +354,33 @@ fn norm_key(p: &str) -> String {
     p.replace('\\', "/").trim_start_matches("./").to_lowercase()
 }
 
+/// True for plain inspection commands that cannot modify files, so they must not make the
+/// whole turn "opaque" (which would claim every concurrent change in the workspace).
+/// Conservative: any redirection, pipe, chaining or substitution counts as unknown.
+fn is_read_only_command(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.is_empty() || cmd.contains(['>', '|', ';', '&', '`', '\n', '\r']) || cmd.contains("$(") {
+        return false;
+    }
+    let lower = cmd.to_lowercase();
+    if lower.contains("-exec") {
+        return false;
+    }
+    let mut toks = lower.split_whitespace();
+    let first = toks.next().unwrap_or("");
+    let second = toks.next().unwrap_or("");
+    match first {
+        "rg" | "grep" | "ls" | "dir" | "cat" | "type" | "head" | "tail" | "fd" | "pwd" | "wc"
+        | "get-content" | "get-childitem" | "select-string" | "get-location" => true,
+        // `find` can delete/execute; allow only without action flags.
+        "find" => !lower.contains("-delete") && !lower.contains("-fprint"),
+        "git" => matches!(second, "status" | "diff" | "log" | "show" | "branch" | "rev-parse")
+            && !lower.contains("--output"),
+        "vx" => matches!(second, "map" | "outline" | "view" | "search" | "check"),
+        _ => false,
+    }
+}
+
 impl TurnTracker {
     pub fn new(enabled: bool) -> Self {
         Self { enabled, pre_tree: None, touched: HashSet::new(), opaque: false }
@@ -376,7 +403,12 @@ impl TurnTracker {
                 }
                 _ => self.opaque = true,
             },
-            "run_command" => self.opaque = true,
+            "run_command" => {
+                let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                if !is_read_only_command(cmd) {
+                    self.opaque = true;
+                }
+            }
             "ast" if args.get("rewrite").and_then(|v| v.as_str()).map_or(false, |r| !r.is_empty()) => {
                 self.opaque = true
             }

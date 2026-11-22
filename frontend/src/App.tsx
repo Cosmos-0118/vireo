@@ -800,7 +800,7 @@ export function App() {
 
       const target = ui[ui.length - 1];
       setLiveFlash({ path: target.path, key, ranges: target.ranges });
-      window.setTimeout(() => setLiveFlash((f) => (f?.key === key ? null : f)), 2500);
+      window.setTimeout(() => setLiveFlash((f) => (f?.key === key ? null : f)), 1650);
       if (followRef.current) {
         const busy = editorDirtyRef.current || Date.now() - userActivityRef.current < 4000;
         if (busy) setPausedJump(target.path);

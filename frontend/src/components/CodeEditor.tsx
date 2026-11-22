@@ -332,8 +332,15 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   );
   useEffect(() => {
     if (!liveAt) return;
+    const clearFlash = setTimeout(() => {
+      const view = viewRef.current;
+      if (view) view.dispatch({ effects: setFlash.of([]) });
+    }, 1600);
     const t = setTimeout(() => setLiveAt(0), 3500);
-    return () => clearTimeout(t);
+    return () => {
+      clearTimeout(clearFlash);
+      clearTimeout(t);
+    };
   }, [liveAt]);
   const isMarkdown = isMarkdownPath(path);
   const [mode, setMode] = useState<'source' | 'preview'>(isMarkdown && !jumpToLine ? 'preview' : 'source');

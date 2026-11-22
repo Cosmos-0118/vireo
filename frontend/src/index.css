@@ -209,8 +209,21 @@ svg.lucide {
     box-shadow: inset 3px 0 0 transparent;
   }
 }
+@keyframes cm-review-agent-glow {
+  from {
+    background-color: color-mix(in srgb, var(--added-fg) 32%, transparent);
+    box-shadow: inset 3px 0 0 var(--added-fg);
+  }
+  to {
+    background-color: color-mix(in srgb, var(--added-fg) 10%, transparent);
+    box-shadow: inset 3px 0 0 var(--added-fg);
+  }
+}
 .cm-agent-flash {
   animation: cm-agent-glow 1.6s ease-out forwards;
+}
+.cm-review-add.cm-agent-flash {
+  animation: cm-review-agent-glow 1.6s ease-out forwards;
 }
 
 @keyframes tab-pulse-a {

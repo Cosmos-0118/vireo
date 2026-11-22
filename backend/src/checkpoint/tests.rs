@@ -131,6 +131,45 @@ async fn files_outside_the_turn_are_never_touched() {
     assert_eq!(read(&dir, "bg.txt"), "bg-from-background-agent\n");
 }
 
+#[test]
+fn read_only_commands_are_not_opaque() {
+    for c in [
+        "rg -il advisor src",
+        "ls -la",
+        "git status --short",
+        "git diff HEAD",
+        "vx view a.rs",
+        "rg -o foo src",
+        "Get-ChildItem -Recurse",
+    ] {
+        assert!(is_read_only_command(c), "{c}");
+    }
+    for c in [
+        "rg -l x | xargs rm",
+        "cat a > b",
+        "git checkout .",
+        "git diff --output=x",
+        "find . -delete",
+        "find . -exec rm {} +",
+        "npm install",
+        "ls; rm a",
+        "echo $(rm a)",
+        "",
+        "vx edit a.rs 1#a",
+    ] {
+        assert!(!is_read_only_command(c), "{c}");
+    }
+}
+
+#[test]
+fn read_only_run_command_does_not_make_turn_opaque() {
+    let mut t = TurnTracker::new(true);
+    t.note_tool("run_command", &serde_json::json!({ "command": "rg foo" }));
+    assert!(!t.opaque);
+    t.note_tool("run_command", &serde_json::json!({ "command": "cargo build" }));
+    assert!(t.opaque);
+}
+
 #[tokio::test]
 async fn manual_restore_keeps_a_way_back() {
     let (state, dir) = setup(&[("a.txt", "v1\n")]);

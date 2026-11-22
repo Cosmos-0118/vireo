@@ -13,10 +13,13 @@ import {
   GitBranch,
   GitCompare,
   History,
+  Lock,
   Plus,
   RotateCcw,
   Undo2,
   Settings,
+  ShieldAlert,
+  ShieldCheck,
   Square,
   Terminal as TerminalIcon,
   X,
@@ -31,6 +34,8 @@ import type {
   GitFileStatus,
   LocalModelsInfo,
   MessagePart,
+  PermissionMode,
+  PermissionRequest,
   RollbackRes,
   ToastAction,
   UiChatMessage,
@@ -55,23 +60,80 @@ const DEFAULT_CONFIG: AgentConfig = {
   autoCheckpoint: true,
 };
 
+/** Human-readable scope of a saved "always allow" rule (mirrors `permission_rule` in the backend). */
+function describeRule(rule: string): string {
+  const [tool, kind, ...rest] = rule.split(':');
+  const value = rest.join(':');
+  if (kind === 'cmd') return `${tool} commands starting with "${value}" (no pipes or chaining)`;
+  if (kind === 'dir') return `${tool} on any file under ${value}/`;
+  return `Every ${rule} request`;
+}
+
+const PERM_MODES: Record<
+  PermissionMode,
+  { label: string; icon: typeof Lock; claudeNote: string; codexNote: string; cliNote: string }
+> = {
+  ask: {
+    label: 'Ask',
+    icon: Lock,
+    claudeNote: 'Asks before every edit and shell command.',
+    codexNote: 'Read-only sandbox. Codex cannot ask in chat, so it cannot edit.',
+    cliNote: 'Read-only / plan mode where supported; no automatic edits.',
+  },
+  auto_edit: {
+    label: 'Auto-edit',
+    icon: ShieldCheck,
+    claudeNote: 'Edits in the workspace are automatic; anything else asks.',
+    codexNote: 'Edits and commands stay inside the workspace sandbox.',
+    cliNote: 'Workspace edits are auto-accepted using the CLI’s safety mode.',
+  },
+  full_access: {
+    label: 'Full access',
+    icon: ShieldAlert,
+    claudeNote: 'Never asks. Can change any file and run any command.',
+    codexNote: 'No sandbox, no approvals. Full access to this machine.',
+    cliNote: 'Auto-approves tools and commands without prompts.',
+  },
+};
+
 const PROVIDER_PRESETS: Record<AgentConfig['provider'], { model: string; baseUrl: string }> = {
   openai: { model: 'gpt-4.1', baseUrl: 'https://api.openai.com/v1' },
   anthropic: { model: 'claude-sonnet-4-20250514', baseUrl: 'https://api.anthropic.com' },
   gemini: { model: 'gemini-2.5-pro', baseUrl: '' },
   ollama: { model: 'qwen2.5-coder:14b', baseUrl: 'http://127.0.0.1:11434/v1' },
+  'antigravity-cli': { model: 'default', baseUrl: '' },
   'claude-cli': { model: 'default', baseUrl: '' },
   'codex-cli': { model: 'default', baseUrl: '' },
+  'gemini-cli': { model: 'default', baseUrl: '' },
+  'opencode-cli': { model: 'default', baseUrl: '' },
+  'cursor-cli': { model: 'default', baseUrl: '' },
+  'copilot-cli': { model: 'default', baseUrl: '' },
+  'amp-cli': { model: 'default', baseUrl: '' },
+  'qwen-cli': { model: 'default', baseUrl: '' },
 };
 
-// Fallbacks only: Ollama and Codex lists are replaced by what is actually installed.
+// Fallbacks only: Ollama, Codex, and Antigravity lists are replaced by what is actually installed.
 const MODEL_PRESETS: Record<AgentConfig['provider'], string[]> = {
   openai: ['gpt-4.1', 'gpt-4.1-mini', 'o4-mini'],
   anthropic: ['claude-sonnet-4-20250514', 'claude-opus-4-20250514'],
   gemini: ['gemini-2.5-pro', 'gemini-2.5-flash'],
   ollama: ['qwen2.5-coder:14b', 'llama3.1', 'deepseek-r1'],
+  'antigravity-cli': [
+    'default',
+    'gemini-4-neon-high',
+    'gemini-4-neon-xhigh',
+    'gemini-3.8-flash-high',
+    'claude-opus-5-5-high',
+    'claude-sonnet-5-5-high',
+  ],
   'claude-cli': ['default', 'sonnet', 'opus', 'haiku'],
   'codex-cli': ['default'],
+  'gemini-cli': ['default', 'gemini-2.5-pro', 'gemini-2.5-flash'],
+  'opencode-cli': ['default'],
+  'cursor-cli': ['default', 'auto'],
+  'copilot-cli': ['default'],
+  'amp-cli': ['default', 'smart', 'rush', 'deep'],
+  'qwen-cli': ['default'],
 };
 
 const PROVIDER_LABEL: Record<AgentConfig['provider'], string> = {
@@ -79,18 +141,42 @@ const PROVIDER_LABEL: Record<AgentConfig['provider'], string> = {
   anthropic: 'Anthropic',
   gemini: 'Gemini',
   ollama: 'Ollama',
+  'antigravity-cli': 'Antigravity',
   'claude-cli': 'Claude Code',
   'codex-cli': 'Codex',
+  'gemini-cli': 'Gemini',
+  'opencode-cli': 'OpenCode',
+  'cursor-cli': 'Cursor',
+  'copilot-cli': 'GitHub Copilot',
+  'amp-cli': 'Amp',
+  'qwen-cli': 'Qwen Code',
 };
 
 /** Providers that run an installed CLI with its own login instead of an API key. */
 const CLI_PROVIDER_TOOL: Partial<Record<AgentConfig['provider'], string>> = {
+  'antigravity-cli': 'antigravity',
   'claude-cli': 'claude',
   'codex-cli': 'codex',
+  'gemini-cli': 'gemini',
+  'opencode-cli': 'opencode',
+  'cursor-cli': 'cursor',
+  'copilot-cli': 'copilot',
+  'amp-cli': 'amp',
+  'qwen-cli': 'qwen',
 };
 
 type Provider = AgentConfig['provider'];
-const CLI_PROVIDERS: Provider[] = ['claude-cli', 'codex-cli'];
+const CLI_PROVIDERS: Provider[] = [
+  'antigravity-cli',
+  'claude-cli',
+  'codex-cli',
+  'gemini-cli',
+  'opencode-cli',
+  'cursor-cli',
+  'copilot-cli',
+  'amp-cli',
+  'qwen-cli',
+];
 const API_PROVIDERS: Provider[] = ['anthropic', 'openai', 'gemini'];
 
 const OK_DOT = '#10b981';
@@ -322,6 +408,11 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const [atRange, setAtRange] = useState<AtRange | null>(null);
   const [pickIdx, setPickIdx] = useState(0);
   const [customModel, setCustomModel] = useState('');
+  // Live tool-approval prompts from a running Claude Code turn. Never persisted with the thread.
+  const [permRequests, setPermRequests] = useState<PermissionRequest[]>([]);
+  const [showPermMenu, setShowPermMenu] = useState(false);
+  // "Always allow in this thread" rules; the CLI runs statelessly, so Vireo re-sends them each turn.
+  const threadRulesRef = useRef<Record<string, string[]>>({});
 
   const [config, setConfig] = useState<AgentConfig>(() => {
     try {
@@ -366,6 +457,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const settingsRef = usePopoverClose(showSettings, () => setShowSettings(false), 'settings');
   const modelRef = usePopoverClose(showModelMenu, () => setShowModelMenu(false), 'engine');
   const threadsRef = usePopoverClose(showThreads, () => setShowThreads(false), 'threads');
+  const permMenuRef = usePopoverClose(showPermMenu, () => setShowPermMenu(false), 'perm');
   const pickerOpen = showFilePicker || atRange !== null;
   const pickerRef = usePopoverClose(
     pickerOpen,
@@ -407,7 +499,16 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       ? ollamaModels
       : config.provider === 'codex-cli' && localModels?.codex.length
         ? ['default', ...localModels.codex]
-        : MODEL_PRESETS[config.provider];
+        : config.provider === 'antigravity-cli' && localModels?.antigravity?.length
+          ? ['default', ...localModels.antigravity]
+          : MODEL_PRESETS[config.provider];
+  const orderedCliProviders = useMemo(() => {
+    return [...CLI_PROVIDERS].sort((a, b) => {
+      const aInst = cliTools.find((t) => t.id === CLI_PROVIDER_TOOL[a])?.installed ? 1 : 0;
+      const bInst = cliTools.find((t) => t.id === CLI_PROVIDER_TOOL[b])?.installed ? 1 : 0;
+      return bInst - aInst;
+    });
+  }, [cliTools]);
   const activeChip =
     activeFilePath && activeFilePath !== dismissedActive && !extraFiles.includes(activeFilePath)
       ? activeFilePath
@@ -470,6 +571,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     setMessages([]);
     setExpandedTools({});
     setGroupOpen({});
+    stickRef.current = true;
+    setAtBottom(true);
     setThreadId(newThreadId());
     setThreadStore({ ws: workspacePath, list: loadThreads(workspacePath) });
   }, [workspacePath, threadStore.ws]);
@@ -662,26 +765,44 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             patchAssistant(assistantId, (m) => ({ ...m, checkpoint: cp }));
             onRefreshGit();
           },
+          onPermissionRequest: (req) =>
+            setPermRequests((prev) =>
+              prev.some((r) => r.request_id === req.request_id) ? prev : [...prev, req]
+            ),
+          onPermissionCancel: (id) => setPermRequests((prev) => prev.filter((r) => r.request_id !== id)),
           onError: (msg) => patchAssistant(assistantId, (m) => ({ ...m, error: msg })),
           onDone: () => {
             patchAssistant(assistantId, (m) => ({ ...m, streaming: false, endedAt: Date.now() }));
             setRunning(false);
+            setPermRequests([]);
             onRefreshGit();
           },
         },
-        ctrl.signal
+        ctrl.signal,
+        threadRulesRef.current[threadId]
       );
     } catch (e: unknown) {
       if ((e as Error).name !== 'AbortError') {
         patchAssistant(assistantId, (m) => ({ ...m, error: String(e), streaming: false, endedAt: Date.now() }));
       }
       setRunning(false);
+      setPermRequests([]);
     }
+  };
+
+  const answerPermission = (p: PermissionRequest, allow: boolean, remember = false) => {
+    setPermRequests((prev) => prev.filter((r) => r.request_id !== p.request_id));
+    if (allow && remember) {
+      const rules = threadRulesRef.current[threadId] ?? [];
+      if (!rules.includes(p.rule)) threadRulesRef.current[threadId] = [...rules, p.rule];
+    }
+    api.answerPermission(p.turn_id, p.request_id, allow, remember).catch(() => {});
   };
 
   const stopGeneration = () => {
     abortRef.current?.abort();
     setRunning(false);
+    setPermRequests([]);
     setMessages((prev) =>
       prev.map((m) => (m.streaming ? { ...m, streaming: false, endedAt: Date.now() } : m))
     );
@@ -690,9 +811,12 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const newThread = () => {
     abortRef.current?.abort();
     setRunning(false);
+    setPermRequests([]);
     setMessages([]);
     setExpandedTools({});
     setGroupOpen({});
+    stickRef.current = true;
+    setAtBottom(true);
     setThreadId(newThreadId());
     setShowThreads(false);
   };
@@ -700,9 +824,12 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const openThread = (t: AgentThread) => {
     abortRef.current?.abort();
     setRunning(false);
+    setPermRequests([]);
     setMessages(t.messages);
     setExpandedTools({});
     setGroupOpen({});
+    stickRef.current = true;
+    setAtBottom(true);
     setThreadId(t.id);
     setShowThreads(false);
   };
@@ -959,12 +1086,19 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 onChange={(e) => setProvider(e.target.value as Provider)}
                 className={inputCls}
               >
-                <option value="openai">OpenAI / Compatible</option>
-                <option value="anthropic">Anthropic Claude</option>
-                <option value="gemini">Google Gemini</option>
-                <option value="ollama">Ollama (Local)</option>
-                <option value="claude-cli">Claude Code (installed CLI)</option>
-                <option value="codex-cli">Codex (installed CLI)</option>
+                <optgroup label="Installed CLI agents">
+                  {CLI_PROVIDERS.map((p) => (
+                    <option key={p} value={p}>
+                      {PROVIDER_LABEL[p]} CLI
+                    </option>
+                  ))}
+                </optgroup>
+                <optgroup label="API &amp; Local">
+                  <option value="openai">OpenAI / Compatible</option>
+                  <option value="anthropic">Anthropic Claude</option>
+                  <option value="gemini">Google Gemini</option>
+                  <option value="ollama">Ollama (Local)</option>
+                </optgroup>
               </select>
             </div>
             <div>
@@ -1193,6 +1327,41 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 </div>
               );
             })}
+            {permRequests.map((p) => (
+              <div
+                key={p.request_id}
+                className="rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2 space-y-1.5"
+              >
+                <div className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
+                  <Lock size={11} className="shrink-0" />
+                  Permission requested · {p.tool}
+                </div>
+                <div className="text-[12px] font-mono text-[var(--text-primary)] break-all max-h-24 overflow-y-auto">
+                  {p.summary}
+                </div>
+                <div className="flex flex-wrap gap-1.5 pt-0.5">
+                  <button
+                    onClick={() => answerPermission(p, true)}
+                    className="h-6 px-2 rounded-md text-[11px] bg-[var(--accent)] text-white cursor-pointer hover:opacity-95"
+                  >
+                    Allow
+                  </button>
+                  <button
+                    onClick={() => answerPermission(p, true, true)}
+                    className="h-6 px-2 rounded-md text-[11px] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                    title={`For the rest of this thread, allow: ${describeRule(p.rule)}`}
+                  >
+                    Always allow in thread
+                  </button>
+                  <button
+                    onClick={() => answerPermission(p, false)}
+                    className="h-6 px-2 rounded-md text-[11px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                  >
+                    Deny
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
         </div>
@@ -1408,7 +1577,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                   className="absolute left-0 bottom-full mb-1 z-40 w-[280px] max-w-[calc(100vw-32px)] max-h-[70vh] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl py-1 text-[12px]"
                 >
                   <div className={menuHead}>Installed CLI agents · no API key</div>
-                  {CLI_PROVIDERS.map((p) => {
+                  {orderedCliProviders.map((p) => {
                     const installed = cliTools.find((t) => t.id === CLI_PROVIDER_TOOL[p])?.installed;
                     return (
                       <div key={p} onClick={() => chooseCli(p)} className={menuRow}>
@@ -1529,6 +1698,56 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             </div>
 
             <div className="flex items-center gap-1 shrink-0">
+              {CLI_PROVIDERS.includes(config.provider) && (
+                <div className="relative">
+                  <button
+                    data-pop="perm"
+                    onClick={() => setShowPermMenu((v) => !v)}
+                    className="flex items-center gap-1 h-6 px-1.5 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
+                    title="What the agent may do without asking"
+                  >
+                    {(() => {
+                      const Icon = PERM_MODES[config.permissionMode ?? 'auto_edit'].icon;
+                      return <Icon size={11} />;
+                    })()}
+                    {PERM_MODES[config.permissionMode ?? 'auto_edit'].label}
+                  </button>
+                  {showPermMenu && (
+                    <div
+                      ref={permMenuRef}
+                      className="absolute right-0 bottom-full mb-1 z-40 w-[260px] max-w-[calc(100vw-32px)] rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl py-1 text-[12px]"
+                    >
+                      {(Object.keys(PERM_MODES) as PermissionMode[]).map((mode) => {
+                        const m = PERM_MODES[mode];
+                        const Icon = m.icon;
+                        const note =
+                          config.provider === 'claude-cli'
+                            ? m.claudeNote
+                            : config.provider === 'codex-cli'
+                              ? m.codexNote
+                              : m.cliNote;
+                        return (
+                          <div
+                            key={mode}
+                            onClick={() => {
+                              setConfig((prev) => ({ ...prev, permissionMode: mode }));
+                              setShowPermMenu(false);
+                            }}
+                            className="flex items-start gap-2 px-3 py-1.5 cursor-pointer hover:bg-[var(--bg-hover)] text-[var(--text-primary)]"
+                          >
+                            <Icon size={12} className="mt-0.5 shrink-0" />
+                            <div className="flex-1 min-w-0">
+                              <div>{m.label}</div>
+                              <div className="text-[11px] text-[var(--text-dim)]">{note}</div>
+                            </div>
+                            {(config.permissionMode ?? 'auto_edit') === mode && <Check size={12} className="mt-0.5" />}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
               <button
                 onClick={onLaunchCliAgent}
                 className="w-6 h-6 flex items-center justify-center rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"

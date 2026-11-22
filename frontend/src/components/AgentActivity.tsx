@@ -251,7 +251,9 @@ export const isFailed = (t: ToolCallTrace) => {
   const r = t.result.trim();
   if (/^error/i.test(r)) return true;
   const exit = EXIT_RE.exec(r);
-  return !!exit && exit[1] !== '0';
+  if (!exit || exit[1] === '0') return false;
+  // rg / grep / findstr exit 1 with no output when nothing matched: that is an answer, not a failure.
+  return !(exit[1] === '1' && !r.slice(exit[0].length).trim());
 };
 
 export function toolStatus(t: ToolCallTrace, turnActive: boolean): ToolStatus {

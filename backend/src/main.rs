@@ -305,6 +305,7 @@ fn build_router(
         .route("/api/git/rollback", post(checkpoint::rollback_checkpoint))
         .route("/api/git/redo", post(checkpoint::redo_checkpoint))
         .route("/api/agent/chat", post(agent::chat))
+        .route("/api/agent/permission", post(cli_agent::answer_permission))
         .route("/api/agent/cli-tools", get(pty::list_cli_tools))
         .route("/api/agent/models", get(agent::list_models))
         .route("/ws/pty", get(pty::ws_pty))

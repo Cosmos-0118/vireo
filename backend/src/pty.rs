@@ -69,15 +69,31 @@ struct CliToolSpec {
     id: &'static str,
     label: &'static str,
     cmd: &'static str,
+    alt_cmds: &'static [&'static str],
     win_install: &'static str,
     unix_install: &'static str,
 }
 
+impl CliToolSpec {
+    fn all_cmds(&self) -> impl Iterator<Item = &'static str> + '_ {
+        std::iter::once(self.cmd).chain(self.alt_cmds.iter().copied())
+    }
+}
+
 const KNOWN_CLI_TOOLS: &[CliToolSpec] = &[
     CliToolSpec {
+        id: "antigravity",
+        label: "Antigravity",
+        cmd: "agy",
+        alt_cmds: &[],
+        win_install: "irm https://antigravity.google/cli/install.ps1 | iex",
+        unix_install: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
+    },
+    CliToolSpec {
         id: "claude",
-        label: "Claude",
+        label: "Claude Code",
         cmd: "claude",
+        alt_cmds: &[],
         win_install: "irm https://claude.ai/install.ps1 | iex",
         unix_install: "curl -fsSL https://claude.ai/install.sh | bash",
     },
@@ -85,29 +101,97 @@ const KNOWN_CLI_TOOLS: &[CliToolSpec] = &[
         id: "codex",
         label: "Codex",
         cmd: "codex",
+        alt_cmds: &[],
         win_install: "npm install -g @openai/codex",
         unix_install: "npm install -g @openai/codex",
     },
     CliToolSpec {
         id: "gemini",
-        label: "Gemini",
+        label: "Gemini CLI",
         cmd: "gemini",
+        alt_cmds: &[],
         win_install: "npm install -g @google/gemini-cli",
         unix_install: "npm install -g @google/gemini-cli",
-    },
-    CliToolSpec {
-        id: "aider",
-        label: "Aider",
-        cmd: "aider",
-        win_install: "pip install aider-chat",
-        unix_install: "pip install aider-chat",
     },
     CliToolSpec {
         id: "opencode",
         label: "OpenCode",
         cmd: "opencode",
+        alt_cmds: &[],
         win_install: "npm install -g opencode-ai",
         unix_install: "curl -fsSL https://opencode.ai/install | bash",
+    },
+    CliToolSpec {
+        id: "cursor",
+        label: "Cursor CLI",
+        cmd: "cursor-agent",
+        alt_cmds: &["agent"],
+        win_install: "irm 'https://cursor.com/install?win32=true' | iex",
+        unix_install: "curl https://cursor.com/install -fsS | bash",
+    },
+    CliToolSpec {
+        id: "copilot",
+        label: "GitHub Copilot",
+        cmd: "copilot",
+        alt_cmds: &[],
+        win_install: "winget install GitHub.Copilot",
+        unix_install: "npm install -g @github/copilot",
+    },
+    CliToolSpec {
+        id: "amp",
+        label: "Amp",
+        cmd: "amp",
+        alt_cmds: &[],
+        win_install: "npm install -g @ampcode/cli",
+        unix_install: "curl -fsSL https://ampcode.com/install.sh | bash",
+    },
+    CliToolSpec {
+        id: "qwen",
+        label: "Qwen Code",
+        cmd: "qwen",
+        alt_cmds: &[],
+        win_install: "npm install -g @qwen-code/qwen-code@latest",
+        unix_install: "npm install -g @qwen-code/qwen-code@latest",
+    },
+    CliToolSpec {
+        id: "aider",
+        label: "Aider",
+        cmd: "aider",
+        alt_cmds: &[],
+        win_install: "pip install aider-chat",
+        unix_install: "pip install aider-chat",
+    },
+    CliToolSpec {
+        id: "cline",
+        label: "Cline",
+        cmd: "cline",
+        alt_cmds: &[],
+        win_install: "npm install -g cline",
+        unix_install: "npm install -g cline",
+    },
+    CliToolSpec {
+        id: "kilo",
+        label: "Kilo Code",
+        cmd: "kilo",
+        alt_cmds: &["kilocode"],
+        win_install: "npm install -g @kilocode/cli",
+        unix_install: "npm install -g @kilocode/cli",
+    },
+    CliToolSpec {
+        id: "goose",
+        label: "Goose",
+        cmd: "goose",
+        alt_cmds: &[],
+        win_install: "irm https://github.com/aaif-goose/goose/releases/download/stable/download_cli.ps1 | iex",
+        unix_install: "curl -fsSL https://github.com/aaif-goose/goose/releases/download/stable/download_cli.sh | bash",
+    },
+    CliToolSpec {
+        id: "kiro",
+        label: "Kiro",
+        cmd: "kiro-cli",
+        alt_cmds: &[],
+        win_install: "curl -fsSL https://cli.kiro.dev/install | bash",
+        unix_install: "curl -fsSL https://cli.kiro.dev/install | bash",
     },
 ];
 
@@ -120,7 +204,10 @@ pub fn augmented_path_env() -> OsString {
     {
         if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
             candidates.push(profile.join(".local").join("bin"));
+            candidates.push(profile.join(".gemini").join("antigravity").join("bin"));
             candidates.push(profile.join(".opencode").join("bin"));
+            candidates.push(profile.join(".amp").join("bin"));
+            candidates.push(profile.join(".kiro").join("bin"));
             candidates.push(profile.join(".bun").join("bin"));
             candidates.push(profile.join(".volta").join("bin"));
             candidates.push(profile.join(".cargo").join("bin"));
@@ -131,12 +218,15 @@ pub fn augmented_path_env() -> OsString {
             candidates.push(profile.join("scoop").join("apps").join("nodejs").join("current").join("bin"));
         }
         if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+            candidates.push(appdata.join("Antigravity").join("bin"));
             candidates.push(appdata.join("npm"));
             for py in ["Python313", "Python312", "Python311"] {
                 candidates.push(appdata.join("Python").join(py).join("Scripts"));
             }
         }
         if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            candidates.push(local.join("agy").join("bin"));
+            candidates.push(local.join("cursor-agent"));
             candidates.push(local.join("pnpm"));
             for py in ["Python313", "Python312", "Python311"] {
                 candidates.push(local.join("Programs").join("Python").join(py).join("Scripts"));
@@ -147,7 +237,10 @@ pub fn augmented_path_env() -> OsString {
     {
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             candidates.push(home.join(".local").join("bin"));
+            candidates.push(home.join(".gemini").join("antigravity").join("bin"));
             candidates.push(home.join(".opencode").join("bin"));
+            candidates.push(home.join(".amp").join("bin"));
+            candidates.push(home.join(".kiro").join("bin"));
             candidates.push(home.join(".bun").join("bin"));
             candidates.push(home.join(".volta").join("bin"));
             candidates.push(home.join(".cargo").join("bin"));
@@ -167,12 +260,15 @@ pub fn augmented_path_env() -> OsString {
     // hash-named folders that are never on PATH. Resolve them now (not once at startup, since
     // app updates replace those folders) and expose the folder to every child process.
     for spec in KNOWN_CLI_TOOLS {
-        if find_in_dirs(spec.cmd, dirs.iter().cloned()).is_some() {
+        if spec.all_cmds().any(|c| find_in_dirs(c, dirs.iter().cloned()).is_some()) {
             continue;
         }
-        if let Some(found) = find_in_dirs(spec.cmd, fallback_tool_dirs(spec.cmd)) {
-            if let Some(parent) = found.parent() {
-                push_unique_dir(&mut dirs, parent.to_path_buf());
+        for c in spec.all_cmds() {
+            if let Some(found) = find_in_dirs(c, fallback_tool_dirs(c)) {
+                if let Some(parent) = found.parent() {
+                    push_unique_dir(&mut dirs, parent.to_path_buf());
+                }
+                break;
             }
         }
     }
@@ -274,14 +370,52 @@ fn fallback_tool_dirs(cmd: &str) -> Vec<PathBuf> {
                     out.push(bin);
                 }
             }
+            "agy" => {
+                if let Some(local) = &local {
+                    out.push(local.join("agy").join("bin"));
+                }
+                if let Some(roaming) = &roaming {
+                    out.push(roaming.join("Antigravity").join("bin"));
+                }
+                if let Some(profile) = &profile {
+                    out.push(profile.join(".gemini").join("antigravity").join("bin"));
+                }
+            }
+            "cursor-agent" | "agent" => {
+                if let Some(local) = &local {
+                    out.push(local.join("cursor-agent"));
+                }
+                if let Some(profile) = &profile {
+                    out.push(profile.join(".local").join("bin"));
+                }
+            }
+            "copilot" => {
+                if let Some(local) = &local {
+                    for pkg in subdirs_newest(&local.join("Microsoft").join("WinGet").join("Packages")) {
+                        let name = pkg
+                            .file_name()
+                            .map(|n| n.to_string_lossy().to_ascii_lowercase())
+                            .unwrap_or_default();
+                        if name.starts_with("github.copilot") {
+                            out.push(pkg.clone());
+                            out.extend(subdirs_newest(&pkg));
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
     #[cfg(not(windows))]
     {
         if let Some(home) = env_dir("HOME") {
-            if cmd == "claude" {
-                out.push(home.join(".claude").join("local"));
+            match cmd {
+                "claude" => out.push(home.join(".claude").join("local")),
+                "agy" => {
+                    out.push(home.join(".gemini").join("antigravity").join("bin"));
+                    out.push(home.join(".local").join("bin"));
+                }
+                _ => {}
             }
         }
     }
@@ -312,6 +446,12 @@ fn extension_dirs(profile: Option<&Path>, prefix: &str, sub: &[&str]) -> Vec<Pat
 /// Resolve an agent CLI to a full executable path, using PATH plus app-bundled locations.
 pub fn resolve_cli_tool(cmd: &str) -> Option<PathBuf> {
     find_command_in_path(cmd, &augmented_path_env())
+}
+
+/// Resolve the first matching binary from a list of candidate command names.
+pub fn resolve_cli_tool_any(cmds: &[&str]) -> Option<PathBuf> {
+    let path_env = augmented_path_env();
+    cmds.iter().find_map(|c| find_command_in_path(c, &path_env))
 }
 
 fn find_command_in_path(cmd_name: &str, path_env: &OsStr) -> Option<PathBuf> {
@@ -354,14 +494,19 @@ fn find_in_dirs(cmd_name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Opti
     None
 }
 
-fn find_known_tool(first_token: &str) -> Option<&'static CliToolSpec> {
+fn find_known_tool(first_token: &str) -> Option<(&'static CliToolSpec, &'static str)> {
     let lower = first_token.trim_matches(['"', '\'']).to_ascii_lowercase();
     let stem = lower
         .strip_suffix(".exe")
         .or_else(|| lower.strip_suffix(".cmd"))
         .or_else(|| lower.strip_suffix(".ps1"))
         .unwrap_or(&lower);
-    KNOWN_CLI_TOOLS.iter().find(|t| t.cmd == stem)
+    for spec in KNOWN_CLI_TOOLS {
+        if let Some(matched) = spec.all_cmds().find(|c| *c == stem) {
+            return Some((spec, matched));
+        }
+    }
+    None
 }
 
 pub async fn list_cli_tools() -> Json<Vec<CliToolStatus>> {
@@ -370,13 +515,19 @@ pub async fn list_cli_tools() -> Json<Vec<CliToolStatus>> {
         KNOWN_CLI_TOOLS
             .iter()
             .map(|spec| {
-                let found = find_command_in_path(spec.cmd, &path_env);
+                let resolved = spec
+                    .all_cmds()
+                    .find_map(|c| find_command_in_path(c, &path_env).map(|p| (c, p)));
+                let (cmd, path) = match resolved {
+                    Some((c, p)) => (c, Some(p)),
+                    None => (spec.cmd, None),
+                };
                 CliToolStatus {
                     id: spec.id.to_string(),
                     label: spec.label.to_string(),
-                    cmd: spec.cmd.to_string(),
-                    installed: found.is_some(),
-                    path: found.map(|p| p.to_string_lossy().to_string()),
+                    cmd: cmd.to_string(),
+                    installed: path.is_some(),
+                    path: path.map(|p| p.to_string_lossy().to_string()),
                     install_hint: if cfg!(windows) {
                         spec.win_install.to_string()
                     } else {
@@ -410,11 +561,11 @@ fn build_windows_shell(
         c.arg("-NoExit");
         c.arg("-Command");
         let first_tok = custom.split_whitespace().next().unwrap_or("");
-        if let Some(spec) = find_known_tool(first_tok) {
+        if let Some((spec, matched_cmd)) = find_known_tool(first_tok) {
             let script = format!(
                 "{utf8}; if (Get-Command '{exe}' -ErrorAction SilentlyContinue) {{ {cmd} }} else {{ Write-Host \"`n[Vireo] '{exe}' is not installed or not on PATH.\" -ForegroundColor Yellow; Write-Host \"Install with: {hint}\" -ForegroundColor Cyan; Write-Host \"After installing, click {label} above or run '{exe}' right here.`n\" -ForegroundColor DarkGray }}",
                 utf8 = utf8_init,
-                exe = spec.cmd,
+                exe = matched_cmd,
                 cmd = custom,
                 hint = spec.win_install,
                 label = spec.label,
@@ -451,10 +602,10 @@ fn build_unix_shell(
     if let Some(custom) = custom_cmd.map(str::trim).filter(|s| !s.is_empty()) {
         c.arg("-lc");
         let first_tok = custom.split_whitespace().next().unwrap_or("");
-        if let Some(spec) = find_known_tool(first_tok) {
+        if let Some((spec, matched_cmd)) = find_known_tool(first_tok) {
             let script = format!(
                 "if command -v {exe} >/dev/null 2>&1; then {cmd}; else printf '\\n\\033[33m[Vireo] '\\''{exe}'\\'' is not installed or not on PATH.\\033[0m\\n\\033[36mInstall with: {hint}\\033[0m\\n\\n'; fi; exec \"{shell}\" -l",
-                exe = spec.cmd,
+                exe = matched_cmd,
                 cmd = custom,
                 hint = spec.unix_install,
                 shell = shell,

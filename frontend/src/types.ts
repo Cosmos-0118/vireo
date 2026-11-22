@@ -237,11 +237,39 @@ export interface OpenTab {
 }
 
 export interface AgentConfig {
-  provider: 'openai' | 'anthropic' | 'gemini' | 'ollama' | 'claude-cli' | 'codex-cli';
+  provider:
+    | 'openai'
+    | 'anthropic'
+    | 'gemini'
+    | 'ollama'
+    | 'antigravity-cli'
+    | 'claude-cli'
+    | 'codex-cli'
+    | 'gemini-cli'
+    | 'opencode-cli'
+    | 'cursor-cli'
+    | 'copilot-cli'
+    | 'amp-cli'
+    | 'qwen-cli';
   baseUrl: string;
   apiKey: string;
   model: string;
   autoCheckpoint: boolean;
+  /** Installed CLI providers only. Defaults to 'auto_edit'. */
+  permissionMode?: PermissionMode;
+}
+
+export type PermissionMode = 'ask' | 'auto_edit' | 'full_access';
+
+/** A tool-approval prompt from a running Claude Code turn, shown inline until answered. */
+export interface PermissionRequest {
+  turn_id: string;
+  request_id: string;
+  tool: string;
+  summary: string;
+  input: Record<string, unknown>;
+  /** Rule saved when the user picks "always allow in this thread". */
+  rule: string;
 }
 
 export interface ToolCallTrace {
@@ -280,6 +308,8 @@ export interface LocalModelsInfo {
   ollama: { running: boolean; models: string[] };
   /** Model slugs listed in the user's Codex install. */
   codex: string[];
+  /** Model slugs reported by `agy models` when Antigravity CLI is installed. */
+  antigravity?: string[];
 }
 
 export interface CliToolStatus {

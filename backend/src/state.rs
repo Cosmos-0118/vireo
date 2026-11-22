@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, OnceLock};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -50,6 +51,18 @@ pub struct AppState {
     pub watcher_retarget_tx: mpsc::Sender<PathBuf>,
     pub http_client: reqwest::Client,
     pub main_window: Arc<OnceLock<tauri::WebviewWindow>>,
+    /// Tool-permission prompts from a running agent CLI awaiting the user's answer,
+    /// keyed by `(turn_id, request_id)`.
+    pub pending_permissions: Arc<std::sync::Mutex<HashMap<(String, String), oneshot::Sender<PermissionDecision>>>>,
+}
+
+/// The user's answer to an in-chat permission card.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct PermissionDecision {
+    pub allow: bool,
+    /// Also allow matching requests for the rest of the thread.
+    #[serde(default)]
+    pub remember: bool,
 }
 
 impl AppState {
@@ -63,6 +76,7 @@ impl AppState {
             watcher_retarget_tx,
             http_client: reqwest::Client::new(),
             main_window: Arc::new(OnceLock::new()),
+            pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 

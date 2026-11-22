@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use walkdir::WalkDir;
@@ -25,12 +26,19 @@ pub struct ChatMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct AgentChatReq {
-    pub provider: String, // "openai" | "anthropic" | "gemini" | "ollama" | "claude-cli" | "codex-cli"
+    pub provider: String, // "openai" | "anthropic" | "gemini" | "ollama" | "antigravity-cli" | "claude-cli" | "codex-cli" | "gemini-cli" | "opencode-cli" | "cursor-cli" | "copilot-cli" | "amp-cli" | "qwen-cli"
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub auto_checkpoint: Option<bool>,
+    /// CLI providers only: "ask" | "auto_edit" (default) | "full_access".
+    #[serde(default)]
+    pub permission_mode: Option<String>,
+    /// Claude CLI only: Vireo permission rules the user chose to "always allow" in this thread
+    /// (see `cli_agent::permission_rule`).
+    #[serde(default)]
+    pub allowed_rules: Option<Vec<String>>,
 }
 
 const SYSTEM_PROMPT: &str = r#"You are Vireo Agent, a concise, practical AI software engineer working directly inside the user's local repository.
@@ -444,8 +452,79 @@ struct LocalModels {
     models: Vec<String>,
 }
 
-/// Models actually available on this machine: what the local Ollama daemon has pulled, and the
-/// models the user's Codex install lists (read-only from Codex's own model cache).
+#[derive(Default)]
+struct AgyModelsCache {
+    models: Vec<String>,
+    fetching: bool,
+    fetched_at: Option<Instant>,
+}
+
+static AGY_MODELS_CACHE: OnceLock<Mutex<AgyModelsCache>> = OnceLock::new();
+
+fn cached_antigravity_models() -> Vec<String> {
+    let cache = AGY_MODELS_CACHE.get_or_init(|| Mutex::new(AgyModelsCache::default()));
+    let (models, should_fetch) = {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        let stale = guard
+            .fetched_at
+            .map(|t| t.elapsed() > Duration::from_secs(600))
+            .unwrap_or(true);
+        let should_fetch = !guard.fetching && stale;
+        if should_fetch {
+            guard.fetching = true;
+        }
+        (guard.models.clone(), should_fetch)
+    };
+
+    if should_fetch {
+        tokio::spawn(async move {
+            let exe = tokio::task::spawn_blocking(|| crate::pty::resolve_cli_tool("agy"))
+                .await
+                .ok()
+                .flatten();
+            let fetched = match exe {
+                Some(path) => {
+                    let mut cmd = background_command(&path.to_string_lossy());
+                    cmd.arg("models")
+                        .env("PATH", crate::pty::augmented_path_env())
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::piped())
+                        .stderr(std::process::Stdio::null());
+                    match tokio::time::timeout(Duration::from_secs(25), cmd.output()).await {
+                        Ok(Ok(out)) if out.status.success() => {
+                            let text = String::from_utf8_lossy(&out.stdout);
+                            let parsed: Vec<String> = text
+                                .lines()
+                                .filter_map(|line| {
+                                    let (slug, _) = line.split_once('\t')?;
+                                    let slug = slug.trim();
+                                    (!slug.is_empty()).then(|| slug.to_string())
+                                })
+                                .collect();
+                            Some(parsed)
+                        }
+                        _ => None,
+                    }
+                }
+                None => Some(Vec::new()),
+            };
+            let cache = AGY_MODELS_CACHE.get_or_init(|| Mutex::new(AgyModelsCache::default()));
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(list) = fetched {
+                if !list.is_empty() {
+                    guard.models = list;
+                }
+            }
+            guard.fetching = false;
+            guard.fetched_at = Some(Instant::now());
+        });
+    }
+
+    models
+}
+
+/// Models actually available on this machine: what the local Ollama daemon has pulled, the models
+/// the user's Codex install lists, and cached models from Antigravity CLI (`agy models`).
 pub async fn list_models(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ModelsQuery>,
@@ -498,7 +577,9 @@ pub async fn list_models(
     .flatten()
     .unwrap_or_default();
 
-    Json(json!({ "ollama": ollama, "codex": codex }))
+    let antigravity = cached_antigravity_models();
+
+    Json(json!({ "ollama": ollama, "codex": codex, "antigravity": antigravity }))
 }
 
 pub(crate) async fn send_sse(tx: &mpsc::Sender<Result<Event, Infallible>>, event: &str, payload: Value) {
@@ -535,7 +616,7 @@ pub async fn chat(
                 &tx,
                 "error",
                 json!({
-                    "message": "No API key is set. Open settings (the gear icon in the Agent panel) to add an OpenAI, Anthropic, Gemini, OpenRouter, or local Ollama model, or pick Claude Code / Codex to use an installed, logged-in CLI without an API key."
+                    "message": "No API key is set. Open settings (the gear icon in the Agent panel) to add an OpenAI, Anthropic, Gemini, OpenRouter, or local Ollama model, or pick an installed, logged-in CLI (Antigravity, Claude Code, Codex, Gemini CLI, OpenCode, Cursor CLI, GitHub Copilot, Amp, or Qwen Code) without an API key."
                 }),
             )
             .await;

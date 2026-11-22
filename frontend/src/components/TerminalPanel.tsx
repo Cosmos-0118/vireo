@@ -37,12 +37,21 @@ export interface TermTabSpec {
 const ptySid = (workspace: string, tab: TermTabSpec) =>
   `term::${workspace}::${tab.id}::${tab.runKey ?? 0}::${tab.cmd ?? ''}`;
 
-const AGENT_PRESETS: { id: string; label: string; cmd: string }[] = [
+const FALLBACK_AGENT_PRESETS: { id: string; label: string; cmd: string }[] = [
+  { id: 'antigravity', label: 'Antigravity', cmd: 'agy' },
   { id: 'claude', label: 'Claude Code', cmd: 'claude' },
-  { id: 'codex', label: 'Codex CLI', cmd: 'codex' },
+  { id: 'codex', label: 'Codex', cmd: 'codex' },
   { id: 'gemini', label: 'Gemini CLI', cmd: 'gemini' },
-  { id: 'aider', label: 'Aider', cmd: 'aider' },
   { id: 'opencode', label: 'OpenCode', cmd: 'opencode' },
+  { id: 'cursor', label: 'Cursor CLI', cmd: 'cursor-agent' },
+  { id: 'copilot', label: 'GitHub Copilot', cmd: 'copilot' },
+  { id: 'amp', label: 'Amp', cmd: 'amp' },
+  { id: 'qwen', label: 'Qwen Code', cmd: 'qwen' },
+  { id: 'aider', label: 'Aider', cmd: 'aider' },
+  { id: 'cline', label: 'Cline', cmd: 'cline' },
+  { id: 'kilo', label: 'Kilo Code', cmd: 'kilo' },
+  { id: 'goose', label: 'Goose', cmd: 'goose' },
+  { id: 'kiro', label: 'Kiro', cmd: 'kiro-cli' },
 ];
 
 interface SingleTerminalProps {
@@ -144,58 +153,71 @@ const LauncherMenu: React.FC<LauncherMenuProps> = ({ anchor, tools, onLaunch, on
     }
   };
 
+  const entries: Array<{
+    id: string;
+    label: string;
+    cmd: string;
+    installed?: boolean;
+    path?: string | null;
+    install_hint?: string;
+  }> =
+    tools.length > 0
+      ? [...tools].sort((a, b) => Number(b.installed) - Number(a.installed))
+      : FALLBACK_AGENT_PRESETS;
+
   return (
     <div
       ref={ref}
-      style={{ position: 'fixed', left: pos.left, bottom: pos.bottom, zIndex: 60, width: 320 }}
+      style={{ position: 'fixed', left: pos.left, bottom: pos.bottom, zIndex: 60, width: 330 }}
       className="rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl py-1 text-[12.5px]"
     >
       <div className="px-3 py-1.5 text-[10.5px] uppercase tracking-wider text-[var(--text-dim)]">
         Launch CLI agent
       </div>
-      {AGENT_PRESETS.map((p) => {
-        const status = tools.find((t) => t.cmd === p.cmd);
-        const installed = status?.installed;
-        return (
-          <div
-            key={p.id}
-            onClick={() => onLaunch(p.label, p.cmd)}
-            className="flex items-center gap-2 px-3 py-1.5 cursor-pointer hover:bg-[var(--bg-hover)]"
-            title={
-              installed
-                ? status?.path || p.cmd
-                : status
-                ? `${p.cmd} was not found on PATH`
-                : `Launch ${p.label}`
-            }
-          >
-            <span
-              className="w-1.5 h-1.5 rounded-full shrink-0"
-              style={{
-                background: installed ? '#10b981' : 'var(--text-dim)',
-                opacity: installed ? 1 : 0.45,
-              }}
-            />
-            <span className="text-[var(--text-primary)] font-medium">{p.label}</span>
-            <span className="font-mono text-[11px] text-[var(--text-dim)] truncate min-w-0 flex-1">
-              {installed ? status?.path || '' : ''}
-            </span>
-            {status && !installed && status.install_hint && (
-              <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  copyHint(p.id, status.install_hint);
+      <div className="max-h-[55vh] overflow-y-auto">
+        {entries.map((p) => {
+          const installed = p.installed;
+          return (
+            <div
+              key={p.id}
+              onClick={() => onLaunch(p.label, p.cmd)}
+              className="flex items-center gap-2 px-3 py-1.5 cursor-pointer hover:bg-[var(--bg-hover)]"
+              title={
+                installed
+                  ? p.path || p.cmd
+                  : installed === false
+                  ? `${p.cmd} was not found on PATH`
+                  : `Launch ${p.label}`
+              }
+            >
+              <span
+                className="w-1.5 h-1.5 rounded-full shrink-0"
+                style={{
+                  background: installed ? '#10b981' : 'var(--text-dim)',
+                  opacity: installed ? 1 : 0.45,
                 }}
-                className="flex items-center gap-1 px-1.5 py-0.5 text-[10.5px] rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-active)] cursor-pointer shrink-0"
-                title={status.install_hint}
-              >
-                {copied === p.id ? <Check size={10} /> : <Copy size={10} />}
-                {copied === p.id ? 'Copied' : 'Install cmd'}
-              </button>
-            )}
-          </div>
-        );
-      })}
+              />
+              <span className="text-[var(--text-primary)] font-medium shrink-0">{p.label}</span>
+              <span className="font-mono text-[11px] text-[var(--text-dim)] truncate min-w-0 flex-1">
+                {installed ? p.path || '' : ''}
+              </span>
+              {installed === false && p.install_hint && (
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    copyHint(p.id, p.install_hint!);
+                  }}
+                  className="flex items-center gap-1 px-1.5 py-0.5 text-[10.5px] rounded border border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-active)] cursor-pointer shrink-0"
+                  title={p.install_hint}
+                >
+                  {copied === p.id ? <Check size={10} /> : <Copy size={10} />}
+                  {copied === p.id ? 'Copied' : 'Install cmd'}
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
       <div className="my-1 border-t border-[var(--border)]" />
       <form
         onSubmit={(e) => {
@@ -383,7 +405,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
                 ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
                 : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
             }`}
-            title="Launch a CLI agent (Claude Code, Codex, Gemini, Aider, OpenCode…)"
+            title="Launch a CLI agent (Antigravity, Claude Code, Codex, Gemini, OpenCode, Cursor, Copilot…)"
           >
             <Sparkles size={13} />
             <span className="hidden @[520px]:inline">Launch Agent</span>

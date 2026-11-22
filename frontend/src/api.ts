@@ -5,6 +5,7 @@ import type {
   RollbackRes,
   CliToolStatus,
   LocalModelsInfo,
+  PermissionRequest,
   CommandRes,
   CommitDetailRes,
   CommitFileChange,
@@ -260,6 +261,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ id, force }),
     }),
+  answerPermission: (turnId: string, requestId: string, allow: boolean, remember = false) =>
+    jsonFetch<{ ok: boolean }>('/api/agent/permission', {
+      method: 'POST',
+      body: JSON.stringify({ turn_id: turnId, request_id: requestId, allow, remember }),
+    }),
   cliTools: () => jsonFetch<CliToolStatus[]>('/api/agent/cli-tools'),
   agentModels: (ollamaBase?: string) =>
     jsonFetch<LocalModelsInfo>(
@@ -275,10 +281,13 @@ export async function streamAgentChat(
     onToolCall: (call: { id: string; name: string; args: Record<string, unknown> }) => void;
     onToolResult: (res: { id: string; name: string; result: string }) => void;
     onCheckpoint: (cp: Checkpoint) => void;
+    onPermissionRequest?: (req: PermissionRequest) => void;
+    onPermissionCancel?: (requestId: string) => void;
     onError: (msg: string) => void;
     onDone: () => void;
   },
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  allowedRules?: string[]
 ) {
   const res = await fetch('/api/agent/chat', {
     method: 'POST',
@@ -291,6 +300,8 @@ export async function streamAgentChat(
       model: config.model,
       messages,
       auto_checkpoint: config.autoCheckpoint,
+      permission_mode: config.permissionMode ?? 'auto_edit',
+      allowed_rules: allowedRules?.length ? allowedRules : undefined,
     }),
   });
 
@@ -330,6 +341,8 @@ export async function streamAgentChat(
         else if (evName === 'tool_call') handlers.onToolCall(data);
         else if (evName === 'tool_result') handlers.onToolResult(data);
         else if (evName === 'checkpoint') handlers.onCheckpoint(data);
+        else if (evName === 'permission_request') handlers.onPermissionRequest?.(data);
+        else if (evName === 'permission_cancel') handlers.onPermissionCancel?.(data.request_id);
         else if (evName === 'error') handlers.onError(data.message || 'Unknown error');
         else if (evName === 'done') handlers.onDone();
       } catch {
