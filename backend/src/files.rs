@@ -125,6 +125,49 @@ pub async fn set_workspace(
     }))
 }
 
+pub async fn pick_workspace(
+    State(state): State<AppState>,
+) -> Result<Json<Option<WorkspaceInfo>>, (StatusCode, String)> {
+    let current = state.workspace_path().await;
+    let picked = rfd::AsyncFileDialog::new()
+        .set_title("Open Repository Folder — Vireo")
+        .set_directory(&current)
+        .pick_folder()
+        .await;
+
+    let Some(folder) = picked else {
+        return Ok(Json(None));
+    };
+
+    let target = folder.path().to_path_buf();
+    let canonical = std::fs::canonicalize(&target).unwrap_or(target);
+    let cleaned_str = canonical
+        .to_string_lossy()
+        .trim_start_matches(r"\\?\")
+        .to_string();
+    let cleaned_path = PathBuf::from(&cleaned_str);
+
+    {
+        let mut ws = state.workspace.write().await;
+        *ws = cleaned_path.clone();
+    }
+    state.checkpoints.write().await.clear();
+    let _ = state.watcher_retarget_tx.send(cleaned_path.clone()).await;
+    let _ = state.events_tx.send(WorkspaceEvent::WorkspaceSwitched {
+        path: cleaned_str.clone(),
+    });
+
+    let name = cleaned_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("workspace")
+        .to_string();
+    Ok(Json(Some(WorkspaceInfo {
+        path: cleaned_str,
+        name,
+    })))
+}
+
 pub async fn get_tree(
     State(state): State<AppState>,
     Query(q): Query<TreeQuery>,

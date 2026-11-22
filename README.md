@@ -15,9 +15,15 @@ A lightweight, agent-first code workbench inspired by VS Code — without Electr
 
 ## Quick Start
 
+**Clean production build & launch (recommended):**
 ```powershell
-# Run as a standalone desktop-style window (opens in Edge App Mode)
-.\vireo.ps1 -Dir "C:\path\to\your\repo"
+.\build-and-run.cmd "C:\path\to\your\repo"
+```
+Optional flags: `--port 4317`, `--clean-all` (full `cargo clean`), `--no-browser`.
+
+**Launch without rebuilding:**
+```powershell
+powershell -ExecutionPolicy Bypass -File .\vireo.ps1 -Dir "C:\path\to\your\repo"
 ```
 
 Or run manually:

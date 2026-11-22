@@ -1,33 +1,33 @@
 @import "tailwindcss";
 
 :root {
-  --bg-base: #1e1e1e;
-  --bg-sidebar: #252526;
-  --bg-activity: #181818;
-  --bg-panel: #1b1b1c;
-  --bg-elevated: #2d2d30;
-  --bg-hover: #2a2d2e;
-  --bg-active: #37373d;
-  --bg-input: #1e1e1e;
-  --border: #333337;
-  --text-primary: #d4d4d4;
-  --text-muted: #9da5b4;
-  --text-dim: #6e7681;
-  --accent: #007acc;
-  --accent-hover: #1f8ad2;
+  --bg-base: #1b1c1f;
+  --bg-sidebar: #16171a;
+  --bg-activity: #111215;
+  --bg-panel: #141518;
+  --bg-elevated: #23252a;
+  --bg-hover: #262930;
+  --bg-active: #2e3340;
+  --bg-input: #121316;
+  --border: #2a2d35;
+  --text-primary: #e4e7ee;
+  --text-muted: #9aa3b2;
+  --text-dim: #646d7c;
+  --accent: #3b82f6;
+  --accent-hover: #60a5fa;
   --accent-fg: #ffffff;
-  --added-bg: rgba(46, 160, 67, 0.16);
-  --added-word: rgba(46, 160, 67, 0.42);
-  --added-fg: #4ec9b0;
-  --removed-bg: rgba(248, 81, 73, 0.16);
-  --removed-word: rgba(248, 81, 73, 0.42);
-  --removed-fg: #f48771;
-  --modified-fg: #e2c08d;
-  --danger: #f14c4c;
-  --status-bar-bg: #007acc;
-  --status-bar-fg: #ffffff;
-  --font-mono: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, 'Courier New', monospace;
-  --font-sans: 'Segoe UI', -apple-system, BlinkMacSystemFont, Inter, Roboto, sans-serif;
+  --added-bg: rgba(46, 160, 67, 0.14);
+  --added-word: rgba(46, 160, 67, 0.36);
+  --added-fg: #4ade80;
+  --removed-bg: rgba(248, 81, 73, 0.14);
+  --removed-word: rgba(248, 81, 73, 0.36);
+  --removed-fg: #f87171;
+  --modified-fg: #fbbf24;
+  --danger: #ef4444;
+  --status-bar-bg: #111215;
+  --status-bar-fg: #cbd5e1;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', 'Cascadia Code', Consolas, monospace;
+  --font-sans: 'Inter Variable', 'Inter', 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
 * {
@@ -45,20 +45,29 @@ body,
   background: var(--bg-base);
   color: var(--text-primary);
   font-family: var(--font-sans);
+  font-feature-settings: "cv02", "cv03", "cv04", "cv11";
   font-size: 13px;
+  line-height: 1.45;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
 }
 
 code,
 pre,
 .font-mono {
   font-family: var(--font-mono);
+  font-feature-settings: "liga" 1, "calt" 1;
 }
 
-/* Thin VS Code-style scrollbars */
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Crisp minimal scrollbars */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
 }
 
 ::-webkit-scrollbar-track {
@@ -66,47 +75,50 @@ pre,
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(128, 128, 128, 0.28);
-  border-radius: 4px;
+  background: rgba(148, 163, 184, 0.22);
+  border-radius: 999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(128, 128, 128, 0.5);
+  background: rgba(148, 163, 184, 0.42);
 }
 
-/* CodeMirror sizing */
+/* CodeMirror typography & sizing */
 .cm-editor {
   height: 100%;
   font-family: var(--font-mono) !important;
-  font-size: 13px;
+  font-feature-settings: "liga" 1, "calt" 1;
+  font-size: 13.5px;
   background: var(--bg-base) !important;
   color: var(--text-primary) !important;
 }
 
 .cm-scroller {
   overflow: auto;
-  line-height: 1.55;
+  line-height: 1.65;
 }
 
 .cm-gutters {
   background: var(--bg-base) !important;
   color: var(--text-dim) !important;
   border-right: 1px solid var(--border) !important;
+  padding-right: 6px;
+  font-variant-numeric: tabular-nums;
 }
 
 .cm-activeLine {
-  background: rgba(128, 128, 128, 0.08) !important;
+  background: rgba(148, 163, 184, 0.06) !important;
 }
 
 .cm-activeLineGutter {
-  background: rgba(128, 128, 128, 0.12) !important;
+  background: rgba(148, 163, 184, 0.1) !important;
   color: var(--text-primary) !important;
 }
 
 /* xterm sizing */
 .xterm {
   height: 100%;
-  padding: 6px 8px;
+  padding: 8px 10px;
 }
 
 .xterm-viewport {

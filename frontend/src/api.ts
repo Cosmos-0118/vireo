@@ -30,6 +30,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path }),
     }),
+  pickWorkspace: () =>
+    jsonFetch<WorkspaceInfo | null>('/api/workspace/pick', {
+      method: 'POST',
+      body: '{}',
+    }),
   getTree: (path = '') =>
     jsonFetch<TreeEntry[]>(`/api/files/tree?path=${encodeURIComponent(path)}`),
   listFiles: () => jsonFetch<string[]>('/api/files/list'),

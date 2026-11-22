@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod agent;
 mod files;
 mod git;
@@ -6,22 +8,55 @@ mod state;
 mod watcher;
 
 use axum::{
+    body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
-    response::IntoResponse,
+    http::{header, StatusCode, Uri},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
 use futures_util::{SinkExt, StreamExt};
+use rust_embed::Embed;
 use state::AppState;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use tower_http::{
-    cors::{Any, CorsLayer},
-    services::{ServeDir, ServeFile},
-};
+use tower_http::cors::{Any, CorsLayer};
+
+#[derive(Embed)]
+#[folder = "../frontend/dist"]
+struct FrontendAssets;
+
+async fn serve_embedded(uri: Uri) -> Response {
+    let raw_path = uri.path().trim_start_matches('/');
+    let path = if raw_path.is_empty() {
+        "index.html"
+    } else {
+        raw_path
+    };
+
+    if let Some(file) = FrontendAssets::get(path) {
+        let mime = mime_guess::from_path(path).first_or_octet_stream();
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, mime.as_ref())
+            .body(Body::from(file.data.into_owned()))
+            .unwrap();
+    }
+
+    // SPA fallback to index.html
+    if let Some(index) = FrontendAssets::get("index.html") {
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .body(Body::from(index.data.into_owned()))
+            .unwrap();
+    }
+
+    (StatusCode::NOT_FOUND, "Frontend assets not built").into_response()
+}
 
 async fn ws_events(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_events_socket(socket, state))
@@ -59,14 +94,20 @@ async fn health() -> &'static str {
     "ok"
 }
 
-fn parse_args() -> (u16, PathBuf, Option<PathBuf>) {
+struct CliArgs {
+    port: u16,
+    workspace: PathBuf,
+    server_only: bool,
+}
+
+fn parse_args() -> CliArgs {
     let args: Vec<String> = std::env::args().collect();
     let mut port: u16 = std::env::var("VIREO_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4317);
+        .unwrap_or(0); // 0 = pick any free local port automatically
     let mut dir: Option<PathBuf> = None;
-    let mut static_dir: Option<PathBuf> = None;
+    let mut server_only = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -81,14 +122,25 @@ fn parse_args() -> (u16, PathBuf, Option<PathBuf>) {
                 dir = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--static" if i + 1 < args.len() => {
-                static_dir = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
+            "--server-only" => {
+                server_only = true;
+                i += 1;
+            }
+            arg if !arg.starts_with('-') && dir.is_none() => {
+                let candidate = PathBuf::from(arg);
+                if candidate.is_dir() {
+                    dir = Some(candidate);
+                }
+                i += 1;
             }
             _ => {
                 i += 1;
             }
         }
+    }
+
+    if server_only && port == 0 {
+        port = 4317;
     }
 
     let workspace = dir.unwrap_or_else(|| {
@@ -101,21 +153,26 @@ fn parse_args() -> (u16, PathBuf, Option<PathBuf>) {
             .trim_start_matches(r"\\?\")
             .to_string(),
     );
-    (port, cleaned, static_dir)
+    CliArgs {
+        port,
+        workspace: cleaned,
+        server_only,
+    }
 }
 
-#[tokio::main]
-async fn main() {
-    let (port, initial_workspace, explicit_static) = parse_args();
-
+fn build_router(initial_workspace: PathBuf) -> Router {
     let (events_tx, _) = tokio::sync::broadcast::channel(128);
     let watcher_tx = watcher::spawn_watcher(initial_workspace.clone(), events_tx.clone());
-    let mut app_state = AppState::new(initial_workspace.clone(), watcher_tx);
+    let mut app_state = AppState::new(initial_workspace, watcher_tx);
     app_state.events_tx = events_tx;
 
-    let api = Router::new()
+    Router::new()
         .route("/api/health", get(health))
-        .route("/api/workspace", get(files::get_workspace).post(files::set_workspace))
+        .route(
+            "/api/workspace",
+            get(files::get_workspace).post(files::set_workspace),
+        )
+        .route("/api/workspace/pick", post(files::pick_workspace))
         .route("/api/files/tree", get(files::get_tree))
         .route("/api/files/list", get(files::list_files))
         .route("/api/files/read", get(files::read_file))
@@ -138,45 +195,74 @@ async fn main() {
         .route("/api/agent/chat", post(agent::chat))
         .route("/ws/pty", get(pty::ws_pty))
         .route("/ws/events", get(ws_events))
-        .with_state(app_state);
+        .with_state(app_state)
+        .fallback(serve_embedded)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+}
 
-    // Resolve frontend dist folder automatically
-    let dist_dir = explicit_static.unwrap_or_else(|| {
-        let exe_parent = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let candidates = [
-            PathBuf::from("../frontend/dist"),
-            PathBuf::from("frontend/dist"),
-            exe_parent
-                .as_ref()
-                .map(|p| p.join("../../../frontend/dist"))
-                .unwrap_or_default(),
-            exe_parent
-                .as_ref()
-                .map(|p| p.join("dist"))
-                .unwrap_or_default(),
-        ];
-        candidates
-            .into_iter()
-            .find(|p| p.join("index.html").exists())
-            .unwrap_or_else(|| PathBuf::from("frontend/dist"))
+fn main() {
+    let cli = parse_args();
+    let app_router = build_router(cli.workspace.clone());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Failed to initialize Tokio runtime");
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
+    let (listener, bound_addr) = rt.block_on(async {
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("Failed to bind local port");
+        let local = listener.local_addr().expect("Failed to read bound address");
+        (listener, local)
     });
 
-    let app = if dist_dir.join("index.html").exists() {
-        let index = dist_dir.join("index.html");
-        api.fallback_service(ServeDir::new(dist_dir).not_found_service(ServeFile::new(index)))
-    } else {
-        api
+    if cli.server_only {
+        println!("Vireo server running at http://{}", bound_addr);
+        println!("Workspace: {}", cli.workspace.display());
+        rt.block_on(async move {
+            axum::serve(listener, app_router)
+                .await
+                .expect("Server error");
+        });
+        return;
     }
-    .layer(CorsLayer::new().allow_origin(Any).allow_methods(Any).allow_headers(Any));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    println!("Vireo server running at http://{}", addr);
-    println!("Workspace: {}", initial_workspace.display());
+    // Run embedded Rust server inside Tokio thread pool
+    rt.spawn(async move {
+        let _ = axum::serve(listener, app_router).await;
+    });
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .expect("Failed to bind port");
-    axum::serve(listener, app).await.expect("Server error");
+    let app_url: url::Url = format!("http://{}", bound_addr)
+        .parse()
+        .expect("Invalid local URL");
+    let ws_title = cli
+        .workspace
+        .file_name()
+        .and_then(|s| s.to_str())
+        .map(|n| format!("Vireo — {}", n))
+        .unwrap_or_else(|| "Vireo".to_string());
+
+    tauri::Builder::default()
+        .setup(move |app| {
+            tauri::WebviewWindowBuilder::new(
+                app,
+                "main",
+                tauri::WebviewUrl::External(app_url),
+            )
+            .title(ws_title)
+            .inner_size(1440.0, 900.0)
+            .min_inner_size(960.0, 620.0)
+            .center()
+            .build()?;
+            Ok(())
+        })
+        .run(tauri::generate_context!())
+        .expect("Error running Vireo desktop app");
 }
