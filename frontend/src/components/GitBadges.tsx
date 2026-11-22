@@ -1,6 +1,58 @@
 import React from 'react';
-import { Cloud, GitBranch, Tag } from 'lucide-react';
+import { ArrowDown, ArrowUp, Cloud, GitBranch, Tag } from 'lucide-react';
 import type { GitRef } from '../types';
+
+const SYNC_OUT = 'var(--accent-hover)';
+const SYNC_IN = 'color-mix(in srgb, #a78bfa 75%, var(--text-primary))';
+
+/** Row marker for a commit that is not pushed (outgoing) or not pulled (incoming). */
+export const SyncMark: React.FC<{ dir: 'outgoing' | 'incoming'; size?: number }> = ({ dir, size = 14 }) => {
+  const color = dir === 'outgoing' ? SYNC_OUT : SYNC_IN;
+  const Icon = dir === 'outgoing' ? ArrowUp : ArrowDown;
+  return (
+    <span
+      role="img"
+      aria-label={dir === 'outgoing' ? 'Not pushed' : 'Incoming, not pulled'}
+      className="inline-flex items-center justify-center shrink-0 rounded-[4px]"
+      style={{
+        width: size,
+        height: size,
+        color,
+        background: `color-mix(in srgb, ${color} 16%, transparent)`,
+        boxShadow: `inset 0 0 0 1px color-mix(in srgb, ${color} 34%, transparent)`,
+      }}
+    >
+      <Icon size={size - 5} strokeWidth={2.75} />
+    </span>
+  );
+};
+
+/** Compact ahead/behind counts ("↓2 ↑1") that inherit the surrounding text colour. */
+export const SyncCounts: React.FC<{ ahead: number; behind: number; className?: string }> = ({
+  ahead,
+  behind,
+  className = '',
+}) => {
+  if (ahead <= 0 && behind <= 0) return null;
+  const chip =
+    'inline-flex items-center gap-px h-[15px] pl-[2px] pr-[4px] rounded-[4px] bg-current/12 font-mono text-[10.5px] font-medium leading-none tabular-nums';
+  return (
+    <span className={`inline-flex items-center gap-1 ${className}`}>
+      {behind > 0 && (
+        <span className={chip}>
+          <ArrowDown size={10} strokeWidth={2.75} />
+          {behind}
+        </span>
+      )}
+      {ahead > 0 && (
+        <span className={chip}>
+          <ArrowUp size={10} strokeWidth={2.75} />
+          {ahead}
+        </span>
+      )}
+    </span>
+  );
+};
 
 export const RefPill: React.FC<{ r: GitRef; compact?: boolean }> = ({ r, compact }) => {
   const base = compact

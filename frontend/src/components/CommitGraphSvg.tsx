@@ -15,6 +15,11 @@ interface CommitGraphSvgProps {
   maxVisibleLanes?: number;
   /** Background behind the row, used to cut a gap ring around nodes */
   background?: string;
+  /**
+   * Size the SVG to this row's own lanes instead of the whole graph, so the text that
+   * follows indents with the rails (VS Code's history view).
+   */
+  fitRow?: boolean;
 }
 
 const STROKE = 1.5;
@@ -33,8 +38,10 @@ export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
   rowHeight: H = 24,
   maxVisibleLanes = 8,
   background = 'var(--graph-row-bg, var(--bg-sidebar))',
+  fitRow = false,
 }) => {
-  const width = graphColumnWidth(maxLanes, W, maxVisibleLanes);
+  const rowLanes = Math.max(row.input.length, row.output.length, row.circleIndex + 1);
+  const width = graphColumnWidth(fitRow ? rowLanes : maxLanes, W, maxVisibleLanes);
   const mid = H / 2;
   const R = Math.min(CURVE, mid - 1);
   const x = (i: number) => W * (i + 1);
@@ -124,18 +131,23 @@ export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
       />
     );
   } else if (row.isHead) {
+    // HEAD: large ring around a solid dot
     node = (
       <g>
-        <circle cx={cx} cy={mid} r={6} fill={color} stroke={background} strokeWidth={1.5} />
-        <circle cx={cx} cy={mid} r={2.4} fill={background} />
+        <circle cx={cx} cy={mid} r={6} fill={background} stroke={color} strokeWidth={2} />
+        <circle cx={cx} cy={mid} r={2.5} fill={color} />
       </g>
     );
   } else if (row.isMerge) {
+    // merge commit: ring with a dot, smaller than HEAD
     node = (
-      <circle cx={cx} cy={mid} r={4} fill={background} stroke={color} strokeWidth={2} />
+      <g>
+        <circle cx={cx} cy={mid} r={4.75} fill={background} stroke={color} strokeWidth={1.5} />
+        <circle cx={cx} cy={mid} r={2} fill={color} />
+      </g>
     );
   } else {
-    node = <circle cx={cx} cy={mid} r={4} fill={color} stroke={background} strokeWidth={1.5} />;
+    node = <circle cx={cx} cy={mid} r={4} fill={color} />;
   }
 
   return (

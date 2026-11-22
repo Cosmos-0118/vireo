@@ -281,13 +281,23 @@ export function usePtyTerminal(
         }
         if (key === 'v') {
           ev.preventDefault();
-          // term.paste honours bracketed-paste mode and normalises newlines
+          // term.paste honours bracketed-paste mode and normalises newlines. When the clipboard
+          // holds an image (no text), CLI agents read it from the OS clipboard themselves once
+          // they get their image-paste key, so forward that instead of pasting nothing.
+          const pasteImageKey = IS_WINDOWS ? '\x1bv' : '\x16'; // Alt+V on Windows, Ctrl+V elsewhere
+          const send = (data: string) => {
+            if (!disposed && sock && sock.readyState === WebSocket.OPEN) {
+              sock.send(JSON.stringify({ type: 'input', data }));
+            }
+          };
           navigator.clipboard
             ?.readText()
             .then((text) => {
-              if (!disposed && text) term.paste(text);
+              if (disposed) return;
+              if (text) term.paste(text);
+              else send(pasteImageKey);
             })
-            .catch(() => {});
+            .catch(() => send(pasteImageKey));
           return HANDLED;
         }
         return !HANDLED;

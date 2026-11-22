@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   Archive,
   BookmarkPlus,
-  ArrowDown,
   ArrowUp,
   Check,
   ChevronDown,
@@ -62,7 +61,7 @@ import {
 import { CommitGraphSvg, GraphRails, graphColumnWidth } from './CommitGraphSvg';
 import { useCommitHover } from './CommitHoverCard';
 import { BranchBar } from './BranchBar';
-import { fileStatusColor, RefBadges } from './GitBadges';
+import { fileStatusColor, RefBadges, SyncMark } from './GitBadges';
 
 function plural(n: number, word: string) {
   return `${n} ${word}${n === 1 ? '' : 's'}`;
@@ -1711,23 +1710,11 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                               laneWidth={GRAPH_LANE_W}
                               rowHeight={GRAPH_ROW_H}
                               maxVisibleLanes={GRAPH_MAX_LANES}
+                              fitRow
                             />
 
                             <div className="min-w-0 flex-1 flex items-center gap-1.5 pl-0.5 pr-2">
-                              {row.sync === 'outgoing' && (
-                                <ArrowUp
-                                  size={11}
-                                  className="shrink-0 text-[var(--accent-hover)]"
-                                  aria-label="Not pushed"
-                                />
-                              )}
-                              {row.sync === 'incoming' && (
-                                <ArrowDown
-                                  size={11}
-                                  className="shrink-0 text-[color-mix(in_srgb,#a78bfa_70%,var(--text-primary))]"
-                                  aria-label="Incoming, not pulled"
-                                />
-                              )}
+                              {row.sync && <SyncMark dir={row.sync} size={13} />}
                               <span
                                 className={`truncate min-w-[40px] text-[12.5px] ${
                                   c.is_head

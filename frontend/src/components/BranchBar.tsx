@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { api } from '../api';
 import type { BranchesRes, BranchInfo, GitStatusRes } from '../types';
+import { SyncCounts } from './GitBadges';
 
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                   */
@@ -302,20 +303,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
   const syncDisabled = busy || sync.kind === 'blocked';
   const counts =
     sync.kind === 'diverged' || sync.kind === 'pull' || sync.kind === 'push' ? (
-      <span className="flex items-center gap-1 font-mono text-[10.5px] tabular-nums">
-        {sync.behind > 0 && (
-          <span className="flex items-center">
-            <ArrowDown size={10} />
-            {sync.behind}
-          </span>
-        )}
-        {sync.ahead > 0 && (
-          <span className="flex items-center">
-            <ArrowUp size={10} />
-            {sync.ahead}
-          </span>
-        )}
-      </span>
+      <SyncCounts ahead={sync.ahead} behind={sync.behind} />
     ) : null;
 
   /* Status line ---------------------------------------------------------- */
@@ -1066,18 +1054,7 @@ const BranchRow: React.FC<{
       <span className="ml-auto pl-1 flex items-center gap-1.5 shrink-0 text-[10.5px] tabular-nums text-[var(--text-dim)] group-hover:invisible">
         {!remote && b.upstream_gone && <span className="text-[var(--modified-fg)]">remote deleted</span>}
         {!remote && !b.upstream && hasRemote && !b.upstream_gone && <span>local only</span>}
-        {b.behind > 0 && (
-          <span className="flex items-center text-[var(--text-muted)]">
-            <ArrowDown size={10} />
-            {b.behind}
-          </span>
-        )}
-        {b.ahead > 0 && (
-          <span className="flex items-center text-[var(--text-muted)]">
-            <ArrowUp size={10} />
-            {b.ahead}
-          </span>
-        )}
+        <SyncCounts ahead={b.ahead} behind={b.behind} className="text-[var(--text-muted)]" />
         {b.timestamp > 0 && <span>{compactAgo(b.timestamp, now)}</span>}
       </span>
 

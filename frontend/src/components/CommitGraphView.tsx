@@ -1,7 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ArrowDown,
-  ArrowUp,
   Check,
   ChevronDown,
   ChevronRight,
@@ -48,7 +46,7 @@ import {
 } from './CommitContextMenu';
 import { CommitGraphSvg, graphColumnWidth } from './CommitGraphSvg';
 import { useCommitHover } from './CommitHoverCard';
-import { fileStatusColor, RefBadges } from './GitBadges';
+import { fileStatusColor, RefBadges, SyncMark } from './GitBadges';
 
 const FULL_ROW_H = 28;
 const FULL_LANE_W = 14;
@@ -934,12 +932,7 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
                     <RefBadges refs={c.refs} color={row.circleColor} labelled={3} maxWidth={160} tooltips={false} />
                   </span>
                 )}
-                {row.sync === 'outgoing' && (
-                  <ArrowUp size={12} className="shrink-0 text-[var(--accent-hover)]" aria-label="Not pushed" />
-                )}
-                {row.sync === 'incoming' && (
-                  <ArrowDown size={12} className="shrink-0 text-[color-mix(in_srgb,#a78bfa_70%,var(--text-primary))]" aria-label="Incoming, not pulled" />
-                )}
+                {row.sync && <SyncMark dir={row.sync} />}
                 <span
                   className={`truncate text-[12.5px] ${c.is_head ? 'font-semibold' : ''} ${
                     row.sync === 'incoming' ? 'text-[var(--text-muted)]' : ''
