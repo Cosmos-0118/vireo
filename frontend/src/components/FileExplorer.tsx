@@ -54,7 +54,7 @@ function parentOf(path: string): string {
   return i < 0 ? '' : path.slice(0, i);
 }
 
-function statusBadge(f: GitFileStatus): string {
+export function statusBadge(f: GitFileStatus): string {
   if (f.untracked) return 'U';
   const w = f.worktree_status.trim();
   if (w && w !== '.') return w;

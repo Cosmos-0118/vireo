@@ -10,7 +10,9 @@ import type {
   GitDiffRes,
   GitStatusRes,
   GithubStatusRes,
-  SearchMatch,
+  ReplaceRes,
+  SearchOptions,
+  SearchRes,
   TaskItem,
   TreeEntry,
   WorkspaceInfo,
@@ -62,8 +64,24 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path, content }),
     }),
-  searchFiles: (q: string) =>
-    jsonFetch<SearchMatch[]>(`/api/files/search?q=${encodeURIComponent(q)}`),
+  searchFiles: (opts: SearchOptions, signal?: AbortSignal) =>
+    jsonFetch<SearchRes>('/api/files/search', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+      signal,
+    }),
+  replaceInFiles: (opts: {
+    q: string;
+    case_sensitive: boolean;
+    whole_word: boolean;
+    regex: boolean;
+    replacement: string;
+    targets: { path: string; lines?: number[] | null }[];
+  }) =>
+    jsonFetch<ReplaceRes>('/api/files/replace', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
   getTasks: () => jsonFetch<TaskItem[]>('/api/tasks'),
 
   gitStatus: () => jsonFetch<GitStatusRes>('/api/git/status'),

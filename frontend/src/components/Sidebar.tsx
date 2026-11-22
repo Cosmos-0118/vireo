@@ -1,13 +1,12 @@
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import {
   Files,
   GitBranch,
   Search,
 } from 'lucide-react';
-import { api } from '../api';
-import type { CommitFileChange, GitStatusRes, SearchMatch } from '../types';
+import type { CommitFileChange, GitStatusRes } from '../types';
 import { FileExplorer } from './FileExplorer';
-import { FileIcon } from './FileIcon';
+import { SearchPane } from './SearchPane';
 import { SourceControlPane } from './SourceControlPane';
 
 export type SidebarTab = 'changes' | 'explorer' | 'search';
@@ -20,7 +19,7 @@ interface SidebarProps {
   selectedTabId: string | null;
   workspacePath: string;
   onOpenDiff: (path: string, staged?: boolean) => void;
-  onOpenFile: (path: string, line?: number) => void;
+  onOpenFile: (path: string, line?: number, col?: number, colEnd?: number) => void;
   onOpenCommitDiff: (
     commit: { hash: string; short_hash: string; subject: string; author: string; date: string },
     file: CommitFileChange,
@@ -55,22 +54,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   fsVersion,
   onAskAgent,
 }) => {
-  const [searchQuery, setSearchQuery] = useState('');
-  const [searchResults, setSearchResults] = useState<SearchMatch[]>([]);
-  const [searching, setSearching] = useState(false);
-
-  const handleSearch = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!searchQuery.trim()) return;
-    setSearching(true);
-    try {
-      const res = await api.searchFiles(searchQuery.trim());
-      setSearchResults(res);
-    } finally {
-      setSearching(false);
-    }
-  };
-
   const totalChanged = gitStatus?.files.length ?? 0;
 
   return (
@@ -161,53 +144,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
           />
         </div>
 
-        {activeTab === 'search' && (
-          <div className="flex-1 flex flex-col min-h-0">
-            <div className="p-2 border-b border-[var(--border)]">
-              <form onSubmit={handleSearch} className="flex gap-1">
-                <input
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search with ripgrep..."
-                  className="flex-1 min-w-0 px-2 py-1 text-xs rounded bg-[var(--bg-input)] border border-[var(--border)] text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
-                  autoFocus
-                />
-                <button
-                  type="submit"
-                  className="px-2 py-1 text-xs rounded bg-[var(--accent)] text-[var(--accent-fg)] cursor-pointer"
-                >
-                  Go
-                </button>
-              </form>
-            </div>
-            <div className="flex-1 overflow-y-auto">
-              {searching ? (
-                <div className="p-3 text-xs text-[var(--text-muted)]">Searching...</div>
-              ) : searchResults.length === 0 ? (
-                <div className="p-3 text-xs text-[var(--text-dim)]">
-                  Enter a query to search across your repo.
-                </div>
-              ) : (
-                searchResults.map((m, idx) => (
-                  <div
-                    key={`${m.path}-${m.line}-${idx}`}
-                    onClick={() => onOpenFile(m.path, m.line)}
-                    className="px-2.5 py-1.5 border-b border-[var(--border)]/40 hover:bg-[var(--bg-hover)] cursor-pointer"
-                  >
-                    <div className="flex items-center justify-between gap-1.5 text-[11px] font-mono">
-                      <FileIcon path={m.path} size={13} />
-                      <span className="truncate flex-1 text-[var(--accent)]">{m.path}</span>
-                      <span className="text-[var(--text-dim)] shrink-0">:{m.line}</span>
-                    </div>
-                    <div className="text-xs font-mono truncate text-[var(--text-primary)]">
-                      {m.text.trim()}
-                    </div>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-        )}
+        <div className={activeTab === 'search' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
+          <SearchPane
+            active={activeTab === 'search'}
+            gitStatus={gitStatus}
+            fsVersion={fsVersion}
+            onOpenFile={onOpenFile}
+            onOpenDiff={onOpenDiff}
+            onAskAgent={onAskAgent}
+            onRefreshGit={onRefreshGit}
+            onToast={onToast}
+          />
+        </div>
       </div>
     </div>
   );

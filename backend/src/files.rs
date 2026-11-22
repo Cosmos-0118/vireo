@@ -53,17 +53,77 @@ pub struct WriteFileReq {
     pub content: String,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
-pub struct SearchQuery {
+pub struct SearchReq {
     pub q: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+    #[serde(default)]
+    pub regex: bool,
+    /// Comma separated globs, e.g. `frontend/**, *.rs`
+    #[serde(default)]
+    pub include: String,
+    /// Comma separated globs, e.g. `*.lock, dist/**`
+    #[serde(default)]
+    pub exclude: String,
+    #[serde(default = "default_true")]
+    pub use_gitignore: bool,
+    /// When set, only these workspace-relative files are searched.
+    #[serde(default)]
+    pub only_paths: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
 pub struct SearchMatch {
     pub path: String,
     pub line: usize,
+    /// 1-based column (UTF-16 units) of the first match on the line.
     pub column: usize,
     pub text: String,
+    /// Match ranges `[start, end)` in UTF-16 units relative to `text`.
+    pub ranges: Vec<(usize, usize)>,
+}
+
+#[derive(Serialize)]
+pub struct SearchRes {
+    pub matches: Vec<SearchMatch>,
+    pub total_matches: usize,
+    pub total_files: usize,
+    pub truncated: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ReplaceTarget {
+    pub path: String,
+    /// 1-based lines to touch; `None` replaces in the whole file.
+    #[serde(default)]
+    pub lines: Option<Vec<usize>>,
+}
+
+#[derive(Deserialize)]
+pub struct ReplaceReq {
+    pub q: String,
+    #[serde(default)]
+    pub case_sensitive: bool,
+    #[serde(default)]
+    pub whole_word: bool,
+    #[serde(default)]
+    pub regex: bool,
+    pub replacement: String,
+    pub targets: Vec<ReplaceTarget>,
+}
+
+#[derive(Serialize)]
+pub struct ReplaceRes {
+    pub files_changed: usize,
+    pub replacements: usize,
+    pub skipped: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -304,126 +364,382 @@ pub async fn write_file(
     Ok(Json(serde_json::json!({ "ok": true, "path": req.path })))
 }
 
+const SEARCH_MAX_TOTAL: usize = 500;
+const SEARCH_MAX_PER_FILE: usize = 50;
+const SEARCH_MAX_TEXT_UNITS: usize = 500;
+const SEARCH_MAX_ONLY_PATHS: usize = 800;
+
+fn split_globs(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|g| g.trim().replace('\\', "/"))
+        .filter(|g| !g.is_empty())
+        .collect()
+}
+
+/// Converts a byte offset within `text` into UTF-16 code units.
+fn utf16_offset(text: &str, byte_idx: usize) -> usize {
+    let idx = byte_idx.min(text.len());
+    text.char_indices()
+        .take_while(|(i, _)| *i < idx)
+        .map(|(_, c)| c.len_utf16())
+        .sum()
+}
+
+fn truncate_utf16(text: &str, max_units: usize) -> String {
+    let mut units = 0;
+    let mut out = String::new();
+    for c in text.chars() {
+        units += c.len_utf16();
+        if units > max_units {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn build_matcher(
+    q: &str,
+    regex: bool,
+    whole_word: bool,
+    case_sensitive: bool,
+) -> Result<regex::Regex, String> {
+    let mut pat = if regex {
+        q.to_string()
+    } else {
+        regex::escape(q)
+    };
+    if whole_word {
+        // Same half-boundary semantics as `rg --word-regexp`.
+        pat = format!(r"\b{{start-half}}(?:{})\b{{end-half}}", pat);
+    }
+    regex::RegexBuilder::new(&pat)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|e| e.to_string())
+}
+
 pub async fn search_files(
     State(state): State<AppState>,
-    Query(q): Query<SearchQuery>,
-) -> Json<Vec<SearchMatch>> {
-    let query = q.q.trim().to_string();
+    Json(req): Json<SearchReq>,
+) -> Result<Json<SearchRes>, (StatusCode, String)> {
+    let query = req.q.clone();
+    let empty = || {
+        Json(SearchRes {
+            matches: Vec::new(),
+            total_matches: 0,
+            total_files: 0,
+            truncated: false,
+        })
+    };
     if query.is_empty() {
-        return Json(Vec::new());
+        return Ok(empty());
+    }
+    if let Some(paths) = &req.only_paths {
+        if paths.is_empty() {
+            return Ok(empty());
+        }
     }
     let ws = state.workspace_path().await;
 
-    // Try ripgrep first for instant speed
-    let rg_out = background_command("rg")
-        .args([
-            "--json",
-            "--smart-case",
-            "--max-count",
-            "8",
-            "--max-filesize",
-            "1M",
-            "--glob",
-            "!.git",
-            "--glob",
-            "!node_modules",
-            "--glob",
-            "!target",
-            "--glob",
-            "!dist",
-            "--",
-            &query,
-        ])
-        .current_dir(&ws)
-        .output()
-        .await;
-
-    if let Ok(output) = rg_out {
-        let mut matches = Vec::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
-                if val.get("type").and_then(|t| t.as_str()) == Some("match") {
-                    let data = &val["data"];
-                    let path = data["path"]["text"]
-                        .as_str()
-                        .unwrap_or("")
-                        .replace('\\', "/");
-                    let line_num = data["line_number"].as_u64().unwrap_or(1) as usize;
-                    let col = data["submatches"]
-                        .as_array()
-                        .and_then(|a| a.first())
-                        .and_then(|m| m["start"].as_u64())
-                        .unwrap_or(0) as usize
-                        + 1;
-                    let text = data["lines"]["text"]
-                        .as_str()
-                        .unwrap_or("")
-                        .trim_end_matches(['\r', '\n'])
-                        .chars()
-                        .take(200)
-                        .collect();
-                    matches.push(SearchMatch {
-                        path,
-                        line: line_num,
-                        column: col,
-                        text,
-                    });
-                    if matches.len() >= 120 {
-                        break;
-                    }
-                }
+    let mut cmd = background_command("rg");
+    cmd.args(["--json", "--max-count"]);
+    cmd.arg(SEARCH_MAX_PER_FILE.to_string());
+    cmd.args(["--max-filesize", "1M"]);
+    cmd.arg(if req.case_sensitive {
+        "--case-sensitive"
+    } else {
+        "--ignore-case"
+    });
+    if !req.regex {
+        cmd.arg("--fixed-strings");
+    }
+    if req.whole_word {
+        cmd.arg("--word-regexp");
+    }
+    if !req.use_gitignore {
+        cmd.arg("--no-ignore-vcs");
+    }
+    // Later globs win in ripgrep: user includes first so they can never re-include
+    // the built-in excluded directories, then built-ins, then user excludes.
+    for g in split_globs(&req.include) {
+        cmd.args(["--glob", &g]);
+    }
+    for g in ["!.git", "!node_modules", "!target", "!dist"] {
+        cmd.args(["--glob", g]);
+    }
+    for g in split_globs(&req.exclude) {
+        let g = g.trim_start_matches('!');
+        cmd.args(["--glob", &format!("!{}", g)]);
+    }
+    cmd.args(["-e", &query, "--"]);
+    if let Some(paths) = &req.only_paths {
+        for p in paths.iter().take(SEARCH_MAX_ONLY_PATHS) {
+            if resolve_safe_path(&ws, p).is_ok() {
+                cmd.arg(p);
             }
         }
-        return Json(matches);
     }
 
-    // Fallback pure-Rust search if ripgrep is unavailable
-    let q_lower = query.to_lowercase();
-    let matches = tokio::task::spawn_blocking(move || {
-        let mut out = Vec::new();
-        let walker = WalkDir::new(&ws).max_depth(6).into_iter().filter_entry(|e| {
-            if e.depth() == 0 {
-                return true;
-            }
-            let name = e.file_name().to_string_lossy();
-            !(e.file_type().is_dir() && is_ignored_dir_name(&name))
-        });
+    let rg_out = cmd.current_dir(&ws).output().await;
 
-        for entry in walker.flatten() {
-            if !entry.file_type().is_file() {
+    if let Ok(output) = rg_out {
+        // rg exits 0 on matches, 1 on none, 2 on error (it may still emit partial results).
+        if output.status.code() == Some(2) && output.stdout.is_empty() {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let detail = err
+                .lines()
+                .map(str::trim)
+                .rev()
+                .find(|l| l.starts_with("error:"))
+                .map(|l| l.trim_start_matches("error:").trim());
+            let head = err
+                .lines()
+                .map(|l| l.trim().trim_start_matches("rg:").trim())
+                .find(|l| !l.is_empty())
+                .unwrap_or("Search failed")
+                .trim_end_matches(':');
+            let msg = match detail {
+                Some(d) if !d.is_empty() => format!("{head}: {d}"),
+                _ => head.to_string(),
+            };
+            return Err((StatusCode::BAD_REQUEST, msg));
+        }
+
+        let mut matches: Vec<SearchMatch> = Vec::new();
+        let mut truncated = false;
+        let mut per_file: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        for line in stdout.lines() {
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if val.get("type").and_then(|t| t.as_str()) != Some("match") {
                 continue;
             }
-            if entry.metadata().map(|m| m.len() > 512_000).unwrap_or(true) {
-                continue;
+            let data = &val["data"];
+            let Some(raw_text) = data["lines"]["text"].as_str() else {
+                continue; // non-UTF8 line
+            };
+            if matches.len() >= SEARCH_MAX_TOTAL {
+                truncated = true;
+                break;
             }
-            if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&ws)
-                    .map(|p| p.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_default();
-                for (idx, line_str) in content.lines().enumerate() {
-                    if let Some(pos) = line_str.to_lowercase().find(&q_lower) {
-                        out.push(SearchMatch {
-                            path: rel.clone(),
-                            line: idx + 1,
-                            column: pos + 1,
-                            text: line_str.chars().take(200).collect(),
-                        });
-                        if out.len() >= 100 {
-                            return out;
-                        }
-                    }
+            let path = data["path"]["text"]
+                .as_str()
+                .unwrap_or("")
+                .trim_start_matches("./")
+                .replace('\\', "/");
+            let line_num = data["line_number"].as_u64().unwrap_or(1) as usize;
+            let full = raw_text.trim_end_matches(['\r', '\n']);
+            let mut ranges: Vec<(usize, usize)> = data["submatches"]
+                .as_array()
+                .map(|subs| {
+                    subs.iter()
+                        .filter_map(|m| {
+                            let s = m["start"].as_u64()? as usize;
+                            let e = m["end"].as_u64()? as usize;
+                            Some((utf16_offset(full, s), utf16_offset(full, e)))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let column = ranges.first().map(|r| r.0).unwrap_or(0) + 1;
+            let text = truncate_utf16(full, SEARCH_MAX_TEXT_UNITS);
+            let text_units: usize = text.chars().map(|c| c.len_utf16()).sum();
+            ranges.retain(|r| r.0 < text_units);
+            for r in ranges.iter_mut() {
+                r.1 = r.1.min(text_units);
+            }
+            let count = per_file.entry(path.clone()).or_insert(0);
+            *count += 1;
+            if *count >= SEARCH_MAX_PER_FILE {
+                truncated = true;
+            }
+            matches.push(SearchMatch {
+                path,
+                line: line_num,
+                column,
+                text,
+                ranges,
+            });
+        }
+        // rg searches in parallel; keep file order stable (line order is preserved per file).
+        matches.sort_by(|a, b| a.path.cmp(&b.path));
+        let total_files = per_file.len();
+        let total_matches = matches.len();
+        return Ok(Json(SearchRes {
+            matches,
+            total_matches,
+            total_files,
+            truncated,
+        }));
+    }
+
+    // Fallback pure-Rust search if ripgrep is unavailable (globs are not supported here).
+    let matcher = build_matcher(&query, req.regex, req.whole_word, req.case_sensitive)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let only: Option<Vec<String>> = req.only_paths.clone();
+    let res = tokio::task::spawn_blocking(move || {
+        let mut out: Vec<SearchMatch> = Vec::new();
+        let mut files = std::collections::HashSet::new();
+        let mut truncated = false;
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(list) = only {
+            candidates.extend(list.iter().map(|p| ws.join(p)));
+        } else {
+            let walker = WalkDir::new(&ws).max_depth(8).into_iter().filter_entry(|e| {
+                if e.depth() == 0 {
+                    return true;
+                }
+                let name = e.file_name().to_string_lossy();
+                !(e.file_type().is_dir() && is_ignored_dir_name(&name))
+            });
+            for entry in walker.flatten() {
+                if entry.file_type().is_file()
+                    && entry.metadata().map(|m| m.len() <= 1_000_000).unwrap_or(false)
+                {
+                    candidates.push(entry.path().to_path_buf());
                 }
             }
         }
-        out
+        'files: for file in candidates {
+            let Ok(content) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let rel = file
+                .strip_prefix(&ws)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            let mut in_file = 0;
+            for (idx, line_str) in content.lines().enumerate() {
+                let ranges: Vec<(usize, usize)> = matcher
+                    .find_iter(line_str)
+                    .map(|m| {
+                        (
+                            utf16_offset(line_str, m.start()),
+                            utf16_offset(line_str, m.end()),
+                        )
+                    })
+                    .collect();
+                if ranges.is_empty() {
+                    continue;
+                }
+                if out.len() >= SEARCH_MAX_TOTAL {
+                    truncated = true;
+                    break 'files;
+                }
+                files.insert(rel.clone());
+                out.push(SearchMatch {
+                    path: rel.clone(),
+                    line: idx + 1,
+                    column: ranges[0].0 + 1,
+                    text: truncate_utf16(line_str, SEARCH_MAX_TEXT_UNITS),
+                    ranges,
+                });
+                in_file += 1;
+                if in_file >= SEARCH_MAX_PER_FILE {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        let total_matches = out.len();
+        SearchRes {
+            matches: out,
+            total_matches,
+            total_files: files.len(),
+            truncated,
+        }
     })
     .await
-    .unwrap_or_default();
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    Json(matches)
+    Ok(Json(res))
+}
+
+pub async fn replace_in_files(
+    State(state): State<AppState>,
+    Json(req): Json<ReplaceReq>,
+) -> Result<Json<ReplaceRes>, (StatusCode, String)> {
+    if req.q.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Empty search query".to_string()));
+    }
+    let matcher = build_matcher(&req.q, req.regex, req.whole_word, req.case_sensitive)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let ws = state.workspace_path().await;
+
+    let mut files_changed = 0;
+    let mut replacements = 0;
+    let mut skipped = Vec::new();
+    let mut changed_paths = Vec::new();
+
+    for target in &req.targets {
+        let full = match resolve_safe_path(&ws, &target.path) {
+            Ok(p) => p,
+            Err(_) => {
+                skipped.push(target.path.clone());
+                continue;
+            }
+        };
+        let Ok(bytes) = tokio::fs::read(&full).await else {
+            skipped.push(target.path.clone());
+            continue;
+        };
+        let Ok(content) = String::from_utf8(bytes) else {
+            skipped.push(target.path.clone());
+            continue;
+        };
+        let only_lines: Option<std::collections::HashSet<usize>> =
+            target.lines.as_ref().map(|l| l.iter().copied().collect());
+
+        let mut out = String::with_capacity(content.len());
+        let mut file_count = 0;
+        for (idx, raw) in content.split_inclusive('\n').enumerate() {
+            if let Some(set) = &only_lines {
+                if !set.contains(&(idx + 1)) {
+                    out.push_str(raw);
+                    continue;
+                }
+            }
+            let body = raw.trim_end_matches(['\r', '\n']);
+            let eol = &raw[body.len()..];
+            let n = matcher.find_iter(body).count();
+            if n == 0 {
+                out.push_str(raw);
+                continue;
+            }
+            file_count += n;
+            let replaced = if req.regex {
+                matcher.replace_all(body, req.replacement.as_str())
+            } else {
+                matcher.replace_all(body, regex::NoExpand(req.replacement.as_str()))
+            };
+            out.push_str(&replaced);
+            out.push_str(eol);
+        }
+        if file_count == 0 {
+            continue;
+        }
+        if tokio::fs::write(&full, out.as_bytes()).await.is_err() {
+            skipped.push(target.path.clone());
+            continue;
+        }
+        files_changed += 1;
+        replacements += file_count;
+        changed_paths.push(target.path.clone());
+    }
+
+    if !changed_paths.is_empty() {
+        state.notify_fs_changed(changed_paths);
+    }
+    Ok(Json(ReplaceRes {
+        files_changed,
+        replacements,
+        skipped,
+    }))
 }
 
 pub async fn get_tasks(State(state): State<AppState>) -> Json<Vec<TaskItem>> {

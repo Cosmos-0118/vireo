@@ -15,9 +15,25 @@ interface CodeEditorProps {
   theme: LiteTheme;
   hasDiff?: boolean;
   jumpToLine?: number;
+  /** 1-based column / end column (UTF-16) to select on the jump line. */
+  jumpToColumn?: number;
+  jumpToEndColumn?: number;
+  /** Changes on every navigation so repeat jumps to the same line re-run. */
+  jumpKey?: number;
   onSave: (newContent: string) => Promise<void>;
   onSwitchToDiff?: () => void;
   onAskAgent: (snippet: string) => void;
+}
+
+function jumpTo(view: EditorView, line: number, col?: number, colEnd?: number) {
+  if (line < 1 || line > view.state.doc.lines) return;
+  const info = view.state.doc.line(line);
+  const anchor = col && col > 0 ? Math.min(info.from + col - 1, info.to) : info.from;
+  const head = col && colEnd && colEnd >= col ? Math.min(info.from + colEnd - 1, info.to) : anchor;
+  view.dispatch({
+    selection: { anchor, head },
+    effects: EditorView.scrollIntoView(anchor, { y: 'center' }),
+  });
 }
 
 function langExtension(path: string, theme: LiteTheme): Extension[] {
@@ -32,6 +48,9 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   theme,
   hasDiff,
   jumpToLine,
+  jumpToColumn,
+  jumpToEndColumn,
+  jumpKey,
   onSave,
   onSwitchToDiff,
   onAskAgent,
@@ -108,13 +127,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     viewRef.current = view;
     setDirty(false);
 
-    if (jumpToLine && jumpToLine > 0 && jumpToLine <= state.doc.lines) {
-      const lineInfo = state.doc.line(jumpToLine);
-      view.dispatch({
-        selection: { anchor: lineInfo.from },
-        effects: EditorView.scrollIntoView(lineInfo.from, { y: 'center' }),
-      });
-    }
+    if (jumpToLine) jumpTo(view, jumpToLine, jumpToColumn, jumpToEndColumn);
 
     return () => {
       view.destroy();
@@ -126,13 +139,11 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
   useEffect(() => {
     const view = viewRef.current;
-    if (!view || !jumpToLine || jumpToLine < 1 || jumpToLine > view.state.doc.lines) return;
-    const lineInfo = view.state.doc.line(jumpToLine);
-    view.dispatch({
-      selection: { anchor: lineInfo.from },
-      effects: EditorView.scrollIntoView(lineInfo.from, { y: 'center' }),
-    });
-  }, [jumpToLine]);
+    if (!view || !jumpToLine) return;
+    jumpTo(view, jumpToLine, jumpToColumn, jumpToEndColumn);
+    view.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jumpToLine, jumpToColumn, jumpToEndColumn, jumpKey]);
 
   if (binary) {
     return (

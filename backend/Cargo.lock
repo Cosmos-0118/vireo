@@ -5119,6 +5119,7 @@ dependencies = [
  "mime_guess",
  "notify",
  "portable-pty",
+ "regex",
  "reqwest 0.12.28",
  "rfd",
  "rust-embed",

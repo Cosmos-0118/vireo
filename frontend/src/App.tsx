@@ -471,13 +471,16 @@ export function App() {
     setActiveTabId(path);
   }, []);
 
-  const openFile = useCallback((path: string, line?: number) => {
+  const openFile = useCallback((path: string, line?: number, col?: number, colEnd?: number) => {
+    const jumpKey = Date.now();
     setTabs((prev) => {
       const existing = prev.find((t) => t.id === path);
       if (existing) {
-        return prev.map((t) => (t.id === path ? { ...t, mode: 'code', line } : t));
+        return prev.map((t) =>
+          t.id === path ? { ...t, mode: 'code', line, col, colEnd, jumpKey } : t
+        );
       }
-      return [...prev, { id: path, path, mode: 'code', line }];
+      return [...prev, { id: path, path, mode: 'code', line, col, colEnd, jumpKey }];
     });
     setActiveTabId(path);
   }, []);
@@ -1245,6 +1248,9 @@ export function App() {
                   theme={activeTheme}
                   hasDiff={!!activeFileStatus}
                   jumpToLine={activeTab.line}
+                  jumpToColumn={activeTab.col}
+                  jumpToEndColumn={activeTab.colEnd}
+                  jumpKey={activeTab.jumpKey}
                   onSave={async (newContent) => {
                     await api.writeFile(activeTab.path, newContent);
                     setFileData({ content: newContent, binary: false });

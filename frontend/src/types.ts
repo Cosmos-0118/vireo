@@ -15,6 +15,32 @@ export interface SearchMatch {
   line: number;
   column: number;
   text: string;
+  /** Match ranges `[start, end)` in UTF-16 units relative to `text`. */
+  ranges: [number, number][];
+}
+
+export interface SearchOptions {
+  q: string;
+  case_sensitive: boolean;
+  whole_word: boolean;
+  regex: boolean;
+  include: string;
+  exclude: string;
+  use_gitignore: boolean;
+  only_paths?: string[] | null;
+}
+
+export interface SearchRes {
+  matches: SearchMatch[];
+  total_matches: number;
+  total_files: number;
+  truncated: boolean;
+}
+
+export interface ReplaceRes {
+  files_changed: number;
+  replacements: number;
+  skipped: string[];
 }
 
 export interface TaskItem {
@@ -168,6 +194,9 @@ export interface OpenTab {
   mode: 'diff' | 'code' | 'commit-diff' | 'compare-diff' | 'graph';
   staged?: boolean;
   line?: number;
+  col?: number;
+  colEnd?: number;
+  jumpKey?: number;
   commitHash?: string;
   commitShortHash?: string;
   commitSubject?: string;
