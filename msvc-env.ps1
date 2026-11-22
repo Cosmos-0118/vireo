@@ -37,7 +37,13 @@ function Enter-MsvcEnv {
 
     $vcvars = Find-Vcvars64
     if (-not $vcvars) {
-        throw "MSVC C++ build tools not found. Install 'Desktop development with C++' (Visual Studio Build Tools) and retry."
+        throw @"
+MSVC C++ build tools were not found.
+Install Microsoft C++ Build Tools: https://visualstudio.microsoft.com/visual-cpp-build-tools/
+In the installer, select 'Desktop development with C++', including the MSVC x64/x86 tools and a Windows SDK.
+If Visual Studio is already installed, use Visual Studio Installer > Modify to add that workload.
+Then open a new PowerShell window and retry. See README.md > Windows prerequisites.
+"@
     }
 
     # Run vcvars64 in cmd, dump the resulting environment, and import it into this session.

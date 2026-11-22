@@ -23,6 +23,23 @@ Write-Host "============================================================" -Foreg
 . (Join-Path $Root "msvc-env.ps1")
 Enter-MsvcEnv
 
+# Check Rust before stopping the app or removing any build artifacts.
+# Existing terminals may still have the PATH from before rustup was installed.
+if (-not (Get-Command cargo -CommandType Application -ErrorAction SilentlyContinue) -or
+    -not (Get-Command rustc -CommandType Application -ErrorAction SilentlyContinue)) {
+    $CargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+    $CargoBin = Join-Path $CargoHome 'bin'
+    if (Test-Path -LiteralPath (Join-Path $CargoBin 'cargo.exe') -PathType Leaf) {
+        $env:PATH = "$CargoBin;$env:PATH"
+    }
+}
+
+foreach ($tool in @('cargo', 'rustc')) {
+    if (-not (Get-Command $tool -CommandType Application -ErrorAction SilentlyContinue)) {
+        throw "Rust tool '$tool' was not found on PATH. Install Rust using https://rustup.rs/ (the MSVC toolchain), then open a new PowerShell window and retry. See README.md > Windows prerequisites."
+    }
+}
+
 Write-Host "`n[1/5] Stopping any running vireo.exe instance..." -ForegroundColor Yellow
 Get-Process -Name "vireo", "vireo-server" -ErrorAction SilentlyContinue | Stop-Process -Force
 
