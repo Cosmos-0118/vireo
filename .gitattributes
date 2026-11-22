@@ -1,0 +1,24 @@
+# Auto-detect text files and normalize line endings on commit.
+* text=auto
+
+# Shell scripts must keep LF line endings on every platform so bash does not choke on CRLF.
+*.sh text eol=lf
+
+# Windows batch and Inno Setup scripts
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.iss text eol=crlf
+
+# Binary files
+*.png binary
+*.ico binary
+*.icns binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.wasm binary
+*.exe binary
+*.zip binary

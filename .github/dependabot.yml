@@ -1,0 +1,68 @@
+# Weekly dependency updates. Workflows pin every action to a full commit SHA
+# with the version tag in a trailing comment; Dependabot moves both together.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/backend"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      tauri:
+        patterns:
+          - "tauri*"
+      tree-sitter:
+        patterns:
+          - "tree-sitter*"
+      tokio-axum:
+        patterns:
+          - "tokio*"
+          - "axum*"
+          - "tower*"
+
+  - package-ecosystem: npm
+    directory: "/frontend"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      codemirror:
+        patterns:
+          - "@codemirror/*"
+          - "@lezer/*"
+      xterm:
+        patterns:
+          - "@xterm/*"
+      react-vite:
+        patterns:
+          - "react*"
+          - "@types/react*"
+          - "vite"
+          - "@vitejs/*"
+          - "tailwindcss"
+          - "@tailwindcss/*"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      # init and analyze must stay on the same CodeQL action version.
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
+      github-actions:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "github/codeql-action*"

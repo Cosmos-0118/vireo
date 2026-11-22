@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Every job states its own permissions; nothing is granted at the workflow level.
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  # Cancel superseded PR runs; every push to main keeps its own complete result.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Actions are pinned to full commit SHAs with the version tag in the comment.
+# Dependabot (.github/dependabot.yml) keeps both in sync.
+# Add a branch protection rule requiring the "CI result" job.
+jobs:
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Type-check and build
+        working-directory: frontend
+        run: npm run build
+
+      - name: Upload frontend bundle
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          retention-days: 1
+
+  backend:
+    name: Backend & Tests (Windows)
+    needs: frontend
+    runs-on: windows-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download frontend bundle
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+
+      - name: Run unit tests
+        run: cargo test --manifest-path backend/Cargo.toml --locked
+
+      - name: Build release binaries
+        run: cargo build --release --bins --manifest-path backend/Cargo.toml --locked
+
+      - name: Stage release layout
+        shell: pwsh
+        run: ./scripts/stage-release.ps1 -Output artifacts/publish
+
+      - name: Upload staged binaries
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vireo-windows-publish
+          path: artifacts/publish
+          retention-days: 3
+
+  installer:
+    name: Installer & Smoke Test
+    needs: backend
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download staged binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vireo-windows-publish
+          path: artifacts/publish
+
+      - name: Install Inno Setup
+        # Pinned so the compiler changes only intentionally. Keep in sync with installer/Vireo.iss.
+        run: choco install innosetup --version=6.7.1 --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: ./installer/build.ps1 -Version 0.0.0 -PublishDir artifacts/publish -OutDir artifacts
+
+      - name: Smoke-test install, health check, and uninstall
+        shell: pwsh
+        run: ./installer/smoke-test.ps1 -Setup artifacts/Vireo-Setup-0.0.0.exe
+
+      - name: Upload test installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Vireo-Setup-test
+          path: artifacts/Vireo-Setup-0.0.0.exe
+          retention-days: 3
+
+  # Single job to require in branch protection rules.
+  result:
+    name: CI result
+    needs: [frontend, backend, installer]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Check job results
+        shell: pwsh
+        env:
+          RESULTS: ${{ toJson(needs) }}
+        run: |
+          $needs = $env:RESULTS | ConvertFrom-Json -AsHashtable
+          $bad = foreach ($job in $needs.Keys) {
+            if ($needs[$job].result -notin 'success', 'skipped') {
+              "${job}: $($needs[$job].result)"
+            }
+          }
+          $needs.Keys | Sort-Object | ForEach-Object {
+            Write-Host ("{0,-12} {1}" -f $_, $needs[$_].result)
+          }
+          if ($bad) {
+            $bad | ForEach-Object { Write-Host "::error::$_" }
+            exit 1
+          }
