@@ -1,223 +1,189 @@
 import React from 'react';
-import { graphColor, type GraphRowLayout } from '../utils/gitGraph';
+import type { GraphRowLayout, Swimlane } from '../utils/gitGraph';
+
+/** Shared geometry so the graph column width and the rails always agree. */
+export function graphColumnWidth(maxLanes: number, laneWidth: number, maxVisibleLanes: number) {
+  return laneWidth * (Math.max(1, Math.min(maxLanes, maxVisibleLanes)) + 1);
+}
 
 interface CommitGraphSvgProps {
   row: GraphRowLayout;
   maxLanes: number;
   laneWidth?: number;
   rowHeight?: number;
-  nodeRadius?: number;
   /** Cap rendered lane columns so narrow sidebars stay readable */
   maxVisibleLanes?: number;
+  /** Background behind the row, used to cut a gap ring around nodes */
+  background?: string;
 }
 
+const STROKE = 1.5;
+const CURVE = 5;
+const DASH = '2.5 2.5';
+
+/**
+ * One row of the commit graph. Geometry follows VS Code's swimlane renderer:
+ * straight rails, quarter-arc merges/forks at the row midline, and short
+ * S-bends when a lane shifts left after another lane ends.
+ */
 export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
   row,
   maxLanes,
-  laneWidth = 14,
-  rowHeight = 28,
-  nodeRadius = 3.6,
+  laneWidth: W = 12,
+  rowHeight: H = 24,
   maxVisibleLanes = 8,
+  background = 'var(--graph-row-bg, var(--bg-sidebar))',
 }) => {
-  const lanesCount = Math.max(1, Math.min(maxLanes, maxVisibleLanes));
-  const padX = Math.max(8, Math.round(laneWidth * 0.65));
-  const width = padX * 2 + Math.max(0, lanesCount - 1) * laneWidth;
-  const midY = rowHeight / 2;
+  const width = graphColumnWidth(maxLanes, W, maxVisibleLanes);
+  const mid = H / 2;
+  const R = Math.min(CURVE, mid - 1);
+  const x = (i: number) => W * (i + 1);
+  const { commit, input, output, circleIndex } = row;
 
-  const xOf = (lane: number) => padX + Math.min(lane, maxVisibleLanes - 1) * laneWidth;
-  const nodeX = xOf(row.lane);
-  const nodeColor = graphColor(row.colorIdx);
-  const strokeWidth = 1.75;
+  const paths: Array<{ d: string; color: string; dashed?: boolean }> = [];
+
+  let outIdx = 0;
+  input.forEach((lane, index) => {
+    if (lane.id === commit.hash) {
+      if (index !== circleIndex) {
+        // ╯ converge into the node from the right
+        paths.push({
+          d: `M ${x(index)} 0 A ${W} ${mid} 0 0 1 ${x(index) - W} ${mid} H ${x(circleIndex)}`,
+          color: lane.color,
+          dashed: lane.dashed,
+        });
+      } else {
+        outIdx++;
+      }
+      return;
+    }
+    if (outIdx < output.length && lane.id === output[outIdx].id) {
+      if (index === outIdx) {
+        paths.push({ d: `M ${x(index)} 0 V ${H}`, color: lane.color, dashed: lane.dashed });
+      } else {
+        // lane shifts left after a lane to its left ended
+        paths.push({
+          d:
+            `M ${x(index)} 0 V ${mid - R} A ${R} ${R} 0 0 1 ${x(index) - R} ${mid} ` +
+            `H ${x(outIdx) + R} A ${R} ${R} 0 0 0 ${x(outIdx)} ${mid + R} V ${H}`,
+          color: lane.color,
+          dashed: lane.dashed,
+        });
+      }
+      outIdx++;
+    }
+  });
+
+  // ╮ fork out to extra parents (merge commits)
+  for (let i = 1; i < commit.parents.length; i++) {
+    let p = -1;
+    for (let k = output.length - 1; k >= 0; k--) {
+      if (output[k].id === commit.parents[i]) {
+        p = k;
+        break;
+      }
+    }
+    if (p === -1) continue;
+    paths.push({
+      d: `M ${x(p) - W} ${mid} A ${W} ${mid} 0 0 1 ${x(p)} ${H} M ${x(p) - W} ${mid} H ${x(circleIndex)}`,
+      color: output[p].color,
+      dashed: output[p].dashed,
+    });
+  }
+
+  const inputIndex = input.findIndex((l) => l.id === commit.hash);
+  if (inputIndex !== -1) {
+    paths.push({
+      d: `M ${x(circleIndex)} 0 V ${mid}`,
+      color: input[inputIndex].color,
+      dashed: input[inputIndex].dashed,
+    });
+  }
+  if (commit.parents.length > 0 && output[circleIndex]) {
+    paths.push({
+      d: `M ${x(circleIndex)} ${mid} V ${H}`,
+      color: row.circleColor,
+      dashed: output[circleIndex].dashed,
+    });
+  }
+
+  const cx = x(Math.min(circleIndex, maxVisibleLanes - 1));
+  const color = row.circleColor;
+
+  let node: React.ReactNode;
+  if (row.kind === 'working-tree') {
+    node = (
+      <circle
+        cx={cx}
+        cy={mid}
+        r={4.5}
+        fill={background}
+        stroke="var(--modified-fg)"
+        strokeWidth={1.6}
+        strokeDasharray="2.2 1.6"
+      />
+    );
+  } else if (row.isHead) {
+    node = (
+      <g>
+        <circle cx={cx} cy={mid} r={6} fill={color} stroke={background} strokeWidth={1.5} />
+        <circle cx={cx} cy={mid} r={2.4} fill={background} />
+      </g>
+    );
+  } else if (row.isMerge) {
+    node = (
+      <circle cx={cx} cy={mid} r={4} fill={background} stroke={color} strokeWidth={2} />
+    );
+  } else {
+    node = <circle cx={cx} cy={mid} r={4} fill={color} stroke={background} strokeWidth={1.5} />;
+  }
 
   return (
     <svg
       width={width}
-      height={rowHeight}
-      viewBox={`0 0 ${width} ${rowHeight}`}
-      className="shrink-0 block overflow-visible"
-      aria-hidden="true"
-    >
-      {/* 1. Uninterrupted vertical pass-through rails */}
-      {row.passThrough.map((pt) => {
-        const x = xOf(pt.lane);
-        return (
-          <line
-            key={`pt-${pt.lane}`}
-            x1={x}
-            y1={0}
-            x2={x}
-            y2={rowHeight}
-            stroke={graphColor(pt.colorIdx)}
-            strokeWidth={strokeWidth}
-            strokeLinecap="round"
-            opacity={0.85}
-          />
-        );
-      })}
-
-      {/* 2. Incoming rails from top edge (y=0) to node center */}
-      {row.incoming.map((seg, idx) => {
-        const x1 = xOf(seg.fromLane);
-        const x2 = xOf(seg.toLane);
-        const color = graphColor(seg.colorIdx);
-        if (seg.fromLane === seg.toLane) {
-          return (
-            <line
-              key={`in-${idx}`}
-              x1={x1}
-              y1={0}
-              x2={x2}
-              y2={midY}
-              stroke={color}
-              strokeWidth={strokeWidth}
-              strokeLinecap="round"
-            />
-          );
-        }
-        const d = `M ${x1} 0 C ${x1} ${midY * 0.62}, ${x2} ${midY * 0.35}, ${x2} ${midY}`;
-        return (
-          <path
-            key={`in-${idx}`}
-            d={d}
-            fill="none"
-            stroke={color}
-            strokeWidth={strokeWidth}
-            strokeLinecap="round"
-          />
-        );
-      })}
-
-      {/* 3. Outgoing rails from node center to bottom edge (y=rowHeight) */}
-      {row.outgoing.map((seg, idx) => {
-        const x1 = xOf(seg.fromLane);
-        const x2 = xOf(seg.toLane);
-        const color = graphColor(seg.colorIdx);
-        if (seg.fromLane === seg.toLane) {
-          return (
-            <line
-              key={`out-${idx}`}
-              x1={x1}
-              y1={midY}
-              x2={x2}
-              y2={rowHeight}
-              stroke={color}
-              strokeWidth={strokeWidth}
-              strokeLinecap="round"
-            />
-          );
-        }
-        const dy = rowHeight - midY;
-        const d = `M ${x1} ${midY} C ${x1} ${midY + dy * 0.65}, ${x2} ${midY + dy * 0.38}, ${x2} ${rowHeight}`;
-        return (
-          <path
-            key={`out-${idx}`}
-            d={d}
-            fill="none"
-            stroke={color}
-            strokeWidth={strokeWidth}
-            strokeLinecap="round"
-          />
-        );
-      })}
-
-      {/* 4. Commit node (HEAD highlight, Merge double-ring, or standard solid dot) */}
-      {row.commit.is_head ? (
-        <g>
-          <circle
-            cx={nodeX}
-            cy={midY}
-            r={nodeRadius + 2.8}
-            fill={nodeColor}
-            opacity={0.22}
-          />
-          <circle
-            cx={nodeX}
-            cy={midY}
-            r={nodeRadius + 1.3}
-            fill="var(--bg-sidebar)"
-            stroke={nodeColor}
-            strokeWidth={1.8}
-          />
-          <circle cx={nodeX} cy={midY} r={Math.max(1.8, nodeRadius - 1.2)} fill={nodeColor} />
-        </g>
-      ) : row.isMerge ? (
-        <g>
-          <circle
-            cx={nodeX}
-            cy={midY}
-            r={nodeRadius + 1.1}
-            fill="var(--bg-sidebar)"
-            stroke={nodeColor}
-            strokeWidth={1.8}
-          />
-          <circle cx={nodeX} cy={midY} r={1.6} fill={nodeColor} />
-        </g>
-      ) : (
-        <circle
-          cx={nodeX}
-          cy={midY}
-          r={nodeRadius}
-          fill={nodeColor}
-          stroke="var(--bg-sidebar)"
-          strokeWidth={1.4}
-        />
-      )}
-    </svg>
-  );
-};
-
-interface WorkingTreeGraphSvgProps {
-  maxLanes: number;
-  headLane: number;
-  headColorIdx: number;
-  laneWidth?: number;
-  rowHeight?: number;
-  maxVisibleLanes?: number;
-}
-
-/** Virtual top row representing local uncommitted changes connected to HEAD */
-export const WorkingTreeGraphSvg: React.FC<WorkingTreeGraphSvgProps> = ({
-  maxLanes,
-  headLane,
-  headColorIdx,
-  laneWidth = 14,
-  rowHeight = 28,
-  maxVisibleLanes = 8,
-}) => {
-  const lanesCount = Math.max(1, Math.min(maxLanes, maxVisibleLanes));
-  const padX = Math.max(8, Math.round(laneWidth * 0.65));
-  const width = padX * 2 + Math.max(0, lanesCount - 1) * laneWidth;
-  const midY = rowHeight / 2;
-  const x = padX + Math.min(headLane, maxVisibleLanes - 1) * laneWidth;
-  const color = graphColor(headColorIdx);
-
-  return (
-    <svg
-      width={width}
-      height={rowHeight}
-      viewBox={`0 0 ${width} ${rowHeight}`}
+      height={H}
+      viewBox={`0 0 ${width} ${H}`}
       className="shrink-0 block"
       aria-hidden="true"
     >
-      <line
-        x1={x}
-        y1={midY + 4}
-        x2={x}
-        y2={rowHeight}
-        stroke={color}
-        strokeWidth={1.6}
-        strokeDasharray="2.5 2.5"
-        opacity={0.8}
-      />
-      <circle
-        cx={x}
-        cy={midY}
-        r={3.8}
-        fill="var(--bg-sidebar)"
-        stroke="var(--modified-fg)"
-        strokeWidth={1.8}
-        strokeDasharray="2 1.5"
-      />
+      {paths.map((p, i) => (
+        <path
+          key={i}
+          d={p.d}
+          fill="none"
+          stroke={p.color}
+          strokeWidth={STROKE}
+          strokeLinecap={p.dashed ? 'butt' : 'round'}
+          strokeDasharray={p.dashed ? DASH : undefined}
+        />
+      ))}
+      {node}
     </svg>
   );
 };
+
+/**
+ * Continues a row's outgoing rails down through content rendered under the row
+ * (e.g. an expanded file list), so the graph never visually breaks.
+ */
+export const GraphRails: React.FC<{
+  lanes: Swimlane[];
+  laneWidth?: number;
+  maxVisibleLanes?: number;
+}> = ({ lanes, laneWidth: W = 12, maxVisibleLanes = 8 }) => (
+  <div className="absolute inset-y-0 left-0 pointer-events-none" aria-hidden="true">
+    {lanes.slice(0, maxVisibleLanes).map((lane, i) => (
+      <div
+        key={i}
+        className="absolute inset-y-0"
+        style={{
+          left: W * (i + 1) - STROKE / 2,
+          width: STROKE,
+          background: lane.dashed
+            ? `repeating-linear-gradient(to bottom, ${lane.color} 0 2.5px, transparent 2.5px 5px)`
+            : lane.color,
+        }}
+      />
+    ))}
+  </div>
+);

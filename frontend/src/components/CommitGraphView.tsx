@@ -1,5 +1,7 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  ArrowDown,
+  ArrowUp,
   Check,
   ChevronDown,
   ChevronRight,
@@ -33,14 +35,24 @@ import type {
   GitStatusRes,
 } from '../types';
 import { buildCompactFileTree, type FileTreeNode } from '../utils/fileTree';
-import { computeGitGraphLayout, parseRemoteUrl } from '../utils/gitGraph';
+import {
+  appendUniqueCommits,
+  computeGitGraphLayout,
+  parseRemoteUrl,
+  WORKING_TREE_ID,
+} from '../utils/gitGraph';
 import {
   buildCommitContextMenuItems,
   FloatingContextMenu,
   type ContextMenuItem,
 } from './CommitContextMenu';
-import { CommitGraphSvg, WorkingTreeGraphSvg } from './CommitGraphSvg';
-import { fileStatusColor, RefPill } from './GitBadges';
+import { CommitGraphSvg, graphColumnWidth } from './CommitGraphSvg';
+import { useCommitHover } from './CommitHoverCard';
+import { fileStatusColor, RefBadges } from './GitBadges';
+
+const FULL_ROW_H = 28;
+const FULL_LANE_W = 14;
+const FULL_MAX_LANES = 16;
 import { GitActionModal, type GitModalState } from './GitActionModal';
 
 interface CommitGraphViewProps {
@@ -101,8 +113,13 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
     [gitStatus?.remote_url]
   );
 
+  const appendInFlight = useRef(false);
   const fetchCommits = useCallback(
     async (opts?: { append?: boolean; skip?: number }) => {
+      if (opts?.append) {
+        if (appendInFlight.current) return;
+        appendInFlight.current = true;
+      }
       setLoading(true);
       try {
         const res = await api.gitLog({
@@ -111,11 +128,12 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
           all: allBranches,
           search: search.trim() || undefined,
         });
-        setCommits((prev) => (opts?.append ? [...prev, ...res.commits] : res.commits));
+        setCommits((prev) => (opts?.append ? appendUniqueCommits(prev, res.commits) : res.commits));
         setHasMore(res.has_more);
       } catch (e: unknown) {
         onToast(e instanceof Error ? e.message : 'Failed to load commit history', true);
       } finally {
+        if (opts?.append) appendInFlight.current = false;
         setLoading(false);
       }
     },
@@ -158,7 +176,24 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
     };
   }, [selectedHash]);
 
-  const layout = useMemo(() => computeGitGraphLayout(commits), [commits]);
+  const uncommittedCount = gitStatus?.files.length ?? 0;
+  const filtered = search.trim().length > 0;
+  const layout = useMemo(
+    () =>
+      computeGitGraphLayout(commits, {
+        workingTree: uncommittedCount > 0 && !filtered,
+        currentBranch: gitStatus?.branch,
+        flat: filtered,
+      }),
+    [commits, uncommittedCount, filtered, gitStatus?.branch]
+  );
+  const upstreamName = useMemo(() => {
+    const up = commits.find((c) => c.hash === layout.upstreamHash);
+    const branch = gitStatus?.branch;
+    return up?.refs.find(
+      (r) => r.kind === 'remote' && branch && r.name.slice(r.name.indexOf('/') + 1) === branch
+    )?.name;
+  }, [commits, layout.upstreamHash, gitStatus?.branch]);
 
   const copyText = useCallback(
     async (text: string, label: string, flashId?: string) => {
@@ -369,11 +404,27 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
       );
     });
 
-  const graphColWidth = Math.max(44, Math.min(layout.maxLanes, 12) * 16 + 22);
-  const uncommittedCount = gitStatus?.files.length ?? 0;
+  const graphColWidth = Math.max(
+    48,
+    graphColumnWidth(layout.maxLanes, FULL_LANE_W, FULL_MAX_LANES) + 4
+  );
+
+  const hover = useCommitHover({
+    remoteHost,
+    upstreamName,
+    disabled: !!contextMenu || !!modal,
+    onCopy: (text, label) => copyText(text, label),
+    onOpenRemote: async (url) => {
+      try {
+        await api.openExternalUrl(url);
+      } catch {
+        window.open(url, '_blank', 'noopener');
+      }
+    },
+  });
 
   return (
-    <div className="flex-1 flex flex-col min-h-0 bg-[var(--bg-base)] select-none">
+    <div className="@container flex-1 flex flex-col min-h-0 bg-[var(--bg-base)] select-none">
       {/* Top Toolbar */}
       <div className="flex items-center justify-between gap-2 px-3 py-2 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0 flex-wrap">
         <div className="flex items-center gap-2 min-w-0">
@@ -387,7 +438,7 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
               {gitStatus.branch}
             </span>
           )}
-          <span className="text-[11px] text-[var(--text-dim)] tabular-nums">
+          <span className="shrink-0 text-[11px] text-[var(--text-dim)] tabular-nums">
             {commits.length} commit{commits.length === 1 ? '' : 's'}
           </span>
         </div>
@@ -470,135 +521,151 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
           Graph
         </div>
         <div className="flex-1 min-w-0 px-2">Description</div>
-        <div className="w-32 shrink-0 px-2 hidden md:block">Author</div>
-        <div className="w-28 shrink-0 px-2 hidden sm:block">Date</div>
-        <div className="w-28 shrink-0 px-2 text-right">Commit</div>
+        <div className="w-36 shrink-0 px-2 hidden @[620px]:block">Author</div>
+        <div className="w-28 shrink-0 px-2 hidden @[460px]:block">Date</div>
+        <div className="w-24 shrink-0 px-2 text-right">Commit</div>
       </div>
 
       {/* Commit Rows */}
-      <div className="flex-1 overflow-y-auto min-h-0">
-        {/* Virtual Uncommitted Changes Row */}
-        {uncommittedCount > 0 && !search && (
-          <div
-            onClick={() => {
-              const first = gitStatus?.files[0];
-              if (first) onOpenDiff(first.path, first.staged && !first.unstaged);
-            }}
-            className="flex items-center h-8 px-3 border-b border-[var(--border)]/40 hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
-          >
-            <div style={{ width: graphColWidth }} className="shrink-0 flex items-center">
-              <WorkingTreeGraphSvg
-                maxLanes={layout.maxLanes}
-                headLane={layout.headLane}
-                headColorIdx={layout.headColorIdx}
-                laneWidth={16}
-                rowHeight={32}
-                maxVisibleLanes={12}
-              />
-            </div>
-            <div className="flex-1 min-w-0 px-2 flex items-center gap-2">
-              <span className="text-xs italic font-medium text-[var(--modified-fg)]">
-                Uncommitted Changes ({uncommittedCount} file{uncommittedCount === 1 ? '' : 's'})
-              </span>
-              <span className="font-mono text-[11px] text-[var(--added-fg)]">
-                +{gitStatus?.total_additions ?? 0}
-              </span>
-              <span className="font-mono text-[11px] text-[var(--removed-fg)]">
-                -{gitStatus?.total_deletions ?? 0}
-              </span>
-            </div>
-            <div className="w-32 shrink-0 px-2 text-xs text-[var(--text-dim)] hidden md:block">
-              Working Tree
-            </div>
-            <div className="w-28 shrink-0 px-2 text-xs text-[var(--text-dim)] hidden sm:block">
-              Now
-            </div>
-            <div className="w-28 shrink-0 px-2 text-right font-mono text-[11px] text-[var(--text-dim)]">
-              *
-            </div>
-          </div>
-        )}
-
+      <div
+        className="flex-1 overflow-y-auto min-h-0 py-0.5"
+        onScroll={(e) => {
+          const el = e.currentTarget;
+          if (hasMore && !loading && el.scrollTop + el.clientHeight > el.scrollHeight - 200) {
+            fetchCommits({ append: true, skip: commits.length });
+          }
+        }}
+      >
         {layout.rows.map((row) => {
           const c = row.commit;
+
+          if (row.kind === 'working-tree') {
+            return (
+              <div
+                key={WORKING_TREE_ID}
+                onClick={() => {
+                  const first = gitStatus?.files[0];
+                  if (first) onOpenDiff(first.path, first.staged && !first.unstaged);
+                }}
+                className="flex items-center h-[28px] px-3 cursor-pointer [--graph-row-bg:var(--bg-base)] hover:[--graph-row-bg:var(--bg-hover)] hover:bg-[var(--bg-hover)]"
+              >
+                <div style={{ width: graphColWidth }} className="shrink-0 flex items-center">
+                  <CommitGraphSvg
+                    row={row}
+                    maxLanes={layout.maxLanes}
+                    laneWidth={FULL_LANE_W}
+                    rowHeight={FULL_ROW_H}
+                    maxVisibleLanes={FULL_MAX_LANES}
+                  />
+                </div>
+                <div className="flex-1 min-w-0 px-2 flex items-center gap-2">
+                  <span className="truncate text-[12.5px] italic font-medium text-[var(--modified-fg)]">
+                    Uncommitted Changes
+                  </span>
+                  <span className="shrink-0 text-[11px] text-[var(--text-dim)] tabular-nums">
+                    {uncommittedCount} file{uncommittedCount === 1 ? '' : 's'}
+                  </span>
+                  <span className="shrink-0 font-mono text-[11px] text-[var(--added-fg)]">
+                    +{gitStatus?.total_additions ?? 0}
+                  </span>
+                  <span className="shrink-0 font-mono text-[11px] text-[var(--removed-fg)]">
+                    −{gitStatus?.total_deletions ?? 0}
+                  </span>
+                </div>
+                <div className="w-36 shrink-0 px-2 text-xs text-[var(--text-dim)] hidden @[620px]:block">
+                  Working Tree
+                </div>
+                <div className="w-28 shrink-0 px-2 text-xs text-[var(--text-dim)] hidden @[460px]:block">
+                  Now
+                </div>
+                <div className="w-24 shrink-0 px-2" />
+              </div>
+            );
+          }
+
           const isSelected = selectedHash === c.hash;
           return (
             <div
               key={c.hash}
+              {...hover.rowProps({
+                commit: c,
+                color: row.circleColor,
+                sync: row.sync,
+                isMerge: row.isMerge,
+              })}
               onClick={() => {
                 setCompareMode(null);
                 setSelectedHash(c.hash);
               }}
-              onContextMenu={(e) => openCommitContextMenu(e, c)}
-              className={`group flex items-center h-8 px-3 border-b border-[var(--border)]/30 cursor-pointer transition-colors ${
+              onContextMenu={(e) => {
+                hover.hide();
+                openCommitContextMenu(e, c);
+              }}
+              className={`group flex items-center h-[28px] px-3 cursor-pointer text-[var(--text-primary)] ${
                 isSelected
-                  ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
-                  : 'hover:bg-[var(--bg-hover)]/80 text-[var(--text-primary)]'
+                  ? '[--graph-row-bg:var(--bg-active)] bg-[var(--bg-active)]'
+                  : '[--graph-row-bg:var(--bg-base)] hover:[--graph-row-bg:var(--bg-hover)] hover:bg-[var(--bg-hover)]'
               }`}
             >
-              {/* Graph SVG */}
               <div style={{ width: graphColWidth }} className="shrink-0 flex items-center">
                 <CommitGraphSvg
                   row={row}
                   maxLanes={layout.maxLanes}
-                  laneWidth={16}
-                  rowHeight={32}
-                  nodeRadius={4}
-                  maxVisibleLanes={12}
+                  laneWidth={FULL_LANE_W}
+                  rowHeight={FULL_ROW_H}
+                  maxVisibleLanes={FULL_MAX_LANES}
                 />
               </div>
 
-              {/* Description + Ref Pills */}
+              {/* Description + Ref labels */}
               <div className="flex-1 min-w-0 px-2 flex items-center gap-1.5 overflow-hidden">
-                {c.refs.map((r, i) => (
-                  <RefPill key={`${r.kind}-${r.name}-${i}`} r={r} />
-                ))}
-                {row.isMerge && (
-                  <span
-                    className="inline-flex items-center gap-0.5 px-1 py-[1px] rounded text-[10px] font-medium bg-purple-500/15 text-purple-400 border border-purple-500/30 shrink-0"
-                    title={`Merge commit (${c.parents.length} parents)`}
-                  >
-                    <GitMerge size={9.5} />
-                    Merge
+                {c.refs.length > 0 && (
+                  <span className="flex min-w-0 max-w-[55%] shrink-0 overflow-hidden">
+                    <RefBadges refs={c.refs} color={row.circleColor} labelled={3} maxWidth={160} tooltips={false} />
                   </span>
                 )}
-                <span className={`truncate text-[12.5px] ${c.is_head ? 'font-semibold' : ''}`}>
+                {row.sync === 'outgoing' && (
+                  <ArrowUp size={12} className="shrink-0 text-[var(--accent-hover)]" aria-label="Not pushed" />
+                )}
+                {row.sync === 'incoming' && (
+                  <ArrowDown size={12} className="shrink-0 text-[color-mix(in_srgb,#a78bfa_70%,var(--text-primary))]" aria-label="Incoming, not pulled" />
+                )}
+                <span
+                  className={`truncate text-[12.5px] ${c.is_head ? 'font-semibold' : ''} ${
+                    row.sync === 'incoming' ? 'text-[var(--text-muted)]' : ''
+                  }`}
+                >
                   {c.message}
                 </span>
               </div>
 
-              {/* Author */}
-              <div className="w-32 shrink-0 px-2 text-xs text-[var(--text-muted)] truncate hidden md:block">
+              <div className="w-36 shrink-0 px-2 text-xs text-[var(--text-muted)] truncate hidden @[620px]:block">
                 {c.author}
               </div>
 
-              {/* Relative Date */}
-              <div
-                className="w-28 shrink-0 px-2 text-[11.5px] text-[var(--text-dim)] truncate hidden sm:block"
-                title={c.iso_date}
-              >
+              <div className="w-28 shrink-0 px-2 text-[11.5px] text-[var(--text-dim)] truncate hidden @[460px]:block">
                 {c.date}
               </div>
 
-              {/* Short SHA + quick copy & context menu */}
-              <div className="w-28 shrink-0 px-2 flex items-center justify-end gap-1">
+              <div className="w-24 shrink-0 px-2 flex items-center justify-end gap-0.5">
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     copyText(c.hash, `SHA (${c.short_hash})`, c.hash);
                   }}
-                  className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-[var(--bg-elevated)]/70 hover:bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:text-[var(--text-primary)] flex items-center gap-1 cursor-pointer"
-                  title="Copy full commit SHA"
+                  className="font-mono text-[11px] px-1 h-5 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-elevated)] flex items-center gap-1 cursor-pointer"
+                  aria-label="Copy full commit SHA"
                 >
-                  {copiedHash === c.hash ? (
-                    <Check size={10} className="text-[var(--added-fg)]" />
-                  ) : null}
+                  {copiedHash === c.hash && <Check size={10} className="text-[var(--added-fg)]" />}
                   {c.short_hash}
                 </button>
                 <button
-                  onClick={(e) => openCommitContextMenu(e, c)}
-                  className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer transition-opacity"
-                  title="Commit actions"
+                  onClick={(e) => {
+                    hover.hide();
+                    openCommitContextMenu(e, c);
+                  }}
+                  className="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+                  aria-label="Commit actions"
                 >
                   <MoreHorizontal size={13} />
                 </button>
@@ -635,10 +702,10 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
           />
           <div
             style={{ height: inspectorHeight }}
-            className="shrink-0 flex flex-col md:flex-row min-h-0 bg-[var(--bg-sidebar)] border-t border-[var(--border)]"
+            className="shrink-0 flex flex-col @[620px]:flex-row min-h-0 bg-[var(--bg-sidebar)] border-t border-[var(--border)]"
           >
             {/* Left: Commit Metadata & Quick Actions */}
-            <div className="w-full md:w-[44%] border-b md:border-b-0 md:border-r border-[var(--border)] flex flex-col min-h-0">
+            <div className="w-full @[620px]:w-[44%] border-b @[620px]:border-b-0 @[620px]:border-r border-[var(--border)] flex flex-col min-h-0">
               <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border)] shrink-0">
                 <div className="flex items-center gap-2 min-w-0">
                   {compareMode ? (
@@ -899,6 +966,8 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
           </div>
         </>
       )}
+
+      {hover.card}
 
       {/* Floating Context Menu */}
       {contextMenu && (

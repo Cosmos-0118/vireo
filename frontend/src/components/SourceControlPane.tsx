@@ -21,6 +21,7 @@ import {
   GitMerge,
   History,
   List,
+  LocateFixed,
   Maximize2,
   Minus,
   MoreHorizontal,
@@ -43,14 +44,24 @@ import type {
   GitStatusRes,
 } from '../types';
 import { buildCompactFileTree, type FileTreeNode } from '../utils/fileTree';
-import { computeGitGraphLayout, parseRemoteUrl } from '../utils/gitGraph';
+import {
+  appendUniqueCommits,
+  computeGitGraphLayout,
+  parseRemoteUrl,
+  WORKING_TREE_ID,
+} from '../utils/gitGraph';
 import {
   buildCommitContextMenuItems,
   FloatingContextMenu,
   type ContextMenuItem,
 } from './CommitContextMenu';
-import { CommitGraphSvg, WorkingTreeGraphSvg } from './CommitGraphSvg';
-import { fileStatusColor, RefPill } from './GitBadges';
+import { CommitGraphSvg, GraphRails, graphColumnWidth } from './CommitGraphSvg';
+import { useCommitHover } from './CommitHoverCard';
+import { fileStatusColor, RefBadges } from './GitBadges';
+
+const GRAPH_ROW_H = 24;
+const GRAPH_LANE_W = 12;
+const GRAPH_MAX_LANES = 6;
 import { GitActionModal, type GitModalState } from './GitActionModal';
 
 interface SourceControlPaneProps {
@@ -169,8 +180,13 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       .catch(() => setBranchInfo({ current: '', branches: [], remote_branches: [] }));
   }, []);
 
+  const appendInFlight = useRef(false);
   const fetchLog = useCallback(
     async (opts?: { append?: boolean; skip?: number }) => {
+      if (opts?.append) {
+        if (appendInFlight.current) return;
+        appendInFlight.current = true;
+      }
       setGraphLoading(true);
       try {
         const res = await api.gitLog({
@@ -179,11 +195,12 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
           all: allBranches,
           search: graphSearch.trim() || undefined,
         });
-        setCommits((prev) => (opts?.append ? [...prev, ...res.commits] : res.commits));
+        setCommits((prev) => (opts?.append ? appendUniqueCommits(prev, res.commits) : res.commits));
         setHasMore(res.has_more);
       } catch {
         // ignore transient error
       } finally {
+        if (opts?.append) appendInFlight.current = false;
         setGraphLoading(false);
       }
     },
@@ -279,7 +296,54 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
   const unstagedTree = useMemo(() => buildCompactFileTree(unstagedFiles), [unstagedFiles]);
   const totalChanged = allFiles.length;
 
-  const graphLayout = useMemo(() => computeGitGraphLayout(commits), [commits]);
+  const graphFiltered = graphSearch.trim().length > 0;
+  const graphLayout = useMemo(
+    () =>
+      computeGitGraphLayout(commits, {
+        workingTree: totalChanged > 0 && !graphFiltered,
+        currentBranch: gitStatus?.branch,
+        flat: graphFiltered,
+      }),
+    [commits, totalChanged, graphFiltered, gitStatus?.branch]
+  );
+  const graphColW = graphColumnWidth(graphLayout.maxLanes, GRAPH_LANE_W, GRAPH_MAX_LANES);
+  const upstreamName = useMemo(() => {
+    const up = commits.find((c) => c.hash === graphLayout.upstreamHash);
+    const branch = gitStatus?.branch;
+    return up?.refs.find(
+      (r) => r.kind === 'remote' && branch && r.name.slice(r.name.indexOf('/') + 1) === branch
+    )?.name;
+  }, [commits, graphLayout.upstreamHash, gitStatus?.branch]);
+
+  const graphScrollRef = useRef<HTMLDivElement>(null);
+  const onGraphScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const el = e.currentTarget;
+    if (hasMore && !graphLoading && el.scrollTop + el.clientHeight > el.scrollHeight - 160) {
+      fetchLog({ append: true, skip: commits.length });
+    }
+  };
+  const revealHead = () => {
+    const head = graphLayout.headHash;
+    const el = head
+      ? graphScrollRef.current?.querySelector<HTMLElement>(`[data-hash="${head}"]`)
+      : null;
+    if (el) el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    else onToast('HEAD is not in the loaded history', true);
+  };
+
+  const commitHover = useCommitHover({
+    remoteHost,
+    upstreamName,
+    disabled: !!contextMenu || !!modal,
+    onCopy: (text, label) => copyText(text, label),
+    onOpenRemote: async (url) => {
+      try {
+        await api.openExternalUrl(url);
+      } catch {
+        window.open(url, '_blank', 'noopener');
+      }
+    },
+  });
 
   const handleCommit = (andPush: boolean, forceAmend?: boolean) => {
     const useAmend = forceAmend ?? amendMode;
@@ -1310,6 +1374,25 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                   <span className="text-[10px] text-[var(--text-dim)] truncate ml-0.5">
                     {allBranches ? 'All' : gitStatus.branch}
                   </span>
+                  {(gitStatus.ahead > 0 || gitStatus.behind > 0) && (
+                    <span
+                      className="flex items-center gap-1 ml-1 text-[10.5px] tabular-nums text-[var(--text-muted)]"
+                      title={`${gitStatus.ahead} to push, ${gitStatus.behind} to pull`}
+                    >
+                      {gitStatus.ahead > 0 && (
+                        <span className="flex items-center">
+                          <ArrowUp size={10} />
+                          {gitStatus.ahead}
+                        </span>
+                      )}
+                      {gitStatus.behind > 0 && (
+                        <span className="flex items-center">
+                          <ArrowDown size={10} />
+                          {gitStatus.behind}
+                        </span>
+                      )}
+                    </span>
+                  )}
                 </div>
 
                 <div
@@ -1344,6 +1427,16 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                     }
                   >
                     <GitFork size={12} />
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (!graphOpen) setGraphOpen(true);
+                      requestAnimationFrame(revealHead);
+                    }}
+                    className="p-1 rounded hover:bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+                    title="Go to current commit (HEAD)"
+                  >
+                    <LocateFixed size={12} />
                   </button>
                   <button
                     onClick={() => onOpenGraphTab(expandedCommitHash || undefined)}
@@ -1436,271 +1529,276 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                   )}
 
                   {/* Scrollable Commit Graph Rows */}
-                  <div className="flex-1 overflow-y-auto">
-                    {/* Virtual Uncommitted Changes row */}
-                    {totalChanged > 0 && !graphSearch && (
-                      <div
-                        onClick={() => setChangesOpen(true)}
-                        className="flex items-center h-[30px] pr-2 hover:bg-[var(--bg-hover)] cursor-pointer border-b border-[var(--border)]/30"
-                      >
-                        <WorkingTreeGraphSvg
-                          maxLanes={graphLayout.maxLanes}
-                          headLane={graphLayout.headLane}
-                          headColorIdx={graphLayout.headColorIdx}
-                          laneWidth={13}
-                          rowHeight={30}
-                          maxVisibleLanes={6}
-                        />
-                        <span className="ml-1 text-[11.5px] italic text-[var(--modified-fg)] truncate flex-1">
-                          Uncommitted Changes ({totalChanged})
-                        </span>
-                      </div>
-                    )}
-
+                  <div
+                    ref={graphScrollRef}
+                    onScroll={onGraphScroll}
+                    className="@container flex-1 overflow-y-auto py-0.5"
+                  >
                     {graphLayout.rows.map((row) => {
                       const c = row.commit;
+
+                      if (row.kind === 'working-tree') {
+                        return (
+                          <div
+                            key={WORKING_TREE_ID}
+                            onClick={() => setChangesOpen(true)}
+                            className="flex items-center h-[24px] pr-2 cursor-pointer [--graph-row-bg:var(--bg-sidebar)] hover:[--graph-row-bg:var(--bg-hover)] hover:bg-[var(--bg-hover)]"
+                          >
+                            <CommitGraphSvg
+                              row={row}
+                              maxLanes={graphLayout.maxLanes}
+                              laneWidth={GRAPH_LANE_W}
+                              rowHeight={GRAPH_ROW_H}
+                              maxVisibleLanes={GRAPH_MAX_LANES}
+                            />
+                            <span className="pl-0.5 text-[12.5px] italic text-[var(--modified-fg)] truncate">
+                              Uncommitted Changes
+                            </span>
+                            <span className="ml-auto pl-2 shrink-0 text-[11px] tabular-nums text-[var(--text-dim)]">
+                              {totalChanged} file{totalChanged === 1 ? '' : 's'}
+                            </span>
+                          </div>
+                        );
+                      }
+
                       const isExpanded = expandedCommitHash === c.hash;
                       const detail = commitDetails[c.hash];
                       const isLoadingDetail = loadingDetailHash === c.hash;
 
                       return (
-                        <div key={c.hash} className="border-b border-[var(--border)]/25">
+                        <div key={c.hash} data-hash={c.hash}>
                           <div
+                            {...commitHover.rowProps({
+                              commit: c,
+                              color: row.circleColor,
+                              sync: row.sync,
+                              isMerge: row.isMerge,
+                            })}
                             onClick={() => toggleCommitExpand(c)}
-                            onContextMenu={(e) => openCommitContextMenu(e, c)}
-                            title={`${c.short_hash} · ${c.message}\n${c.author} · ${c.date}\nRight-click for Cherry-Pick, Copy SHA, Revert, Reset...`}
-                            className={`group flex items-center h-[38px] pr-1.5 cursor-pointer transition-colors ${
+                            onContextMenu={(e) => {
+                              commitHover.hide();
+                              openCommitContextMenu(e, c);
+                            }}
+                            className={`group relative flex items-center h-[24px] cursor-pointer ${
                               isExpanded
-                                ? 'bg-[var(--bg-active)]'
-                                : 'hover:bg-[var(--bg-hover)]/80'
+                                ? '[--graph-row-bg:var(--bg-active)] bg-[var(--bg-active)]'
+                                : '[--graph-row-bg:var(--bg-sidebar)] hover:[--graph-row-bg:var(--bg-hover)] hover:bg-[var(--bg-hover)]'
                             }`}
                           >
-                            {/* Real SVG Branch/Merge Track Cell */}
                             <CommitGraphSvg
                               row={row}
                               maxLanes={graphLayout.maxLanes}
-                              laneWidth={13}
-                              rowHeight={38}
-                              nodeRadius={3.4}
-                              maxVisibleLanes={6}
+                              laneWidth={GRAPH_LANE_W}
+                              rowHeight={GRAPH_ROW_H}
+                              maxVisibleLanes={GRAPH_MAX_LANES}
                             />
 
-                            {/* Commit info */}
-                            <div className="min-w-0 flex-1 pl-1 pr-1 flex flex-col justify-center">
-                              <div className="flex items-center gap-1 min-w-0">
-                                {c.refs.slice(0, 2).map((r, i) => (
-                                  <RefPill key={`${r.kind}-${r.name}-${i}`} r={r} compact />
-                                ))}
-                                {c.refs.length > 2 && (
-                                  <span className="text-[9.5px] px-1 rounded bg-[var(--bg-elevated)] text-[var(--text-dim)] shrink-0">
-                                    +{c.refs.length - 2}
-                                  </span>
-                                )}
-                                {row.isMerge && (
-                                  <GitMerge
-                                    size={11}
-                                    className="text-purple-400 shrink-0"
-                                  />
-                                )}
-                                <span
-                                  className={`truncate text-[12px] leading-tight ${
-                                    c.is_head
-                                      ? 'font-semibold text-[var(--text-primary)]'
+                            <div className="min-w-0 flex-1 flex items-center gap-1.5 pl-0.5 pr-2">
+                              {row.sync === 'outgoing' && (
+                                <ArrowUp
+                                  size={11}
+                                  className="shrink-0 text-[var(--accent-hover)]"
+                                  aria-label="Not pushed"
+                                />
+                              )}
+                              {row.sync === 'incoming' && (
+                                <ArrowDown
+                                  size={11}
+                                  className="shrink-0 text-[color-mix(in_srgb,#a78bfa_70%,var(--text-primary))]"
+                                  aria-label="Incoming, not pulled"
+                                />
+                              )}
+                              <span
+                                className={`truncate min-w-[40px] text-[12.5px] ${
+                                  c.is_head
+                                    ? 'font-semibold text-[var(--text-primary)]'
+                                    : row.sync === 'incoming'
+                                      ? 'text-[var(--text-muted)]'
                                       : 'text-[var(--text-primary)]'
-                                  }`}
-                                >
-                                  {c.message}
+                                }`}
+                              >
+                                {c.message}
+                              </span>
+                              <span className="hidden @[300px]:inline truncate min-w-0 shrink-[4] text-[11.5px] text-[var(--text-dim)]">
+                                {c.author}
+                              </span>
+                              {c.refs.length > 0 && (
+                                <span className="ml-auto pl-1 shrink-0 flex items-center">
+                                  <RefBadges refs={c.refs} color={row.circleColor} maxWidth={96} tooltips={false} />
                                 </span>
-                              </div>
-                              <div className="flex items-center gap-1.5 text-[10.5px] text-[var(--text-dim)] leading-tight mt-0.5">
-                                <span className="truncate">{c.author}</span>
-                                <span>·</span>
-                                <span className="font-mono">{c.short_hash}</span>
-                                <span className="ml-auto shrink-0">{c.date}</span>
-                              </div>
+                              )}
                             </div>
 
-                            {/* Hover quick actions */}
-                            <div className="hidden group-hover:flex items-center gap-0.5 shrink-0">
+                            {/* Hover quick actions overlay the row end (no reflow) */}
+                            <div
+                              className="absolute right-0 inset-y-0 hidden group-hover:flex items-center gap-0.5 pl-6 pr-1"
+                              style={{
+                                background:
+                                  'linear-gradient(to right, transparent, var(--graph-row-bg) 20px)',
+                              }}
+                            >
                               <button
                                 onClick={(e) => {
                                   e.stopPropagation();
                                   copyText(c.hash, `SHA (${c.short_hash})`, c.hash);
                                 }}
                                 className="p-1 rounded hover:bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
-                                title="Copy Commit ID (Full SHA)"
+                                aria-label="Copy commit SHA"
                               >
                                 {copiedHash === c.hash ? (
-                                  <Check size={11.5} className="text-[var(--added-fg)]" />
+                                  <Check size={12} className="text-[var(--added-fg)]" />
                                 ) : (
-                                  <Copy size={11.5} />
+                                  <Copy size={12} />
                                 )}
                               </button>
                               <button
-                                onClick={(e) => openCommitContextMenu(e, c)}
+                                onClick={(e) => {
+                                  commitHover.hide();
+                                  openCommitContextMenu(e, c);
+                                }}
                                 className="p-1 rounded hover:bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
-                                title="More Commit Actions (Cherry-Pick, Revert, Reset, Copy...)"
+                                aria-label="More commit actions"
                               >
-                                <MoreHorizontal size={12.5} />
+                                <MoreHorizontal size={13} />
                               </button>
                             </div>
                           </div>
 
-                          {/* Inline Expanded Commit Inspector (Files + Quick Actions) */}
+                          {/* Inline expanded commit: rails continue down the left edge */}
                           {isExpanded && (
-                            <div className="bg-[var(--bg-panel)] border-t border-[var(--border)]/60 px-2.5 py-2 space-y-2">
-                              {/* Quick Action Chips */}
-                              <div className="flex flex-wrap items-center gap-1">
-                                <button
-                                  onClick={() => copyText(c.hash, `SHA (${c.short_hash})`, c.hash)}
-                                  className="px-1.5 py-0.5 text-[10.5px] rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)]/80 text-[var(--text-primary)] flex items-center gap-1 cursor-pointer"
-                                  title={`Copy full SHA: ${c.hash}`}
-                                >
-                                  <Copy size={10} />
-                                  {c.short_hash}
-                                </button>
-                                <button
-                                  onClick={() => setModal({ kind: 'cherry-pick', commit: c })}
-                                  className="px-1.5 py-0.5 text-[10.5px] rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)]/80 text-[var(--text-primary)] flex items-center gap-1 cursor-pointer"
-                                  title="Cherry-Pick commit onto current branch"
-                                >
-                                  <GitCommitHorizontal size={10} className="text-[var(--accent)]" />
-                                  Cherry-Pick
-                                </button>
-                                <button
-                                  onClick={() => setModal({ kind: 'revert', commit: c })}
-                                  className="px-1.5 py-0.5 text-[10.5px] rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)]/80 text-[var(--text-primary)] flex items-center gap-1 cursor-pointer"
-                                  title="Revert this commit"
-                                >
-                                  <Undo2 size={10} />
-                                  Revert
-                                </button>
-                                {remoteHost && (
+                            <div
+                              className="relative bg-[var(--bg-hover)]/25"
+                              style={{ paddingLeft: graphColW }}
+                            >
+                              <GraphRails
+                                lanes={row.output}
+                                laneWidth={GRAPH_LANE_W}
+                                maxVisibleLanes={GRAPH_MAX_LANES}
+                              />
+                              <div className="pl-1 pr-2 py-1.5 space-y-1.5">
+                                <div className="flex flex-wrap items-center gap-1">
                                   <button
-                                    onClick={async () => {
-                                      const url = remoteHost.commitUrl(c.hash);
-                                      try {
-                                        await api.openExternalUrl(url);
-                                      } catch {
-                                        window.open(url, '_blank', 'noopener');
-                                      }
-                                    }}
-                                    className="px-1.5 py-0.5 text-[10.5px] rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)]/80 text-[var(--accent)] flex items-center gap-1 cursor-pointer"
-                                    title={`Open on ${remoteHost.label}`}
+                                    onClick={() => setModal({ kind: 'cherry-pick', commit: c })}
+                                    className="h-[22px] px-1.5 text-[11px] rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)] text-[var(--text-primary)] flex items-center gap-1 cursor-pointer"
                                   >
-                                    <ExternalLink size={10} />
-                                    {remoteHost.label}
+                                    <GitCommitHorizontal size={11} className="text-[var(--accent)]" />
+                                    Cherry-Pick
                                   </button>
-                                )}
-                                <button
-                                  onClick={(e) => openCommitContextMenu(e, c)}
-                                  className="px-1.5 py-0.5 text-[10.5px] rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)]/80 text-[var(--text-muted)] cursor-pointer ml-auto"
-                                  title="All commit options"
-                                >
-                                  <MoreHorizontal size={11} />
-                                </button>
-                              </div>
-
-                              {/* Commit body if present */}
-                              {detail?.body && (
-                                <div className="text-[11px] text-[var(--text-muted)] whitespace-pre-wrap leading-relaxed bg-[var(--bg-input)] px-2 py-1.5 rounded border border-[var(--border)]/50 max-h-24 overflow-y-auto select-text">
-                                  {detail.body}
-                                </div>
-                              )}
-
-                              {/* Changed files list */}
-                              <div className="space-y-0.5">
-                                <div className="flex items-center justify-between text-[10.5px] text-[var(--text-dim)] pb-0.5">
-                                  <span>
-                                    {isLoadingDetail
-                                      ? 'Loading changed files...'
-                                      : `${detail?.files.length ?? 0} changed file${
-                                          (detail?.files.length ?? 0) === 1 ? '' : 's'
-                                        }`}
-                                  </span>
+                                  <button
+                                    onClick={() => setModal({ kind: 'revert', commit: c })}
+                                    className="h-[22px] px-1.5 text-[11px] rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)] text-[var(--text-primary)] flex items-center gap-1 cursor-pointer"
+                                  >
+                                    <Undo2 size={11} />
+                                    Revert
+                                  </button>
+                                  {remoteHost && (
+                                    <button
+                                      onClick={async () => {
+                                        const url = remoteHost.commitUrl(c.hash);
+                                        try {
+                                          await api.openExternalUrl(url);
+                                        } catch {
+                                          window.open(url, '_blank', 'noopener');
+                                        }
+                                      }}
+                                      className="h-[22px] px-1.5 text-[11px] rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)] text-[var(--accent-hover)] flex items-center gap-1 cursor-pointer"
+                                    >
+                                      <ExternalLink size={11} />
+                                      {remoteHost.label}
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={(e) => openCommitContextMenu(e, c)}
+                                    className="h-[22px] px-1.5 rounded bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] border border-[var(--border)] text-[var(--text-muted)] flex items-center cursor-pointer"
+                                    aria-label="All commit actions"
+                                  >
+                                    <MoreHorizontal size={12} />
+                                  </button>
                                   {detail && (
-                                    <span className="font-mono tabular-nums">
-                                      <span className="text-[var(--added-fg)]">
-                                        +{detail.total_additions}
-                                      </span>{' '}
-                                      <span className="text-[var(--removed-fg)]">
-                                        -{detail.total_deletions}
-                                      </span>
+                                    <span className="ml-auto font-mono text-[10.5px] tabular-nums">
+                                      <span className="text-[var(--added-fg)]">+{detail.total_additions}</span>{' '}
+                                      <span className="text-[var(--removed-fg)]">−{detail.total_deletions}</span>
                                     </span>
                                   )}
                                 </div>
 
-                                {detail?.files.map((f) => {
-                                  const fName = f.path.split('/').pop() || f.path;
-                                  const fDir = f.path.includes('/')
-                                    ? f.path.slice(0, f.path.lastIndexOf('/'))
-                                    : '';
-                                  const commitFileKey = `commit:${c.hash}:${f.path}`;
-                                  const isFileActive = selectedCommitKey === commitFileKey;
+                                {isLoadingDetail && !detail && (
+                                  <div className="space-y-1 py-0.5">
+                                    {[0, 1, 2].map((i) => (
+                                      <div
+                                        key={i}
+                                        className="h-3 rounded bg-[var(--bg-hover)] animate-pulse"
+                                        style={{ width: `${70 - i * 15}%` }}
+                                      />
+                                    ))}
+                                  </div>
+                                )}
 
-                                  return (
-                                    <div
-                                      key={f.path}
-                                      onClick={() =>
-                                        onOpenCommitDiff(
-                                          {
-                                            hash: detail.hash,
-                                            short_hash: detail.short_hash,
-                                            subject: detail.subject,
-                                            author: detail.author,
-                                            date: detail.date,
-                                          },
-                                          f,
-                                          detail.files
-                                        )
-                                      }
-                                      title={f.old_path ? `${f.old_path} → ${f.path}` : f.path}
-                                      className={`flex items-center justify-between gap-1.5 px-1.5 py-1 rounded text-[11.5px] cursor-pointer transition-colors ${
-                                        isFileActive
-                                          ? 'bg-[var(--bg-active)] font-medium'
-                                          : 'hover:bg-[var(--bg-hover)]'
-                                      }`}
-                                    >
-                                      <div className="flex items-center gap-1.5 min-w-0">
-                                        <FileCode
-                                          size={12}
-                                          className="shrink-0 text-[var(--text-dim)]"
-                                        />
-                                        <span
-                                          className={`truncate ${
-                                            f.status === 'D' ? 'line-through opacity-75' : ''
+                                {detail && detail.files.length === 0 && (
+                                  <div className="text-[11px] text-[var(--text-dim)] py-0.5">
+                                    No file changes.
+                                  </div>
+                                )}
+
+                                {detail && detail.files.length > 0 && (
+                                  <div className="-mx-1">
+                                    {detail.files.map((f) => {
+                                      const fName = f.path.split('/').pop() || f.path;
+                                      const fDir = f.path.includes('/')
+                                        ? f.path.slice(0, f.path.lastIndexOf('/'))
+                                        : '';
+                                      const isFileActive =
+                                        selectedCommitKey === `commit:${c.hash}:${f.path}`;
+                                      return (
+                                        <div
+                                          key={f.path}
+                                          onClick={() =>
+                                            onOpenCommitDiff(
+                                              {
+                                                hash: detail.hash,
+                                                short_hash: detail.short_hash,
+                                                subject: detail.subject,
+                                                author: detail.author,
+                                                date: detail.date,
+                                              },
+                                              f,
+                                              detail.files
+                                            )
+                                          }
+                                          title={f.old_path ? `${f.old_path} → ${f.path}` : f.path}
+                                          className={`flex items-center justify-between gap-1.5 h-[22px] px-1 rounded text-[12px] cursor-pointer ${
+                                            isFileActive
+                                              ? 'bg-[var(--bg-active)]'
+                                              : 'hover:bg-[var(--bg-hover)]'
                                           }`}
-                                          style={{ color: fileStatusColor(f.status) }}
                                         >
-                                          {fName}
-                                        </span>
-                                        {fDir && (
-                                          <span className="truncate text-[10px] text-[var(--text-dim)]">
-                                            {fDir}
+                                          <div className="flex items-center gap-1.5 min-w-0">
+                                            <FileCode size={12} className="shrink-0 text-[var(--text-dim)]" />
+                                            <span
+                                              className={`truncate shrink-0 max-w-[70%] ${
+                                                f.status === 'D' ? 'line-through opacity-75' : ''
+                                              }`}
+                                              style={{ color: fileStatusColor(f.status) }}
+                                            >
+                                              {fName}
+                                            </span>
+                                            {fDir && (
+                                              <span className="truncate text-[11px] text-[var(--text-dim)]">
+                                                {fDir}
+                                              </span>
+                                            )}
+                                          </div>
+                                          <span
+                                            className="w-3 text-center font-mono text-[10.5px] font-bold shrink-0"
+                                            style={{ color: fileStatusColor(f.status) }}
+                                          >
+                                            {f.status}
                                           </span>
-                                        )}
-                                      </div>
-                                      <div className="flex items-center gap-1 shrink-0 font-mono text-[10px] tabular-nums">
-                                        {f.additions > 0 && (
-                                          <span className="text-[var(--added-fg)]">
-                                            +{f.additions}
-                                          </span>
-                                        )}
-                                        {f.deletions > 0 && (
-                                          <span className="text-[var(--removed-fg)]">
-                                            -{f.deletions}
-                                          </span>
-                                        )}
-                                        <span
-                                          className="w-3 text-center font-bold"
-                                          style={{ color: fileStatusColor(f.status) }}
-                                        >
-                                          {f.status}
-                                        </span>
-                                      </div>
-                                    </div>
-                                  );
-                                })}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                )}
                               </div>
                             </div>
                           )}
@@ -1715,13 +1813,13 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                     )}
 
                     {hasMore && (
-                      <div className="p-2 flex justify-center">
+                      <div className="px-2 py-1.5 flex justify-center">
                         <button
                           disabled={graphLoading}
                           onClick={() => fetchLog({ append: true, skip: commits.length })}
-                          className="w-full py-1 text-[11px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+                          className="w-full h-6 text-[11px] rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
                         >
-                          {graphLoading ? 'Loading...' : 'Load more commits'}
+                          {graphLoading ? 'Loading…' : 'Load more commits'}
                         </button>
                       </div>
                     )}
@@ -1852,6 +1950,8 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       )}
 
       {/* Floating Context Menu */}
+      {commitHover.card}
+
       {contextMenu && (
         <FloatingContextMenu
           x={contextMenu.x}
