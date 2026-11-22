@@ -53,10 +53,10 @@ import {
 } from './AgentActivity';
 
 const DEFAULT_CONFIG: AgentConfig = {
-  provider: 'openai',
+  provider: 'claude-cli',
   baseUrl: '',
   apiKey: '',
-  model: 'gpt-4.1',
+  model: 'default',
   autoCheckpoint: true,
 };
 

@@ -154,7 +154,7 @@ export function App() {
 
   // Layout toggles & sizes
   const [showSidebar, setShowSidebar] = useState(true);
-  const [showAgent, setShowAgent] = useState(true);
+  const [showAgent, setShowAgent] = useState(false);
   const [showTerminal, setShowTerminal] = useState(true);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('changes');
   // Preferred (user-chosen, persisted) sizes. What is rendered is derived below from the
