@@ -29,15 +29,15 @@ use xxhash_rust::xxh32::xxh32;
 /// per-turn "schema" cost of the vx tools).
 pub const AGENT_HINT: &str = "Vireo `vx` is on PATH: token-cheap code tools. Prefer it over cat/grep/sed and full-file rewrites.\n\
 vx map [query] - ranked repo symbol map\n\
-vx outline <file> - symbols as [start#hash..end#hash] ranges\n\
+vx outline <file> - symbols as [start#hash..end#hash] ranges (markdown: headings)\n\
 vx view <file> [symbol|A..B] - lines as N#hash|code\n\
-vx edit <file> A#h..B#h - replace those lines with new code from stdin or --text (no old text needed; anchors come from view/outline/check output). Also --insert-after, --insert-before, --delete (anchor A#h only)\n\
+vx search <regex> [--glob G] - grep; every hit carries an N#hash anchor\n\
+vx edit <file> A#h..B#h - replace those lines with new code from stdin or --text (no old text needed; anchors come from view/outline/search/check output). Also --insert-after, --insert-before, --delete (anchor A#h only)\n\
 vx symbol <file> <name> [--replace|--insert-after|--delete] - read or change a whole function/class by name (code on stdin); the range includes its doc comments/attributes\n\
 vx create <file> - new file from stdin\n\
-vx search <regex> - grep with anchors\n\
-vx ast '<pattern>' [-r '<rewrite>'] [-l lang] - structural search/codemod\n\
+vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] - structural search/codemod (-r edits files in place; preview with --dry-run)\n\
 vx check [--cmd C] - build/tests, only deduped errors with anchors\n\
-Edits report new syntax errors immediately; no need to re-read after editing.";
+Edits print the new anchors and flag new syntax errors immediately, so do not re-read after editing. A stale anchor is re-located if still unique, else rejected with fresh lines. `vx help` has details.";
 
 // ---------------------------------------------------------------------------------------------
 // Process helpers
@@ -52,7 +52,30 @@ pub fn set_path_env(p: OsString) {
     let _ = PATH_ENV.set(p);
 }
 
+/// Windows: `Command::new("foo")` only tries `foo.exe`, so npm/scoop shims (`foo.cmd`, `foo.bat`)
+/// look "not installed". Resolve extension-less names against PATH ourselves.
+#[cfg(windows)]
+fn resolve_program(program: &str) -> OsString {
+    let p = Path::new(program);
+    if p.extension().is_some() || p.components().count() > 1 {
+        return program.into();
+    }
+    let path = PATH_ENV.get().cloned().or_else(|| std::env::var_os("PATH")).unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        for ext in ["exe", "cmd", "bat"] {
+            let cand = dir.join(format!("{program}.{ext}"));
+            if cand.is_file() {
+                return cand.into_os_string();
+            }
+        }
+    }
+    program.into()
+}
+
 fn command(program: &str) -> Command {
+    #[cfg(windows)]
+    let mut c = Command::new(resolve_program(program));
+    #[cfg(not(windows))]
     let mut c = Command::new(program);
     #[cfg(windows)]
     {
@@ -286,7 +309,12 @@ impl Doc {
 fn read_doc(ws: &Path, path: &str) -> Result<(PathBuf, String, Doc), String> {
     let full = resolve(ws, path)?;
     let rel = rel_of(ws, &full);
-    let bytes = std::fs::read(&full).map_err(|e| format!("cannot read {rel}: {e}"))?;
+    if full.is_dir() {
+        return Err(format!("{rel} is a directory (list it with: vx map --dir {rel})"));
+    }
+    let bytes = std::fs::read(&full).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound { format!("{rel} not found") } else { format!("cannot read {rel}: {e}") }
+    })?;
     let text = String::from_utf8(bytes).map_err(|_| format!("{rel} is not UTF-8 text"))?;
     Ok((full, rel, Doc::parse(&text)))
 }
@@ -790,8 +818,44 @@ fn find_symbol<'a>(syms: &'a [Sym], query: &str) -> Result<&'a Sym, String> {
 
 const MAX_VIEW_LINES: usize = 400;
 
+/// Markdown has no tree-sitter grammar here; headings (outside code fences) are its symbols.
+fn markdown_outline(rel: &str, doc: &Doc) -> String {
+    let mut heads: Vec<(usize, usize, String)> = Vec::new(); // (row, level, title)
+    let mut fence: Option<String> = None;
+    for (i, l) in doc.lines.iter().enumerate() {
+        let t = l.trim_start();
+        if let Some(f) = &fence {
+            if t.starts_with(f.as_str()) {
+                fence = None;
+            }
+            continue;
+        }
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fence = Some(t.chars().take(3).collect());
+            continue;
+        }
+        let level = t.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&level) && t[level..].starts_with(' ') && l.len() - t.len() <= 3 {
+            heads.push((i, level, t[level..].trim().trim_end_matches('#').trim().to_string()));
+        }
+    }
+    let n = doc.lines.len();
+    let mut out = format!("# {rel} ({n} lines)\n");
+    if heads.is_empty() {
+        out.push_str("(no headings found)\n");
+    }
+    for (k, (row, level, title)) in heads.iter().enumerate() {
+        let end = heads[k + 1..].iter().find(|h| h.1 <= *level).map(|h| h.0 - 1).unwrap_or(n - 1);
+        out.push_str(&format!("{}[{}..{}] {} {}\n", "  ".repeat(level - 1), doc.anchor(*row), doc.anchor(end), "#".repeat(*level), title));
+    }
+    out
+}
+
 pub fn outline(ws: &Path, path: &str) -> Result<String, String> {
     let (_, rel, doc) = read_doc(ws, path)?;
+    if rel.to_lowercase().ends_with(".md") || rel.to_lowercase().ends_with(".markdown") {
+        return Ok(markdown_outline(&rel, &doc));
+    }
     let Some(lang) = lang_for(&rel).filter(|l| *l != Lang::Json) else {
         return Err(format!("no outline support for {rel}; use view"));
     };
@@ -834,6 +898,9 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>) -> Result<String, Strin
         None => (0, n - 1, None),
         Some(t) => {
             if let Some((a, b)) = parse_line_range(t) {
+                if a > n {
+                    return Err(format!("{rel} has only {n} line(s); line {a} is past the end"));
+                }
                 let a0 = (a - 1).min(n - 1);
                 let b0 = b.map(|b| b.saturating_sub(1)).unwrap_or(n - 1).min(n - 1).max(a0);
                 (a0, b0, Some(format!("lines {}..{} of {n}", a0 + 1, b0 + 1)))
@@ -854,9 +921,11 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>) -> Result<String, Strin
         let line = hl(i + 1, &doc.lines[i]);
         if shown >= MAX_VIEW_LINES || out.len() + line.len() > 30_000 {
             out.push_str(&format!(
-                "…[{} more lines; view {} A..B or outline]\n",
+                "…[{} more lines; continue with: vx view {} {}..{}]\n",
                 to + 1 - i,
-                rel
+                rel,
+                i + 1,
+                to + 1
             ));
             break;
         }
@@ -961,6 +1030,9 @@ pub fn symbol_op(ws: &Path, path: &str, symbol: &str, mode: &str, new_code: &str
             out.push_str(&hl(i + 1, &doc.lines[i]));
             out.push('\n');
         }
+        if r1 + 1 > r0 + MAX_VIEW_LINES {
+            out.push_str(&format!("…[{} more lines; vx view {rel} {}..{}]\n", r1 + 1 - (r0 + MAX_VIEW_LINES), r0 + MAX_VIEW_LINES + 1, r1 + 1));
+        }
         return Ok(out);
     }
     let before = syntax_errors(Some(lang), &text);
@@ -1016,31 +1088,124 @@ pub fn create(ws: &Path, path: &str, content: &str, force: bool) -> Result<Strin
 
 // --------------------------------- search -----------------------------------------------------
 
-pub fn search(ws: &Path, query: &str, glob: Option<&str>) -> Result<String, String> {
-    if query.trim().is_empty() {
-        return Err("empty query".into());
-    }
+type Hit = (String, usize, String);
+
+/// `Ok(None)` when ripgrep is not installed (callers fall back to the built-in walker).
+fn rg_search(ws: &Path, query: &str, glob: Option<&str>) -> Result<Option<Vec<Hit>>, String> {
     let mut cmd = command("rg");
     cmd.args(["-n", "--no-heading", "--smart-case", "--max-count", "10", "--glob", "!.git", "--glob", "!node_modules", "--glob", "!target", "--glob", "!dist"]);
     if let Some(g) = glob.filter(|g| !g.is_empty()) {
         cmd.args(["--glob", g]);
     }
     cmd.args(["--", query]).current_dir(ws);
-    let out = run_capture(cmd, Duration::from_secs(20)).map_err(|e| format!("rg failed: {e}"))?;
+    let Ok(out) = run_capture(cmd, Duration::from_secs(20)) else { return Ok(None) };
+    // Exit 1 = no matches; exit 2 with no output = bad regex / bad glob (must not look like "no matches").
+    if out.code == 2 && out.stdout.trim().is_empty() {
+        let msg: String = out.stderr.trim().lines().take(4).collect::<Vec<_>>().join("\n");
+        return Err(format!("search failed: {msg}"));
+    }
     let re = lazy_re!(r"^(.+?):(\d+):(.*)$");
-    let mut res = String::new();
-    let mut count = 0usize;
+    let mut hits = Vec::new();
     for l in out.stdout.lines() {
         let Some(c) = re.captures(l) else { continue };
-        let text: String = c[3].chars().take(200).collect();
         let file = c[1].replace('\\', "/");
-        let file = file.trim_start_matches("./");
-        res.push_str(&format!("{}:{}#{}| {}\n", file, &c[2], line_hash(&c[3]), text.trim()));
-        count += 1;
-        if count >= 80 || res.len() > 12_000 {
-            res.push_str("…[more matches; narrow the query]\n");
+        hits.push((file.trim_start_matches("./").to_string(), c[2].parse().unwrap_or(0), c[3].to_string()));
+    }
+    Ok(Some(hits))
+}
+
+/// Translate an rg-style glob (`*`, `**`, `?`, `{a,b}`) into an anchored regex.
+fn glob_to_regex(g: &str) -> Result<Regex, String> {
+    let cs: Vec<char> = g.trim_start_matches("./").chars().collect();
+    let mut re = String::from("^");
+    let (mut i, mut in_brace) = (0usize, false);
+    while i < cs.len() {
+        match cs[i] {
+            '*' if cs.get(i + 1) == Some(&'*') => {
+                i += 1;
+                if cs.get(i + 1) == Some(&'/') {
+                    i += 1;
+                    re.push_str("(?:.*/)?");
+                } else {
+                    re.push_str(".*");
+                }
+            }
+            '*' => re.push_str("[^/]*"),
+            '?' => re.push_str("[^/]"),
+            '{' => {
+                in_brace = true;
+                re.push_str("(?:");
+            }
+            '}' if in_brace => {
+                in_brace = false;
+                re.push(')');
+            }
+            ',' if in_brace => re.push('|'),
+            c => re.push_str(&regex::escape(&c.to_string())),
+        }
+        i += 1;
+    }
+    re.push('$');
+    Regex::new(&re).map_err(|e| format!("invalid glob `{g}`: {e}"))
+}
+
+/// Dependency-free fallback for machines without ripgrep (same hit shape, same ignore list).
+fn builtin_search(ws: &Path, query: &str, glob: Option<&str>) -> Result<Vec<Hit>, String> {
+    let smart = !query.chars().any(|c| c.is_uppercase());
+    let re = regex::RegexBuilder::new(query).case_insensitive(smart).build().map_err(|e| format!("search failed: invalid regex: {e}"))?;
+    let glob_re = glob.filter(|g| !g.is_empty()).map(glob_to_regex).transpose()?;
+    let mut hits: Vec<Hit> = Vec::new();
+    let walk = WalkDir::new(ws).sort_by_file_name().into_iter().filter_entry(|e| {
+        let name = e.file_name().to_string_lossy();
+        e.depth() == 0 || !(name.starts_with('.') || (e.file_type().is_dir() && ignored_dir(&name)))
+    });
+    for e in walk.flatten() {
+        if !e.file_type().is_file() {
+            continue;
+        }
+        let rel = rel_of(ws, e.path());
+        if let Some(g) = &glob_re {
+            if !(g.is_match(&rel) || g.is_match(&e.file_name().to_string_lossy())) {
+                continue;
+            }
+        }
+        if e.metadata().map(|m| m.len() > 2_000_000).unwrap_or(true) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
+        let mut per_file = 0;
+        for (i, l) in text.lines().enumerate() {
+            if re.is_match(l) {
+                hits.push((rel.clone(), i + 1, l.to_string()));
+                per_file += 1;
+                if per_file >= 10 {
+                    break;
+                }
+            }
+        }
+        if hits.len() >= 400 {
             break;
         }
+    }
+    Ok(hits)
+}
+
+pub fn search(ws: &Path, query: &str, glob: Option<&str>) -> Result<String, String> {
+    if query.trim().is_empty() {
+        return Err("empty query".into());
+    }
+    let hits = match rg_search(ws, query, glob)? {
+        Some(h) => h,
+        None => builtin_search(ws, query, glob)?,
+    };
+    let mut res = String::new();
+    for (count, (file, line, raw)) in hits.iter().enumerate() {
+        if count >= 80 || res.len() > 12_000 {
+            res.push_str(&format!("…[{} more matches; narrow the query or --glob]\n", hits.len() - count));
+            break;
+        }
+        let text: String = raw.chars().take(200).collect();
+        res.push_str(&format!("{file}:{line}#{}| {}\n", line_hash(raw), text.trim()));
     }
     Ok(if res.is_empty() { "No matches found.".into() } else { res })
 }
@@ -1172,7 +1337,7 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
 
 // --------------------------------- ast-grep ---------------------------------------------------
 
-pub fn ast(ws: &Path, pattern: &str, lang: Option<&str>, path: Option<&str>, rewrite: Option<&str>) -> Result<String, String> {
+pub fn ast(ws: &Path, pattern: &str, lang: Option<&str>, path: Option<&str>, rewrite: Option<&str>, dry_run: bool) -> Result<String, String> {
     if pattern.trim().is_empty() {
         return Err("empty pattern".into());
     }
@@ -1202,7 +1367,8 @@ pub fn ast(ws: &Path, pattern: &str, lang: Option<&str>, path: Option<&str>, rew
         c
     };
     let out = run_capture(build(true, false), Duration::from_secs(60))?;
-    if out.code != 0 && out.stdout.trim().is_empty() {
+    // ast-grep exits 1 with empty output when nothing matched; that is not a failure.
+    if out.code != 0 && out.stdout.trim().is_empty() && !out.stderr.trim().is_empty() && !out.stderr.contains("No matches") {
         return Err(format!("ast-grep failed: {}", out.stderr.trim().chars().take(400).collect::<String>()));
     }
     let mut matches: Vec<(String, usize, String)> = Vec::new();
@@ -1217,8 +1383,12 @@ pub fn ast(ws: &Path, pattern: &str, lang: Option<&str>, path: Option<&str>, rew
     if matches.is_empty() {
         return Ok("No matches.".into());
     }
-    if rewrite.is_none() {
-        let mut res = format!("{} match(es):\n", matches.len());
+    if rewrite.is_none() || dry_run {
+        let mut res = if dry_run && rewrite.is_some() {
+            format!("{} match(es) (dry run, nothing written):\n", matches.len())
+        } else {
+            format!("{} match(es):\n", matches.len())
+        };
         for (f, l, t) in matches.iter().take(60) {
             let shown: String = t.trim().chars().take(160).collect();
             res.push_str(&format!("{f}:{l}#{}| {shown}\n", line_hash(t)));
@@ -1440,7 +1610,9 @@ pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64) -> Result<String, 
         } else if errors > 0 {
             report.push_str(&render_diags(ws, &diags, &label, out.secs));
         } else {
-            report.push_str(&format!("✖ {label} failed (exit {}, {:.1}s):\n{}\n", out.code, out.secs, compress_plain(&raw)));
+            let tail = compress_plain(&raw);
+            let tail = if tail.trim().is_empty() { "(no output)".to_string() } else { tail };
+            report.push_str(&format!("✖ {label} failed (exit {}, {:.1}s):\n{}\n", out.code, out.secs, tail));
         }
     }
     Ok(report.chars().take(8000).collect())
@@ -1470,7 +1642,7 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
         ),
         "symbol" => symbol_op(ws, need("path")?, need("symbol")?, s(a, "mode").unwrap_or("read"), s(a, "new_code").unwrap_or("")),
         "create" => create(ws, need("path")?, s(a, "content").unwrap_or(""), a["force"].as_bool().unwrap_or(false)),
-        "ast" => ast(ws, need("pattern")?, s(a, "lang"), s(a, "path"), s(a, "rewrite")),
+        "ast" => ast(ws, need("pattern")?, s(a, "lang"), s(a, "path"), s(a, "rewrite"), a["dry_run"].as_bool().unwrap_or(false)),
         "check" => check(ws, s(a, "cmd"), a["timeout"].as_u64().unwrap_or(180)),
         other => Err(format!("unknown op `{other}`")),
     }
@@ -1592,5 +1764,38 @@ mod tests {
         assert_eq!(d.len(), 1, "deduped");
         let r = render_diags(&ws, &d, "tsc", 0.5);
         assert!(r.contains("a.ts:1:5 [TS2322]") && r.contains(&format!(">  1#{}|", line_hash("let a: number = 'x';"))) || r.contains("1#"), "{r}");
+    }
+
+    #[test]
+    fn markdown_outline_skips_code_fences() {
+        let ws = tmp("md");
+        std::fs::write(ws.join("R.md"), "# T\n\n```\n# not a heading\n```\n\n## Sec\ntext\n").unwrap();
+        let r = outline(&ws, "R.md").unwrap();
+        assert!(r.contains("] # T"), "{r}");
+        assert!(r.contains("] ## Sec"), "{r}");
+        assert!(!r.contains("not a heading"), "{r}");
+    }
+
+    #[test]
+    fn builtin_search_smart_case_and_globs() {
+        let ws = tmp("bs");
+        std::fs::create_dir_all(ws.join("src/deep")).unwrap();
+        std::fs::write(ws.join("src/deep/a.rs"), "fn Alpha() {}\nfn beta() {}\n").unwrap();
+        std::fs::write(ws.join("b.py"), "alpha = 1\n").unwrap();
+        let rs = builtin_search(&ws, "alpha", Some("**/*.rs")).unwrap();
+        assert_eq!(rs.len(), 1, "{rs:?}");
+        assert_eq!(rs[0].0, "src/deep/a.rs");
+        assert_eq!(builtin_search(&ws, "alpha", Some("*.{py,rs}")).unwrap().len(), 2);
+        assert!(builtin_search(&ws, "fn (", None).is_err());
+    }
+
+    #[test]
+    fn view_errors_are_actionable() {
+        let ws = tmp("ve");
+        std::fs::write(ws.join("a.rs"), "fn a() {}\n").unwrap();
+        std::fs::create_dir_all(ws.join("d")).unwrap();
+        assert!(view(&ws, "a.rs", Some("5..9")).unwrap_err().contains("past the end"));
+        assert!(view(&ws, "nope.rs", None).unwrap_err().contains("not found"));
+        assert!(view(&ws, "d", None).unwrap_err().contains("directory"));
     }
 }

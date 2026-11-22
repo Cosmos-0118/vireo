@@ -1256,6 +1256,20 @@ fn build_prompt_capped(messages: &[ChatMessage], max_history: usize) -> String {
     )
 }
 
+fn with_vx_hint(kind: CliKind, prompt: String, has_vx: bool) -> String {
+    // Claude and Codex get `AGENT_HINT` via CLI flags in `cli_args`. Antigravity (`agy`) has no
+    // system-prompt CLI flag, so prepend the hint to the turn prompt when `vx` is available.
+    if has_vx && kind == CliKind::Antigravity && !prompt.is_empty() {
+        format!(
+            "[Vireo environment]\n{}\n\n{}",
+            crate::code_intel::AGENT_HINT,
+            prompt
+        )
+    } else {
+        prompt
+    }
+}
+
 fn cli_args(kind: CliKind, ws: &Path, model: &str, mode: PermMode) -> Vec<String> {
     let model = model.trim();
     let want_model = !model.is_empty() && !model.eq_ignore_ascii_case("default");
@@ -1361,8 +1375,9 @@ fn cli_args(kind: CliKind, ws: &Path, model: &str, mode: PermMode) -> Vec<String
             a
         }
     };
-    // Give the CLI the `vx` tools (found on PATH) without touching its own config: the usage
-    // hint and, for Claude's headless mode, permission to run `vx` come from command-line flags.
+    // Give the CLI the `vx` tools (found on PATH) without touching its own config: Claude and
+    // Codex take the usage hint (and Claude's `vx` allow rule) via command-line flags;
+    // Antigravity (`agy`) has no system-prompt flag and receives it via `with_vx_hint` in `run`.
     if crate::pty::vx_dir().is_some() {
         match kind {
             CliKind::Claude => {
@@ -1436,6 +1451,7 @@ pub async fn run(
     let mut turn = TurnTracker::new(auto_cp);
     turn.begin(state).await;
 
+    let has_vx = crate::pty::vx_dir().is_some();
     let mut args = cli_args(kind, ws, &req.model, PermMode::parse(req.permission_mode.as_deref()));
     let prompt = if kind == CliKind::Copilot {
         let p = build_prompt_capped(&req.messages, MAX_ARG_PROMPT_CHARS);
@@ -1443,7 +1459,7 @@ pub async fn run(
         args.push(p.clone());
         p
     } else {
-        build_prompt(&req.messages)
+        with_vx_hint(kind, build_prompt(&req.messages), has_vx)
     };
 
     let mut command = background_command(&exe.to_string_lossy());
@@ -2048,5 +2064,18 @@ x
         assert!(has(CliKind::Cursor, "default", PermMode::AutoEdit, "--force"));
         assert!(has(CliKind::Copilot, "default", PermMode::AutoEdit, "--allow-all-tools"));
         assert!(has(CliKind::Amp, "rush", PermMode::AutoEdit, "--mode"));
+    }
+
+    #[test]
+    fn antigravity_prompt_includes_vx_hint() {
+        let p = with_vx_hint(CliKind::Antigravity, "fix the bug".into(), true);
+        assert!(p.contains(crate::code_intel::AGENT_HINT));
+        assert!(p.ends_with("fix the bug"));
+
+        // No hint when vx is absent, or for CLIs that receive it via flags.
+        assert_eq!(with_vx_hint(CliKind::Antigravity, "fix the bug".into(), false), "fix the bug");
+        assert_eq!(with_vx_hint(CliKind::Claude, "fix the bug".into(), true), "fix the bug");
+        assert_eq!(with_vx_hint(CliKind::Codex, "fix the bug".into(), true), "fix the bug");
+        assert_eq!(with_vx_hint(CliKind::Antigravity, String::new(), true), "");
     }
 }
