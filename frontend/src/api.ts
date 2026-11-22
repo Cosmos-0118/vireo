@@ -1,6 +1,7 @@
 import type {
   AgentConfig,
   Checkpoint,
+  CliToolStatus,
   CommandRes,
   CommitLogItem,
   GitDiffRes,
@@ -28,6 +29,11 @@ export const api = {
     jsonFetch<{ factor: number; native: boolean }>('/api/window/zoom', {
       method: 'POST',
       body: JSON.stringify({ factor }),
+    }),
+  windowControl: (action: 'state' | 'minimize' | 'toggle_maximize' | 'close' | 'drag') =>
+    jsonFetch<{ native: boolean; maximized: boolean }>('/api/window/control', {
+      method: 'POST',
+      body: JSON.stringify({ action }),
     }),
   getWorkspace: () => jsonFetch<WorkspaceInfo>('/api/workspace'),
   setWorkspace: (path: string) =>
@@ -108,6 +114,7 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ id }),
     }),
+  cliTools: () => jsonFetch<CliToolStatus[]>('/api/agent/cli-tools'),
 };
 
 export async function streamAgentChat(

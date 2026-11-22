@@ -5,6 +5,8 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  Play,
+  RefreshCw,
   RotateCcw,
   Send,
   Settings,
@@ -17,7 +19,7 @@ import {
 import { api, streamAgentChat } from '../api';
 import { highlightLines } from '../syntax';
 import type { LiteTheme } from '../themes';
-import type { AgentConfig, UiChatMessage } from '../types';
+import type { AgentConfig, CliToolStatus, UiChatMessage } from '../types';
 import { VireoLogo } from './VireoLogo';
 
 const CliAgentPty = lazy(() => import('./CliAgentPty'));
@@ -402,8 +404,11 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   onToast,
 }) => {
   const [mode, setMode] = useState<'chat' | 'cli'>('chat');
+  const [cliMounted, setCliMounted] = useState(false);
   const [cliCmd, setCliCmd] = useState<string>('');
+  const [customCliInput, setCustomCliInput] = useState<string>('');
   const [cliRunKey, setCliRunKey] = useState<number>(1);
+  const [cliTools, setCliTools] = useState<CliToolStatus[]>([]);
   const [showSettings, setShowSettings] = useState(false);
 
   const [config, setConfig] = useState<AgentConfig>(() => {
@@ -555,9 +560,24 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     setRunning(false);
   };
 
+  const refreshCliTools = () => {
+    api
+      .cliTools()
+      .then((list) => setCliTools(list))
+      .catch(() => {});
+  };
+
+  useEffect(() => {
+    if (mode === 'cli') {
+      setCliMounted(true);
+      refreshCliTools();
+    }
+  }, [mode]);
+
   const launchCli = (cmd: string) => {
-    setCliCmd(cmd);
+    setCliCmd(cmd.trim());
     setCliRunKey((k) => k + 1);
+    setCliMounted(true);
     setMode('cli');
   };
 
@@ -663,7 +683,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
           {config.provider !== 'gemini' && (
             <div>
               <label className="block text-[11px] text-[var(--text-muted)] mb-0.5">
-                Base URL (optional — works with OpenRouter, DeepSeek, LM Studio)
+                Base URL (optional, for OpenRouter, DeepSeek, or LM Studio)
               </label>
               <input
                 value={config.baseUrl}
@@ -702,8 +722,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         </div>
       )}
 
-      {mode === 'chat' ? (
-        <>
+      {/* Agent Chat View (kept separate from persistent CLI PTY) */}
+      <div className={mode === 'chat' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
           {/* Chat timeline */}
           <div className="flex-1 overflow-y-auto p-3.5 space-y-3.5">
             {messages.length === 0 ? (
@@ -887,28 +907,100 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               </div>
             </div>
           </div>
-        </>
-      ) : (
-        <div className="flex-1 flex flex-col min-h-0">
-          <div className="flex items-center gap-1 px-2 py-1.5 border-b border-[var(--border)] overflow-x-auto shrink-0">
-            <span className="text-[10px] text-[var(--text-dim)] shrink-0 mr-1">Launch:</span>
-            {[
-              { label: 'Shell', cmd: '' },
-              { label: 'Claude', cmd: 'claude' },
-              { label: 'Codex', cmd: 'codex' },
-              { label: 'Gemini', cmd: 'gemini' },
-              { label: 'Aider', cmd: 'aider' },
-              { label: 'OpenCode', cmd: 'opencode' },
-            ].map((item) => (
-              <button
-                key={item.label}
-                onClick={() => launchCli(item.cmd)}
-                className="px-2 py-0.5 text-[11px] rounded border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] shrink-0 cursor-pointer"
-              >
-                {item.label}
-              </button>
-            ))}
+      </div>
+
+      {/* Persistent CLI Agent View (lazy-mounted on first visit, preserved across tab switches) */}
+      {cliMounted && (
+        <div className={mode === 'cli' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
+          <div className="flex items-center justify-between gap-1 px-2 py-1.5 border-b border-[var(--border)] shrink-0">
+            <div className="flex items-center gap-1 overflow-x-auto min-w-0">
+              <span className="text-[10px] text-[var(--text-dim)] shrink-0 mr-1">Launch:</span>
+              {[
+                { label: 'Shell', cmd: '' },
+                { label: 'Claude', cmd: 'claude' },
+                { label: 'Codex', cmd: 'codex' },
+                { label: 'Gemini', cmd: 'gemini' },
+                { label: 'Aider', cmd: 'aider' },
+                { label: 'OpenCode', cmd: 'opencode' },
+              ].map((item) => {
+                const status = item.cmd
+                  ? cliTools.find((t) => t.cmd === item.cmd)
+                  : undefined;
+                const isActive = cliCmd === item.cmd;
+                const title = !item.cmd
+                  ? 'Interactive shell in workspace'
+                  : status?.installed
+                  ? `Launch ${item.label} (${status.path})`
+                  : status
+                  ? `${item.label} was not found on PATH. Click for install instructions (${status.install_hint})`
+                  : `Launch ${item.label}`;
+                return (
+                  <button
+                    key={item.label}
+                    onClick={(e) => {
+                      e.currentTarget.blur();
+                      launchCli(item.cmd);
+                    }}
+                    title={title}
+                    className={`px-2 py-0.5 text-[11px] rounded border shrink-0 cursor-pointer flex items-center gap-1 transition-colors ${
+                      isActive
+                        ? 'border-[var(--accent)] bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
+                        : 'border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {status && (
+                      <span
+                        className="w-1.5 h-1.5 rounded-full shrink-0"
+                        style={{
+                          background: status.installed ? '#10b981' : 'var(--text-dim)',
+                          opacity: status.installed ? 1 : 0.45,
+                        }}
+                      />
+                    )}
+                    {item.label}
+                  </button>
+                );
+              })}
+            </div>
+            <button
+              onClick={(e) => {
+                e.currentTarget.blur();
+                refreshCliTools();
+                launchCli(cliCmd);
+              }}
+              className="p-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded shrink-0 cursor-pointer"
+              title="Restart current CLI session"
+            >
+              <RefreshCw size={12} />
+            </button>
           </div>
+
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              const trimmed = customCliInput.trim();
+              if (!trimmed) return;
+              launchCli(trimmed);
+            }}
+            className="flex items-center gap-1.5 px-2 py-1 border-b border-[var(--border)] bg-[var(--bg-panel)]/60 shrink-0"
+          >
+            <input
+              value={customCliInput}
+              onChange={(e) => setCustomCliInput(e.target.value)}
+              placeholder="Custom CLI command (e.g. claude --resume, codex --full-auto)..."
+              className="flex-1 min-w-0 px-2 py-0.5 text-[11.5px] font-mono rounded bg-[var(--bg-input)] border border-[var(--border)] text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none focus:border-[var(--accent)]"
+            />
+            <button
+              type="submit"
+              disabled={!customCliInput.trim()}
+              className="px-2 py-0.5 text-[11px] rounded bg-[var(--bg-elevated)] border border-[var(--border)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] disabled:opacity-40 flex items-center gap-1 shrink-0 cursor-pointer"
+              title="Run custom CLI command"
+            >
+              <Play size={10} />
+              Run
+            </button>
+          </form>
+
           <Suspense
             fallback={
               <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-dim)]">
@@ -919,6 +1011,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             <CliAgentPty
               command={cliCmd || undefined}
               runKey={cliRunKey}
+              active={mode === 'cli'}
               theme={theme}
               workspacePath={workspacePath}
             />

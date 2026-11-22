@@ -86,6 +86,39 @@ export function App() {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [liveConnected, setLiveConnected] = useState(false);
 
+  // Native window state for the custom title bar (null = running in a browser)
+  const [nativeWindow, setNativeWindow] = useState<{ maximized: boolean } | null>(null);
+  const windowAction = useCallback(
+    (action: 'state' | 'minimize' | 'toggle_maximize' | 'close' | 'drag') => {
+      api
+        .windowControl(action)
+        .then((res) => setNativeWindow(res.native ? { maximized: res.maximized } : null))
+        .catch(() => {});
+    },
+    []
+  );
+  useEffect(() => {
+    windowAction('state');
+    let timer: number | undefined;
+    const onResize = () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => windowAction('state'), 120);
+    };
+    window.addEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('resize', onResize);
+      window.clearTimeout(timer);
+    };
+  }, [windowAction]);
+
+  const handleTitleBarMouseDown = (e: React.MouseEvent) => {
+    if (!nativeWindow || e.button !== 0) return;
+    const target = e.target as HTMLElement;
+    if (target.closest('button, input, textarea, select, a, kbd, form, [data-no-drag]')) return;
+    e.preventDefault();
+    windowAction(e.detail === 2 ? 'toggle_maximize' : 'drag');
+  };
+
   // Layout toggles & sizes
   const [showSidebar, setShowSidebar] = useState(true);
   const [showAgent, setShowAgent] = useState(true);
@@ -307,6 +340,8 @@ export function App() {
       const mod = e.ctrlKey || e.metaKey;
       if (!mod) return;
 
+      const inXterm = !!(e.target as HTMLElement | null)?.closest?.('.xterm');
+
       if (e.key === '=' || e.key === '+' || e.code === 'Equal' || e.code === 'NumpadAdd') {
         e.preventDefault();
         e.stopPropagation();
@@ -324,7 +359,7 @@ export function App() {
         e.preventDefault();
         e.stopPropagation();
         adjustZoom(1.0);
-      } else if (e.key.toLowerCase() === 'p') {
+      } else if (e.key.toLowerCase() === 'p' && !inXterm) {
         e.preventDefault();
         setQuickOpenVisible((v) => !v);
       } else if (e.shiftKey && e.key.toLowerCase() === 'f') {
@@ -334,7 +369,7 @@ export function App() {
       } else if (e.key === '`') {
         e.preventDefault();
         setShowTerminal((v) => !v);
-      } else if (e.key.toLowerCase() === 'b') {
+      } else if (e.key.toLowerCase() === 'b' && !inXterm) {
         e.preventDefault();
         setShowSidebar((v) => !v);
       }
@@ -478,205 +513,240 @@ export function App() {
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-[var(--bg-base)] text-[var(--text-primary)]">
-      {/* Top Workbench Header */}
-      <header className="h-12 px-3.5 grid grid-cols-[1fr_auto_1fr] items-center border-b border-[var(--border)] bg-[var(--bg-activity)] shrink-0 gap-3 select-none">
-        {/* Left: Brand & Workspace Path */}
-        <div className="flex items-center gap-2.5 min-w-0">
-          <div className="flex items-center gap-2 font-semibold text-sm text-[var(--text-primary)] shrink-0">
-            <VireoLogo size={24} className="shrink-0 drop-shadow-sm" />
-            <span className="tracking-tight">Vireo</span>
-          </div>
-
-          <div className="h-4 w-[1px] bg-[var(--border)] shrink-0" />
+      {/* Title Bar (custom, frameless window) */}
+      <header
+        onMouseDown={handleTitleBarMouseDown}
+        className="h-[38px] grid grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-[var(--border)] bg-[var(--bg-activity)] shrink-0 select-none"
+      >
+        {/* Left: brand and workspace */}
+        <div className="flex items-center gap-1 min-w-0 pl-3">
+          <VireoLogo size={18} className="shrink-0 mr-1.5" />
 
           {editingWs ? (
-            <form onSubmit={handleSwitchWorkspace} className="flex items-center gap-1.5 min-w-0">
+            <form onSubmit={handleSwitchWorkspace} className="flex items-center min-w-0">
               <input
                 value={wsDraft}
                 onChange={(e) => setWsDraft(e.target.value)}
                 onBlur={() => setEditingWs(false)}
                 autoFocus
-                className="w-72 h-8 px-2.5 text-[13px] font-mono rounded-md bg-[var(--bg-input)] border border-[var(--accent)] text-[var(--text-primary)] outline-none"
+                className="w-72 h-7 px-2 text-[12.5px] font-mono rounded-md bg-[var(--bg-input)] border border-[var(--accent)] text-[var(--text-primary)] outline-none"
                 placeholder="C:\path\to\repo"
               />
             </form>
           ) : (
-            <div className="flex items-center gap-1.5 min-w-0">
+            <>
               <button
                 onClick={() => {
                   setWsDraft(workspace.path);
                   setEditingWs(true);
                 }}
-                className="flex items-center gap-1.5 h-8 px-2.5 rounded-md hover:bg-[var(--bg-hover)] text-[13px] text-[var(--text-primary)] max-w-[220px] cursor-pointer transition-colors"
-                title={`Workspace: ${workspace.path} (click to edit path)`}
+                className="flex items-center gap-1.5 h-7 px-2 rounded-md hover:bg-[var(--bg-hover)] text-[13px] font-medium text-[var(--text-primary)] max-w-[240px] cursor-pointer transition-colors"
+                title={`${workspace.path}\nClick to edit the path`}
               >
-                <FolderGit2 size={15} className="text-[var(--accent)] shrink-0" />
-                <span className="truncate font-medium">{workspace.name}</span>
+                <FolderGit2 size={14} className="text-[var(--text-muted)] shrink-0" />
+                <span className="truncate">{workspace.name}</span>
               </button>
               <button
                 onClick={handlePickWorkspace}
-                className="flex items-center gap-1.5 h-8 px-2.5 rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[12.5px] text-[var(--text-primary)] shrink-0 cursor-pointer transition-colors"
-                title="Open Folder (Native Dialog)"
+                className="w-7 h-7 flex items-center justify-center rounded-md text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] shrink-0 cursor-pointer transition-colors"
+                title="Open Folder"
+                aria-label="Open Folder"
               >
-                <FolderOpen size={14} className="text-[var(--accent)]" />
-                <span className="hidden lg:inline">Open Folder</span>
+                <FolderOpen size={15} />
               </button>
-            </div>
+            </>
           )}
         </div>
 
-        {/* Center: True-Centered Quick Open Bar */}
+        {/* Center: Quick Open */}
         <button
           onClick={() => setQuickOpenVisible(true)}
-          className="hidden md:flex items-center gap-2.5 h-8 px-3.5 w-[340px] lg:w-[400px] rounded-lg border border-[var(--border)] bg-[var(--bg-input)] hover:border-[var(--accent)] text-[13px] text-[var(--text-dim)] cursor-pointer transition-colors"
+          className="hidden md:flex items-center gap-2 h-[26px] px-2.5 w-[300px] lg:w-[380px] rounded-md border border-[var(--border)] bg-[var(--bg-input)] hover:border-[var(--text-dim)] text-[12.5px] text-[var(--text-dim)] cursor-pointer transition-colors"
         >
-          <Search size={14} className="shrink-0" />
-          <span className="flex-1 text-left truncate">
-            Quick Open files, themes, tasks...
-          </span>
-          <kbd className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text-muted)]">
-            Ctrl+P
-          </kbd>
+          <Search size={13} className="shrink-0" />
+          <span className="flex-1 text-left truncate">Search files, themes, and tasks</span>
+          <kbd className="text-[10.5px] font-mono text-[var(--text-dim)]">Ctrl+P</kbd>
         </button>
 
-        {/* Right: Run Tasks, Themes, Pane Toggles */}
-        <div className="flex items-center justify-end gap-2 shrink-0">
-          {/* Run Scripts Dropdown */}
-          <div className="relative">
-            <button
-              onClick={() => {
-                setShowRunMenu((v) => !v);
-                setShowThemeMenu(false);
-              }}
-              className="h-8 px-2.5 text-[12.5px] rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] flex items-center gap-1.5 cursor-pointer transition-colors"
-              title="Run detected project scripts"
-            >
-              <Play size={13} className="text-[var(--added-fg)]" />
-              Run
-            </button>
-            {showRunMenu && (
-              <div className="absolute right-0 mt-1.5 w-68 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 py-1.5">
-                <div className="px-3 py-1 text-[11px] uppercase font-semibold tracking-wider text-[var(--text-dim)]">
-                  Detected Project Tasks
-                </div>
-                {tasks.length === 0 ? (
-                  <div className="px-3 py-2 text-[13px] text-[var(--text-dim)]">
-                    No package.json / Cargo.toml tasks found.
+        {/* Right: actions, layout toggles, window controls */}
+        <div className="flex items-center justify-end h-full min-w-0">
+          <div className="flex items-center gap-0.5 pr-2">
+            {/* Run Scripts */}
+            <div className="relative" data-no-drag>
+              <button
+                onClick={() => {
+                  setShowRunMenu((v) => !v);
+                  setShowThemeMenu(false);
+                }}
+                className={`h-7 px-2 text-[12.5px] rounded-md flex items-center gap-1.5 cursor-pointer transition-colors ${
+                  showRunMenu
+                    ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
+                    : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                }`}
+                title="Run a project task"
+              >
+                <Play size={13} className="text-[var(--added-fg)]" />
+                <span className="hidden lg:inline">Run</span>
+              </button>
+              {showRunMenu && (
+                <div className="absolute right-0 top-full mt-1.5 w-68 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 py-1.5">
+                  <div className="px-3 py-1 text-[11px] uppercase font-semibold tracking-wider text-[var(--text-dim)]">
+                    Project Tasks
                   </div>
-                ) : (
-                  tasks.map((t) => (
+                  {tasks.length === 0 ? (
+                    <div className="px-3 py-2 text-[13px] text-[var(--text-dim)]">
+                      No tasks found in package.json or Cargo.toml.
+                    </div>
+                  ) : (
+                    tasks.map((t) => (
+                      <button
+                        key={`${t.source}-${t.name}`}
+                        onClick={() => handleRunTask(t)}
+                        className="w-full text-left px-3 py-2 hover:bg-[var(--bg-hover)] flex flex-col cursor-pointer"
+                      >
+                        <span className="text-[13px] text-[var(--text-primary)]">{t.name}</span>
+                        <span className="text-[11px] font-mono text-[var(--text-dim)] truncate">
+                          {t.command}
+                        </span>
+                      </button>
+                    ))
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Theme Picker */}
+            <div className="relative" data-no-drag>
+              <button
+                onClick={() => {
+                  setShowThemeMenu((v) => !v);
+                  setShowRunMenu(false);
+                }}
+                className={`w-7 h-7 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
+                  showThemeMenu
+                    ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
+                    : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                }`}
+                title={`Theme: ${activeTheme.name}`}
+                aria-label="Change theme"
+              >
+                <Palette size={15} />
+              </button>
+              {showThemeMenu && (
+                <div className="absolute right-0 top-full mt-1.5 w-60 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 py-1.5">
+                  <div className="px-3 py-1 text-[11px] uppercase font-semibold tracking-wider text-[var(--text-dim)]">
+                    Color Theme
+                  </div>
+                  {themes.map((th) => (
                     <button
-                      key={`${t.source}-${t.name}`}
-                      onClick={() => handleRunTask(t)}
-                      className="w-full text-left px-3 py-2 hover:bg-[var(--bg-hover)] flex flex-col cursor-pointer"
+                      key={th.id}
+                      onClick={() => {
+                        setThemeId(th.id);
+                        setShowThemeMenu(false);
+                      }}
+                      className={`w-full text-left px-3 py-2 text-[13px] flex items-center justify-between cursor-pointer ${
+                        th.id === activeTheme.id
+                          ? 'bg-[var(--accent)] text-[var(--accent-fg)]'
+                          : 'hover:bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                      }`}
                     >
-                      <span className="text-[13px] text-[var(--text-primary)]">{t.name}</span>
-                      <span className="text-[11px] font-mono text-[var(--text-dim)] truncate">
-                        {t.command}
-                      </span>
+                      <span>{th.name}</span>
+                      <span
+                        className="w-3.5 h-3.5 rounded-full border border-white/25"
+                        style={{ background: th.vars['--bg-base'] }}
+                      />
                     </button>
-                  ))
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Theme Picker Dropdown */}
-          <div className="relative">
-            <button
-              onClick={() => {
-                setShowThemeMenu((v) => !v);
-                setShowRunMenu(false);
-              }}
-              className="h-8 px-2.5 text-[12.5px] rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] flex items-center gap-1.5 cursor-pointer transition-colors"
-              title="Switch theme or import a VS Code JSON theme"
-            >
-              <Palette size={14} className="text-[var(--accent)]" />
-              <span className="hidden sm:inline">{activeTheme.name}</span>
-            </button>
-            {showThemeMenu && (
-              <div className="absolute right-0 mt-1.5 w-60 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 py-1.5">
-                <div className="px-3 py-1 text-[11px] uppercase font-semibold tracking-wider text-[var(--text-dim)]">
-                  Color Themes
-                </div>
-                {themes.map((th) => (
-                  <button
-                    key={th.id}
-                    onClick={() => {
-                      setThemeId(th.id);
-                      setShowThemeMenu(false);
-                    }}
-                    className={`w-full text-left px-3 py-2 text-[13px] flex items-center justify-between cursor-pointer ${
-                      th.id === activeTheme.id
-                        ? 'bg-[var(--accent)] text-[var(--accent-fg)]'
-                        : 'hover:bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                    }`}
-                  >
-                    <span>{th.name}</span>
-                    <span
-                      className="w-3.5 h-3.5 rounded-full border border-white/25"
-                      style={{ background: th.vars['--bg-base'] }}
+                  ))}
+                  <div className="border-t border-[var(--border)] mt-1.5 pt-1.5 px-2">
+                    <button
+                      onClick={() => themeFileInputRef.current?.click()}
+                      className="w-full py-1.5 px-2 text-[12.5px] text-left whitespace-nowrap rounded hover:bg-[var(--bg-hover)] text-[var(--accent)] flex items-center gap-1.5 cursor-pointer"
+                      title="Import a VS Code color theme (.json)"
+                    >
+                      <Upload size={13} />
+                      <span className="truncate">Import VS Code theme…</span>
+                    </button>
+                    <input
+                      ref={themeFileInputRef}
+                      type="file"
+                      accept=".json"
+                      onChange={handleImportVsCodeTheme}
+                      className="hidden"
                     />
-                  </button>
-                ))}
-                <div className="border-t border-[var(--border)] mt-1.5 pt-1.5 px-2">
-                  <button
-                    onClick={() => themeFileInputRef.current?.click()}
-                    className="w-full py-1.5 px-2 text-[12.5px] rounded hover:bg-[var(--bg-hover)] text-[var(--accent)] flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Upload size={13} />
-                    Import VS Code Theme (.json)
-                  </button>
-                  <input
-                    ref={themeFileInputRef}
-                    type="file"
-                    accept=".json"
-                    onChange={handleImportVsCodeTheme}
-                    className="hidden"
-                  />
+                  </div>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
+
+            <div className="h-4 w-px bg-[var(--border)] mx-1.5" />
+
+            {/* Layout Toggles */}
+            {(
+              [
+                { on: showSidebar, toggle: () => setShowSidebar((v) => !v), Icon: PanelLeft, label: 'Toggle Sidebar (Ctrl+B)' },
+                { on: showTerminal, toggle: () => setShowTerminal((v) => !v), Icon: PanelBottom, label: 'Toggle Terminal (Ctrl+`)' },
+                { on: showAgent, toggle: () => setShowAgent((v) => !v), Icon: PanelRight, label: 'Toggle Agent Panel' },
+              ] as const
+            ).map(({ on, toggle, Icon, label }) => (
+              <button
+                key={label}
+                onClick={toggle}
+                className={`w-7 h-7 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
+                  on
+                    ? 'text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
+                    : 'text-[var(--text-dim)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-muted)]'
+                }`}
+                title={label}
+                aria-label={label}
+                aria-pressed={on}
+              >
+                <Icon size={15} />
+              </button>
+            ))}
           </div>
 
-          <div className="h-4 w-[1px] bg-[var(--border)] mx-0.5" />
-
-          {/* Layout Toggles */}
-          <div className="flex items-center gap-1">
-            <button
-              onClick={() => setShowSidebar((v) => !v)}
-              className={`w-8 h-8 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
-                showSidebar
-                  ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
-                  : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
-              }`}
-              title="Toggle Sidebar (Ctrl+B)"
-            >
-              <PanelLeft size={16} />
-            </button>
-            <button
-              onClick={() => setShowTerminal((v) => !v)}
-              className={`w-8 h-8 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
-                showTerminal
-                  ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
-                  : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
-              }`}
-              title="Toggle Terminal (Ctrl+`)"
-            >
-              <PanelBottom size={16} />
-            </button>
-            <button
-              onClick={() => setShowAgent((v) => !v)}
-              className={`w-8 h-8 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
-                showAgent
-                  ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
-                  : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
-              }`}
-              title="Toggle Agent Panel"
-            >
-              <PanelRight size={16} />
-            </button>
-          </div>
+          {/* Window Controls */}
+          {nativeWindow && (
+            <div className="flex h-full shrink-0">
+              <button
+                onClick={() => windowAction('minimize')}
+                className="w-[46px] h-full flex items-center justify-center text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] transition-colors"
+                title="Minimize"
+                aria-label="Minimize"
+              >
+                <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+                  <path d="M0 5.5h10" stroke="currentColor" strokeWidth="1" />
+                </svg>
+              </button>
+              <button
+                onClick={() => windowAction('toggle_maximize')}
+                className="w-[46px] h-full flex items-center justify-center text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] transition-colors"
+                title={nativeWindow.maximized ? 'Restore' : 'Maximize'}
+                aria-label={nativeWindow.maximized ? 'Restore' : 'Maximize'}
+              >
+                {nativeWindow.maximized ? (
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                    <path d="M2.5 2.5V0.5h7v7h-2" stroke="currentColor" strokeWidth="1" />
+                    <rect x="0.5" y="2.5" width="7" height="7" stroke="currentColor" strokeWidth="1" />
+                  </svg>
+                ) : (
+                  <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+                    <rect x="0.5" y="0.5" width="9" height="9" stroke="currentColor" strokeWidth="1" />
+                  </svg>
+                )}
+              </button>
+              <button
+                onClick={() => windowAction('close')}
+                className="w-[46px] h-full flex items-center justify-center text-[var(--text-muted)] hover:bg-[#e81123] hover:text-white transition-colors"
+                title="Close"
+                aria-label="Close"
+              >
+                <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true">
+                  <path d="M0.5 0.5l9 9M9.5 0.5l-9 9" stroke="currentColor" strokeWidth="1" />
+                </svg>
+              </button>
+            </div>
+          )}
         </div>
       </header>
 
@@ -750,15 +820,15 @@ export function App() {
           {/* Main Viewer Stage */}
           <div className="flex-1 flex flex-col min-h-0">
             {!activeTab ? (
-              <div className="flex-1 flex flex-col items-center justify-center p-8 text-center gap-5">
+              <div className="flex-1 min-h-0 overflow-y-auto flex flex-col items-center justify-center-safe p-8 text-center gap-5">
                 <VireoLogo size={56} className="drop-shadow-lg" />
                 <div className="space-y-1.5 max-w-md">
                   <h2 className="text-lg font-semibold tracking-tight text-[var(--text-primary)]">
-                    Vireo — Agent Review Workbench
+                    Welcome to Vireo
                   </h2>
                   <p className="text-[13.5px] text-[var(--text-muted)] leading-relaxed">
-                    Ultra-lightweight workspace for reviewing live agent diffs, running commands,
-                    and shipping commits to GitHub without VS Code overhead.
+                    Review your coding agent's changes as they happen, run commands, and commit
+                    to GitHub, all from one lightweight window.
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center justify-center gap-2.5 text-[13px]">
@@ -906,71 +976,96 @@ export function App() {
         )}
       </div>
 
-      {/* Bottom Status Bar */}
+      {/* Status Bar */}
       <footer
-        className="h-7 px-3.5 flex items-center justify-between text-xs border-t border-[var(--border)] shrink-0 select-none"
+        className="h-6 flex items-stretch justify-between text-[12px] leading-none border-t border-[var(--border)] shrink-0 select-none"
         style={{
           background: 'var(--status-bar-bg)',
           color: 'var(--status-bar-fg)',
         }}
       >
-        <div className="flex items-center gap-3.5">
-          <span className="flex items-center gap-1.5 font-medium">
-            <GitBranch size={13} />
-            {gitStatus?.is_repo ? gitStatus.branch || 'HEAD' : 'No Git'}
-          </span>
-          {gitStatus?.is_repo && (
-            <span className="tabular-nums text-[var(--text-muted)]">
-              {gitStatus.files.length} changed
-              {gitStatus.total_additions > 0 || gitStatus.total_deletions > 0
-                ? ` (+${gitStatus.total_additions} -${gitStatus.total_deletions})`
-                : ''}
+        <div className="flex items-stretch min-w-0 pl-1">
+          <button
+            onClick={() => {
+              setShowSidebar(true);
+              setSidebarTab('changes');
+            }}
+            className="flex items-center gap-1.5 px-2 status-item"
+            title={gitStatus?.is_repo ? 'Show changes' : 'This folder is not a Git repository'}
+          >
+            <GitBranch size={12} className="shrink-0" />
+            <span className="truncate max-w-[180px]">
+              {gitStatus?.is_repo ? gitStatus.branch || 'HEAD' : 'No Git'}
             </span>
-          )}
-          <span className="flex items-center gap-1.5 text-[var(--text-muted)]">
-            <span
-              className="w-2 h-2 rounded-full"
-              style={{
-                background: liveConnected ? '#10b981' : '#f59e0b',
+          </button>
+          {gitStatus?.is_repo && (
+            <button
+              onClick={() => {
+                setShowSidebar(true);
+                setSidebarTab('changes');
               }}
+              className="flex items-center gap-2 px-2 tabular-nums status-item"
+              title={`${gitStatus.files.length} changed ${gitStatus.files.length === 1 ? 'file' : 'files'}`}
+            >
+              <span className="flex items-center gap-1">
+                <FileCode size={12} className="shrink-0" />
+                {gitStatus.files.length}
+              </span>
+              {(gitStatus.total_additions > 0 || gitStatus.total_deletions > 0) && (
+                <span className="flex items-center gap-1.5">
+                  <span className="text-[var(--added-fg)]">+{gitStatus.total_additions}</span>
+                  <span className="text-[var(--danger)]">-{gitStatus.total_deletions}</span>
+                </span>
+              )}
+            </button>
+          )}
+          <span
+            className="flex items-center gap-1.5 px-2 opacity-80"
+            title={liveConnected ? 'Watching the workspace for changes' : 'Reconnecting to the file watcher'}
+          >
+            <span
+              className="w-1.5 h-1.5 rounded-full"
+              style={{ background: liveConnected ? '#10b981' : '#f59e0b' }}
             />
-            {liveConnected ? 'Live Diff Sync' : 'Reconnecting'}
+            {liveConnected ? 'Live' : 'Reconnecting'}
           </span>
         </div>
 
-        <div className="flex items-center gap-3.5">
-          {/* Interactive Zoom Controls */}
-          <div
-            className="flex items-center gap-0.5 rounded px-1 py-0.5 bg-[var(--bg-elevated)]/60 border border-[var(--border)]/70"
-            title="Adjust UI Zoom (Ctrl+= / Ctrl+- / Ctrl+0)"
-          >
+        <div className="flex items-stretch pr-1">
+          <div className="group flex items-stretch" title="Zoom (Ctrl+= / Ctrl+- / Ctrl+0)">
             <button
               onClick={() => adjustZoom((z) => z - ZOOM_STEP)}
-              className="p-0.5 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
-              title="Zoom Out (Ctrl+-)"
+              className="px-1.5 flex items-center opacity-0 group-hover:opacity-80 hover:!opacity-100 status-item"
+              aria-label="Zoom out"
             >
               <Minus size={11} />
             </button>
             <button
               onClick={() => adjustZoom(1.0)}
-              className="px-1.5 text-[11px] font-mono tabular-nums text-[var(--text-primary)] hover:text-[var(--accent)] cursor-pointer"
-              title="Reset Zoom to 100% (Ctrl+0)"
+              className="px-1 flex items-center tabular-nums status-item"
+              title="Reset zoom to 100%"
             >
               {Math.round(zoom * 100)}%
             </button>
             <button
               onClick={() => adjustZoom((z) => z + ZOOM_STEP)}
-              className="p-0.5 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
-              title="Zoom In (Ctrl+=)"
+              className="px-1.5 flex items-center opacity-0 group-hover:opacity-80 hover:!opacity-100 status-item"
+              aria-label="Zoom in"
             >
               <Plus size={11} />
             </button>
           </div>
-
-          <span className="text-[var(--text-muted)]">{activeTheme.name}</span>
-          <span className="hidden md:inline text-[var(--text-dim)]">
-            Ctrl+P Quick Open · Ctrl+` Terminal · Ctrl+± Zoom
-          </span>
+          <button
+            onClick={() => {
+              setShowThemeMenu((v) => !v);
+              setShowRunMenu(false);
+            }}
+            className="flex items-center gap-1.5 px-2 status-item"
+            title="Change theme"
+          >
+            <Palette size={12} className="shrink-0" />
+            {activeTheme.name}
+          </button>
         </div>
       </footer>
 

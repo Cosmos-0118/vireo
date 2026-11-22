@@ -480,7 +480,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
 
   if (loading && !diff) {
     return (
-      <div className="flex-1 flex items-center justify-center text-[var(--text-muted)]">
+      <div className="flex-1 flex items-center justify-center p-6 text-center text-[var(--text-muted)]">
         Loading diff...
       </div>
     );
@@ -488,7 +488,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
 
   if (!diff) {
     return (
-      <div className="flex-1 flex items-center justify-center text-[var(--text-muted)]">
+      <div className="flex-1 flex items-center justify-center p-6 text-center text-[var(--text-muted)]">
         Select a modified file to inspect its live diff.
       </div>
     );
@@ -513,7 +513,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   return (
     <div className="flex-1 flex flex-col min-h-0 bg-[var(--bg-base)]">
       {/* Diff toolbar */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-b border-[var(--border)] bg-[var(--bg-sidebar)] gap-2 shrink-0">
+      <div className="@container flex flex-wrap items-center justify-between px-3 py-1.5 border-b border-[var(--border)] bg-[var(--bg-sidebar)] gap-x-2 gap-y-1 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="font-mono text-xs font-medium truncate text-[var(--text-primary)]">
             {diff.path}
@@ -554,7 +554,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex flex-wrap items-center justify-end gap-1.5 min-w-0 ml-auto whitespace-nowrap">
           {/* Prev / Next Change Jump */}
           {totalHunks > 0 && (
             <div className="flex items-center rounded border border-[var(--border)] overflow-hidden bg-[var(--bg-elevated)]/40">
@@ -596,7 +596,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             }
           >
             {compactMode ? <FoldVertical size={13} /> : <UnfoldVertical size={13} />}
-            {compactMode ? 'Compact' : 'Full'}
+            <span className="hidden @[620px]:inline">{compactMode ? 'Compact' : 'Full'}</span>
           </button>
 
           {/* Split vs Unified Toggle */}
@@ -611,7 +611,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
               title="Side-by-Side Diff"
             >
               <Columns2 size={13} />
-              Split
+              <span className="hidden @[620px]:inline">Split</span>
             </button>
             <button
               onClick={() => setViewMode('unified')}
@@ -623,7 +623,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
               title="Unified Diff"
             >
               <Rows3 size={13} />
-              Unified
+              <span className="hidden @[620px]:inline">Unified</span>
             </button>
           </div>
 
@@ -633,7 +633,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             title="Send this diff to Agent Chat"
           >
             <MessageSquarePlus size={13} />
-            Ask Agent
+            <span className="hidden @[620px]:inline">Ask Agent</span>
           </button>
 
           {fileStatus && !fileStatus.staged && onStage && (
@@ -643,7 +643,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
               title="Stage file"
             >
               <Plus size={13} />
-              Stage
+              <span className="hidden @[620px]:inline">Stage</span>
             </button>
           )}
           {fileStatus && fileStatus.staged && onUnstage && (
@@ -653,7 +653,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
               title="Unstage file"
             >
               <Minus size={13} />
-              Unstage
+              <span className="hidden @[620px]:inline">Unstage</span>
             </button>
           )}
           {fileStatus && onDiscard && (
@@ -671,15 +671,15 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
             title="Open in quick editor"
           >
             <Edit3 size={13} />
-            Edit
+            <span className="hidden @[620px]:inline">Edit</span>
           </button>
         </div>
       </div>
 
       {/* Diff body */}
       {diff.binary ? (
-        <div className="flex-1 flex items-center justify-center text-[var(--text-muted)]">
-          Binary file changed — diff preview unavailable.
+        <div className="flex-1 flex items-center justify-center p-6 text-center text-[var(--text-muted)]">
+          Binary file changed. No preview available.
         </div>
       ) : computed.adds === 0 && computed.dels === 0 ? (
         <div className="flex-1 flex flex-col items-center justify-center gap-2 text-[var(--text-muted)]">

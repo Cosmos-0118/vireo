@@ -36,6 +36,7 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
 
   useEffect(() => {
     if (!hostRef.current) return;
+    let disposed = false;
 
     const term = new Terminal({
       cursorBlink: true,
@@ -54,7 +55,14 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
     termRef.current = term;
     fitRef.current = fit;
 
+    try {
+      fit.fit();
+    } catch {
+      // ignore initial layout race
+    }
+
     const fitAndResize = () => {
+      if (disposed) return;
       try {
         fit.fit();
         const sock = wsRef.current;
@@ -72,22 +80,49 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
       }
     };
 
-    setTimeout(fitAndResize, 40);
+    const timer = window.setTimeout(fitAndResize, 40);
 
     const params = new URLSearchParams({
-      cols: String(term.cols || 100),
-      rows: String(term.rows || 24),
+      cols: String(Math.max(20, term.cols || 100)),
+      rows: String(Math.max(5, term.rows || 24)),
     });
     if (tab.cmd) params.set('cmd', tab.cmd);
 
     const sock = new WebSocket(wsUrl(`/ws/pty?${params.toString()}`));
     wsRef.current = sock;
 
+    term.attachCustomKeyEventHandler((ev) => {
+      if (ev.type !== 'keydown') return true;
+      const mod = ev.ctrlKey || ev.metaKey;
+      if (mod && !ev.altKey && ev.key.toLowerCase() === 'c' && term.hasSelection()) {
+        const sel = term.getSelection();
+        if (sel) {
+          navigator.clipboard?.writeText(sel).catch(() => {});
+          term.clearSelection();
+        }
+        return false;
+      }
+      if (mod && !ev.altKey && ev.key.toLowerCase() === 'v') {
+        ev.preventDefault();
+        navigator.clipboard
+          ?.readText()
+          .then((text) => {
+            if (!disposed && text && sock.readyState === WebSocket.OPEN) {
+              sock.send(JSON.stringify({ type: 'input', data: text }));
+            }
+          })
+          .catch(() => {});
+        return false;
+      }
+      return true;
+    });
+
     sock.onopen = () => {
       fitAndResize();
     };
 
     sock.onmessage = (ev) => {
+      if (disposed) return;
       const text = typeof ev.data === 'string' ? ev.data : '';
       term.write(text);
       // Keep clean plain-text tail for "Send Output to Agent"
@@ -97,11 +132,13 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
     };
 
     sock.onclose = () => {
-      term.write('\r\n\x1b[90m[Process exited]\x1b[0m\r\n');
+      if (!disposed) {
+        term.write('\r\n\x1b[90m[Process exited]\x1b[0m\r\n');
+      }
     };
 
     const dataSub = term.onData((data) => {
-      if (sock.readyState === WebSocket.OPEN) {
+      if (!disposed && sock.readyState === WebSocket.OPEN) {
         sock.send(JSON.stringify({ type: 'input', data }));
       }
     });
@@ -112,9 +149,14 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
     ro.observe(hostRef.current);
 
     return () => {
+      disposed = true;
+      window.clearTimeout(timer);
       ro.disconnect();
       dataSub.dispose();
       sock.close();
+      wsRef.current = null;
+      fitRef.current = null;
+      termRef.current = null;
       term.dispose();
     };
     // Re-spawn when tab id or workspace changes
@@ -213,13 +255,13 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   return (
     <div className="flex flex-col h-full bg-[var(--bg-panel)] border-t border-[var(--border)]">
       {/* Terminal tab bar */}
-      <div className="flex items-center justify-between px-3 h-9 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
-        <div className="flex items-center gap-1.5 overflow-x-auto">
+      <div className="@container flex items-center justify-between gap-2 px-3 h-9 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
+        <div className="flex items-center gap-1.5 min-w-0 flex-1 overflow-x-auto">
           {tabs.map((t) => (
             <div
               key={t.id}
               onClick={() => setActiveId(t.id)}
-              className={`flex items-center gap-1.5 px-3 py-1 text-[12.5px] rounded-md cursor-pointer select-none transition-colors ${
+              className={`flex items-center gap-1.5 min-w-0 whitespace-nowrap px-3 py-1 text-[12.5px] rounded-md cursor-pointer select-none transition-colors ${
                 t.id === activeId
                   ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
                   : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
@@ -242,21 +284,21 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           ))}
           <button
             onClick={addShell}
-            className="p-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer"
+            className="shrink-0 p-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer"
             title="New terminal"
           >
             <Plus size={15} />
           </button>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 shrink-0">
           <button
             onClick={sendLastOutput}
-            className="px-2.5 py-1 text-xs rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 cursor-pointer transition-colors"
+            className="px-2.5 py-1 text-xs whitespace-nowrap rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 cursor-pointer transition-colors"
             title="Send recent terminal output to Agent Chat"
           >
             <Send size={12} />
-            Send Output to Agent
+            <span className="hidden @[460px]:inline">Send Output to Agent</span>
           </button>
           <button
             onClick={() => closeTab(activeId)}

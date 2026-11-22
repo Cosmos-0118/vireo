@@ -354,12 +354,14 @@ async fn exec_tool(
             }
             let fut = if cfg!(windows) {
                 background_command("powershell.exe")
-                    .args(["-NoProfile", "-Command", cmd])
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd])
+                    .env("PATH", crate::pty::augmented_path_env())
                     .current_dir(ws)
                     .output()
             } else {
                 background_command("sh")
                     .args(["-lc", cmd])
+                    .env("PATH", crate::pty::augmented_path_env())
                     .current_dir(ws)
                     .output()
             };
@@ -411,7 +413,7 @@ pub async fn chat(
                 &tx,
                 "error",
                 json!({
-                    "message": "No API key configured. Click the settings gear in the Agent panel to add an OpenAI, Anthropic, Gemini, OpenRouter, or local Ollama model — or switch to the CLI Agent tab to run Claude Code / Codex / Gemini CLI / Aider in the terminal."
+                    "message": "No API key is set. Open settings (the gear icon in the Agent panel) to add an OpenAI, Anthropic, Gemini, OpenRouter, or local Ollama model. You can also use the CLI Agent tab to run Claude Code, Codex, Gemini CLI, or Aider in a terminal."
                 }),
             )
             .await;

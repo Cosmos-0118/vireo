@@ -135,7 +135,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
   if (binary) {
     return (
-      <div className="flex-1 flex items-center justify-center text-[var(--text-muted)]">
+      <div className="flex-1 flex items-center justify-center p-6 text-center text-[var(--text-muted)]">
         Binary file cannot be displayed in the text editor.
       </div>
     );

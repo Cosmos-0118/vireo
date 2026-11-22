@@ -1,39 +1,40 @@
 # Vireo
 
-A lightweight, agent-first code workbench inspired by VS Code — without Electron or heavy language-server overhead.
+A lightweight code workbench built around coding agents. It borrows the feel of VS Code but skips Electron and heavy language servers, so it starts fast and stays light.
 
-## What's Inside
-- **Live Diff Viewer** — Side-by-side & unified diffs with word-level change highlights, automatic live refresh via filesystem watcher, per-file Stage/Unstage/Discard, and 1-click "Ask Agent" on any diff or line.
-- **Quick Code Editor** — CodeMirror 6 with syntax highlighting, `Ctrl+S` save, and instant diff/code toggle.
-- **Agent Panel (Dual Mode)**
-  - **Agent Chat**: Built-in tool-using coding agent (`read_file`, `edit_file`, `write_file`, `search_code`, `list_files`, `run_command`) supporting OpenAI / OpenRouter / DeepSeek / Ollama, Anthropic Claude, and Google Gemini — with automatic Git checkpoints for 1-click turn rollback.
-  - **CLI Agent**: Embedded native Windows ConPTY terminal tab with quick launchers for `claude`, `codex`, `gemini`, `aider`, and `opencode` right next to the live diff viewer.
-- **Integrated Terminal** — Multi-tab `xterm.js` + Rust `portable-pty` terminal with **One-Click Run Tasks** (auto-detected from `package.json` / `Cargo.toml` / Python) and **Send Output to Agent**.
-- **Git & GitHub Workflow** — Stage/unstage/discard, branch switcher & creator, Commit, **Commit & Push**, Pull, recent commits log, and instant Git checkpoints.
-- **Themes** — 6 built-in themes (`VS Code Dark+`, `Tokyo Night`, `Catppuccin Mocha`, `One Dark Pro`, `GitHub Dark Dimmed`, `GitHub Light`) + **Import any VS Code `.json` theme file**.
-- **Quick Open (`Ctrl+P`) & Ripgrep Search (`Ctrl+Shift+F`)**.
+## Features
+
+- **Live diff viewer.** Side-by-side and unified diffs with word-level highlights. Diffs refresh automatically as files change on disk. You can stage, unstage, or discard each file, and send any diff or line to the agent with one click.
+- **Code editor.** CodeMirror 6 with syntax highlighting, `Ctrl+S` to save, and a quick toggle between code and diff views.
+- **Agent panel** with two modes:
+  - **Agent Chat** is a built-in coding agent that can read, edit, and write files, search code, list files, and run commands. It works with OpenAI, OpenRouter, DeepSeek, Ollama, Anthropic Claude, and Google Gemini. Every turn creates a Git checkpoint, so you can roll a turn back in one click.
+  - **CLI Agent** is an embedded terminal (Windows ConPTY) with launchers for `claude`, `codex`, `gemini`, `aider`, and `opencode`, sitting right beside the diff viewer.
+- **Integrated terminal.** Multiple tabs powered by `xterm.js` and Rust `portable-pty`. Project tasks are detected from `package.json`, `Cargo.toml`, and Python projects and can be run in one click. Terminal output can be sent straight to the agent.
+- **Git and GitHub.** Stage, unstage, and discard changes, switch or create branches, commit, commit and push, pull, browse recent commits, and create checkpoints.
+- **Themes.** Six built-in themes (VS Code Dark+, Tokyo Night, Catppuccin Mocha, One Dark Pro, GitHub Dark Dimmed, and GitHub Light). You can also import any VS Code `.json` theme.
+- **Quick Open and search.** `Ctrl+P` opens files, themes, and tasks. `Ctrl+Shift+F` searches the workspace with ripgrep.
 
 ## Quick Start
 
-**Clean production build & launch (recommended):**
+**Build and launch (recommended):**
 ```powershell
 .\build-and-run.ps1 "C:\path\to\your\repo"
 ```
-Optional flags: `-CleanAll` (full `cargo clean`), `-BuildOnly` (build without launching).
+Optional flags: `-CleanAll` runs a full `cargo clean` first, and `-BuildOnly` builds without launching.
 
-**Launch without rebuilding:**
+**Launch an existing build:**
 ```powershell
 .\vireo.ps1 "C:\path\to\your\repo"
 ```
 
-Or run manually:
+**Build and run by hand:**
 
 ```powershell
-# Build frontend
+# Build the frontend
 npm.cmd --prefix frontend run build
 
-# Build & start Rust server
+# Build and start the desktop app
 cargo run --release --manifest-path backend/Cargo.toml -- --dir "C:\path\to\your\repo" --port 4317
 ```
 
-Then open `http://127.0.0.1:4317`.
+To use Vireo in a browser instead of the desktop window, add `--server-only` and open `http://127.0.0.1:4317`.

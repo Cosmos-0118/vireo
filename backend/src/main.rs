@@ -123,6 +123,57 @@ async fn set_window_zoom(
     })
 }
 
+#[derive(Deserialize)]
+struct WindowControlReq {
+    /// One of: "state", "minimize", "toggle_maximize", "close", "drag".
+    action: String,
+}
+
+#[derive(Serialize)]
+struct WindowControlRes {
+    native: bool,
+    maximized: bool,
+}
+
+/// Window controls for the custom (frameless) title bar. The page is served
+/// over HTTP rather than Tauri IPC, so the frontend drives the native window
+/// through this endpoint. In server-only mode there is no window and every
+/// action reports `native: false`.
+async fn window_control(
+    State(state): State<AppState>,
+    Json(req): Json<WindowControlReq>,
+) -> Json<WindowControlRes> {
+    let Some(win) = state.main_window.get() else {
+        return Json(WindowControlRes {
+            native: false,
+            maximized: false,
+        });
+    };
+    match req.action.as_str() {
+        "minimize" => {
+            let _ = win.minimize();
+        }
+        "toggle_maximize" => {
+            if win.is_maximized().unwrap_or(false) {
+                let _ = win.unmaximize();
+            } else {
+                let _ = win.maximize();
+            }
+        }
+        "close" => {
+            let _ = win.close();
+        }
+        "drag" => {
+            let _ = win.start_dragging();
+        }
+        _ => {}
+    }
+    Json(WindowControlRes {
+        native: true,
+        maximized: win.is_maximized().unwrap_or(false),
+    })
+}
+
 struct CliArgs {
     port: u16,
     workspace: PathBuf,
@@ -202,6 +253,7 @@ fn build_router(
     Router::new()
         .route("/api/health", get(health))
         .route("/api/window/zoom", post(set_window_zoom))
+        .route("/api/window/control", post(window_control))
         .route(
             "/api/workspace",
             get(files::get_workspace).post(files::set_workspace),
@@ -227,6 +279,7 @@ fn build_router(
         .route("/api/git/checkpoint", post(git::create_checkpoint))
         .route("/api/git/rollback", post(git::rollback_checkpoint))
         .route("/api/agent/chat", post(agent::chat))
+        .route("/api/agent/cli-tools", get(pty::list_cli_tools))
         .route("/ws/pty", get(pty::ws_pty))
         .route("/ws/events", get(ws_events))
         .with_state(app_state)
@@ -281,7 +334,7 @@ fn main() {
         .workspace
         .file_name()
         .and_then(|s| s.to_str())
-        .map(|n| format!("Vireo — {}", n))
+        .map(|n| format!("{} - Vireo", n))
         .unwrap_or_else(|| "Vireo".to_string());
 
     let win_slot = main_window.clone();
@@ -295,6 +348,8 @@ fn main() {
             .title(ws_title)
             .inner_size(1440.0, 900.0)
             .min_inner_size(960.0, 620.0)
+            .decorations(false)
+            .shadow(true)
             .zoom_hotkeys_enabled(false)
             .center()
             .build()?;

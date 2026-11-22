@@ -131,7 +131,7 @@ pub async fn pick_workspace(
 ) -> Result<Json<Option<WorkspaceInfo>>, (StatusCode, String)> {
     let current = state.workspace_path().await;
     let picked = rfd::AsyncFileDialog::new()
-        .set_title("Open Repository Folder — Vireo")
+        .set_title("Open Folder")
         .set_directory(&current)
         .pick_folder()
         .await;

@@ -107,3 +107,12 @@ export interface UiChatMessage {
   error?: string;
   streaming?: boolean;
 }
+
+export interface CliToolStatus {
+  id: string;
+  label: string;
+  cmd: string;
+  installed: boolean;
+  path?: string | null;
+  install_hint: string;
+}
