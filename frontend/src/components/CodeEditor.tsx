@@ -2,8 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { EditorState, Extension } from '@codemirror/state';
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
-import { HighlightStyle, syntaxHighlighting } from '@codemirror/language';
-import { tags } from '@lezer/highlight';
+import { syntaxHighlighting } from '@codemirror/language';
 import { javascript } from '@codemirror/lang-javascript';
 import { rust } from '@codemirror/lang-rust';
 import { python } from '@codemirror/lang-python';
@@ -12,6 +11,7 @@ import { css } from '@codemirror/lang-css';
 import { html } from '@codemirror/lang-html';
 import { markdown } from '@codemirror/lang-markdown';
 import { GitCompare, MessageSquarePlus, Save } from 'lucide-react';
+import { buildHighlightStyle } from '../syntax';
 import type { LiteTheme } from '../themes';
 
 interface CodeEditorProps {
@@ -28,10 +28,10 @@ interface CodeEditorProps {
 
 function langExtension(path: string): Extension[] {
   const lower = path.toLowerCase();
-  if (lower.endsWith('.ts') || lower.endsWith('.tsx')) {
+  if (lower.endsWith('.ts') || lower.endsWith('.tsx') || lower.endsWith('.mts') || lower.endsWith('.cts')) {
     return [javascript({ typescript: true, jsx: lower.endsWith('.tsx') })];
   }
-  if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs')) {
+  if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) {
     return [javascript({ jsx: lower.endsWith('.jsx') })];
   }
   if (lower.endsWith('.rs')) return [rust()];
@@ -41,19 +41,6 @@ function langExtension(path: string): Extension[] {
   if (lower.endsWith('.html') || lower.endsWith('.htm')) return [html()];
   if (lower.endsWith('.md') || lower.endsWith('.markdown')) return [markdown()];
   return [];
-}
-
-function buildHighlightStyle(theme: LiteTheme) {
-  return HighlightStyle.define([
-    { tag: [tags.keyword, tags.controlKeyword, tags.modifier], color: theme.syntax.keyword },
-    { tag: [tags.string, tags.special(tags.string)], color: theme.syntax.string },
-    { tag: [tags.number, tags.bool, tags.null], color: theme.syntax.number },
-    { tag: [tags.comment, tags.lineComment, tags.blockComment], color: theme.syntax.comment, fontStyle: 'italic' },
-    { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: theme.syntax.func },
-    { tag: [tags.typeName, tags.className, tags.namespace], color: theme.syntax.type },
-    { tag: [tags.variableName, tags.propertyName], color: theme.syntax.variable },
-    { tag: [tags.operator, tags.punctuation], color: theme.syntax.operator },
-  ]);
 }
 
 export const CodeEditor: React.FC<CodeEditorProps> = ({
@@ -156,16 +143,16 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="flex items-center justify-between px-3 py-1.5 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
+      <div className="flex items-center justify-between h-9 px-3.5 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="font-mono text-xs truncate text-[var(--text-primary)]">{path}</span>
+          <span className="font-mono text-[13px] truncate text-[var(--text-primary)]">{path}</span>
           {dirty && (
-            <span className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--modified-fg)] text-black font-semibold">
+            <span className="text-[10.5px] px-1.5 py-0.5 rounded bg-[var(--modified-fg)] text-black font-semibold">
               UNSAVED
             </span>
           )}
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-2">
           <button
             onClick={() => {
               const sel = viewRef.current?.state.sliceDoc(
@@ -177,7 +164,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
                 : `Look at \`${path}\` and `;
               onAskAgent(snippet);
             }}
-            className="px-2 py-1 text-xs rounded border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] flex items-center gap-1 cursor-pointer"
+            className="h-7 px-2.5 text-xs rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 cursor-pointer transition-colors"
           >
             <MessageSquarePlus size={13} />
             Ask Agent
@@ -185,7 +172,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           {hasDiff && onSwitchToDiff && (
             <button
               onClick={onSwitchToDiff}
-              className="px-2 py-1 text-xs rounded border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] flex items-center gap-1 cursor-pointer"
+              className="h-7 px-2.5 text-xs rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 cursor-pointer transition-colors"
             >
               <GitCompare size={13} />
               View Diff
@@ -194,7 +181,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           <button
             onClick={handleSave}
             disabled={!dirty || saving}
-            className="px-2.5 py-1 text-xs rounded bg-[var(--accent)] text-[var(--accent-fg)] disabled:opacity-40 hover:opacity-90 flex items-center gap-1 cursor-pointer"
+            className="h-7 px-3 text-xs rounded-md bg-[var(--accent)] text-[var(--accent-fg)] disabled:opacity-40 hover:opacity-90 flex items-center gap-1.5 font-medium cursor-pointer transition-opacity"
           >
             <Save size={13} />
             {saving ? 'Saving...' : 'Save'}

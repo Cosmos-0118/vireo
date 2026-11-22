@@ -1,4 +1,6 @@
-use crate::state::{is_ignored_dir_name, resolve_safe_path, AppState, WorkspaceEvent};
+use crate::state::{
+    background_command, is_ignored_dir_name, resolve_safe_path, AppState, WorkspaceEvent,
+};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -6,7 +8,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use tokio::process::Command;
 use walkdir::WalkDir;
 
 #[derive(Serialize)]
@@ -314,7 +315,7 @@ pub async fn search_files(
     let ws = state.workspace_path().await;
 
     // Try ripgrep first for instant speed
-    let rg_out = Command::new("rg")
+    let rg_out = background_command("rg")
         .args([
             "--json",
             "--smart-case",

@@ -59,6 +59,13 @@ const TOKEN_CLASSES: Array<{ tag: any; key: keyof LiteTheme['syntax']; italic?: 
   { tag: [tags.operator, tags.punctuation], key: 'operator' },
 ];
 
+const TOKEN_HIGHLIGHTER = HighlightStyle.define(
+  TOKEN_CLASSES.map((item, idx) => ({
+    tag: item.tag,
+    class: String(idx),
+  }))
+);
+
 /**
  * Tokenize a full document into per-line syntax-highlighted spans using Lezer.
  * Fast enough for instant diff rendering and keeps multi-line comments/strings accurate.
@@ -77,12 +84,7 @@ export function highlightLines(
     return lines.map((l) => (l ? [{ text: l }] : []));
   }
 
-  const highlighter = HighlightStyle.define(
-    TOKEN_CLASSES.map((item, idx) => ({
-      tag: item.tag,
-      class: String(idx),
-    }))
-  );
+  const highlighter = TOKEN_HIGHLIGHTER;
 
   // Build line start offsets for fast slicing
   const normalized = lines.join('\n');

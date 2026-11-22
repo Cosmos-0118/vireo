@@ -17,13 +17,13 @@ A lightweight, agent-first code workbench inspired by VS Code — without Electr
 
 **Clean production build & launch (recommended):**
 ```powershell
-.\build-and-run.cmd "C:\path\to\your\repo"
+.\build-and-run.ps1 "C:\path\to\your\repo"
 ```
-Optional flags: `--port 4317`, `--clean-all` (full `cargo clean`), `--no-browser`.
+Optional flags: `-CleanAll` (full `cargo clean`), `-BuildOnly` (build without launching).
 
 **Launch without rebuilding:**
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\vireo.ps1 -Dir "C:\path\to\your\repo"
+.\vireo.ps1 "C:\path\to\your\repo"
 ```
 
 Or run manually:

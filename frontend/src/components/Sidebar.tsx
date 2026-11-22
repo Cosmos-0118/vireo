@@ -68,26 +68,26 @@ const TreeNode: React.FC<{
     <div>
       <div
         onClick={toggle}
-        style={{ paddingLeft: `${8 + depth * 14}px` }}
-        className={`flex items-center gap-1.5 py-1 pr-2 text-xs cursor-pointer select-none ${
+        style={{ paddingLeft: `${10 + depth * 15}px` }}
+        className={`mx-1.5 flex items-center gap-2 py-1.5 pr-2.5 rounded-md text-[13px] cursor-pointer select-none transition-colors ${
           isSelected
-            ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
+            ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
             : 'hover:bg-[var(--bg-hover)] text-[var(--text-primary)]'
         }`}
       >
         {entry.is_dir ? (
           <>
-            {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            {open ? <ChevronDown size={14} className="shrink-0 text-[var(--text-muted)]" /> : <ChevronRight size={14} className="shrink-0 text-[var(--text-muted)]" />}
             {open ? (
-              <FolderOpen size={14} className="text-[var(--accent)] shrink-0" />
+              <FolderOpen size={15} className="text-[var(--accent)] shrink-0" />
             ) : (
-              <Folder size={14} className="text-[var(--accent)] shrink-0" />
+              <Folder size={15} className="text-[var(--accent)] shrink-0" />
             )}
           </>
         ) : (
           <>
-            <span className="w-[13px] shrink-0" />
-            <FileCode size={13} className="text-[var(--text-muted)] shrink-0" />
+            <span className="w-[14px] shrink-0" />
+            <FileCode size={15} className="text-[var(--text-muted)] shrink-0" />
           </>
         )}
         <span
@@ -240,22 +240,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <div
         key={`${isStagedSection ? 's' : 'u'}-${f.path}`}
         onClick={() => onOpenDiff(f.path, isStagedSection)}
-        className={`group flex items-center justify-between px-2.5 py-1 text-xs cursor-pointer gap-1.5 ${
+        className={`group mx-1.5 flex items-center justify-between px-2.5 py-1.5 rounded-md text-[13px] cursor-pointer gap-2 transition-colors ${
           selectedPath === f.path
-            ? 'bg-[var(--bg-active)]'
+            ? 'bg-[var(--bg-active)] font-medium'
             : 'hover:bg-[var(--bg-hover)]'
         }`}
       >
-        <div className="min-w-0 flex-1 flex items-center gap-1.5">
+        <div className="min-w-0 flex-1 flex items-center gap-2">
           <span
-            className="font-mono text-[11px] font-bold w-3 shrink-0"
+            className="font-mono text-[11.5px] font-bold w-3.5 text-center shrink-0"
             style={{ color: badgeColor }}
           >
             {badge}
           </span>
           <span className="truncate text-[var(--text-primary)]">{fileName}</span>
           {dirPart && (
-            <span className="truncate text-[11px] text-[var(--text-dim)]">{dirPart}</span>
+            <span className="truncate text-[11.5px] text-[var(--text-dim)]">{dirPart}</span>
           )}
         </div>
 
@@ -320,46 +320,55 @@ export const Sidebar: React.FC<SidebarProps> = ({
   return (
     <div className="flex h-full bg-[var(--bg-sidebar)] border-r border-[var(--border)] select-none">
       {/* Slim Activity Bar */}
-      <div className="w-11 bg-[var(--bg-activity)] border-r border-[var(--border)] flex flex-col items-center py-2 gap-2 shrink-0">
+      <div className="w-12 bg-[var(--bg-activity)] border-r border-[var(--border)] flex flex-col items-center py-2.5 gap-2 shrink-0">
         <button
           onClick={() => onTabChange('changes')}
-          className={`relative p-2 rounded cursor-pointer ${
+          className={`relative w-9 h-9 flex items-center justify-center rounded-lg cursor-pointer transition-colors ${
             activeTab === 'changes'
               ? 'text-[var(--text-primary)] bg-[var(--bg-active)]'
-              : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+              : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
           }`}
           title="Source Control & Agent Diffs"
         >
-          <GitBranch size={18} />
+          {activeTab === 'changes' && (
+            <span className="absolute -left-1.5 top-2 bottom-2 w-[3px] rounded-r bg-[var(--accent)]" />
+          )}
+          <GitBranch size={19} />
           {totalChanged > 0 && (
-            <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 rounded-full bg-[var(--accent)] text-[var(--accent-fg)] text-[10px] font-bold flex items-center justify-center">
-              {totalChanged}
+            <span className="absolute -bottom-0.5 -right-0.5 min-w-[17px] h-[17px] px-1 rounded-full bg-[var(--accent)] text-[var(--accent-fg)] text-[10px] font-bold leading-none flex items-center justify-center ring-2 ring-[var(--bg-activity)] tabular-nums">
+              {totalChanged > 99 ? '99+' : totalChanged}
             </span>
           )}
         </button>
 
         <button
           onClick={() => onTabChange('explorer')}
-          className={`p-2 rounded cursor-pointer ${
+          className={`relative w-9 h-9 flex items-center justify-center rounded-lg cursor-pointer transition-colors ${
             activeTab === 'explorer'
               ? 'text-[var(--text-primary)] bg-[var(--bg-active)]'
-              : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+              : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
           }`}
           title="File Explorer"
         >
-          <Files size={18} />
+          {activeTab === 'explorer' && (
+            <span className="absolute -left-1.5 top-2 bottom-2 w-[3px] rounded-r bg-[var(--accent)]" />
+          )}
+          <Files size={19} />
         </button>
 
         <button
           onClick={() => onTabChange('search')}
-          className={`p-2 rounded cursor-pointer ${
+          className={`relative w-9 h-9 flex items-center justify-center rounded-lg cursor-pointer transition-colors ${
             activeTab === 'search'
               ? 'text-[var(--text-primary)] bg-[var(--bg-active)]'
-              : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+              : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
           }`}
           title="Search in Files (Ctrl+Shift+F)"
         >
-          <Search size={18} />
+          {activeTab === 'search' && (
+            <span className="absolute -left-1.5 top-2 bottom-2 w-[3px] rounded-r bg-[var(--accent)]" />
+          )}
+          <Search size={19} />
         </button>
       </div>
 
@@ -368,8 +377,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
         {activeTab === 'changes' && (
           <div className="flex-1 flex flex-col min-h-0 overflow-y-auto">
             {/* Header */}
-            <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border)] shrink-0">
-              <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+            <div className="flex items-center justify-between h-10 px-3.5 border-b border-[var(--border)] shrink-0">
+              <span className="text-[11.5px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                 Changes & Git
               </span>
               <div className="flex items-center gap-1">
@@ -380,17 +389,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       onToast('Checkpoint saved!');
                     })
                   }
-                  className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+                  className="p-1.5 rounded-md hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
                   title="Save instant checkpoint"
                 >
-                  <Save size={13} />
+                  <Save size={14} />
                 </button>
                 <button
                   onClick={() => onRefreshGit()}
-                  className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+                  className="p-1.5 rounded-md hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
                   title="Refresh Git status"
                 >
-                  <RefreshCw size={13} />
+                  <RefreshCw size={14} />
                 </button>
               </div>
             </div>
@@ -642,19 +651,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
         {activeTab === 'explorer' && (
           <div className="flex-1 flex flex-col min-h-0">
-            <div className="flex items-center justify-between px-3 py-2 border-b border-[var(--border)] shrink-0">
-              <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+            <div className="flex items-center justify-between h-10 px-3.5 border-b border-[var(--border)] shrink-0">
+              <span className="text-[11.5px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
                 Explorer
               </span>
               <button
                 onClick={() => api.getTree('').then(setRootTree).catch(() => {})}
-                className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-pointer"
+                className="p-1.5 rounded-md hover:bg-[var(--bg-hover)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
                 title="Refresh files"
               >
-                <RefreshCw size={12} />
+                <RefreshCw size={14} />
               </button>
             </div>
-            <div className="flex-1 overflow-y-auto py-1">
+            <div className="flex-1 overflow-y-auto py-1.5 space-y-0.5">
               {rootTree.map((entry) => (
                 <TreeNode
                   key={entry.path}

@@ -1,10 +1,10 @@
-import React, { useEffect, useRef, useState } from 'react';
-import { Terminal } from '@xterm/xterm';
-import { FitAddon } from '@xterm/addon-fit';
+import React, { Suspense, lazy, useEffect, useRef, useState } from 'react';
 import {
   Bot,
+  Check,
   ChevronDown,
   ChevronRight,
+  Copy,
   RotateCcw,
   Send,
   Settings,
@@ -14,9 +14,13 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
-import { api, streamAgentChat, wsUrl } from '../api';
+import { api, streamAgentChat } from '../api';
+import { highlightLines } from '../syntax';
 import type { LiteTheme } from '../themes';
 import type { AgentConfig, UiChatMessage } from '../types';
+import { VireoLogo } from './VireoLogo';
+
+const CliAgentPty = lazy(() => import('./CliAgentPty'));
 
 const DEFAULT_CONFIG: AgentConfig = {
   provider: 'openai',
@@ -33,82 +37,350 @@ const PROVIDER_PRESETS: Record<AgentConfig['provider'], { model: string; baseUrl
   ollama: { model: 'qwen2.5-coder:14b', baseUrl: 'http://127.0.0.1:11434/v1' },
 };
 
-const CliAgentPty: React.FC<{
-  command?: string;
-  runKey: number;
+const LANG_TO_EXT: Record<string, string> = {
+  ts: 'file.ts',
+  typescript: 'file.ts',
+  tsx: 'file.tsx',
+  js: 'file.js',
+  javascript: 'file.js',
+  jsx: 'file.jsx',
+  rs: 'file.rs',
+  rust: 'file.rs',
+  py: 'file.py',
+  python: 'file.py',
+  json: 'file.json',
+  css: 'file.css',
+  html: 'file.html',
+  md: 'file.md',
+  markdown: 'file.md',
+};
+
+const FencedCodeBlock: React.FC<{
+  lang: string;
+  code: string;
   theme: LiteTheme;
-  workspacePath: string;
-}> = ({ command, runKey, theme, workspacePath }) => {
-  const hostRef = useRef<HTMLDivElement>(null);
-  const termRef = useRef<Terminal | null>(null);
+}> = ({ lang, code, theme }) => {
+  const [copied, setCopied] = useState(false);
 
-  useEffect(() => {
-    if (!hostRef.current) return;
-    const term = new Terminal({
-      cursorBlink: true,
-      fontSize: 12.5,
-      fontFamily: "'Cascadia Code', 'JetBrains Mono', Consolas, monospace",
-      theme: theme.terminal,
-      scrollback: 3000,
-    });
-    const fit = new FitAddon();
-    term.loadAddon(fit);
-    term.open(hostRef.current);
-    termRef.current = term;
-
-    const params = new URLSearchParams({ cols: '80', rows: '30' });
-    if (command) params.set('cmd', command);
-
-    const sock = new WebSocket(wsUrl(`/ws/pty?${params.toString()}`));
-
-    const resize = () => {
-      try {
-        fit.fit();
-        if (sock.readyState === WebSocket.OPEN) {
-          sock.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
-        }
-      } catch {
-        // ignore
-      }
-    };
-
-    sock.onopen = resize;
-    sock.onmessage = (e) => {
-      if (typeof e.data === 'string') term.write(e.data);
-    };
-    sock.onclose = () => term.write('\r\n\x1b[90m[Agent session ended]\x1b[0m\r\n');
-
-    const sub = term.onData((data) => {
-      if (sock.readyState === WebSocket.OPEN) {
-        sock.send(JSON.stringify({ type: 'input', data }));
-      }
-    });
-
-    const ro = new ResizeObserver(resize);
-    ro.observe(hostRef.current);
-    setTimeout(resize, 50);
-
-    return () => {
-      ro.disconnect();
-      sub.dispose();
-      sock.close();
-      term.dispose();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [runKey, workspacePath]);
-
-  useEffect(() => {
-    if (termRef.current) {
-      termRef.current.options.theme = theme.terminal;
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1800);
+    } catch {
+      // ignore clipboard errors
     }
-  }, [theme]);
+  };
+
+  const normalizedLang = lang.trim().toLowerCase();
+  const fakePath = LANG_TO_EXT[normalizedLang];
+  const isDiff = normalizedLang === 'diff';
+  const highlighted = fakePath ? highlightLines(code, fakePath, theme) : null;
+  const rawLines = code.split(/\r?\n/);
 
   return (
-    <div
-      ref={hostRef}
-      className="flex-1 min-h-0"
-      style={{ background: theme.terminal.background }}
-    />
+    <div className="my-2 rounded-md border border-[var(--border)] bg-[var(--bg-panel)] overflow-hidden">
+      <div className="flex items-center justify-between px-2.5 py-1 border-b border-[var(--border)]/80 bg-[var(--bg-elevated)]/60">
+        <span className="text-[10.5px] font-mono uppercase tracking-wider text-[var(--text-muted)]">
+          {normalizedLang || 'code'}
+        </span>
+        <button
+          onClick={handleCopy}
+          className="flex items-center gap-1 px-1.5 py-0.5 text-[10.5px] rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
+          title="Copy code block"
+        >
+          {copied ? (
+            <>
+              <Check size={11} className="text-[var(--added-fg)]" />
+              <span className="text-[var(--added-fg)]">Copied</span>
+            </>
+          ) : (
+            <>
+              <Copy size={11} />
+              <span>Copy</span>
+            </>
+          )}
+        </button>
+      </div>
+      <pre className="p-2.5 overflow-x-auto font-mono text-[12px] leading-[1.55] text-[var(--text-primary)] m-0">
+        {highlighted ? (
+          <code>
+            {highlighted.map((lineSpans, idx) => (
+              <div key={idx} className="min-h-[1.55em]">
+                {lineSpans.length > 0
+                  ? lineSpans.map((sp, sIdx) => (
+                      <span
+                        key={sIdx}
+                        style={{
+                          color: sp.color,
+                          fontStyle: sp.italic ? 'italic' : undefined,
+                          fontWeight: sp.bold ? 500 : undefined,
+                        }}
+                      >
+                        {sp.text}
+                      </span>
+                    ))
+                  : '\u00A0'}
+              </div>
+            ))}
+          </code>
+        ) : isDiff ? (
+          <code>
+            {rawLines.map((line, idx) => {
+              const isAdd = line.startsWith('+') && !line.startsWith('+++');
+              const isRem = line.startsWith('-') && !line.startsWith('---');
+              const isHunk = line.startsWith('@@');
+              return (
+                <div
+                  key={idx}
+                  className="px-1 -mx-1"
+                  style={{
+                    background: isAdd
+                      ? 'var(--added-bg)'
+                      : isRem
+                      ? 'var(--removed-bg)'
+                      : undefined,
+                    color: isAdd
+                      ? 'var(--added-fg)'
+                      : isRem
+                      ? 'var(--removed-fg)'
+                      : isHunk
+                      ? 'var(--accent)'
+                      : undefined,
+                  }}
+                >
+                  {line || '\u00A0'}
+                </div>
+              );
+            })}
+          </code>
+        ) : (
+          <code>{code}</code>
+        )}
+      </pre>
+    </div>
+  );
+};
+
+function renderInlineMarkdown(text: string): React.ReactNode[] {
+  // Tokenize inline code, bold, italic, and links
+  const regex = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]]+\]\((https?:\/\/[^\s)]+)\))/g;
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  let key = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(text.slice(lastIndex, match.index));
+    }
+    const token = match[0];
+    if (token.startsWith('`') && token.endsWith('`')) {
+      parts.push(
+        <code
+          key={key++}
+          className="px-1 py-0.5 mx-0.5 rounded bg-[var(--bg-elevated)] border border-[var(--border)]/60 font-mono text-[11.5px] text-[var(--text-primary)]"
+        >
+          {token.slice(1, -1)}
+        </code>
+      );
+    } else if (token.startsWith('**') && token.endsWith('**')) {
+      parts.push(
+        <strong key={key++} className="font-semibold text-[var(--text-primary)]">
+          {token.slice(2, -2)}
+        </strong>
+      );
+    } else if (token.startsWith('*') && token.endsWith('*')) {
+      parts.push(
+        <em key={key++} className="italic">
+          {token.slice(1, -1)}
+        </em>
+      );
+    } else if (token.startsWith('[')) {
+      const linkMatch = /^\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)$/.exec(token);
+      if (linkMatch) {
+        parts.push(
+          <a
+            key={key++}
+            href={linkMatch[2]}
+            target="_blank"
+            rel="noreferrer"
+            className="text-[var(--accent)] hover:underline"
+          >
+            {linkMatch[1]}
+          </a>
+        );
+      } else {
+        parts.push(token);
+      }
+    }
+    lastIndex = regex.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    parts.push(text.slice(lastIndex));
+  }
+  return parts;
+}
+
+const MarkdownProse: React.FC<{ text: string }> = ({ text }) => {
+  const lines = text.split(/\r?\n/);
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+  let key = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) {
+      i++;
+      continue;
+    }
+
+    // Heading
+    const headingMatch = /^(#{1,3})\s+(.*)$/.exec(line);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const cls =
+        level === 1
+          ? 'text-[13.5px] font-semibold mt-2.5 mb-1 text-[var(--text-primary)]'
+          : level === 2
+          ? 'text-[13px] font-semibold mt-2 mb-1 text-[var(--text-primary)]'
+          : 'text-[12.5px] font-semibold mt-1.5 mb-0.5 text-[var(--text-primary)]';
+      blocks.push(
+        <div key={key++} className={cls}>
+          {renderInlineMarkdown(headingMatch[2])}
+        </div>
+      );
+      i++;
+      continue;
+    }
+
+    // Horizontal rule
+    if (/^(-{3,}|\*{3,})$/.test(line.trim())) {
+      blocks.push(<hr key={key++} className="my-2 border-[var(--border)]" />);
+      i++;
+      continue;
+    }
+
+    // Blockquote
+    if (line.startsWith('>')) {
+      const qLines: string[] = [];
+      while (i < lines.length && lines[i].startsWith('>')) {
+        qLines.push(lines[i].replace(/^>\s?/, ''));
+        i++;
+      }
+      blocks.push(
+        <blockquote
+          key={key++}
+          className="my-1.5 pl-2.5 border-l-2 border-[var(--accent)]/70 text-[var(--text-muted)] space-y-0.5"
+        >
+          {qLines.map((ql, idx) => (
+            <div key={idx}>{renderInlineMarkdown(ql)}</div>
+          ))}
+        </blockquote>
+      );
+      continue;
+    }
+
+    // Unordered list
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*]\s+/, ''));
+        i++;
+      }
+      blocks.push(
+        <ul key={key++} className="my-1.5 pl-4 list-disc space-y-0.5">
+          {items.map((it, idx) => (
+            <li key={idx} className="leading-[1.55]">
+              {renderInlineMarkdown(it)}
+            </li>
+          ))}
+        </ul>
+      );
+      continue;
+    }
+
+    // Ordered list
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ''));
+        i++;
+      }
+      blocks.push(
+        <ol key={key++} className="my-1.5 pl-4 list-decimal space-y-0.5">
+          {items.map((it, idx) => (
+            <li key={idx} className="leading-[1.55]">
+              {renderInlineMarkdown(it)}
+            </li>
+          ))}
+        </ol>
+      );
+      continue;
+    }
+
+    // Regular paragraph (consume consecutive plain lines)
+    const pLines: string[] = [];
+    while (
+      i < lines.length &&
+      lines[i].trim() !== '' &&
+      !/^(#{1,3}\s+|>|\s*[-*]\s+|\s*\d+\.\s+|(-{3,}|\*{3,})$)/.test(lines[i])
+    ) {
+      pLines.push(lines[i]);
+      i++;
+    }
+    blocks.push(
+      <p key={key++} className="my-1.5 first:mt-0 last:mb-0 leading-[1.6]">
+        {pLines.map((pl, idx) => (
+          <React.Fragment key={idx}>
+            {idx > 0 && <br />}
+            {renderInlineMarkdown(pl)}
+          </React.Fragment>
+        ))}
+      </p>
+    );
+  }
+
+  return <>{blocks}</>;
+};
+
+const MarkdownMessage: React.FC<{ content: string; theme: LiteTheme }> = ({
+  content,
+  theme,
+}) => {
+  // Split into prose and fenced code segments (tolerates unclosed fence during streaming)
+  const segments: Array<
+    { type: 'prose'; text: string } | { type: 'code'; lang: string; code: string }
+  > = [];
+
+  const fenceRegex = /```([a-zA-Z0-9_+-]*)[ \t]*\r?\n([\s\S]*?)(?:```|$)/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = fenceRegex.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      segments.push({ type: 'prose', text: content.slice(lastIndex, match.index) });
+    }
+    const rawCode = match[2].replace(/\r?\n$/, '');
+    segments.push({ type: 'code', lang: match[1] || '', code: rawCode });
+    lastIndex = fenceRegex.lastIndex;
+  }
+
+  if (lastIndex < content.length) {
+    segments.push({ type: 'prose', text: content.slice(lastIndex) });
+  }
+
+  return (
+    <div className="text-[13.5px] leading-[1.65] text-[var(--text-primary)] break-words">
+      {segments.map((seg, idx) =>
+        seg.type === 'code' ? (
+          <FencedCodeBlock key={idx} lang={seg.lang} code={seg.code} theme={theme} />
+        ) : (
+          <MarkdownProse key={idx} text={seg.text} />
+        )
+      )}
+    </div>
   );
 };
 
@@ -292,28 +564,28 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   return (
     <div className="flex flex-col h-full bg-[var(--bg-sidebar)] border-l border-[var(--border)]">
       {/* Header */}
-      <div className="flex items-center justify-between px-2.5 h-9 border-b border-[var(--border)] shrink-0">
-        <div className="flex items-center gap-1">
+      <div className="flex items-center justify-between px-3 h-10 border-b border-[var(--border)] shrink-0">
+        <div className="flex items-center gap-1.5">
           <button
             onClick={() => setMode('chat')}
-            className={`px-2 py-1 text-xs rounded flex items-center gap-1 cursor-pointer ${
+            className={`px-2.5 py-1 text-[12.5px] rounded-md flex items-center gap-1.5 cursor-pointer transition-colors ${
               mode === 'chat'
                 ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
-                : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
             }`}
           >
-            <Bot size={13} />
+            <Bot size={14} />
             Agent Chat
           </button>
           <button
             onClick={() => setMode('cli')}
-            className={`px-2 py-1 text-xs rounded flex items-center gap-1 cursor-pointer ${
+            className={`px-2.5 py-1 text-[12.5px] rounded-md flex items-center gap-1.5 cursor-pointer transition-colors ${
               mode === 'cli'
                 ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
-                : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
             }`}
           >
-            <TerminalIcon size={13} />
+            <TerminalIcon size={14} />
             CLI Agent
           </button>
         </div>
@@ -323,21 +595,21 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             <>
               <button
                 onClick={() => setMessages([])}
-                className="p-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded hover:bg-[var(--bg-hover)] cursor-pointer"
+                className="p-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded-md hover:bg-[var(--bg-hover)] cursor-pointer"
                 title="Clear chat"
               >
-                <Trash2 size={13} />
+                <Trash2 size={14} />
               </button>
               <button
                 onClick={() => setShowSettings(!showSettings)}
-                className={`p-1 rounded hover:bg-[var(--bg-hover)] cursor-pointer ${
+                className={`p-1.5 rounded-md hover:bg-[var(--bg-hover)] cursor-pointer ${
                   showSettings
                     ? 'text-[var(--accent)]'
                     : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
                 }`}
                 title="Agent model & API settings"
               >
-                <Settings size={14} />
+                <Settings size={15} />
               </button>
             </>
           )}
@@ -433,27 +705,35 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       {mode === 'chat' ? (
         <>
           {/* Chat timeline */}
-          <div className="flex-1 overflow-y-auto p-3 space-y-3">
+          <div className="flex-1 overflow-y-auto p-3.5 space-y-3.5">
             {messages.length === 0 ? (
-              <div className="space-y-3 pt-4 text-xs text-[var(--text-muted)]">
-                <div className="text-sm font-medium text-[var(--text-primary)]">
-                  Vireo Agent
+              <div className="space-y-4 pt-5 text-[13px] text-[var(--text-muted)]">
+                <div className="flex items-center gap-3">
+                  <VireoLogo size={36} className="shrink-0 drop-shadow-sm" />
+                  <div>
+                    <div className="text-[15px] font-semibold tracking-tight text-[var(--text-primary)]">
+                      Vireo Agent
+                    </div>
+                    <div className="text-xs text-[var(--text-dim)]">
+                      Live diffs & automatic Git checkpoints
+                    </div>
+                  </div>
                 </div>
                 <p className="leading-relaxed">
                   Ask the agent to inspect files, implement features, or fix terminal errors. Every
                   file edit streams live into the Diff Viewer with automatic Git checkpoints.
                 </p>
-                <div className="p-2.5 rounded border border-[var(--border)] bg-[var(--bg-base)] space-y-1.5">
+                <div className="p-3.5 rounded-lg border border-[var(--border)] bg-[var(--bg-base)] space-y-2">
                   <div className="font-medium text-[var(--text-primary)]">Two ways to code:</div>
-                  <div>
-                    1. Click <Settings size={11} className="inline" /> above to connect an LLM API
+                  <div className="leading-relaxed">
+                    1. Click <Settings size={13} className="inline -mt-0.5 mx-0.5" /> above to connect an LLM API
                     (OpenAI, Claude, Gemini, OpenRouter, or local Ollama).
                   </div>
-                  <div>
+                  <div className="leading-relaxed">
                     2. Or switch to{' '}
                     <button
                       onClick={() => setMode('cli')}
-                      className="underline text-[var(--accent)] cursor-pointer"
+                      className="underline text-[var(--accent)] font-medium cursor-pointer"
                     >
                       CLI Agent
                     </button>{' '}
@@ -552,9 +832,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                   )}
 
                   {m.content && (
-                    <div className="whitespace-pre-wrap leading-relaxed text-[var(--text-primary)] break-words">
-                      {m.content}
-                    </div>
+                    <MarkdownMessage content={m.content} theme={theme} />
                   )}
 
                   {m.error && (
@@ -569,8 +847,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
           </div>
 
           {/* Prompt input */}
-          <div className="p-2.5 border-t border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
-            <div className="rounded border border-[var(--border)] bg-[var(--bg-input)] focus-within:border-[var(--accent)]">
+          <div className="p-3 border-t border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
+            <div className="rounded-lg border border-[var(--border)] bg-[var(--bg-input)] focus-within:border-[var(--accent)] transition-colors">
               <textarea
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
@@ -582,27 +860,27 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 }}
                 rows={3}
                 placeholder="Ask the agent to edit code, explain a diff, or fix an error... (Enter to send)"
-                className="w-full p-2 text-xs bg-transparent text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none"
+                className="w-full p-3 text-[13px] leading-relaxed bg-transparent text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none"
               />
-              <div className="flex items-center justify-between px-2 py-1.5 border-t border-[var(--border)]/60">
-                <span className="text-[10px] text-[var(--text-dim)] truncate">
+              <div className="flex items-center justify-between px-3 py-2 border-t border-[var(--border)]/60">
+                <span className="text-[11.5px] text-[var(--text-dim)] truncate">
                   {config.provider} · {config.model}
                 </span>
                 {running ? (
                   <button
                     onClick={stopGeneration}
-                    className="px-2.5 py-1 text-xs rounded bg-[var(--danger)] text-white flex items-center gap-1 cursor-pointer"
+                    className="px-3 py-1.5 text-xs font-medium rounded-md bg-[var(--danger)] text-white flex items-center gap-1.5 cursor-pointer"
                   >
-                    <Square size={11} />
+                    <Square size={12} />
                     Stop
                   </button>
                 ) : (
                   <button
                     onClick={sendPrompt}
                     disabled={!input.trim()}
-                    className="px-2.5 py-1 text-xs rounded bg-[var(--accent)] text-[var(--accent-fg)] disabled:opacity-40 flex items-center gap-1 cursor-pointer"
+                    className="px-3 py-1.5 text-xs font-medium rounded-md bg-[var(--accent)] text-[var(--accent-fg)] disabled:opacity-40 flex items-center gap-1.5 cursor-pointer hover:opacity-95 transition-opacity"
                   >
-                    <Send size={11} />
+                    <Send size={12} />
                     Send
                   </button>
                 )}
@@ -631,12 +909,20 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               </button>
             ))}
           </div>
-          <CliAgentPty
-            command={cliCmd || undefined}
-            runKey={cliRunKey}
-            theme={theme}
-            workspacePath={workspacePath}
-          />
+          <Suspense
+            fallback={
+              <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-dim)]">
+                Starting CLI terminal...
+              </div>
+            }
+          >
+            <CliAgentPty
+              command={cliCmd || undefined}
+              runKey={cliRunKey}
+              theme={theme}
+              workspacePath={workspacePath}
+            />
+          </Suspense>
         </div>
       )}
     </div>

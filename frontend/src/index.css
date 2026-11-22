@@ -46,8 +46,8 @@ body,
   color: var(--text-primary);
   font-family: var(--font-sans);
   font-feature-settings: "cv02", "cv03", "cv04", "cv11";
-  font-size: 13px;
-  line-height: 1.45;
+  font-size: 14px;
+  line-height: 1.5;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
@@ -88,7 +88,7 @@ pre,
   height: 100%;
   font-family: var(--font-mono) !important;
   font-feature-settings: "liga" 1, "calt" 1;
-  font-size: 13.5px;
+  font-size: 14.5px;
   background: var(--bg-base) !important;
   color: var(--text-primary) !important;
 }

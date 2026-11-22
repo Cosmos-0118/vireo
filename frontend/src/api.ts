@@ -24,6 +24,11 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  setWindowZoom: (factor: number) =>
+    jsonFetch<{ factor: number; native: boolean }>('/api/window/zoom', {
+      method: 'POST',
+      body: JSON.stringify({ factor }),
+    }),
   getWorkspace: () => jsonFetch<WorkspaceInfo>('/api/workspace'),
   setWorkspace: (path: string) =>
     jsonFetch<WorkspaceInfo>('/api/workspace', {

@@ -1,5 +1,5 @@
 use crate::git::create_checkpoint_internal;
-use crate::state::{is_ignored_dir_name, resolve_safe_path, AppState};
+use crate::state::{background_command, is_ignored_dir_name, resolve_safe_path, AppState};
 use axum::{
     extract::State,
     response::{
@@ -13,7 +13,6 @@ use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::path::Path;
 use std::time::Duration;
-use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use walkdir::WalkDir;
@@ -276,7 +275,7 @@ async fn exec_tool(
             if q.is_empty() {
                 return "Empty query".to_string();
             }
-            let out = Command::new("rg")
+            let out = background_command("rg")
                 .args([
                     "-n",
                     "--smart-case",
@@ -354,12 +353,12 @@ async fn exec_tool(
                 return "Empty command".to_string();
             }
             let fut = if cfg!(windows) {
-                Command::new("powershell.exe")
+                background_command("powershell.exe")
                     .args(["-NoProfile", "-Command", cmd])
                     .current_dir(ws)
                     .output()
             } else {
-                Command::new("sh")
+                background_command("sh")
                     .args(["-lc", cmd])
                     .current_dir(ws)
                     .output()

@@ -1,4 +1,4 @@
-use crate::state::{resolve_safe_path, AppState, Checkpoint, WorkspaceEvent};
+use crate::state::{background_command, resolve_safe_path, AppState, Checkpoint, WorkspaceEvent};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -8,7 +8,6 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use tokio::process::Command;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GitFileStatus {
@@ -113,7 +112,7 @@ pub struct RollbackReq {
 }
 
 async fn run_git(ws: &Path, args: &[&str]) -> Result<(bool, String, String), String> {
-    let output = Command::new("git")
+    let output = background_command("git")
         .args(args)
         .current_dir(ws)
         .output()
@@ -542,7 +541,7 @@ pub async fn create_checkpoint_internal(
     }
 
     let tmp_index = std::env::temp_dir().join(format!("vireo-idx-{}", uuid::Uuid::new_v4()));
-    let add_out = Command::new("git")
+    let add_out = background_command("git")
         .args(["add", "-A"])
         .env("GIT_INDEX_FILE", &tmp_index)
         .current_dir(&ws)
@@ -554,7 +553,7 @@ pub async fn create_checkpoint_internal(
         return Err(String::from_utf8_lossy(&add_out.stderr).to_string());
     }
 
-    let tree_out = Command::new("git")
+    let tree_out = background_command("git")
         .args(["write-tree"])
         .env("GIT_INDEX_FILE", &tmp_index)
         .current_dir(&ws)

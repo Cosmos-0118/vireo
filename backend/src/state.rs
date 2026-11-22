@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::sync::{broadcast, mpsc, RwLock};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,6 +26,7 @@ pub struct AppState {
     pub checkpoints: Arc<RwLock<Vec<Checkpoint>>>,
     pub watcher_retarget_tx: mpsc::Sender<PathBuf>,
     pub http_client: reqwest::Client,
+    pub main_window: Arc<OnceLock<tauri::WebviewWindow>>,
 }
 
 impl AppState {
@@ -37,6 +38,7 @@ impl AppState {
             checkpoints: Arc::new(RwLock::new(Vec::new())),
             watcher_retarget_tx,
             http_client: reqwest::Client::new(),
+            main_window: Arc::new(OnceLock::new()),
         }
     }
 
@@ -85,4 +87,15 @@ pub fn is_ignored_dir_name(name: &str) -> bool {
             | ".cache"
             | "coverage"
     )
+}
+
+/// Spawns a background CLI command without flashing a console window on Windows GUI builds.
+pub fn background_command(program: &str) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
 }

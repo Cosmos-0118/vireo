@@ -39,8 +39,9 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
 
     const term = new Terminal({
       cursorBlink: true,
-      fontSize: 13,
-      fontFamily: "'Cascadia Code', 'JetBrains Mono', Consolas, monospace",
+      fontSize: 14,
+      lineHeight: 1.38,
+      fontFamily: "'JetBrains Mono Variable', 'JetBrains Mono', 'Cascadia Code', Consolas, monospace",
       theme: theme.terminal,
       scrollback: 3000,
     });
@@ -212,20 +213,20 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   return (
     <div className="flex flex-col h-full bg-[var(--bg-panel)] border-t border-[var(--border)]">
       {/* Terminal tab bar */}
-      <div className="flex items-center justify-between px-2 h-8 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
-        <div className="flex items-center gap-1 overflow-x-auto">
+      <div className="flex items-center justify-between px-3 h-9 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
+        <div className="flex items-center gap-1.5 overflow-x-auto">
           {tabs.map((t) => (
             <div
               key={t.id}
               onClick={() => setActiveId(t.id)}
-              className={`flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-t cursor-pointer select-none ${
+              className={`flex items-center gap-1.5 px-3 py-1 text-[12.5px] rounded-md cursor-pointer select-none transition-colors ${
                 t.id === activeId
-                  ? 'bg-[var(--bg-panel)] text-[var(--text-primary)] border-t border-x border-[var(--border)]'
-                  : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                  ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
+                  : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
               }`}
             >
-              <TerminalIcon size={12} />
-              <span className="max-w-[140px] truncate">{t.title}</span>
+              <TerminalIcon size={13} />
+              <span className="max-w-[160px] truncate">{t.title}</span>
               {tabs.length > 1 && (
                 <button
                   onClick={(e) => {
@@ -234,43 +235,43 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
                   }}
                   className="hover:text-[var(--danger)] cursor-pointer"
                 >
-                  <X size={11} />
+                  <X size={12} />
                 </button>
               )}
             </div>
           ))}
           <button
             onClick={addShell}
-            className="p-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded cursor-pointer"
+            className="p-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer"
             title="New terminal"
           >
-            <Plus size={14} />
+            <Plus size={15} />
           </button>
         </div>
 
         <div className="flex items-center gap-1.5">
           <button
             onClick={sendLastOutput}
-            className="px-2 py-0.5 text-[11px] rounded border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] flex items-center gap-1 cursor-pointer"
+            className="px-2.5 py-1 text-xs rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 cursor-pointer transition-colors"
             title="Send recent terminal output to Agent Chat"
           >
-            <Send size={11} />
+            <Send size={12} />
             Send Output to Agent
           </button>
           <button
             onClick={() => closeTab(activeId)}
-            className="p-1 text-[var(--text-muted)] hover:text-[var(--danger)] rounded cursor-pointer"
+            className="p-1.5 text-[var(--text-muted)] hover:text-[var(--danger)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer"
             title="Kill current terminal"
           >
-            <Trash2 size={13} />
+            <Trash2 size={14} />
           </button>
           {onClosePanel && (
             <button
               onClick={onClosePanel}
-              className="p-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] rounded cursor-pointer"
+              className="p-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer"
               title="Hide terminal (Ctrl+`)"
             >
-              <X size={14} />
+              <X size={15} />
             </button>
           )}
         </div>

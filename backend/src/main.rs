@@ -16,13 +16,15 @@ use axum::{
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Router,
+    Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
 use rust_embed::Embed;
+use serde::{Deserialize, Serialize};
 use state::AppState;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use tower_http::cors::{Any, CorsLayer};
 
 #[derive(Embed)]
@@ -94,6 +96,33 @@ async fn health() -> &'static str {
     "ok"
 }
 
+#[derive(Deserialize)]
+struct ZoomReq {
+    factor: f64,
+}
+
+#[derive(Serialize)]
+struct ZoomRes {
+    factor: f64,
+    native: bool,
+}
+
+async fn set_window_zoom(
+    State(state): State<AppState>,
+    Json(req): Json<ZoomReq>,
+) -> Json<ZoomRes> {
+    let clamped = req.factor.clamp(0.7, 2.0);
+    let native = if let Some(win) = state.main_window.get() {
+        win.set_zoom(clamped).is_ok()
+    } else {
+        false
+    };
+    Json(ZoomRes {
+        factor: clamped,
+        native,
+    })
+}
+
 struct CliArgs {
     port: u16,
     workspace: PathBuf,
@@ -160,14 +189,19 @@ fn parse_args() -> CliArgs {
     }
 }
 
-fn build_router(initial_workspace: PathBuf) -> Router {
+fn build_router(
+    initial_workspace: PathBuf,
+    main_window: Arc<OnceLock<tauri::WebviewWindow>>,
+) -> Router {
     let (events_tx, _) = tokio::sync::broadcast::channel(128);
     let watcher_tx = watcher::spawn_watcher(initial_workspace.clone(), events_tx.clone());
     let mut app_state = AppState::new(initial_workspace, watcher_tx);
     app_state.events_tx = events_tx;
+    app_state.main_window = main_window;
 
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/window/zoom", post(set_window_zoom))
         .route(
             "/api/workspace",
             get(files::get_workspace).post(files::set_workspace),
@@ -207,7 +241,8 @@ fn build_router(initial_workspace: PathBuf) -> Router {
 
 fn main() {
     let cli = parse_args();
-    let app_router = build_router(cli.workspace.clone());
+    let main_window: Arc<OnceLock<tauri::WebviewWindow>> = Arc::new(OnceLock::new());
+    let app_router = build_router(cli.workspace.clone(), main_window.clone());
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -249,9 +284,10 @@ fn main() {
         .map(|n| format!("Vireo — {}", n))
         .unwrap_or_else(|| "Vireo".to_string());
 
+    let win_slot = main_window.clone();
     tauri::Builder::default()
         .setup(move |app| {
-            tauri::WebviewWindowBuilder::new(
+            let win = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::External(app_url),
@@ -259,8 +295,10 @@ fn main() {
             .title(ws_title)
             .inner_size(1440.0, 900.0)
             .min_inner_size(960.0, 620.0)
+            .zoom_hotkeys_enabled(false)
             .center()
             .build()?;
+            let _ = win_slot.set(win);
             Ok(())
         })
         .run(tauri::generate_context!())
