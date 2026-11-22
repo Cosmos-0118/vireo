@@ -1,9 +1,12 @@
 import type {
   AgentConfig,
+  BranchesRes,
   Checkpoint,
   CliToolStatus,
   CommandRes,
-  CommitLogItem,
+  CommitDetailRes,
+  CommitFileChange,
+  CommitLogRes,
   GitDiffRes,
   GitStatusRes,
   SearchMatch,
@@ -82,10 +85,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path, untracked }),
     }),
-  gitCommit: (message: string, stage_all = false) =>
+  gitDiscardAll: (include_untracked = false) =>
+    jsonFetch<CommandRes>('/api/git/discard-all', {
+      method: 'POST',
+      body: JSON.stringify({ include_untracked }),
+    }),
+  gitCommit: (message: string, stage_all = false, amend = false) =>
     jsonFetch<CommandRes>('/api/git/commit', {
       method: 'POST',
-      body: JSON.stringify({ message, stage_all }),
+      body: JSON.stringify({ message, stage_all, amend }),
     }),
   gitPush: (set_upstream = false) =>
     jsonFetch<CommandRes>('/api/git/push', {
@@ -97,13 +105,109 @@ export const api = {
       method: 'POST',
       body: '{}',
     }),
-  gitBranches: () => jsonFetch<{ current: string; branches: string[] }>('/api/git/branches'),
-  gitCheckout: (branch: string, create = false) =>
+  gitFetch: () =>
+    jsonFetch<CommandRes>('/api/git/fetch', {
+      method: 'POST',
+      body: '{}',
+    }),
+  gitBranches: () => jsonFetch<BranchesRes>('/api/git/branches'),
+  gitCheckout: (branch: string, create = false, start_point?: string) =>
     jsonFetch<CommandRes>('/api/git/checkout', {
       method: 'POST',
-      body: JSON.stringify({ branch, create }),
+      body: JSON.stringify({ branch, create, start_point }),
     }),
-  gitLog: () => jsonFetch<CommitLogItem[]>('/api/git/log'),
+  gitDeleteBranch: (name: string, force = false) =>
+    jsonFetch<CommandRes>('/api/git/branch-delete', {
+      method: 'POST',
+      body: JSON.stringify({ name, force }),
+    }),
+  gitLog: (opts?: {
+    limit?: number;
+    skip?: number;
+    all?: boolean;
+    search?: string;
+    branch?: string;
+  }) => {
+    const params = new URLSearchParams();
+    if (opts?.limit !== undefined) params.set('limit', String(opts.limit));
+    if (opts?.skip !== undefined) params.set('skip', String(opts.skip));
+    if (opts?.all !== undefined) params.set('all', opts.all ? 'true' : 'false');
+    if (opts?.search) params.set('search', opts.search);
+    if (opts?.branch) params.set('branch', opts.branch);
+    const qs = params.toString();
+    return jsonFetch<CommitLogRes>(`/api/git/log${qs ? `?${qs}` : ''}`);
+  },
+  gitCommitDetail: (hash: string) =>
+    jsonFetch<CommitDetailRes>(`/api/git/commit-detail?hash=${encodeURIComponent(hash)}`),
+  gitCommitDiff: (hash: string, path: string, oldPath?: string | null) => {
+    const params = new URLSearchParams({ hash, path });
+    if (oldPath) params.set('old_path', oldPath);
+    return jsonFetch<GitDiffRes>(`/api/git/commit-diff?${params.toString()}`);
+  },
+  gitCommitPatch: (hash: string) =>
+    jsonFetch<{ hash: string; patch: string }>(
+      `/api/git/commit-patch?hash=${encodeURIComponent(hash)}`
+    ),
+  gitCompareFiles: (base: string) =>
+    jsonFetch<CommitFileChange[]>(
+      `/api/git/compare-files?base=${encodeURIComponent(base)}`
+    ),
+  gitCompareDiff: (base: string, path: string, oldPath?: string | null) => {
+    const params = new URLSearchParams({ base, path });
+    if (oldPath) params.set('old_path', oldPath);
+    return jsonFetch<GitDiffRes>(`/api/git/compare-diff?${params.toString()}`);
+  },
+  gitCherryPick: (hash: string, no_commit = false) =>
+    jsonFetch<CommandRes>('/api/git/cherry-pick', {
+      method: 'POST',
+      body: JSON.stringify({ hash, no_commit }),
+    }),
+  gitRevert: (hash: string, no_commit = false) =>
+    jsonFetch<CommandRes>('/api/git/revert', {
+      method: 'POST',
+      body: JSON.stringify({ hash, no_commit }),
+    }),
+  gitReset: (target: string, mode: 'soft' | 'mixed' | 'hard') =>
+    jsonFetch<CommandRes>('/api/git/reset', {
+      method: 'POST',
+      body: JSON.stringify({ target, mode }),
+    }),
+  gitMerge: (target: string) =>
+    jsonFetch<CommandRes>('/api/git/merge', {
+      method: 'POST',
+      body: JSON.stringify({ target }),
+    }),
+  gitCreateTag: (name: string, target: string, message?: string) =>
+    jsonFetch<CommandRes>('/api/git/tag', {
+      method: 'POST',
+      body: JSON.stringify({ name, target, message }),
+    }),
+  gitStash: (
+    action: 'push' | 'pop' | 'apply' | 'drop',
+    opts?: { message?: string; index?: string }
+  ) =>
+    jsonFetch<CommandRes>('/api/git/stash', {
+      method: 'POST',
+      body: JSON.stringify({ action, ...opts }),
+    }),
+  gitOperation: (
+    kind: 'cherry-pick' | 'merge' | 'revert' | 'rebase',
+    action: 'continue' | 'abort'
+  ) =>
+    jsonFetch<CommandRes>('/api/git/operation', {
+      method: 'POST',
+      body: JSON.stringify({ kind, action }),
+    }),
+  gitApplyPatch: (patch: string, cached = false, reverse = false) =>
+    jsonFetch<CommandRes>('/api/git/apply-patch', {
+      method: 'POST',
+      body: JSON.stringify({ patch, cached, reverse }),
+    }),
+  openExternalUrl: (url: string) =>
+    jsonFetch<CommandRes>('/api/git/open-external', {
+      method: 'POST',
+      body: JSON.stringify({ url }),
+    }),
   gitCheckpoint: (label?: string) =>
     jsonFetch<Checkpoint>('/api/git/checkpoint', {
       method: 'POST',
@@ -153,7 +257,7 @@ export async function streamAgentChat(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  let currentEvent = 'message';
+  const currentEvent = 'message';
 
   while (true) {
     const { done, value } = await reader.read();

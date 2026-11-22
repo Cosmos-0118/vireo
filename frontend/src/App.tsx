@@ -3,7 +3,9 @@ import {
   FolderGit2,
   FolderOpen,
   GitBranch,
+  GitCommitHorizontal,
   GitCompare,
+  GitFork,
   Minus,
   Palette,
   PanelBottom,
@@ -24,6 +26,7 @@ import {
   parseVsCodeThemeJson,
 } from './themes';
 import type {
+  CommitFileChange,
   GitDiffRes,
   GitStatusRes,
   OpenTab,
@@ -36,6 +39,9 @@ import { VireoLogo } from './components/VireoLogo';
 
 const DiffViewer = lazy(() =>
   import('./components/DiffViewer').then((m) => ({ default: m.DiffViewer }))
+);
+const CommitGraphView = lazy(() =>
+  import('./components/CommitGraphView').then((m) => ({ default: m.CommitGraphView }))
 );
 const CodeEditor = lazy(() =>
   import('./components/CodeEditor').then((m) => ({ default: m.CodeEditor }))
@@ -124,9 +130,10 @@ export function App() {
   const [showAgent, setShowAgent] = useState(true);
   const [showTerminal, setShowTerminal] = useState(true);
   const [sidebarTab, setSidebarTab] = useState<SidebarTab>('changes');
-  const [sidebarWidth, setSidebarWidth] = useState(300);
+  const [sidebarWidth, setSidebarWidth] = useState(320);
   const [agentWidth, setAgentWidth] = useState(400);
   const [terminalHeight, setTerminalHeight] = useState(240);
+  const [graphSelectedHash, setGraphSelectedHash] = useState<string | null>(null);
 
   // Zoom (persisted, synced to native Tauri WebView2 zoom with CSS fallback)
   const [zoom, setZoom] = useState<number>(() => {
@@ -147,7 +154,7 @@ export function App() {
 
   // Tabs & Active content
   const [tabs, setTabs] = useState<OpenTab[]>([]);
-  const [activeTabPath, setActiveTabPath] = useState<string | null>(null);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [diffData, setDiffData] = useState<GitDiffRes | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
   const [fileData, setFileData] = useState<{ content: string; binary: boolean } | null>(null);
@@ -197,8 +204,15 @@ export function App() {
       setTabs((prev) => {
         if (prev.length === 0 && status.files.length > 0) {
           const first = status.files[0];
-          setActiveTabPath(first.path);
-          return [{ path: first.path, mode: 'diff', staged: first.staged && !first.unstaged }];
+          setActiveTabId(first.path);
+          return [
+            {
+              id: first.path,
+              path: first.path,
+              mode: 'diff',
+              staged: first.staged && !first.unstaged,
+            },
+          ];
         }
         return prev;
       });
@@ -212,7 +226,7 @@ export function App() {
   }, [loadWorkspaceData]);
 
   // Active tab loader
-  const activeTab = tabs.find((t) => t.path === activeTabPath) || null;
+  const activeTab = tabs.find((t) => t.id === activeTabId) || null;
 
   const reloadActiveContent = useCallback(async () => {
     if (!activeTab) {
@@ -220,10 +234,41 @@ export function App() {
       setFileData(null);
       return;
     }
+    if (activeTab.mode === 'graph') {
+      return;
+    }
     if (activeTab.mode === 'diff') {
       setDiffLoading(true);
       try {
         const d = await api.gitDiff(activeTab.path, !!activeTab.staged);
+        setDiffData(d);
+      } catch {
+        setDiffData(null);
+      } finally {
+        setDiffLoading(false);
+      }
+    } else if (activeTab.mode === 'commit-diff' && activeTab.commitHash) {
+      setDiffLoading(true);
+      try {
+        const d = await api.gitCommitDiff(
+          activeTab.commitHash,
+          activeTab.path,
+          activeTab.oldPath
+        );
+        setDiffData(d);
+      } catch {
+        setDiffData(null);
+      } finally {
+        setDiffLoading(false);
+      }
+    } else if (activeTab.mode === 'compare-diff' && activeTab.commitHash) {
+      setDiffLoading(true);
+      try {
+        const d = await api.gitCompareDiff(
+          activeTab.commitHash,
+          activeTab.path,
+          activeTab.oldPath
+        );
         setDiffData(d);
       } catch {
         setDiffData(null);
@@ -315,7 +360,7 @@ export function App() {
             reloadActiveContentRef.current();
           } else if (data.type === 'workspace_switched') {
             setTabs([]);
-            setActiveTabPath(null);
+            setActiveTabId(null);
             loadWorkspaceData();
           } else if (data.type === 'checkpoint_created') {
             refreshGit();
@@ -366,6 +411,10 @@ export function App() {
         e.preventDefault();
         setShowSidebar(true);
         setSidebarTab('search');
+      } else if (e.shiftKey && e.key.toLowerCase() === 'g' && !inXterm) {
+        e.preventDefault();
+        setShowSidebar(true);
+        setSidebarTab('changes');
       } else if (e.key === '`') {
         e.preventDefault();
         setShowTerminal((v) => !v);
@@ -391,31 +440,97 @@ export function App() {
 
   const openDiff = useCallback((path: string, staged = false) => {
     setTabs((prev) => {
-      const existing = prev.find((t) => t.path === path);
+      const existing = prev.find((t) => t.id === path);
       if (existing) {
-        return prev.map((t) => (t.path === path ? { ...t, mode: 'diff', staged } : t));
+        return prev.map((t) => (t.id === path ? { ...t, mode: 'diff', staged } : t));
       }
-      return [...prev, { path, mode: 'diff', staged }];
+      return [...prev, { id: path, path, mode: 'diff', staged }];
     });
-    setActiveTabPath(path);
+    setActiveTabId(path);
   }, []);
 
   const openFile = useCallback((path: string, line?: number) => {
     setTabs((prev) => {
-      const existing = prev.find((t) => t.path === path);
+      const existing = prev.find((t) => t.id === path);
       if (existing) {
-        return prev.map((t) => (t.path === path ? { ...t, mode: 'code', line } : t));
+        return prev.map((t) => (t.id === path ? { ...t, mode: 'code', line } : t));
       }
-      return [...prev, { path, mode: 'code', line }];
+      return [...prev, { id: path, path, mode: 'code', line }];
     });
-    setActiveTabPath(path);
+    setActiveTabId(path);
   }, []);
 
-  const closeTab = (path: string) => {
+  const openCommitDiff = useCallback(
+    (
+      commit: { hash: string; short_hash: string; subject: string; author: string; date: string },
+      file: CommitFileChange,
+      allFiles: CommitFileChange[]
+    ) => {
+      const id = `commit:${commit.hash}:${file.path}`;
+      const tab: OpenTab = {
+        id,
+        path: file.path,
+        mode: 'commit-diff',
+        commitHash: commit.hash,
+        commitShortHash: commit.short_hash,
+        commitSubject: commit.subject,
+        commitAuthor: commit.author,
+        commitDate: commit.date,
+        oldPath: file.old_path,
+        commitFiles: allFiles,
+      };
+      setTabs((prev) => {
+        const existing = prev.find((t) => t.id === id);
+        if (existing) return prev.map((t) => (t.id === id ? tab : t));
+        return [...prev, tab];
+      });
+      setActiveTabId(id);
+    },
+    []
+  );
+
+  const openCompareDiff = useCallback(
+    (
+      commit: { hash: string; short_hash: string; subject: string },
+      file: CommitFileChange,
+      allFiles: CommitFileChange[]
+    ) => {
+      const id = `compare:${commit.hash}:${file.path}`;
+      const tab: OpenTab = {
+        id,
+        path: file.path,
+        mode: 'compare-diff',
+        commitHash: commit.hash,
+        commitShortHash: commit.short_hash,
+        commitSubject: commit.subject,
+        oldPath: file.old_path,
+        commitFiles: allFiles,
+      };
+      setTabs((prev) => {
+        const existing = prev.find((t) => t.id === id);
+        if (existing) return prev.map((t) => (t.id === id ? tab : t));
+        return [...prev, tab];
+      });
+      setActiveTabId(id);
+    },
+    []
+  );
+
+  const openGraphTab = useCallback((selectedHash?: string) => {
+    const id = 'git-graph';
+    if (selectedHash) setGraphSelectedHash(selectedHash);
     setTabs((prev) => {
-      const next = prev.filter((t) => t.path !== path);
-      if (activeTabPath === path) {
-        setActiveTabPath(next.length > 0 ? next[next.length - 1].path : null);
+      if (prev.some((t) => t.id === id)) return prev;
+      return [...prev, { id, path: 'Git Graph', mode: 'graph' }];
+    });
+    setActiveTabId(id);
+  }, []);
+
+  const closeTab = (id: string) => {
+    setTabs((prev) => {
+      const next = prev.filter((t) => t.id !== id);
+      if (activeTabId === id) {
+        setActiveTabId(next.length > 0 ? next[next.length - 1].id : null);
       }
       return next;
     });
@@ -440,7 +555,7 @@ export function App() {
       setWorkspace(info);
       setEditingWs(false);
       setTabs([]);
-      setActiveTabPath(null);
+      setActiveTabId(null);
       await loadWorkspaceData();
       showToast(`Opened workspace: ${info.name}`);
     } catch (err: unknown) {
@@ -456,7 +571,7 @@ export function App() {
       setWsDraft(info.path);
       setEditingWs(false);
       setTabs([]);
-      setActiveTabPath(null);
+      setActiveTabId(null);
       await loadWorkspaceData();
       showToast(`Opened workspace: ${info.name}`);
     } catch (err: unknown) {
@@ -507,9 +622,87 @@ export function App() {
     window.addEventListener('mouseup', onUp);
   };
 
-  const activeFileStatus = activeTab
-    ? gitStatus?.files.find((f) => f.path === activeTab.path)
-    : undefined;
+  const activeFileStatus =
+    activeTab && (activeTab.mode === 'diff' || activeTab.mode === 'code')
+      ? gitStatus?.files.find((f) => f.path === activeTab.path)
+      : undefined;
+
+  const activeCommitContext =
+    activeTab &&
+    (activeTab.mode === 'commit-diff' || activeTab.mode === 'compare-diff') &&
+    activeTab.commitHash
+      ? {
+          mode: activeTab.mode === 'commit-diff' ? ('commit' as const) : ('compare' as const),
+          hash: activeTab.commitHash,
+          shortHash: activeTab.commitShortHash || activeTab.commitHash.slice(0, 7),
+          subject: activeTab.commitSubject || '',
+          author: activeTab.commitAuthor,
+          date: activeTab.commitDate,
+        }
+      : null;
+
+  const activeFileNav = (() => {
+    if (!activeTab) return null;
+    if (activeTab.mode === 'diff' && gitStatus && gitStatus.files.length > 1) {
+      const idx = gitStatus.files.findIndex((f) => f.path === activeTab.path);
+      if (idx === -1) return null;
+      const go = (delta: number) => {
+        const nextIdx = (idx + delta + gitStatus.files.length) % gitStatus.files.length;
+        const f = gitStatus.files[nextIdx];
+        openDiff(f.path, f.staged && !f.unstaged);
+      };
+      return {
+        index: idx,
+        total: gitStatus.files.length,
+        onPrev: () => go(-1),
+        onNext: () => go(1),
+      };
+    }
+    if (
+      (activeTab.mode === 'commit-diff' || activeTab.mode === 'compare-diff') &&
+      activeTab.commitFiles &&
+      activeTab.commitFiles.length > 1 &&
+      activeTab.commitHash
+    ) {
+      const files = activeTab.commitFiles;
+      const idx = files.findIndex((f) => f.path === activeTab.path);
+      if (idx === -1) return null;
+      const go = (delta: number) => {
+        const nextIdx = (idx + delta + files.length) % files.length;
+        const nextFile = files[nextIdx];
+        if (activeTab.mode === 'commit-diff') {
+          openCommitDiff(
+            {
+              hash: activeTab.commitHash!,
+              short_hash: activeTab.commitShortHash || activeTab.commitHash!.slice(0, 7),
+              subject: activeTab.commitSubject || '',
+              author: activeTab.commitAuthor || '',
+              date: activeTab.commitDate || '',
+            },
+            nextFile,
+            files
+          );
+        } else {
+          openCompareDiff(
+            {
+              hash: activeTab.commitHash!,
+              short_hash: activeTab.commitShortHash || activeTab.commitHash!.slice(0, 7),
+              subject: activeTab.commitSubject || '',
+            },
+            nextFile,
+            files
+          );
+        }
+      };
+      return {
+        index: idx,
+        total: files.length,
+        onPrev: () => go(-1),
+        onNext: () => go(1),
+      };
+    }
+    return null;
+  })();
 
   return (
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-[var(--bg-base)] text-[var(--text-primary)]">
@@ -755,56 +948,72 @@ export function App() {
         {/* Left Sidebar */}
         {showSidebar && (
           <>
-            <div style={{ width: sidebarWidth }} className="shrink-0 h-full min-w-[210px]">
+            <div style={{ width: sidebarWidth }} className="shrink-0 h-full min-w-[240px]">
               <Sidebar
                 activeTab={sidebarTab}
                 onTabChange={setSidebarTab}
                 gitStatus={gitStatus}
-                selectedPath={activeTabPath}
+                selectedPath={activeTab?.mode === 'diff' || activeTab?.mode === 'code' ? activeTab.path : null}
+                selectedTabId={activeTabId}
                 workspacePath={workspace.path}
                 onOpenDiff={openDiff}
                 onOpenFile={openFile}
+                onOpenCommitDiff={openCommitDiff}
+                onOpenCompareDiff={openCompareDiff}
+                onOpenGraphTab={openGraphTab}
                 onRefreshGit={refreshGit}
                 onToast={showToast}
               />
             </div>
             <div
               onMouseDown={startDrag('x', (dx) =>
-                setSidebarWidth((w) => Math.max(210, Math.min(500, w + dx)))
+                setSidebarWidth((w) => Math.max(240, Math.min(560, w + dx)))
               )}
               className="w-1 cursor-col-resize hover:bg-[var(--accent)]/60 shrink-0"
             />
           </>
         )}
 
-        {/* Center Column: Diff/Code + Bottom Terminal */}
+        {/* Center Column: Diff/Code/Graph + Bottom Terminal */}
         <div className="flex-1 flex flex-col min-w-0 min-h-0">
           {/* Open Tabs Bar */}
           {tabs.length > 0 && (
             <div className="flex items-center h-10 bg-[var(--bg-sidebar)] border-b border-[var(--border)] overflow-x-auto shrink-0">
               {tabs.map((tab) => {
-                const active = tab.path === activeTabPath;
-                const name = tab.path.split('/').pop() || tab.path;
+                const active = tab.id === activeTabId;
+                const baseName = tab.path.split('/').pop() || tab.path;
+                const label =
+                  tab.mode === 'graph'
+                    ? 'Git Graph'
+                    : tab.mode === 'commit-diff'
+                    ? `${baseName} (${tab.commitShortHash})`
+                    : tab.mode === 'compare-diff'
+                    ? `${baseName} (${tab.commitShortHash}↔WT)`
+                    : baseName;
                 return (
                   <div
-                    key={tab.path}
-                    onClick={() => setActiveTabPath(tab.path)}
+                    key={tab.id}
+                    onClick={() => setActiveTabId(tab.id)}
                     className={`group flex items-center gap-2 px-3.5 h-full text-[13px] border-r border-[var(--border)] cursor-pointer select-none shrink-0 transition-colors ${
                       active
                         ? 'bg-[var(--bg-base)] text-[var(--text-primary)] font-medium border-t-2 border-t-[var(--accent)]'
                         : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
                     }`}
                   >
-                    {tab.mode === 'diff' ? (
+                    {tab.mode === 'graph' ? (
+                      <GitFork size={14} className="text-[var(--accent)] shrink-0" />
+                    ) : tab.mode === 'commit-diff' ? (
+                      <GitCommitHorizontal size={14} className="text-[var(--accent)] shrink-0" />
+                    ) : tab.mode === 'diff' || tab.mode === 'compare-diff' ? (
                       <GitCompare size={14} className="text-[var(--modified-fg)] shrink-0" />
                     ) : (
                       <FileCode size={14} className="text-[var(--text-muted)] shrink-0" />
                     )}
-                    <span>{name}</span>
+                    <span>{label}</span>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        closeTab(tab.path);
+                        closeTab(tab.id);
                       }}
                       className="ml-0.5 p-0.5 rounded hover:bg-[var(--bg-hover)] hover:text-[var(--danger)] cursor-pointer"
                       title="Close tab"
@@ -827,8 +1036,8 @@ export function App() {
                     Welcome to Vireo
                   </h2>
                   <p className="text-[13.5px] text-[var(--text-muted)] leading-relaxed">
-                    Review your coding agent's changes as they happen, run commands, and commit
-                    to GitHub, all from one lightweight window.
+                    Review your coding agent's changes as they happen, inspect Git history & branches,
+                    and commit to GitHub, all from one lightweight window.
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center justify-center gap-2.5 text-[13px]">
@@ -838,6 +1047,15 @@ export function App() {
                   >
                     Quick Open (Ctrl+P)
                   </button>
+                  {gitStatus?.is_repo && (
+                    <button
+                      onClick={() => openGraphTab()}
+                      className="px-3.5 py-2 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 cursor-pointer transition-colors"
+                    >
+                      <GitFork size={15} className="text-[var(--accent)]" />
+                      Git Commit Graph
+                    </button>
+                  )}
                   <button
                     onClick={() => {
                       setShowSidebar(true);
@@ -862,7 +1080,28 @@ export function App() {
                   </button>
                 </div>
               </div>
-            ) : activeTab.mode === 'diff' ? (
+            ) : activeTab.mode === 'graph' ? (
+              <Suspense
+                fallback={
+                  <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-dim)]">
+                    Loading Git Graph...
+                  </div>
+                }
+              >
+                <CommitGraphView
+                  gitStatus={gitStatus}
+                  workspacePath={workspace.path}
+                  initialSelectedHash={graphSelectedHash}
+                  onOpenCommitDiff={openCommitDiff}
+                  onOpenCompareDiff={openCompareDiff}
+                  onOpenDiff={openDiff}
+                  onRefreshGit={refreshGit}
+                  onToast={showToast}
+                />
+              </Suspense>
+            ) : activeTab.mode === 'diff' ||
+              activeTab.mode === 'commit-diff' ||
+              activeTab.mode === 'compare-diff' ? (
               <Suspense
                 fallback={
                   <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-dim)]">
@@ -873,6 +1112,8 @@ export function App() {
                 <DiffViewer
                   diff={diffData}
                   fileStatus={activeFileStatus}
+                  commitContext={activeCommitContext}
+                  fileNav={activeFileNav}
                   theme={activeTheme}
                   loading={diffLoading}
                   onStage={async () => {
@@ -891,8 +1132,30 @@ export function App() {
                     reloadActiveContent();
                     showToast(`Discarded changes in ${activeTab.path}`);
                   }}
+                  onApplyHunk={async (patch, action) => {
+                    try {
+                      const cached = action === 'stage' || action === 'unstage';
+                      const reverse = action === 'unstage' || action === 'revert';
+                      const res = await api.gitApplyPatch(patch, cached, reverse);
+                      if (!res.ok) {
+                        throw new Error(res.stderr || `Failed to ${action} hunk`);
+                      }
+                      await refreshGit();
+                      await reloadActiveContent();
+                      showToast(
+                        action === 'stage'
+                          ? 'Staged hunk'
+                          : action === 'unstage'
+                          ? 'Unstaged hunk'
+                          : 'Reverted hunk'
+                      );
+                    } catch (e: unknown) {
+                      showToast(e instanceof Error ? e.message : `Failed to ${action} hunk`, true);
+                    }
+                  }}
                   onSwitchToCode={() => openFile(activeTab.path)}
                   onAskAgent={handleAskAgent}
+                  onToast={showToast}
                 />
               </Suspense>
             ) : (

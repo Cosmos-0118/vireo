@@ -30,6 +30,12 @@ export interface Checkpoint {
   created_at: string;
 }
 
+export interface StashItem {
+  index: string;
+  message: string;
+  date: string;
+}
+
 export interface GitFileStatus {
   path: string;
   index_status: string;
@@ -44,13 +50,16 @@ export interface GitFileStatus {
 export interface GitStatusRes {
   is_repo: boolean;
   branch: string;
+  head_hash: string;
   ahead: number;
   behind: number;
   remote_url: string;
+  state: 'cherry-pick' | 'merge' | 'revert' | 'rebase' | null;
   files: GitFileStatus[];
   total_additions: number;
   total_deletions: number;
   checkpoints: Checkpoint[];
+  stashes: StashItem[];
 }
 
 export interface GitDiffRes {
@@ -62,12 +71,61 @@ export interface GitDiffRes {
   binary: boolean;
 }
 
+export interface GitRef {
+  name: string;
+  kind: 'head' | 'local' | 'remote' | 'tag';
+  is_current: boolean;
+}
+
 export interface CommitLogItem {
   hash: string;
   short_hash: string;
+  parents: string[];
+  refs: GitRef[];
   message: string;
   author: string;
+  author_email: string;
   date: string;
+  iso_date: string;
+  timestamp: number;
+  is_head: boolean;
+}
+
+export interface CommitLogRes {
+  commits: CommitLogItem[];
+  has_more: boolean;
+  head_hash: string;
+}
+
+export interface CommitFileChange {
+  path: string;
+  old_path?: string | null;
+  status: string;
+  additions: number;
+  deletions: number;
+  binary: boolean;
+}
+
+export interface CommitDetailRes {
+  hash: string;
+  short_hash: string;
+  parents: string[];
+  refs: GitRef[];
+  subject: string;
+  body: string;
+  author: string;
+  author_email: string;
+  date: string;
+  iso_date: string;
+  files: CommitFileChange[];
+  total_additions: number;
+  total_deletions: number;
+}
+
+export interface BranchesRes {
+  current: string;
+  branches: string[];
+  remote_branches: string[];
 }
 
 export interface CommandRes {
@@ -77,10 +135,18 @@ export interface CommandRes {
 }
 
 export interface OpenTab {
+  id: string;
   path: string;
-  mode: 'diff' | 'code';
+  mode: 'diff' | 'code' | 'commit-diff' | 'compare-diff' | 'graph';
   staged?: boolean;
   line?: number;
+  commitHash?: string;
+  commitShortHash?: string;
+  commitSubject?: string;
+  commitAuthor?: string;
+  commitDate?: string;
+  oldPath?: string | null;
+  commitFiles?: CommitFileChange[];
 }
 
 export interface AgentConfig {
