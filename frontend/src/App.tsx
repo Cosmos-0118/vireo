@@ -47,6 +47,7 @@ import type {
 } from './types';
 import { Sidebar, SidebarTab } from './components/Sidebar';
 import { AgentPanel } from './components/AgentPanel';
+import { AgentEditsStrip } from './components/AgentEditsStrip';
 import { FileIcon } from './components/FileIcon';
 import { VireoLogo } from './components/VireoLogo';
 import ResizeHandle from './components/ResizeHandle';
@@ -1716,46 +1717,12 @@ export function App() {
             (pillVisible || pausedJump || reviewPaths.length > 0) &&
             liveEdits.length > 0 && (
               <div className="shrink-0 flex items-center gap-2 h-9 px-3 border-t border-[var(--border)] bg-[var(--bg-sidebar)] text-xs">
-                <div className="flex items-center gap-2 shrink-0">
-                  <span className="live-dot w-1.5 h-1.5 rounded-full bg-[var(--added-fg)]" />
-                  <span className="font-medium text-[var(--text-primary)]">Agent edits</span>
-                  <span className="text-[var(--text-dim)] tabular-nums">
-                    {liveEdits.length} {liveEdits.length === 1 ? 'file' : 'files'}
-                  </span>
-                </div>
-                <span className="w-px h-4 bg-[var(--border)] shrink-0" />
-                <div className="flex items-center gap-0.5 min-w-0 flex-1 overflow-x-auto">
-                  {liveEdits
-                    .slice()
-                    .reverse()
-                    .map((e) => {
-                      const name = e.path.split('/').pop() || e.path;
-                      const current = activeTab?.path === e.path;
-                      return (
-                        <button
-                          key={e.path}
-                          onClick={() => focusPath(e.path)}
-                          title={e.path}
-                          className={`h-6 px-2 rounded-md flex items-center gap-1.5 shrink-0 cursor-pointer transition-colors ${
-                            current
-                              ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
-                              : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                          } ${
-                            tabPulse[e.path] !== undefined ? `row-pulse-${tabPulse[e.path] % 2}` : ''
-                          }`}
-                        >
-                          <FileIcon path={e.path} size={12} />
-                          <span>{name}</span>
-                          <span className="font-mono text-[11px] tabular-nums text-[var(--added-fg)]">
-                            +{e.adds}
-                          </span>
-                          <span className="font-mono text-[11px] tabular-nums text-[var(--removed-fg)]">
-                            -{e.dels}
-                          </span>
-                        </button>
-                      );
-                    })}
-                </div>
+                <AgentEditsStrip
+                  edits={liveEdits}
+                  activePath={activeTab?.path ?? null}
+                  tabPulse={tabPulse}
+                  onFocus={focusPath}
+                />
                 <div className="flex items-center gap-1.5 shrink-0">
                   {pausedJump && (
                     <button

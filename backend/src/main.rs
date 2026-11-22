@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod cli_agent;
 mod files;
 mod git;
 mod pty;
@@ -302,6 +303,7 @@ fn build_router(
         .route("/api/git/rollback", post(git::rollback_checkpoint))
         .route("/api/agent/chat", post(agent::chat))
         .route("/api/agent/cli-tools", get(pty::list_cli_tools))
+        .route("/api/agent/models", get(agent::list_models))
         .route("/ws/pty", get(pty::ws_pty))
         .route("/api/pty/kill", post(pty::kill_pty))
         .route("/ws/events", get(ws_events))

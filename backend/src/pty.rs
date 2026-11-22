@@ -158,31 +158,159 @@ pub fn augmented_path_env() -> OsString {
     }
 
     for cand in candidates {
-        if !cand.is_dir() {
+        if cand.is_dir() {
+            push_unique_dir(&mut dirs, cand);
+        }
+    }
+
+    // Agent CLIs that ship inside desktop apps / IDE extensions live in version- or
+    // hash-named folders that are never on PATH. Resolve them now (not once at startup, since
+    // app updates replace those folders) and expose the folder to every child process.
+    for spec in KNOWN_CLI_TOOLS {
+        if find_in_dirs(spec.cmd, dirs.iter().cloned()).is_some() {
             continue;
         }
-        let already = dirs.iter().any(|d| {
-            if cfg!(windows) {
-                d.to_string_lossy()
-                    .trim_end_matches(['\\', '/'])
-                    .eq_ignore_ascii_case(cand.to_string_lossy().trim_end_matches(['\\', '/']))
-            } else {
-                d == &cand
+        if let Some(found) = find_in_dirs(spec.cmd, fallback_tool_dirs(spec.cmd)) {
+            if let Some(parent) = found.parent() {
+                push_unique_dir(&mut dirs, parent.to_path_buf());
             }
-        });
-        if !already {
-            dirs.push(cand);
         }
     }
 
     std::env::join_paths(dirs).unwrap_or(existing_raw)
 }
 
+fn same_dir(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .eq_ignore_ascii_case(b.to_string_lossy().trim_end_matches(['\\', '/']))
+    } else {
+        a == b
+    }
+}
+
+fn push_unique_dir(dirs: &mut Vec<PathBuf>, cand: PathBuf) {
+    if !dirs.iter().any(|d| same_dir(d, &cand)) {
+        dirs.push(cand);
+    }
+}
+
+/// Existing child directories of `dir`, most recently modified first.
+fn subdirs_newest(dir: &Path) -> Vec<PathBuf> {
+    let mut v: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| {
+            let mtime = e
+                .metadata()
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (mtime, e.path())
+        })
+        .collect();
+    v.sort_by(|a, b| b.0.cmp(&a.0));
+    v.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Directories to probe, newest first, when `cmd` is not reachable through PATH.
+fn fallback_tool_dirs(cmd: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let env_dir = |name: &str| std::env::var_os(name).map(PathBuf::from);
+
+    #[cfg(windows)]
+    {
+        let profile = env_dir("USERPROFILE");
+        let local = env_dir("LOCALAPPDATA");
+        let roaming = env_dir("APPDATA");
+
+        if let Some(local) = &local {
+            out.push(local.join("Microsoft").join("WinGet").join("Links"));
+        }
+        match cmd {
+            "claude" => {
+                // Claude desktop bundles the Claude Code CLI: <root>/claude-code/<version>/<hash>/claude.exe
+                let mut roots: Vec<PathBuf> = Vec::new();
+                if let Some(local) = &local {
+                    for data in subdirs_newest(&local.join("Claude-Data")) {
+                        roots.push(data.join("claude-code"));
+                    }
+                }
+                if let Some(roaming) = &roaming {
+                    roots.push(roaming.join("Claude").join("claude-code"));
+                }
+                for root in roots {
+                    for ver in subdirs_newest(&root) {
+                        out.push(ver.clone());
+                        out.extend(subdirs_newest(&ver));
+                    }
+                }
+                if let Some(profile) = &profile {
+                    out.push(profile.join(".claude").join("local"));
+                }
+                out.extend(extension_dirs(profile.as_deref(), "anthropic.claude-code-", &["resources", "native-binary"]));
+            }
+            "codex" => {
+                // Codex desktop keeps the CLI in a hash-named folder: OpenAI/Codex/bin/<hash>/codex.exe
+                if let Some(local) = &local {
+                    out.extend(subdirs_newest(&local.join("OpenAI").join("Codex").join("bin")));
+                }
+                for bin in extension_dirs(profile.as_deref(), "openai.chatgpt-", &["bin"]) {
+                    out.extend(subdirs_newest(&bin));
+                    out.push(bin);
+                }
+            }
+            _ => {}
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = env_dir("HOME") {
+            if cmd == "claude" {
+                out.push(home.join(".claude").join("local"));
+            }
+        }
+    }
+
+    out.into_iter().filter(|d| d.is_dir()).collect()
+}
+
+/// `<home>/.vscode|.cursor/extensions/<prefix>*/<sub...>` directories, newest extension first.
+#[cfg(windows)]
+fn extension_dirs(profile: Option<&Path>, prefix: &str, sub: &[&str]) -> Vec<PathBuf> {
+    let Some(profile) = profile else { return Vec::new() };
+    let mut out = Vec::new();
+    for ide in [".vscode", ".cursor", ".vscode-insiders", ".windsurf"] {
+        for ext in subdirs_newest(&profile.join(ide).join("extensions")) {
+            let name = ext.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+            if name.starts_with(prefix) {
+                let mut p = ext.clone();
+                for s in sub {
+                    p = p.join(s);
+                }
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Resolve an agent CLI to a full executable path, using PATH plus app-bundled locations.
+pub fn resolve_cli_tool(cmd: &str) -> Option<PathBuf> {
+    find_command_in_path(cmd, &augmented_path_env())
+}
+
 fn find_command_in_path(cmd_name: &str, path_env: &OsStr) -> Option<PathBuf> {
+    find_in_dirs(cmd_name, std::env::split_paths(path_env))
+}
+
+fn find_in_dirs(cmd_name: &str, dirs: impl IntoIterator<Item = PathBuf>) -> Option<PathBuf> {
     if cmd_name.is_empty() {
         return None;
     }
-    for dir in std::env::split_paths(path_env) {
+    for dir in dirs {
         if dir.as_os_str().is_empty() {
             continue;
         }

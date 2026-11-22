@@ -25,7 +25,7 @@ pub struct ChatMessage {
 
 #[derive(Debug, Deserialize)]
 pub struct AgentChatReq {
-    pub provider: String, // "openai" | "anthropic" | "gemini" | "ollama"
+    pub provider: String, // "openai" | "anthropic" | "gemini" | "ollama" | "claude-cli" | "codex-cli"
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub model: String,
@@ -386,7 +386,76 @@ async fn exec_tool(
     }
 }
 
-async fn send_sse(tx: &mpsc::Sender<Result<Event, Infallible>>, event: &str, payload: Value) {
+#[derive(Debug, Deserialize)]
+pub struct ModelsQuery {
+    /// Ollama base URL as stored in the UI (with or without the trailing `/v1`).
+    pub ollama_base: Option<String>,
+}
+
+#[derive(Serialize)]
+struct LocalModels {
+    running: bool,
+    models: Vec<String>,
+}
+
+/// Models actually available on this machine: what the local Ollama daemon has pulled, and the
+/// models the user's Codex install lists (read-only from Codex's own model cache).
+pub async fn list_models(
+    State(state): State<AppState>,
+    axum::extract::Query(q): axum::extract::Query<ModelsQuery>,
+) -> Json<Value> {
+    let base = q
+        .ollama_base
+        .as_deref()
+        .map(|b| b.trim().trim_end_matches('/').trim_end_matches("/v1").to_string())
+        .filter(|b| b.starts_with("http://") || b.starts_with("https://"))
+        .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
+
+    let probe = async {
+        let resp = state
+            .http_client
+            .get(format!("{base}/api/tags"))
+            .timeout(Duration::from_millis(800))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?;
+        let body: Value = resp.json().await.ok()?;
+        let models = body["models"]
+            .as_array()?
+            .iter()
+            .filter_map(|m| m["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        Some(models)
+    };
+    let ollama = match probe.await {
+        Some(models) => LocalModels { running: true, models },
+        None => LocalModels { running: false, models: vec![] },
+    };
+
+    let codex = tokio::task::spawn_blocking(|| {
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+        let raw = std::fs::read_to_string(Path::new(&home).join(".codex").join("models_cache.json")).ok()?;
+        let v: Value = serde_json::from_str(&raw).ok()?;
+        Some(
+            v["models"]
+                .as_array()?
+                .iter()
+                .filter(|m| m["visibility"].as_str() == Some("list"))
+                .filter_map(|m| m["slug"].as_str().map(str::to_string))
+                .collect::<Vec<_>>(),
+        )
+    })
+    .await
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+
+    Json(json!({ "ollama": ollama, "codex": codex }))
+}
+
+pub(crate) async fn send_sse(tx: &mpsc::Sender<Result<Event, Infallible>>, event: &str, payload: Value) {
     let _ = tx
         .send(Ok(Event::default()
             .event(event)
@@ -408,12 +477,19 @@ pub async fn chat(
         let provider = req.provider.to_lowercase();
         let api_key = req.api_key.clone().unwrap_or_default();
 
+        // Installed agent CLIs use their own login; no API key involved.
+        if let Some(kind) = crate::cli_agent::CliKind::from_provider(&provider) {
+            crate::cli_agent::run(&state, &ws, &req, kind, auto_cp, &tx).await;
+            send_sse(&tx, "done", json!({})).await;
+            return;
+        }
+
         if provider != "ollama" && api_key.trim().is_empty() {
             send_sse(
                 &tx,
                 "error",
                 json!({
-                    "message": "No API key is set. Open settings (the gear icon in the Agent panel) to add an OpenAI, Anthropic, Gemini, OpenRouter, or local Ollama model. You can also use the CLI Agent tab to run Claude Code, Codex, Gemini CLI, or Aider in a terminal."
+                    "message": "No API key is set. Open settings (the gear icon in the Agent panel) to add an OpenAI, Anthropic, Gemini, OpenRouter, or local Ollama model, or pick Claude Code / Codex to use an installed, logged-in CLI without an API key."
                 }),
             )
             .await;

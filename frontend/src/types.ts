@@ -207,7 +207,7 @@ export interface OpenTab {
 }
 
 export interface AgentConfig {
-  provider: 'openai' | 'anthropic' | 'gemini' | 'ollama';
+  provider: 'openai' | 'anthropic' | 'gemini' | 'ollama' | 'claude-cli' | 'codex-cli';
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -229,6 +229,12 @@ export interface UiChatMessage {
   checkpoint?: Checkpoint;
   error?: string;
   streaming?: boolean;
+}
+
+export interface LocalModelsInfo {
+  ollama: { running: boolean; models: string[] };
+  /** Model slugs listed in the user's Codex install. */
+  codex: string[];
 }
 
 export interface CliToolStatus {

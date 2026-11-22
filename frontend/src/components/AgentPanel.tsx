@@ -21,7 +21,7 @@ import {
 } from 'lucide-react';
 import { api, streamAgentChat } from '../api';
 import type { LiteTheme } from '../themes';
-import type { AgentConfig, ToolCallTrace, UiChatMessage } from '../types';
+import type { AgentConfig, CliToolStatus, LocalModelsInfo, ToolCallTrace, UiChatMessage } from '../types';
 import { MarkdownMessage } from './MarkdownView';
 import { VireoLogo } from './VireoLogo';
 
@@ -38,15 +38,18 @@ const PROVIDER_PRESETS: Record<AgentConfig['provider'], { model: string; baseUrl
   anthropic: { model: 'claude-sonnet-4-20250514', baseUrl: 'https://api.anthropic.com' },
   gemini: { model: 'gemini-2.5-pro', baseUrl: '' },
   ollama: { model: 'qwen2.5-coder:14b', baseUrl: 'http://127.0.0.1:11434/v1' },
+  'claude-cli': { model: 'default', baseUrl: '' },
+  'codex-cli': { model: 'default', baseUrl: '' },
 };
 
-
-
+// Fallbacks only: Ollama and Codex lists are replaced by what is actually installed.
 const MODEL_PRESETS: Record<AgentConfig['provider'], string[]> = {
   openai: ['gpt-4.1', 'gpt-4.1-mini', 'o4-mini'],
   anthropic: ['claude-sonnet-4-20250514', 'claude-opus-4-20250514'],
   gemini: ['gemini-2.5-pro', 'gemini-2.5-flash'],
   ollama: ['qwen2.5-coder:14b', 'llama3.1', 'deepseek-r1'],
+  'claude-cli': ['default', 'sonnet', 'opus', 'haiku'],
+  'codex-cli': ['default'],
 };
 
 const PROVIDER_LABEL: Record<AgentConfig['provider'], string> = {
@@ -54,6 +57,14 @@ const PROVIDER_LABEL: Record<AgentConfig['provider'], string> = {
   anthropic: 'Anthropic',
   gemini: 'Gemini',
   ollama: 'Ollama',
+  'claude-cli': 'Claude Code',
+  'codex-cli': 'Codex',
+};
+
+/** Providers that run an installed CLI with its own login instead of an API key. */
+const CLI_PROVIDER_TOOL: Partial<Record<AgentConfig['provider'], string>> = {
+  'claude-cli': 'claude',
+  'codex-cli': 'codex',
 };
 
 /** Close a popover on outside click / Escape. */
@@ -270,7 +281,37 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const modelRef = usePopoverClose(showModelMenu, () => setShowModelMenu(false));
   const pickerRef = usePopoverClose(showFilePicker, () => setShowFilePicker(false));
 
-  const configured = config.provider === 'ollama' || !!config.apiKey.trim();
+  const [cliTools, setCliTools] = useState<CliToolStatus[]>([]);
+  const [localModels, setLocalModels] = useState<LocalModelsInfo | null>(null);
+
+  // Refresh what is installed locally (CLIs, Ollama models) at mount and whenever a menu opens.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .cliTools()
+      .then((t) => !cancelled && setCliTools(t))
+      .catch(() => {});
+    api
+      .agentModels(config.provider === 'ollama' ? config.baseUrl : undefined)
+      .then((m) => !cancelled && setLocalModels(m))
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showSettings, showModelMenu, config.provider]);
+
+  const cliToolId = CLI_PROVIDER_TOOL[config.provider];
+  const cliInstalled = cliToolId ? cliTools.find((t) => t.id === cliToolId)?.installed : undefined;
+  const configured = cliToolId
+    ? cliInstalled !== false
+    : config.provider === 'ollama' || !!config.apiKey.trim();
+  const modelOptions: string[] =
+    config.provider === 'ollama' && localModels?.ollama.running && localModels.ollama.models.length
+      ? localModels.ollama.models
+      : config.provider === 'codex-cli' && localModels?.codex.length
+        ? ['default', ...localModels.codex]
+        : MODEL_PRESETS[config.provider];
   const activeChip =
     activeFilePath && activeFilePath !== dismissedActive && !extraFiles.includes(activeFilePath)
       ? activeFilePath
@@ -306,7 +347,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     setConfig((prev) => ({
       ...prev,
       provider: p,
-      model: PROVIDER_PRESETS[p].model,
+      model:
+        p === 'ollama' && localModels?.ollama.running && localModels.ollama.models.length
+          ? localModels.ollama.models[0]
+          : PROVIDER_PRESETS[p].model,
       baseUrl: PROVIDER_PRESETS[p].baseUrl,
     }));
 
@@ -508,7 +552,9 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             title={
               configured
                 ? `${PROVIDER_LABEL[config.provider]} ready`
-                : 'No API key set for the selected provider'
+                : cliToolId
+                  ? `${PROVIDER_LABEL[config.provider]} CLI not found`
+                  : 'No API key set for the selected provider'
             }
           />
         </div>
@@ -556,6 +602,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 <option value="anthropic">Anthropic Claude</option>
                 <option value="gemini">Google Gemini</option>
                 <option value="ollama">Ollama (Local)</option>
+                <option value="claude-cli">Claude Code (installed CLI)</option>
+                <option value="codex-cli">Codex (installed CLI)</option>
               </select>
             </div>
             <div>
@@ -567,7 +615,19 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               />
             </div>
           </div>
-          {config.provider !== 'gemini' && (
+          {cliToolId && (
+            <div className="text-[11px] leading-snug text-[var(--text-muted)]">
+              {cliInstalled === false
+                ? `${PROVIDER_LABEL[config.provider]} CLI not found. Install it, then reopen this menu.`
+                : `Runs your installed ${PROVIDER_LABEL[config.provider]} CLI with its own login — no API key. File edits are auto-accepted; use "default" to keep the CLI's configured model.`}
+            </div>
+          )}
+          {config.provider === 'ollama' && localModels && !localModels.ollama.running && (
+            <div className="text-[11px] leading-snug text-[var(--text-muted)]">
+              Ollama isn&apos;t running at this address, so the model list below is a placeholder.
+            </div>
+          )}
+          {config.provider !== 'gemini' && !cliToolId && (
             <div>
               <label className="block text-[11px] text-[var(--text-muted)] mb-0.5">
                 Base URL (optional — OpenRouter, DeepSeek, LM Studio)
@@ -580,7 +640,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               />
             </div>
           )}
-          {config.provider !== 'ollama' && (
+          {config.provider !== 'ollama' && !cliToolId && (
             <div>
               <label className="block text-[11px] text-[var(--text-muted)] mb-0.5">
                 API key (stored only in this browser)
@@ -843,7 +903,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                     ))}
                   </div>
                   <div className="my-1 border-t border-[var(--border)]" />
-                  {MODEL_PRESETS[config.provider].map((m) => (
+                  {modelOptions.map((m) => (
                     <div
                       key={m}
                       onClick={() => {

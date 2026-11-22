@@ -3,6 +3,7 @@ import type {
   BranchesRes,
   Checkpoint,
   CliToolStatus,
+  LocalModelsInfo,
   CommandRes,
   CommitDetailRes,
   CommitFileChange,
@@ -254,6 +255,10 @@ export const api = {
       body: JSON.stringify({ id }),
     }),
   cliTools: () => jsonFetch<CliToolStatus[]>('/api/agent/cli-tools'),
+  agentModels: (ollamaBase?: string) =>
+    jsonFetch<LocalModelsInfo>(
+      `/api/agent/models${ollamaBase ? `?ollama_base=${encodeURIComponent(ollamaBase)}` : ''}`
+    ),
 };
 
 export async function streamAgentChat(
