@@ -57,7 +57,11 @@ try {
         )) {
         $exe = Join-Path $dir $tool.Path
         if (-not (Test-Path $exe)) { throw "Bundled tool not installed: $($tool.Path)" }
-        $ver = (& $exe --version 2>&1 | Select-Object -First 1)
+        # Capture all output before trimming: `| Select-Object -First 1` stops the pipeline early,
+        # so $LASTEXITCODE is never set and strict mode throws when it is read.
+        $global:LASTEXITCODE = 0
+        $verOut = @(& $exe --version 2>&1)
+        $ver = $verOut | Select-Object -First 1
         if ($LASTEXITCODE -ne 0 -or "$ver" -notmatch [regex]::Escape($tool.Expect)) {
             throw "Bundled tool $($tool.Path) failed to run: $ver"
         }
