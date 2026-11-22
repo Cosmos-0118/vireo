@@ -8,12 +8,14 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
+  CloudUpload,
   Copy,
   ExternalLink,
   FileCode,
   Folder,
   FolderOpen,
   FolderTree,
+  GitBranch,
   GitCommitHorizontal,
   GitCompare,
   GitFork,
@@ -97,6 +99,7 @@ const GRAPH_LANE_W = 12;
 const GRAPH_MAX_LANES = 6;
 import { GitActionModal, type GitModalState } from './GitActionModal';
 import { FileIcon } from './FileIcon';
+import { PublishDialog, type PublishMode } from './PublishDialog';
 
 interface SourceControlPaneProps {
   gitStatus: GitStatusRes | null;
@@ -137,6 +140,9 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
   const [amendMode, setAmendMode] = useState(false);
   const [showCommitMenu, setShowCommitMenu] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [showMoreMenu, setShowMoreMenu] = useState(false);
+  const [publishDialog, setPublishDialog] = useState<PublishMode | null>(null);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
 
   // Branch picker
   const [branchInfo, setBranchInfo] = useState<BranchesRes>({
@@ -350,6 +356,50 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       document.removeEventListener('keydown', onKey);
     };
   }, [showCommitMenu]);
+
+  useEffect(() => {
+    if (!showMoreMenu) return;
+    const onDown = (e: MouseEvent) => {
+      if (!moreMenuRef.current?.contains(e.target as Node)) setShowMoreMenu(false);
+    };
+    const onKey = (e: KeyboardEvent) => e.key === 'Escape' && setShowMoreMenu(false);
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [showMoreMenu]);
+
+  const folderName = useMemo(
+    () => workspacePath.replace(/[\\/]+$/, '').split(/[\\/]/).pop() || 'my-project',
+    [workspacePath]
+  );
+  const hasCommits = !!gitStatus?.head_hash;
+
+  const handleInitRepo = () =>
+    runAction(async () => {
+      const res = await api.gitInit();
+      if (!res.ok) throw new Error(res.stderr || res.stdout || 'Failed to initialize repository');
+      onToast('Initialized empty Git repository');
+    });
+
+  const handlePublishGithub = (name: string, isPrivate: boolean, description: string) =>
+    runAction(async () => {
+      const res = await api.gitPublishGithub(name, isPrivate, description);
+      if (!res.ok) throw new Error((res.stderr || res.stdout || 'Publish failed').trim());
+      setPublishDialog(null);
+      const url = res.stdout.match(/https:\/\/github\.com\/\S+/)?.[0];
+      onToast(url ? `Published to ${url}` : `Published ${name} to GitHub`);
+    });
+
+  const handleAddRemote = (url: string) =>
+    runAction(async () => {
+      const res = await api.gitRemoteAdd(url);
+      if (!res.ok) throw new Error((res.stderr || res.stdout || 'Failed to add remote').trim());
+      setPublishDialog(null);
+      onToast('Remote added. Use Publish Branch to push.');
+    });
 
   const graphFiltered = graphSearch.trim().length > 0;
   const graphLayout = useMemo(
@@ -770,6 +820,8 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       return renderFileRow(node.item, isStagedSection, depth, false);
     });
 
+  // Clean tree: hide the commit box entirely (VS Code style); the BranchBar shows the next sync step.
+  const showCommitBox = totalChanged > 0 || amendMode || commitMsg.trim().length > 0;
   const firstLineLen = commitMsg.split('\n')[0].length;
   const commitBtnLabel = amendMode
     ? 'Amend Last Commit'
@@ -789,6 +841,17 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
 
   return (
     <div className="flex-1 flex flex-col min-h-0 overflow-hidden select-none">
+      <PublishDialog
+        open={publishDialog !== null}
+        initialMode={publishDialog ?? 'github'}
+        defaultName={folderName}
+        isRepo={!!gitStatus?.is_repo}
+        hasCommits={hasCommits}
+        busy={busy}
+        onClose={() => setPublishDialog(null)}
+        onPublishGithub={handlePublishGithub}
+        onAddRemote={handleAddRemote}
+      />
       {/* Top Header */}
       <div className="flex items-center justify-between h-10 px-3 border-b border-[var(--border)] shrink-0">
         <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-muted)]">
@@ -833,14 +896,125 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
           >
             <RefreshCw size={13.5} className={graphLoading ? 'animate-spin' : ''} />
           </button>
+          {gitStatus?.is_repo && (
+            <div ref={moreMenuRef} className="relative">
+              <button
+                onClick={() => setShowMoreMenu((v) => !v)}
+                className={`p-1.5 rounded-md hover:bg-[var(--bg-hover)] cursor-pointer ${
+                  showMoreMenu
+                    ? 'text-[var(--text-primary)] bg-[var(--bg-hover)]'
+                    : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                }`}
+                title="More actions"
+                aria-label="More actions"
+              >
+                <MoreHorizontal size={14} />
+              </button>
+              {showMoreMenu && (
+                <div className="absolute right-0 top-full mt-1 w-60 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-[0_12px_32px_-8px_rgba(0,0,0,0.6)] z-40 py-1 text-[12px]">
+                  {!hasRemote && (
+                    <>
+                      <CommitMenuItem
+                        icon={<CloudUpload size={13} />}
+                        label="Publish to GitHub…"
+                        hint="Create a private or public repository"
+                        onClick={() => {
+                          setShowMoreMenu(false);
+                          setPublishDialog('github');
+                        }}
+                      />
+                      <CommitMenuItem
+                        icon={<GitBranch size={13} />}
+                        label="Add Remote…"
+                        hint="Use an existing repository URL"
+                        onClick={() => {
+                          setShowMoreMenu(false);
+                          setPublishDialog('remote');
+                        }}
+                      />
+                      <div className="my-1 border-t border-[var(--border)]" />
+                    </>
+                  )}
+                  <CommitMenuItem
+                    icon={<Pencil size={13} />}
+                    label={amendMode ? 'Stop Amending' : 'Amend Last Commit'}
+                    hint={headPushed && !amendMode ? 'Already pushed — will need force push' : undefined}
+                    warn={!amendMode && headPushed}
+                    disabled={!gitStatus.head_hash}
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      toggleAmend();
+                    }}
+                  />
+                  <CommitMenuItem
+                    icon={<Undo2 size={13} />}
+                    label="Undo Last Commit"
+                    hint={headPushed ? 'Already pushed — will need force push' : 'Keeps its changes staged'}
+                    warn={headPushed}
+                    disabled={!gitStatus.head_hash}
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      handleUndoLastCommit();
+                    }}
+                  />
+                  <div className="my-1 border-t border-[var(--border)]" />
+                  <CommitMenuItem
+                    icon={<Archive size={13} />}
+                    label="Stash All Changes"
+                    hint="Includes untracked files"
+                    disabled={totalChanged === 0}
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      runAction(async () => {
+                        const res = await api.gitStash('push', {
+                          message: `On ${isDetached ? 'detached HEAD' : gitStatus.branch}`,
+                        });
+                        if (!res.ok) throw new Error(res.stderr || 'Stash failed');
+                        onToast('Stashed working changes');
+                      });
+                    }}
+                  />
+                  <CommitMenuItem
+                    icon={<History size={13} />}
+                    label="Pop Latest Stash"
+                    disabled={(gitStatus.stashes?.length ?? 0) === 0}
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      runAction(async () => {
+                        const res = await api.gitStash('pop');
+                        if (!res.ok) throw new Error(res.stderr || 'Stash pop failed');
+                        onToast('Popped latest stash');
+                      });
+                    }}
+                  />
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
       {!gitStatus?.is_repo ? (
-        <div className="p-3.5 text-xs text-[var(--text-muted)] leading-relaxed">
-          This folder is not a Git repository. Open a Git repo or run{' '}
-          <code className="px-1.5 py-0.5 bg-[var(--bg-elevated)] rounded font-mono">git init</code>{' '}
-          in the terminal.
+        <div className="p-3.5 space-y-3">
+          <p className="text-[12px] text-[var(--text-muted)] leading-relaxed">
+            The folder currently open doesn’t have a Git repository. Initialize one to enable source control.
+          </p>
+          <button
+            onClick={handleInitRepo}
+            disabled={busy}
+            className="w-full h-[28px] flex items-center justify-center gap-1.5 text-[12.5px] font-medium rounded-md bg-[var(--accent)] text-[var(--accent-fg)] hover:brightness-110 disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
+          >
+            <GitBranch size={13} />
+            Initialize Repository
+          </button>
+          <button
+            onClick={() => setPublishDialog('github')}
+            disabled={busy}
+            className="w-full h-[28px] flex items-center justify-center gap-1.5 text-[12.5px] font-medium rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 cursor-pointer disabled:cursor-not-allowed"
+          >
+            <CloudUpload size={13} />
+            Publish to GitHub
+          </button>
         </div>
       ) : (
         <>
@@ -892,8 +1066,12 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
               runAction={runAction}
               onToast={onToast}
               onRefreshBranches={fetchBranches}
+              onOpenPublish={setPublishDialog}
+              largeAction={!showCommitBox}
             />
 
+            {showCommitBox && (
+            <>
             {/* Amend mode banner: makes the mode obvious and easy to leave */}
             {amendMode && (
               <div
@@ -1059,6 +1237,8 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                 </div>
               )}
             </div>
+            </>
+            )}
           </div>
 
           {/* Resizable Split between CHANGES and GRAPH (VS Code Accordion style) */}
@@ -1066,9 +1246,9 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
             {/* SECTION 1: CHANGES */}
             <div
               style={
-                changesOpen && graphOpen
+                changesOpen && graphOpen && totalChanged > 0
                   ? { flex: `0 0 ${Math.round(changesRatio * 100)}%` }
-                  : changesOpen
+                  : changesOpen && totalChanged > 0
                   ? { flex: '1 1 auto' }
                   : { flex: '0 0 auto' }
               }
@@ -1176,14 +1356,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                   )}
 
                   <div className="flex-1 overflow-y-auto py-1">
-                    {totalChanged === 0 ? (
-                      <div className="px-3 py-4 text-center text-xs text-[var(--text-dim)]">
-                        Working tree clean.
-                        <div className="text-[11px] mt-0.5 opacity-80">
-                          Agent & editor changes appear here live.
-                        </div>
-                      </div>
-                    ) : (
+                    {totalChanged === 0 ? null : (
                       <>
                         {/* Staged Changes Sub-section */}
                         {stagedFiles.length > 0 && (
@@ -1270,7 +1443,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
             </div>
 
             {/* Draggable Splitter between Changes & Graph */}
-            {changesOpen && graphOpen && (
+            {changesOpen && graphOpen && totalChanged > 0 && (
               <div
                 onMouseDown={startSplitDrag}
                 className="h-[3px] cursor-row-resize bg-[var(--border)]/70 hover:bg-[var(--accent)] shrink-0 transition-colors"

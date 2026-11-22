@@ -9,6 +9,7 @@ import type {
   CommitLogRes,
   GitDiffRes,
   GitStatusRes,
+  GithubStatusRes,
   SearchMatch,
   TaskItem,
   TreeEntry,
@@ -94,6 +95,22 @@ export const api = {
     jsonFetch<CommandRes>('/api/git/commit', {
       method: 'POST',
       body: JSON.stringify({ message, stage_all, amend }),
+    }),
+  gitInit: (branch?: string) =>
+    jsonFetch<CommandRes>('/api/git/init', {
+      method: 'POST',
+      body: JSON.stringify(branch ? { branch } : {}),
+    }),
+  githubStatus: () => jsonFetch<GithubStatusRes>('/api/git/github-status'),
+  gitPublishGithub: (name: string, isPrivate: boolean, description?: string) =>
+    jsonFetch<CommandRes>('/api/git/publish-github', {
+      method: 'POST',
+      body: JSON.stringify({ name, private: isPrivate, description: description || undefined }),
+    }),
+  gitRemoteAdd: (url: string, name = 'origin') =>
+    jsonFetch<CommandRes>('/api/git/remote-add', {
+      method: 'POST',
+      body: JSON.stringify({ name, url }),
     }),
   gitPush: (set_upstream = false) =>
     jsonFetch<CommandRes>('/api/git/push', {

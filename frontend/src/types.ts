@@ -62,6 +62,12 @@ export interface GitStatusRes {
   stashes: StashItem[];
 }
 
+export interface GithubStatusRes {
+  installed: boolean;
+  authenticated: boolean;
+  login: string;
+}
+
 export interface GitDiffRes {
   path: string;
   staged: boolean;

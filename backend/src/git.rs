@@ -366,6 +366,7 @@ async fn run_git(ws: &Path, args: &[&str]) -> Result<(bool, String, String), Str
     let output = background_command("git")
         .args(args)
         .current_dir(ws)
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .await
         .map_err(|e| format!("Failed to run git: {}", e))?;
@@ -613,6 +614,21 @@ fn parse_z_diff_files(name_status_bytes: &[u8], numstat_bytes: &[u8]) -> Vec<Com
     files
 }
 
+/// Current branch name. Works on an unborn branch (fresh `git init`, no commits);
+/// returns "HEAD" only when HEAD is truly detached.
+async fn current_branch(ws: &Path) -> String {
+    if let Ok((true, out, _)) = run_git(ws, &["symbolic-ref", "--short", "-q", "HEAD"]).await {
+        let b = out.trim();
+        if !b.is_empty() {
+            return b.to_string();
+        }
+    }
+    match run_git(ws, &["rev-parse", "--abbrev-ref", "HEAD"]).await {
+        Ok((_, out, _)) if !out.trim().is_empty() => out.trim().to_string(),
+        _ => "HEAD".to_string(),
+    }
+}
+
 fn validate_git_ref_arg(s: &str) -> Result<&str, (StatusCode, String)> {
     let t = s.trim();
     if t.is_empty() || t.starts_with('-') || t.contains('\0') || t.contains('\n') || t.contains('\r')
@@ -647,10 +663,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<GitStatusRes> {
         });
     }
 
-    let (_, branch_out, _) = run_git(&ws, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .await
-        .unwrap_or((false, "main".to_string(), String::new()));
-    let branch = branch_out.trim().to_string();
+    let branch = current_branch(&ws).await;
 
     let (head_ok, head_out, _) = run_git(&ws, &["rev-parse", "HEAD"])
         .await
@@ -1009,11 +1022,9 @@ pub async fn push_changes(
 ) -> Result<Json<CommandRes>, (StatusCode, String)> {
     let ws = state.workspace_path().await;
     let res = if req.set_upstream.unwrap_or(false) {
-        let (_, branch_out, _) = run_git(&ws, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .await
-            .unwrap_or((false, "main".to_string(), String::new()));
-        let b = branch_out.trim().to_string();
-        run_git(&ws, &["push", "-u", "origin", &b]).await
+        let b = current_branch(&ws).await;
+        let remote = pick_remote(&ws).await;
+        run_git(&ws, &["push", "-u", &remote, &b]).await
     } else {
         run_git(&ws, &["push"]).await
     };
@@ -1055,9 +1066,7 @@ pub async fn fetch_changes(
 
 pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
     let ws = state.workspace_path().await;
-    let (_, cur, _) = run_git(&ws, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
+    let cur = current_branch(&ws).await;
     let (_, list, _) = run_git(&ws, &["branch", "--format=%(refname:short)"])
         .await
         .unwrap_or((false, String::new(), String::new()));
@@ -1090,7 +1099,7 @@ pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
     .unwrap_or((false, String::new(), String::new()));
     let details = parse_branch_refs(&refs_out);
 
-    let current = cur.trim().to_string();
+    let current = cur;
     let detached = current == "HEAD";
     let (upstream, upstream_gone) = details
         .iter()
@@ -1803,6 +1812,274 @@ pub async fn apply_patch(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     state.notify_fs_changed(vec!["git:apply-patch".to_string()]);
+    Ok(Json(CommandRes { ok, stdout, stderr }))
+}
+
+/// Prefer "origin", else the first configured remote, else "origin".
+async fn pick_remote(ws: &Path) -> String {
+    let remotes = get_remotes(ws).await;
+    if remotes.iter().any(|r| r == "origin") {
+        "origin".to_string()
+    } else {
+        remotes
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "origin".to_string())
+    }
+}
+
+async fn run_gh(ws: &Path, args: &[&str]) -> Result<(bool, String, String), String> {
+    let output = background_command("gh")
+        .args(args)
+        .current_dir(ws)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("NO_COLOR", "1")
+        .output()
+        .await
+        .map_err(|e| format!("Failed to run gh: {}", e))?;
+    Ok((
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    ))
+}
+
+#[derive(Deserialize, Default)]
+pub struct InitReq {
+    pub branch: Option<String>,
+}
+
+pub async fn init_repo(
+    State(state): State<AppState>,
+    body: Option<Json<InitReq>>,
+) -> Result<Json<CommandRes>, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let req = body.map(|Json(r)| r).unwrap_or_default();
+    let branch = req.branch.unwrap_or_else(|| "main".to_string());
+    let branch = validate_git_ref_arg(&branch)?.to_string();
+    let (ok, stdout, stderr) = run_git(&ws, &["init", "-b", &branch])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    state.notify_fs_changed(vec!["git:init".to_string()]);
+    Ok(Json(CommandRes { ok, stdout, stderr }))
+}
+
+#[derive(Serialize)]
+pub struct GithubStatusRes {
+    pub installed: bool,
+    pub authenticated: bool,
+    pub login: String,
+}
+
+pub async fn github_status(State(state): State<AppState>) -> Json<GithubStatusRes> {
+    let ws = state.workspace_path().await;
+    let installed = run_gh(&ws, &["--version"])
+        .await
+        .map(|r| r.0)
+        .unwrap_or(false);
+    if !installed {
+        return Json(GithubStatusRes {
+            installed: false,
+            authenticated: false,
+            login: String::new(),
+        });
+    }
+    let (ok, out, _) = run_gh(&ws, &["api", "user", "--jq", ".login"])
+        .await
+        .unwrap_or((false, String::new(), String::new()));
+    let login = out.trim().to_string();
+    Json(GithubStatusRes {
+        installed: true,
+        authenticated: ok && !login.is_empty(),
+        login,
+    })
+}
+
+#[derive(Deserialize)]
+pub struct RemoteAddReq {
+    pub name: Option<String>,
+    pub url: String,
+}
+
+fn valid_remote_url(url: &str) -> bool {
+    let ok_scheme = url.starts_with("https://")
+        || url.starts_with("http://")
+        || url.starts_with("ssh://")
+        || url.starts_with("git://")
+        || url.starts_with("git@");
+    ok_scheme && !url.chars().any(|c| c.is_control() || c.is_whitespace())
+}
+
+pub async fn add_remote(
+    State(state): State<AppState>,
+    Json(req): Json<RemoteAddReq>,
+) -> Result<Json<CommandRes>, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let name = req.name.as_deref().unwrap_or("origin").trim().to_string();
+    let url = req.url.trim().to_string();
+    if name.is_empty()
+        || name.starts_with('-')
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err((StatusCode::BAD_REQUEST, "Invalid remote name".to_string()));
+    }
+    if !valid_remote_url(&url) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Enter a valid remote URL (https://..., ssh://... or git@host:owner/repo.git)"
+                .to_string(),
+        ));
+    }
+    let (is_repo, _, _) = run_git(&ws, &["rev-parse", "--is-inside-work-tree"])
+        .await
+        .unwrap_or((false, String::new(), String::new()));
+    if !is_repo {
+        let (ok, stdout, stderr) = run_git(&ws, &["init", "-b", "main"])
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        if !ok {
+            return Ok(Json(CommandRes { ok, stdout, stderr }));
+        }
+    }
+    let existing = get_remotes(&ws).await;
+    let args: Vec<&str> = if existing.iter().any(|r| r == &name) {
+        vec!["remote", "set-url", &name, &url]
+    } else {
+        vec!["remote", "add", &name, &url]
+    };
+    let (ok, stdout, stderr) = run_git(&ws, &args)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    state.notify_fs_changed(vec!["git:remote".to_string()]);
+    Ok(Json(CommandRes { ok, stdout, stderr }))
+}
+
+#[derive(Deserialize)]
+pub struct PublishGithubReq {
+    pub name: String,
+    pub private: bool,
+    pub description: Option<String>,
+}
+
+/// Create a GitHub repository with `gh` and wire it up as `origin`.
+/// Initializes the repo and makes an initial commit first when needed.
+pub async fn publish_github(
+    State(state): State<AppState>,
+    Json(req): Json<PublishGithubReq>,
+) -> Result<Json<CommandRes>, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let name = req.name.trim().to_string();
+    let valid_name = !name.is_empty()
+        && !name.starts_with('-')
+        && name.len() <= 100
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    if !valid_name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Repository name may only contain letters, numbers, '.', '-' and '_'".to_string(),
+        ));
+    }
+    let fail = |msg: &str| {
+        Json(CommandRes {
+            ok: false,
+            stdout: String::new(),
+            stderr: msg.to_string(),
+        })
+    };
+    let ise = |e: String| (StatusCode::INTERNAL_SERVER_ERROR, e);
+
+    let gh = github_status(State(state.clone())).await.0;
+    if !gh.installed {
+        return Ok(fail(
+            "GitHub CLI (gh) is not installed. Install it from https://cli.github.com, or add a remote URL instead.",
+        ));
+    }
+    if !gh.authenticated {
+        return Ok(fail(
+            "GitHub CLI is not signed in. Run `gh auth login` in the terminal, then try again.",
+        ));
+    }
+
+    let (is_repo, _, _) = run_git(&ws, &["rev-parse", "--is-inside-work-tree"])
+        .await
+        .unwrap_or((false, String::new(), String::new()));
+    if !is_repo {
+        let (ok, _, err) = run_git(&ws, &["init", "-b", "main"]).await.map_err(ise)?;
+        if !ok {
+            return Ok(fail(&err));
+        }
+    }
+
+    if !get_remotes(&ws).await.is_empty() {
+        return Ok(fail(
+            "This repository already has a remote. Use Push / Publish Branch instead.",
+        ));
+    }
+
+    let has_commits = run_git(&ws, &["rev-parse", "--verify", "-q", "HEAD"])
+        .await
+        .map(|r| r.0)
+        .unwrap_or(false);
+    let mut committed_initial = false;
+    if !has_commits {
+        let _ = run_git(&ws, &["add", "-A"]).await;
+        // `diff --cached --quiet` exits 0 when nothing is staged.
+        let nothing_staged = run_git(&ws, &["diff", "--cached", "--quiet"])
+            .await
+            .map(|r| r.0)
+            .unwrap_or(true);
+        if !nothing_staged {
+            let (ok, out, err) = run_git(&ws, &["commit", "-m", "Initial commit"])
+                .await
+                .map_err(ise)?;
+            if !ok {
+                let msg = if err.trim().is_empty() { out } else { err };
+                return Ok(fail(&format!(
+                    "Could not create the initial commit: {}",
+                    msg.trim()
+                )));
+            }
+            committed_initial = true;
+        }
+    }
+    let can_push = has_commits || committed_initial;
+
+    let visibility = if req.private { "--private" } else { "--public" };
+    let mut args: Vec<&str> = vec![
+        "repo",
+        "create",
+        &name,
+        visibility,
+        "--source=.",
+        "--remote=origin",
+    ];
+    let desc = req
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    if let Some(d) = desc {
+        args.push("--description");
+        args.push(d);
+    }
+    if can_push {
+        args.push("--push");
+    }
+    let (ok, stdout, stderr) = run_gh(&ws, &args).await.map_err(ise)?;
+    state.notify_fs_changed(vec!["git:publish".to_string()]);
+    let stdout = if ok && !can_push {
+        format!(
+            "{}\nNo commits yet. Commit your files, then publish the branch.",
+            stdout.trim()
+        )
+    } else {
+        stdout
+    };
     Ok(Json(CommandRes { ok, stdout, stderr }))
 }
 

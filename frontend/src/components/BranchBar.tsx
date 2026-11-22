@@ -11,6 +11,7 @@ import {
   CornerDownLeft,
   GitBranch,
   GitCommitHorizontal,
+  Link2,
   Loader2,
   Plus,
   RefreshCw,
@@ -108,6 +109,10 @@ interface BranchBarProps {
   runAction: (fn: () => Promise<void>) => Promise<void>;
   onToast: (msg: string, isError?: boolean) => void;
   onRefreshBranches: () => void;
+  /** Opens the "publish to GitHub / add remote" dialog. */
+  onOpenPublish: (mode: 'github' | 'remote') => void;
+  /** Working tree is clean: show the next sync step as a full-width button (VS Code style). */
+  largeAction?: boolean;
 }
 
 export const BranchBar: React.FC<BranchBarProps> = ({
@@ -118,6 +123,8 @@ export const BranchBar: React.FC<BranchBarProps> = ({
   runAction,
   onToast,
   onRefreshBranches,
+  onOpenPublish,
+  largeAction = false,
 }) => {
   const now = useNow();
   const [pickerOpen, setPickerOpen] = useState(false);
@@ -214,10 +221,28 @@ export const BranchBar: React.FC<BranchBarProps> = ({
     emphasis: boolean;
   } | null = null;
 
+  const isLarge =
+    largeAction &&
+    (sync.kind === 'no-remote' ||
+      sync.kind === 'publish' ||
+      sync.kind === 'gone' ||
+      sync.kind === 'diverged' ||
+      sync.kind === 'pull' ||
+      sync.kind === 'push');
+
   switch (sync.kind) {
+    case 'no-remote':
+      primary = {
+        label: isLarge ? 'Publish Branch' : 'Publish',
+        icon: <CloudUpload size={13} />,
+        title: 'Publish this repository to GitHub or add a remote',
+        onClick: () => onOpenPublish('github'),
+        emphasis: true,
+      };
+      break;
     case 'publish':
       primary = {
-        label: 'Publish',
+        label: isLarge ? 'Publish Branch' : 'Publish',
         icon: <CloudUpload size={13} />,
         title: `Push ${branch} to ${sync.remote} and track it`,
         onClick: doPublish,
@@ -226,7 +251,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
       break;
     case 'gone':
       primary = {
-        label: 'Publish',
+        label: isLarge ? 'Publish Branch' : 'Publish',
         icon: <CloudUpload size={13} />,
         title: `${upstreamLabel} was deleted on the remote. Publish ${branch} again`,
         onClick: doPublish,
@@ -235,7 +260,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
       break;
     case 'diverged':
       primary = {
-        label: 'Sync',
+        label: isLarge ? 'Sync Changes' : 'Sync',
         icon: <RefreshCw size={12.5} />,
         title: `${plural(sync.behind, 'commit')} to pull and ${plural(sync.ahead, 'commit')} to push. Choose how to combine them.`,
         onClick: () => setSyncMenuOpen((v) => !v),
@@ -300,8 +325,8 @@ export const BranchBar: React.FC<BranchBarProps> = ({
   let statusTone = 'text-[var(--text-dim)]';
   switch (sync.kind) {
     case 'no-remote':
-      statusIcon = <CloudOff size={11} className="shrink-0" />;
-      statusText = 'Local only — no remote configured';
+      // The Publish button already says it; keep the panel quiet like VS Code.
+      statusText = null;
       break;
     case 'detached':
       statusIcon = <AlertTriangle size={11} className="shrink-0" />;
@@ -342,7 +367,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
 
   return (
     <div className="@container relative">
-      <div className="flex items-stretch gap-1 h-[28px]">
+      <div className="flex flex-wrap items-stretch gap-1">
         {/* Branch switcher button */}
         <button
           ref={branchBtnRef}
@@ -354,7 +379,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
           disabled={!!gitStatus.state}
           aria-haspopup="listbox"
           aria-expanded={pickerOpen}
-          className={`flex items-center gap-1.5 min-w-0 flex-1 px-2 rounded-md border text-[12.5px] font-medium cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
+          className={`flex items-center gap-1.5 min-w-0 flex-1 h-[28px] px-2 rounded-md border text-[12.5px] font-medium cursor-pointer transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
             pickerOpen
               ? 'bg-[var(--bg-hover)] border-[var(--accent)]'
               : 'bg-[var(--bg-elevated)] border-[var(--border)] hover:bg-[var(--bg-hover)]'
@@ -384,19 +409,30 @@ export const BranchBar: React.FC<BranchBarProps> = ({
 
         {/* Contextual sync button (+ menu) */}
         {primary && (
-          <div ref={syncMenuRef} className="relative flex items-stretch shrink-0">
+          <div
+            ref={syncMenuRef}
+            className={`relative flex items-stretch h-[28px] ${isLarge ? 'w-full mt-0.5' : 'shrink-0'}`}
+          >
             <button
               onClick={primary.onClick}
               disabled={syncDisabled}
               title={primary.title}
               className={`flex items-center gap-1.5 pl-2 pr-1.5 rounded-l-md border text-[12px] font-medium cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${
+                isLarge ? 'flex-1 min-w-0 justify-center' : ''
+              } ${
                 primary.emphasis
                   ? 'bg-[var(--accent)] border-[var(--accent)] text-[var(--accent-fg)] hover:brightness-110'
                   : 'bg-[var(--bg-elevated)] border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
               }`}
             >
-              {running ? <Loader2 size={12.5} className="animate-spin" /> : counts ? null : primary.icon}
-              <span className={!running && counts ? 'hidden @[280px]:inline' : undefined}>{running ?? primary.label}</span>
+              {running ? (
+                <Loader2 size={12.5} className="animate-spin" />
+              ) : counts && !isLarge ? null : (
+                primary.icon
+              )}
+              <span className={!running && counts && !isLarge ? 'hidden @[280px]:inline' : undefined}>
+                {running ?? primary.label}
+              </span>
               {!running && counts}
             </button>
             <button
@@ -435,25 +471,51 @@ export const BranchBar: React.FC<BranchBarProps> = ({
                     <div className="my-1 border-t border-[var(--border)]" />
                   </>
                 )}
-                <SyncMenuItem
-                  icon={<RefreshCw size={13} />}
-                  label="Fetch"
-                  hint={fetched ? `Last ${fetched}` : 'Check the remote for new commits'}
-                  onClick={doFetch}
-                />
-                <SyncMenuItem
-                  icon={<ArrowDown size={13} />}
-                  label="Pull (merge)"
-                  disabled={sync.kind === 'publish'}
-                  onClick={() => doPull('merge')}
-                />
-                <SyncMenuItem
-                  icon={<ArrowDown size={13} />}
-                  label="Pull (rebase)"
-                  disabled={sync.kind === 'publish'}
-                  onClick={() => doPull('rebase')}
-                />
-                {sync.kind === 'publish' || sync.kind === 'gone' ? (
+                {sync.kind === 'no-remote' && (
+                  <>
+                    <SyncMenuItem
+                      icon={<CloudUpload size={13} />}
+                      label="Publish to GitHub…"
+                      hint="Create a private or public repository"
+                      onClick={() => {
+                        setSyncMenuOpen(false);
+                        onOpenPublish('github');
+                      }}
+                    />
+                    <SyncMenuItem
+                      icon={<Link2 size={13} />}
+                      label="Add remote URL…"
+                      hint="Use a repository that already exists"
+                      onClick={() => {
+                        setSyncMenuOpen(false);
+                        onOpenPublish('remote');
+                      }}
+                    />
+                  </>
+                )}
+                {sync.kind !== 'no-remote' && (
+                  <>
+                    <SyncMenuItem
+                      icon={<RefreshCw size={13} />}
+                      label="Fetch"
+                      hint={fetched ? `Last ${fetched}` : 'Check the remote for new commits'}
+                      onClick={doFetch}
+                    />
+                    <SyncMenuItem
+                      icon={<ArrowDown size={13} />}
+                      label="Pull (merge)"
+                      disabled={sync.kind === 'publish'}
+                      onClick={() => doPull('merge')}
+                    />
+                    <SyncMenuItem
+                      icon={<ArrowDown size={13} />}
+                      label="Pull (rebase)"
+                      disabled={sync.kind === 'publish'}
+                      onClick={() => doPull('rebase')}
+                    />
+                  </>
+                )}
+                {sync.kind === 'no-remote' ? null : sync.kind === 'publish' || sync.kind === 'gone' ? (
                   <SyncMenuItem
                     icon={<CloudUpload size={13} />}
                     label="Publish branch"
@@ -475,16 +537,18 @@ export const BranchBar: React.FC<BranchBarProps> = ({
       </div>
 
       {/* One-line status: where this branch stands relative to its remote */}
-      <div
-        className={`flex items-center gap-1.5 h-[20px] mt-1 px-0.5 text-[11px] ${statusTone}`}
-        title={fetched ? `Last ${fetched}` : undefined}
-      >
-        {statusIcon}
-        <span className="truncate min-w-0">{statusText}</span>
-        {fetched && sync.kind !== 'no-remote' && (
-          <span className="hidden @[320px]:inline ml-auto pl-2 shrink-0 text-[var(--text-dim)]">{fetched}</span>
-        )}
-      </div>
+      {statusText && !isLarge && (
+        <div
+          className={`flex items-center gap-1.5 h-[20px] mt-1 px-0.5 text-[11px] ${statusTone}`}
+          title={fetched ? `Last ${fetched}` : undefined}
+        >
+          {statusIcon}
+          <span className="truncate min-w-0">{statusText}</span>
+          {fetched && (
+            <span className="hidden @[320px]:inline ml-auto pl-2 shrink-0 text-[var(--text-dim)]">{fetched}</span>
+          )}
+        </div>
+      )}
 
       {pickerOpen && (
         <BranchPicker
