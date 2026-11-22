@@ -1,0 +1,105 @@
+name: Bug report
+description: Something in Vireo does not work as expected.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a problem.
+
+        **Security problems:** do not report them here. Follow the [security policy](https://github.com/Cosmos-0118/vireo/security/policy) instead.
+
+        Please search [existing issues](https://github.com/Cosmos-0118/vireo/issues?q=is%3Aissue) first to avoid duplicates.
+
+  - type: input
+    id: version
+    attributes:
+      label: Vireo version
+      description: Release tag or commit hash you are running.
+      placeholder: "0.2.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install-type
+    attributes:
+      label: How did you install it?
+      options:
+        - Installer (Vireo-Setup-*.exe)
+        - Portable ZIP
+        - Built from source
+        - Browser mode (--server-only)
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: OS version
+      description: On Windows, run `winver` to see the version and build.
+      placeholder: "Windows 11 24H2, build 26100"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where did it happen?
+      options:
+        - Live diff viewer
+        - Code editor
+        - Agent Chat (built-in)
+        - CLI Agent (Claude / Codex / Gemini / Antigravity / etc.)
+        - Integrated terminal (xterm.js / Ghostty)
+        - Git / Source Control / Commit Graph / Checkpoints
+        - Quick Open / Workspace Search
+        - vx CLI tools
+        - Themes / UI layout
+        - Installer / Startup
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, step by step.
+      placeholder: |
+        1. Open a repository in Vireo
+        2. Switch to the Agent panel
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead?
+      description: Include the exact error message if there was one. Screenshots help; drag them into this box.
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else?
+      description: Model provider or CLI tool in use, whether it happens every time, terminal output, etc. Remove any API keys or private tokens before pasting.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this has not been reported.
+          required: true
+        - label: I removed API keys, tokens, and anything I do not want to be public from logs and screenshots.
+          required: true

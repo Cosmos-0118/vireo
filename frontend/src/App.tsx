@@ -1484,7 +1484,10 @@ export function App() {
             <div style={{ width: widths.sidebarWidth }} className="shrink-0 h-full overflow-hidden">
               <Sidebar
                 activeTab={sidebarTab}
-                onTabChange={setSidebarTab}
+                onTabChange={(t) => {
+                  if (t === sidebarTab) setShowSidebar(false);
+                  else setSidebarTab(t);
+                }}
                 gitStatus={gitStatus}
                 selectedPath={activeTab?.mode === 'diff' || activeTab?.mode === 'code' ? activeTab.path : null}
                 selectedTabId={activeTabId}

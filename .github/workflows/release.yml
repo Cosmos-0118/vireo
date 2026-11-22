@@ -1,0 +1,282 @@
+name: Release
+
+on:
+  push:
+    tags:
+      # Match semantic version tags such as v0.2.0 or v0.3.0-rc.1.
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach to its release (for example v0.2.0)
+        required: true
+        type: string
+
+# Every job states its own permissions; nothing is granted at the workflow level.
+permissions: {}
+
+concurrency:
+  # Never cancel a release half way through publishing.
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# Actions are pinned to full commit SHAs with the version tag in the comment.
+# Dependabot (.github/dependabot.yml) keeps both in sync.
+jobs:
+  release:
+    name: Build & Publish (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: write # creates/updates the GitHub Release and attaches assets
+      id-token: write # signs the build provenance attestation
+      attestations: write # stores the attestation on the repository
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+
+      - name: Read version from tag
+        shell: pwsh
+        run: |
+          if ($env:TAG -notmatch '^v(?<core>\d+\.\d+\.\d+)(?<pre>-[0-9A-Za-z.-]+)?$') {
+            throw "Tag '$env:TAG' must match vX.Y.Z or vX.Y.Z-prerelease."
+          }
+          $appVersion = $Matches.core + $Matches.pre
+          $installerVersion = $Matches.core
+          $isPrerelease = [bool]$Matches.pre
+          "APP_VERSION=$appVersion" | Add-Content -Path $env:GITHUB_ENV
+          "INSTALLER_VERSION=$installerVersion" | Add-Content -Path $env:GITHUB_ENV
+          "IS_PRERELEASE=$($isPrerelease.ToString().ToLowerInvariant())" | Add-Content -Path $env:GITHUB_ENV
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+
+      - name: Run unit tests
+        run: cargo test --manifest-path backend/Cargo.toml --locked
+
+      - name: Build release binaries
+        run: cargo build --release --bins --manifest-path backend/Cargo.toml --locked
+
+      - name: Stage release layout
+        shell: pwsh
+        run: ./scripts/stage-release.ps1 -Output artifacts/publish
+
+      - name: Create portable ZIP
+        shell: pwsh
+        run: |
+          $zipPath = "artifacts/Vireo-$env:APP_VERSION-win-x64.zip"
+          Compress-Archive -Path artifacts/publish/* -DestinationPath $zipPath -Force
+
+      - name: Install Inno Setup
+        # Pinned so the compiler changes only intentionally. Keep in sync with installer/Vireo.iss.
+        run: choco install innosetup --version=6.7.1 --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          ./installer/build.ps1 -Version $env:INSTALLER_VERSION -PublishDir artifacts/publish -OutDir artifacts
+          $built = "artifacts/Vireo-Setup-$env:INSTALLER_VERSION.exe"
+          $final = "artifacts/Vireo-Setup-$env:APP_VERSION.exe"
+          if ($built -ne $final) {
+            Move-Item -Path $built -Destination $final -Force
+          }
+
+      - name: Smoke-test install, health check, and uninstall
+        shell: pwsh
+        run: ./installer/smoke-test.ps1 -Setup "artifacts/Vireo-Setup-$env:APP_VERSION.exe"
+
+      - name: Write checksums and release notes
+        id: notes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "artifacts/Vireo-$env:APP_VERSION-win-x64.zip"
+          $setup = "artifacts/Vireo-Setup-$env:APP_VERSION.exe"
+
+          # Hash files and write SHA256SUMS.txt. The README rewrite here is a scratch check;
+          # the update-readme job opens a PR against the default branch for stable releases.
+          ./scripts/update-release-integrity.ps1 `
+            -Version $env:APP_VERSION `
+            -Files @($zip, $setup) `
+            -ChecksumsPath 'artifacts/SHA256SUMS.txt' `
+            -Repository '${{ github.repository }}'
+
+          Get-Content artifacts/SHA256SUMS.txt
+
+          $installerName = "Vireo-Setup-$env:APP_VERSION.exe"
+          $sha = (Get-FileHash $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+
+          # Preserve hand-written release notes from .github/release-notes/<tag>.md or an existing
+          # draft/published release body, appending the checksum block between markers.
+          $custom = ''
+          $notesFile = ".github/release-notes/$env:TAG.md"
+          if (Test-Path $notesFile) {
+            $custom = (Get-Content $notesFile -Raw).Trim()
+          } else {
+            try {
+              $existing = (gh release view $env:TAG --json body --jq .body 2>$null) -join "`n"
+              if ($LASTEXITCODE -eq 0 -and $existing) {
+                $existing = $existing -replace '(?s)<!-- vireo-integrity:start -->.*?<!-- vireo-integrity:end -->', ''
+                $custom = $existing.Trim()
+              }
+            } catch { }
+          }
+
+          $integrity = @(
+            '<!-- vireo-integrity:start -->',
+            '## Download & Verify',
+            '',
+            "- **Installer:** ``$installerName``",
+            "- **Portable:** ``Vireo-$env:APP_VERSION-win-x64.zip``",
+            '',
+            'Vireo binaries are unsigned, so Windows SmartScreen may prompt on first run. Verify your download in PowerShell (prints `True` when it matches):',
+            '',
+            '```powershell',
+            "(Get-FileHash .\$installerName -Algorithm SHA256).Hash -eq '$sha'",
+            '```',
+            '',
+            'Or verify the GitHub build provenance attestation:',
+            '',
+            '```powershell',
+            "gh attestation verify $installerName --repo ${{ github.repository }}",
+            '```',
+            '',
+            'All checksums are listed in `SHA256SUMS.txt`.',
+            '<!-- vireo-integrity:end -->'
+          ) -join "`n"
+
+          if ($custom) {
+            $body = $custom + "`n`n---`n`n" + $integrity
+            "has_custom=true" | Add-Content -Path $env:GITHUB_OUTPUT
+          } else {
+            $body = $integrity
+            "has_custom=false" | Add-Content -Path $env:GITHUB_OUTPUT
+          }
+          Set-Content -Path "$env:RUNNER_TEMP/release-notes.md" -Value $body -Encoding utf8
+
+      - name: Attest build provenance
+        # Anyone can verify a download with:
+        #   gh attestation verify Vireo-Setup-<version>.exe --repo Cosmos-0118/vireo
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            artifacts/Vireo-*-win-x64.zip
+            artifacts/Vireo-Setup-*.exe
+            artifacts/SHA256SUMS.txt
+
+      - name: Upload workflow release artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vireo-windows-release
+          path: |
+            artifacts/Vireo-*-win-x64.zip
+            artifacts/Vireo-Setup-*.exe
+            artifacts/SHA256SUMS.txt
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $files = @(
+            "artifacts/Vireo-$env:APP_VERSION-win-x64.zip",
+            "artifacts/Vireo-Setup-$env:APP_VERSION.exe",
+            "artifacts/SHA256SUMS.txt"
+          )
+          $exists = $false
+          try {
+            gh release view $env:TAG *> $null
+            $exists = $LASTEXITCODE -eq 0
+          } catch {
+            $exists = $false
+          }
+
+          if ($exists) {
+            gh release upload $env:TAG @files --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Failed to upload release assets." }
+            gh release edit $env:TAG --notes-file "$env:RUNNER_TEMP/release-notes.md"
+            if ($LASTEXITCODE -ne 0) { throw "Failed to update release notes." }
+          } else {
+            $args = @('release', 'create', $env:TAG) + $files + @(
+              '--title', "Vireo $env:TAG",
+              '--notes-file', "$env:RUNNER_TEMP/release-notes.md",
+              '--verify-tag'
+            )
+            if ('${{ steps.notes.outputs.has_custom }}' -ne 'true') {
+              $args += '--generate-notes'
+            }
+            if ($env:IS_PRERELEASE -eq 'true') {
+              $args += '--prerelease'
+            }
+            & gh @args
+            if ($LASTEXITCODE -ne 0) { throw "Failed to create GitHub release." }
+          }
+
+  update-readme:
+    # Opens a PR against the default branch updating the README checksum block for stable releases.
+    # Requires "Allow GitHub Actions to create and approve pull requests" in repository settings.
+    name: Update README checksums
+    needs: release
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download release checksums
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vireo-windows-release
+          path: release
+
+      - name: Update README integrity block
+        shell: pwsh
+        run: |
+          $version = $env:TAG.TrimStart('v')
+          ./scripts/update-release-integrity.ps1 `
+            -Version $version `
+            -FromChecksums release/SHA256SUMS.txt `
+            -Repository '${{ github.repository }}'
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@3ffccacd46053766916f087ce41d627c0b8cf2d1 # v8.1.3
+        with:
+          token: ${{ secrets.RELEASE_README_TOKEN || github.token }}
+          branch: chore/readme-${{ inputs.tag || github.ref_name }}
+          delete-branch: true
+          add-paths: README.md
+          commit-message: "docs: update README checksums for Vireo ${{ inputs.tag || github.ref_name }}"
+          title: "docs: update README checksums for Vireo ${{ inputs.tag || github.ref_name }}"
+          body: |
+            Automated by the release workflow after publishing [Vireo ${{ inputs.tag || github.ref_name }}](${{ github.server_url }}/${{ github.repository }}/releases/tag/${{ inputs.tag || github.ref_name }}).
+
+            Updates the version, SHA256 checksums, and verification commands in the README's *Download integrity* section.
