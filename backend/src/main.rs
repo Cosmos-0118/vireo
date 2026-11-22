@@ -7,6 +7,7 @@ mod code_intel;
 mod files;
 mod git;
 mod pty;
+mod secrets;
 mod state;
 mod watcher;
 
@@ -335,6 +336,8 @@ fn build_router(
         .route("/api/agent/permission", post(cli_agent::answer_permission))
         .route("/api/agent/cli-tools", get(pty::list_cli_tools))
         .route("/api/agent/models", get(agent::list_models))
+        .route("/api/secrets", get(secrets::get_secrets))
+        .route("/api/secrets/{name}", axum::routing::put(secrets::put_secret))
         .route("/ws/pty", get(pty::ws_pty))
         .route("/api/pty/kill", post(pty::kill_pty))
         .route("/ws/events", get(ws_events))

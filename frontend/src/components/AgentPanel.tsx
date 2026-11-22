@@ -136,6 +136,7 @@ const MODEL_PRESETS: Record<AgentConfig['provider'], string[]> = {
   'qwen-cli': ['default'],
 };
 
+const LEGACY_KEYS_STORE = 'vireo-agent-keys';
 const PROVIDER_LABEL: Record<AgentConfig['provider'], string> = {
   openai: 'OpenAI',
   anthropic: 'Anthropic',
@@ -151,6 +152,9 @@ const PROVIDER_LABEL: Record<AgentConfig['provider'], string> = {
   'amp-cli': 'Amp',
   'qwen-cli': 'Qwen Code',
 };
+
+/** Provider ids whose API keys are kept in the OS credential store. */
+const SECRET_NAMES = Object.keys(PROVIDER_LABEL);
 
 /** Providers that run an installed CLI with its own login instead of an API key. */
 const CLI_PROVIDER_TOOL: Partial<Record<AgentConfig['provider'], string>> = {
@@ -424,9 +428,12 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     return DEFAULT_CONFIG;
   });
   // Keys are remembered per provider so switching engines never leaks one provider's key to another.
+  const [secretsReady, setSecretsReady] = useState(false);
+  const savedSecretsRef = useRef<Record<string, string>>({});
   const [apiKeys, setApiKeys] = useState<Record<string, string>>(() => {
     try {
-      return JSON.parse(localStorage.getItem('vireo-agent-keys') || '{}');
+      // Legacy clear-text store; migrated to the OS credential store on mount, then removed.
+      return JSON.parse(localStorage.getItem(LEGACY_KEYS_STORE) || '{}');
     } catch {
       return {};
     }
@@ -533,9 +540,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         : { ok: false, text: 'No API key' };
   const engineShort = `${PROVIDER_LABEL[config.provider]}${shortModel(config.model) ? ` · ${shortModel(config.model)}` : ''}`;
 
+  // Persist everything except the API key, which goes to the OS credential store instead.
   useEffect(() => {
     try {
-      localStorage.setItem('vireo-agent-config', JSON.stringify(config));
+      localStorage.setItem('vireo-agent-config', JSON.stringify({ ...config, apiKey: '' }));
     } catch {
       // ignore
     }
@@ -547,13 +555,67 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     );
   }, [config.provider, config.apiKey]);
 
+  // Load keys from the OS credential store; keys a previous version left in localStorage are
+  // moved there once and then erased from the browser.
   useEffect(() => {
-    try {
-      localStorage.setItem('vireo-agent-keys', JSON.stringify(apiKeys));
-    } catch {
-      // ignore
-    }
-  }, [apiKeys]);
+    let cancelled = false;
+    (async () => {
+      let stored: Record<string, string> = {};
+      try {
+        stored = await api.getSecrets(SECRET_NAMES);
+      } catch {
+        // credential store unavailable: fall back to whatever is in memory
+      }
+      if (cancelled) return;
+      const merged: Record<string, string> = { ...stored };
+      for (const [k, v] of Object.entries(apiKeys)) if (v.trim()) merged[k] = v;
+      const saved = { ...stored };
+      let migrated = true;
+      for (const name of SECRET_NAMES) {
+        if ((merged[name] ?? '') === (stored[name] ?? '')) continue;
+        try {
+          await api.putSecret(name, merged[name]);
+          saved[name] = merged[name];
+        } catch {
+          migrated = false;
+        }
+      }
+      if (cancelled) return;
+      if (migrated) {
+        try {
+          localStorage.removeItem(LEGACY_KEYS_STORE);
+        } catch {
+          // ignore
+        }
+      }
+      savedSecretsRef.current = saved;
+      setApiKeys(merged);
+      setConfig((c) => (c.apiKey ? c : { ...c, apiKey: merged[c.provider] ?? '' }));
+      setSecretsReady(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Write changed keys back to the credential store (debounced while typing).
+  useEffect(() => {
+    if (!secretsReady) return;
+    const timer = setTimeout(() => {
+      for (const name of SECRET_NAMES) {
+        const value = apiKeys[name] ?? '';
+        if (value === (savedSecretsRef.current[name] ?? '')) continue;
+        api
+          .putSecret(name, value)
+          .then(() => {
+            savedSecretsRef.current[name] = value;
+          })
+          .catch(() => onToast('Could not save API key to the OS credential store', true));
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [apiKeys, secretsReady, onToast]);
 
   // Persist threads per workspace; a workspace switch swaps the list and starts a fresh thread.
   useEffect(() => {

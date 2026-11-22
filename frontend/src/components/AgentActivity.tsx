@@ -263,10 +263,20 @@ export function toolStatus(t: ToolCallTrace, turnActive: boolean): ToolStatus {
   return BLOCKED_RE.test(t.result.slice(0, 400)) ? 'blocked' : 'failed';
 }
 
+/** Remove `<tag>` / `</tag>` markers, repeating until stable so nested input like `<scr<x>ipt>` cannot reassemble a tag. */
+const stripTags = (s: string) => {
+  let prev: string;
+  do {
+    prev = s;
+    s = s.replace(/<\/?[a-z_]+>/gi, '');
+  } while (s !== prev);
+  return s;
+};
+
 /** First readable line of a failed result, without the "Error:" / "exit=N" prefix. */
 const failureLine = (t: ToolCallTrace) => {
   const r = (t.result ?? '').replace(/^exit=-?\d+\s*/, '').replace(/^error:?\s*/i, '');
-  return firstLine(r.replace(/<\/?[a-z_]+>/gi, '')) || 'Step failed';
+  return firstLine(stripTags(r)) || 'Step failed';
 };
 
 /** Files a turn successfully modified (deduplicated, original path spelling kept). */

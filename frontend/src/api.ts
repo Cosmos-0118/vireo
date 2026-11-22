@@ -273,6 +273,17 @@ export const api = {
       body: JSON.stringify({ turn_id: turnId, request_id: requestId, allow, remember }),
     }),
   cliTools: () => jsonFetch<CliToolStatus[]>('/api/agent/cli-tools'),
+  /** API keys live in the OS credential store (via the backend), never in browser storage. */
+  getSecrets: (names: string[]) =>
+    jsonFetch<Record<string, string>>(`/api/secrets?names=${encodeURIComponent(names.join(','))}`),
+  putSecret: async (name: string, value: string) => {
+    const res = await fetch(`/api/secrets/${encodeURIComponent(name)}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ value }),
+    });
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+  },
   agentModels: (ollamaBase?: string) =>
     jsonFetch<LocalModelsInfo>(
       `/api/agent/models${ollamaBase ? `?ollama_base=${encodeURIComponent(ollamaBase)}` : ''}`

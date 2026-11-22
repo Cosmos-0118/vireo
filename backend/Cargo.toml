@@ -47,3 +47,12 @@ xxhash-rust = { version = "0.8.21", features = ["xxh32"] }
 lto = "fat"
 codegen-units = 1
 strip = true
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+keyring = { version = "3", features = ["linux-native"] }
