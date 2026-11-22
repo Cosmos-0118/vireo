@@ -3,15 +3,9 @@ import { EditorState, Extension } from '@codemirror/state';
 import { EditorView, keymap, lineNumbers, highlightActiveLine, highlightActiveLineGutter } from '@codemirror/view';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { syntaxHighlighting } from '@codemirror/language';
-import { javascript } from '@codemirror/lang-javascript';
-import { rust } from '@codemirror/lang-rust';
-import { python } from '@codemirror/lang-python';
-import { json } from '@codemirror/lang-json';
-import { css } from '@codemirror/lang-css';
-import { html } from '@codemirror/lang-html';
-import { markdown } from '@codemirror/lang-markdown';
-import { GitCompare, MessageSquarePlus, Save } from 'lucide-react';
-import { buildHighlightStyle } from '../syntax';
+import { Code2, Eye, GitCompare, MessageSquarePlus, Save } from 'lucide-react';
+import { buildHighlightStyle, getLanguageSupport, isMarkdownPath, semanticHighlighting } from '../syntax';
+import { MarkdownMessage } from './MarkdownView';
 import type { LiteTheme } from '../themes';
 
 interface CodeEditorProps {
@@ -26,21 +20,9 @@ interface CodeEditorProps {
   onAskAgent: (snippet: string) => void;
 }
 
-function langExtension(path: string): Extension[] {
-  const lower = path.toLowerCase();
-  if (lower.endsWith('.ts') || lower.endsWith('.tsx') || lower.endsWith('.mts') || lower.endsWith('.cts')) {
-    return [javascript({ typescript: true, jsx: lower.endsWith('.tsx') })];
-  }
-  if (lower.endsWith('.js') || lower.endsWith('.jsx') || lower.endsWith('.mjs') || lower.endsWith('.cjs')) {
-    return [javascript({ jsx: lower.endsWith('.jsx') })];
-  }
-  if (lower.endsWith('.rs')) return [rust()];
-  if (lower.endsWith('.py')) return [python()];
-  if (lower.endsWith('.json')) return [json()];
-  if (lower.endsWith('.css')) return [css()];
-  if (lower.endsWith('.html') || lower.endsWith('.htm')) return [html()];
-  if (lower.endsWith('.md') || lower.endsWith('.markdown')) return [markdown()];
-  return [];
+function langExtension(path: string, theme: LiteTheme): Extension[] {
+  const support = getLanguageSupport(path);
+  return support ? [support, ...semanticHighlighting(path, theme)] : [];
 }
 
 export const CodeEditor: React.FC<CodeEditorProps> = ({
@@ -58,6 +40,25 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const viewRef = useRef<EditorView | null>(null);
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
+  const isMarkdown = isMarkdownPath(path);
+  const [mode, setMode] = useState<'source' | 'preview'>(isMarkdown && !jumpToLine ? 'preview' : 'source');
+  const [previewText, setPreviewText] = useState(content);
+
+  // Markdown opens rendered; everything else (and jump-to-line) opens as source.
+  useEffect(() => {
+    setMode(isMarkdown && !jumpToLine ? 'preview' : 'source');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
+
+  useEffect(() => {
+    setPreviewText(content);
+  }, [content]);
+
+  const switchMode = (next: 'source' | 'preview') => {
+    if (next === 'preview' && viewRef.current) setPreviewText(viewRef.current.state.doc.toString());
+    setMode(next);
+    if (next === 'source') requestAnimationFrame(() => viewRef.current?.requestMeasure());
+  };
 
   const handleSave = async () => {
     if (!viewRef.current) return;
@@ -90,7 +91,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           ...defaultKeymap,
           ...historyKeymap,
         ]),
-        ...langExtension(path),
+        ...langExtension(path, theme),
         syntaxHighlighting(buildHighlightStyle(theme)),
         EditorView.updateListener.of((u) => {
           if (u.docChanged) {
@@ -153,6 +154,24 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           )}
         </div>
         <div className="flex items-center gap-2">
+          {isMarkdown && (
+            <div className="flex items-center rounded-md border border-[var(--border)] overflow-hidden">
+              {(['preview', 'source'] as const).map((m) => (
+                <button
+                  key={m}
+                  onClick={() => switchMode(m)}
+                  className={`h-7 px-2.5 text-xs flex items-center gap-1.5 cursor-pointer transition-colors ${
+                    mode === m
+                      ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
+                      : 'bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
+                  }`}
+                >
+                  {m === 'preview' ? <Eye size={13} /> : <Code2 size={13} />}
+                  {m === 'preview' ? 'Preview' : 'Source'}
+                </button>
+              ))}
+            </div>
+          )}
           <button
             onClick={() => {
               const sel = viewRef.current?.state.sliceDoc(
@@ -188,7 +207,17 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           </button>
         </div>
       </div>
-      <div ref={containerRef} className="flex-1 min-h-0 overflow-hidden" />
+      {isMarkdown && mode === 'preview' && (
+        <div className="flex-1 min-h-0 overflow-auto px-6 py-4 bg-[var(--bg-base)]">
+          <div className="max-w-[860px] mx-auto">
+            <MarkdownMessage content={previewText} theme={theme} />
+          </div>
+        </div>
+      )}
+      <div
+        ref={containerRef}
+        className={`flex-1 min-h-0 overflow-hidden ${isMarkdown && mode === 'preview' ? 'hidden' : ''}`}
+      />
     </div>
   );
 };

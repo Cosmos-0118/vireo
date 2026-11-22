@@ -150,6 +150,7 @@ function renderSyntaxSpans(
           color: sp.color,
           fontStyle: sp.italic ? 'italic' : undefined,
           fontWeight: sp.bold ? 500 : undefined,
+          textDecoration: sp.underline ? 'underline' : sp.strike ? 'line-through' : undefined,
         }}
       >
         {sp.text}
@@ -186,6 +187,7 @@ function renderSyntaxSpans(
               color: sp.color,
               fontStyle: sp.italic ? 'italic' : undefined,
               fontWeight: sp.bold ? 500 : undefined,
+              textDecoration: sp.underline ? 'underline' : sp.strike ? 'line-through' : undefined,
             }}
           >
             {sp.text.slice(pos - spStart, segStart - spStart)}
@@ -201,6 +203,7 @@ function renderSyntaxSpans(
               color: sp.color,
               fontStyle: sp.italic ? 'italic' : undefined,
               fontWeight: sp.bold ? 500 : undefined,
+              textDecoration: sp.underline ? 'underline' : sp.strike ? 'line-through' : undefined,
               background: wordBgVar,
               borderRadius: 3,
               padding: '0.5px 0',
@@ -227,6 +230,7 @@ function renderSyntaxSpans(
             color: sp.color,
             fontStyle: sp.italic ? 'italic' : undefined,
             fontWeight: sp.bold ? 500 : undefined,
+            textDecoration: sp.underline ? 'underline' : sp.strike ? 'line-through' : undefined,
           }}
         >
           {sp.text.slice(pos - spStart)}

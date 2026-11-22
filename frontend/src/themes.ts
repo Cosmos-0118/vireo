@@ -38,6 +38,10 @@ export interface LiteTheme {
     type: string;
     variable: string;
     operator: string;
+    /** Member access / object keys; falls back to `variable` when unset. */
+    property?: string;
+    /** Decorators, attributes, markup markers; falls back to `type` when unset. */
+    meta?: string;
   };
   terminal: {
     background: string;
@@ -95,6 +99,8 @@ export const BUILTIN_THEMES: LiteTheme[] = [
       func: '#dcdcaa',
       type: '#4ec9b0',
       variable: '#9cdcfe',
+      property: '#9cdcfe',
+      meta: '#c586c0',
       operator: '#d4d4d4',
     },
     terminal: {
@@ -151,6 +157,8 @@ export const BUILTIN_THEMES: LiteTheme[] = [
       func: '#7aa2f7',
       type: '#2ac3de',
       variable: '#c0caf5',
+      property: '#73daca',
+      meta: '#e0af68',
       operator: '#89ddff',
     },
     terminal: {
@@ -207,6 +215,8 @@ export const BUILTIN_THEMES: LiteTheme[] = [
       func: '#89b4fa',
       type: '#f9e2af',
       variable: '#cdd6f4',
+      property: '#94e2d5',
+      meta: '#f5c2e7',
       operator: '#89dceb',
     },
     terminal: {
@@ -263,6 +273,8 @@ export const BUILTIN_THEMES: LiteTheme[] = [
       func: '#61afef',
       type: '#e5c07b',
       variable: '#e06c75',
+      property: '#d19a66',
+      meta: '#e5c07b',
       operator: '#56b6c2',
     },
     terminal: {
@@ -319,6 +331,8 @@ export const BUILTIN_THEMES: LiteTheme[] = [
       func: '#dcbdfb',
       type: '#f69d50',
       variable: '#cdd9e5',
+      property: '#6cb6ff',
+      meta: '#daaa3f',
       operator: '#f47067',
     },
     terminal: {
@@ -375,6 +389,8 @@ export const BUILTIN_THEMES: LiteTheme[] = [
       func: '#8250df',
       type: '#953800',
       variable: '#1f2328',
+      property: '#0550ae',
+      meta: '#116329',
       operator: '#cf222e',
     },
     terminal: {
@@ -471,6 +487,8 @@ export function parseVsCodeThemeJson(raw: string, fallbackName = 'Imported VS Co
       type: pickToken('type', base.syntax.type),
       variable: pickToken('variable', base.syntax.variable),
       operator: pickToken('operator', base.syntax.operator),
+      property: pickToken('property', base.syntax.property ?? base.syntax.variable),
+      meta: pickToken('decorator', base.syntax.meta ?? base.syntax.type),
     },
     terminal: {
       ...base.terminal,
