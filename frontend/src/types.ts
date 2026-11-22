@@ -229,6 +229,13 @@ export interface UiChatMessage {
   checkpoint?: Checkpoint;
   error?: string;
   streaming?: boolean;
+  /** User turns: context attached by the composer (shown as badges, never as raw text). */
+  ctxFiles?: string[];
+  ctxChanges?: number;
+  /** Assistant turns: timing (epoch ms) for the "Thought for Ns" row. */
+  startedAt?: number;
+  firstOutputAt?: number;
+  endedAt?: number;
 }
 
 export interface LocalModelsInfo {

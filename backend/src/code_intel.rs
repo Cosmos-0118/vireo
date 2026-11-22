@@ -46,6 +46,8 @@ Edits report new syntax errors immediately; no need to re-read after editing.";
 static PATH_ENV: OnceLock<OsString> = OnceLock::new();
 
 /// PATH used when spawning helper tools (rg, ast-grep, build commands). Optional.
+/// Only the main app calls this; the `vx` bin includes this file but never does.
+#[allow(dead_code)]
 pub fn set_path_env(p: OsString) {
     let _ = PATH_ENV.set(p);
 }
@@ -1475,6 +1477,8 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
 }
 
 /// Convenience for callers that want a plain string (errors prefixed with `Error:`).
+/// Used by the in-app agent only, not by the `vx` bin.
+#[allow(dead_code)]
 pub fn run_op_string(ws: &Path, op: &str, a: &Value) -> String {
     match run_op(ws, op, a) {
         Ok(s) => s,

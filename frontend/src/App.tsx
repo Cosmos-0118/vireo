@@ -1890,6 +1890,8 @@ export function App() {
                     : null
                 }
                 changedFileCount={gitStatus?.files.length ?? 0}
+                changedFiles={gitStatus?.files ?? []}
+                branch={gitStatus?.branch ?? ''}
                 allFiles={allFiles}
                 onLaunchCliAgent={() => {
                   setShowTerminal(true);

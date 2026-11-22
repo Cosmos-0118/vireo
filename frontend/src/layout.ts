@@ -6,7 +6,7 @@
 // min/max-constrained grid with layout priorities).
 
 export const SIDEBAR = { min: 220, max: 560, def: 320 };
-export const AGENT = { min: 280, max: 620, def: 400 };
+export const AGENT = { min: 290, max: 640, def: 360 };
 export const TERMINAL = { min: 100, def: 240 };
 /** The editor/diff column must never be squeezed below this. */
 export const CENTER_MIN_WIDTH = 340;
