@@ -286,7 +286,10 @@ impl Normalizer {
                         }
                         if matches!(state, Some("DONE") | Some("ERROR") | Some("FAILED") | Some("CANCELED")) {
                             let name = self.names.get(&id).cloned().unwrap_or_else(|| raw_name.to_string());
-                            let err = info["error"].as_str().filter(|s| !s.trim().is_empty());
+                            let err = info["error"]["message"]
+                                .as_str()
+                                .or_else(|| info["error"].as_str())
+                                .filter(|s| !s.trim().is_empty());
                             let mut text = if let Some(e) = err {
                                 if e.starts_with("Error") { e.to_string() } else { format!("Error: {e}") }
                             } else {
@@ -310,7 +313,10 @@ impl Normalizer {
                 self.finished = true;
                 let res = if v["result"].is_object() { &v["result"] } else { v };
                 let status = res["status"].as_str().unwrap_or("");
-                let err_msg = res["error"].as_str().filter(|s| !s.trim().is_empty());
+                let err_msg = res["error"]["message"]
+                    .as_str()
+                    .or_else(|| res["error"].as_str())
+                    .filter(|s| !s.trim().is_empty());
                 if status.eq_ignore_ascii_case("ERROR") || err_msg.is_some() {
                     let msg = err_msg
                         .map(str::to_string)
@@ -319,6 +325,15 @@ impl Normalizer {
                 } else if !self.emitted_text {
                     if let Some(resp) = res["response"].as_str().filter(|s| !s.trim().is_empty()) {
                         out.push(Out::Text(resp.trim().to_string()));
+                    } else if let Some(denied) = res["denied_actions"].as_array().filter(|a| !a.is_empty()) {
+                        let actions: Vec<&str> = denied
+                            .iter()
+                            .filter_map(|d| d["display_name"].as_str().or_else(|| d["action"].as_str()))
+                            .collect();
+                        let what = if actions.is_empty() { "a tool".to_string() } else { actions.join(", ") };
+                        out.push(Out::Error(format!(
+                            "Antigravity denied permission for {what} in headless mode. Switch the permission mode to Auto-edit or Full access to allow it."
+                        )));
                     }
                 }
             }
@@ -1256,9 +1271,10 @@ fn cli_args(kind: CliKind, ws: &Path, model: &str, mode: PermMode) -> Vec<String
             .to_vec();
             match mode {
                 PermMode::Ask => a.extend(["--mode", "plan"].map(String::from)),
-                PermMode::AutoEdit => a.extend(["--mode", "accept-edits"].map(String::from)),
-                PermMode::FullAccess => {
-                    a.extend(["--mode", "auto", "--dangerously-skip-permissions"].map(String::from))
+                // Headless `agy` auto-denies shell commands under `--mode accept-edits` because it
+                // cannot prompt for approval, so AutoEdit and FullAccess both skip interactive prompts.
+                PermMode::AutoEdit | PermMode::FullAccess => {
+                    a.push("--dangerously-skip-permissions".to_string());
                 }
             }
             a
@@ -1899,6 +1915,29 @@ x
     }
 
     #[test]
+    fn antigravity_tool_error_object_and_denied_actions() {
+        // Captured from agy.exe when a command is denied in headless mode.
+        let out = feed_all(
+            CliKind::Antigravity,
+            r"C:\proj",
+            &[
+                r#"{"event":"step_update","step_update":{"step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hello"}}}}"#,
+                r#"{"event":"step_update","step_update":{"step_index":2,"state":"ERROR","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"echo hello"},"error":{"type":"TOOL_ERROR","message":"permission check failed"}}}}"#,
+                r#"{"event":"result","result":{"status":"SUCCESS","response":"","denied_actions":[{"action":"command","display_name":"Bash"}]}}"#,
+            ],
+        );
+        assert_eq!(
+            out[0],
+            Out::ToolCall { id: "step_2".into(), name: "run_command".into(), args: json!({"command": "echo hello"}) }
+        );
+        assert_eq!(
+            out[1],
+            Out::ToolResult { id: "step_2".into(), name: "run_command".into(), result: "Error: permission check failed".into() }
+        );
+        assert!(matches!(&out[2], Out::Error(msg) if msg.contains("Bash")));
+    }
+
+    #[test]
     fn gemini_and_qwen_streams_normalize() {
         let out = feed_all(
             CliKind::Gemini,
@@ -1998,8 +2037,8 @@ x
     fn new_cli_args_and_modes() {
         let ws = Path::new("C:/proj");
         let has = |k, model, m, f: &str| cli_args(k, ws, model, m).iter().any(|a| a == f);
-        assert!(has(CliKind::Antigravity, "default", PermMode::AutoEdit, "accept-edits"));
         assert!(has(CliKind::Antigravity, "default", PermMode::Ask, "plan"));
+        assert!(has(CliKind::Antigravity, "default", PermMode::AutoEdit, "--dangerously-skip-permissions"));
         assert!(has(CliKind::Antigravity, "default", PermMode::FullAccess, "--dangerously-skip-permissions"));
         assert!(has(CliKind::Antigravity, "gemini-4-neon-high", PermMode::AutoEdit, "--model"));
         assert!(has(CliKind::Gemini, "gemini-2.5-pro", PermMode::AutoEdit, "auto_edit"));
