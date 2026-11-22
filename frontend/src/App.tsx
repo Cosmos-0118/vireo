@@ -1,5 +1,15 @@
-import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
+import React, {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from 'react';
 import {
+  Check,
+  Crosshair,
   FolderGit2,
   FolderOpen,
   GitBranch,
@@ -12,6 +22,7 @@ import {
   PanelLeft,
   PanelRight,
   Play,
+  RotateCcw,
   Plus,
   Search,
   Upload,
@@ -210,6 +221,15 @@ export function App() {
   const [pillDismissed, setPillDismissed] = useState(false);
   const [undoConfirm, setUndoConfirm] = useState(false);
   const userActivityRef = useRef(0);
+  /** Last loaded content per tab, shown instantly on switch while a fresh copy loads. */
+  const contentCacheRef = useRef(
+    new Map<
+      string,
+      { diff?: GitDiffRes; file?: { path: string; content: string; binary: boolean } }
+    >()
+  );
+  const activeTabIdRef = useRef<string | null>(null);
+  const reviewRef = useRef<Record<string, string>>({});
   const editorDirtyRef = useRef(false);
   /** Last known on-disk content per path; the baseline for "what did the agent just change". */
   const snapshotsRef = useRef<Map<string, string>>(new Map());
@@ -306,6 +326,8 @@ export function App() {
   // Active tab loader
   const activeTab = tabs.find((t) => t.id === activeTabId) || null;
 
+  activeTabIdRef.current = activeTabId;
+
   const reloadActiveContent = useCallback(async () => {
     if (!activeTab) {
       setDiffData(null);
@@ -315,11 +337,41 @@ export function App() {
     if (activeTab.mode === 'graph') {
       return;
     }
+    const id = activeTab.id;
+    const cache = contentCacheRef.current;
+    const isCurrent = () => activeTabIdRef.current === id;
+    const remember = (patch: { diff?: GitDiffRes; file?: { path: string; content: string; binary: boolean } }) => {
+      const prev = cache.get(id);
+      cache.delete(id);
+      cache.set(id, { ...prev, ...patch });
+      while (cache.size > 30) cache.delete(cache.keys().next().value as string);
+    };
+    const sameDiff = (a: GitDiffRes | null, b: GitDiffRes) =>
+      !!a &&
+      a.path === b.path &&
+      a.staged === b.staged &&
+      a.binary === b.binary &&
+      a.modified === b.modified &&
+      a.original === b.original;
+
+    let loadDiff: (() => Promise<GitDiffRes>) | null = null;
     if (activeTab.mode === 'diff') {
-      setDiffLoading(true);
+      loadDiff = () => api.gitDiff(activeTab.path, !!activeTab.staged);
+    } else if (activeTab.mode === 'commit-diff' && activeTab.commitHash) {
+      const hash = activeTab.commitHash;
+      loadDiff = () => api.gitCommitDiff(hash, activeTab.path, activeTab.oldPath);
+    } else if (activeTab.mode === 'compare-diff' && activeTab.commitHash) {
+      const hash = activeTab.commitHash;
+      loadDiff = () => api.gitCompareDiff(hash, activeTab.path, activeTab.oldPath);
+    }
+
+    if (loadDiff) {
+      // Cached copy is already on screen: revalidate silently, no loading flash.
+      if (!cache.get(id)?.diff) setDiffLoading(true);
       try {
-        const d = await api.gitDiff(activeTab.path, !!activeTab.staged);
+        const d = await loadDiff();
         if (
+          activeTab.mode === 'diff' &&
           !d.binary &&
           !activeTab.staged &&
           !snapshotsRef.current.has(activeTab.path) &&
@@ -327,39 +379,13 @@ export function App() {
         ) {
           snapshotsRef.current.set(activeTab.path, d.modified);
         }
-        setDiffData(d);
+        remember({ diff: d });
+        // Keep the same object when nothing changed so the viewer does no recompute.
+        if (isCurrent()) setDiffData((prev) => (sameDiff(prev, d) ? prev : d));
       } catch {
-        setDiffData(null);
+        if (isCurrent()) setDiffData(null);
       } finally {
-        setDiffLoading(false);
-      }
-    } else if (activeTab.mode === 'commit-diff' && activeTab.commitHash) {
-      setDiffLoading(true);
-      try {
-        const d = await api.gitCommitDiff(
-          activeTab.commitHash,
-          activeTab.path,
-          activeTab.oldPath
-        );
-        setDiffData(d);
-      } catch {
-        setDiffData(null);
-      } finally {
-        setDiffLoading(false);
-      }
-    } else if (activeTab.mode === 'compare-diff' && activeTab.commitHash) {
-      setDiffLoading(true);
-      try {
-        const d = await api.gitCompareDiff(
-          activeTab.commitHash,
-          activeTab.path,
-          activeTab.oldPath
-        );
-        setDiffData(d);
-      } catch {
-        setDiffData(null);
-      } finally {
-        setDiffLoading(false);
+        if (isCurrent()) setDiffLoading(false);
       }
     } else {
       try {
@@ -371,12 +397,40 @@ export function App() {
         ) {
           snapshotsRef.current.set(activeTab.path, f.content);
         }
-        setFileData({ path: activeTab.path, content: f.content, binary: f.binary });
+        const fd = { path: activeTab.path, content: f.content, binary: f.binary };
+        remember({ file: fd });
+        if (isCurrent()) {
+          setFileData((prev) =>
+            prev && prev.path === fd.path && prev.content === fd.content && prev.binary === fd.binary
+              ? prev
+              : fd
+          );
+        }
       } catch {
-        setFileData(null);
+        if (isCurrent()) setFileData(null);
       }
     }
   }, [activeTab]);
+
+  // Switching tabs: paint the cached content immediately (before the browser paints), then revalidate.
+  useLayoutEffect(() => {
+    const c = activeTabId ? contentCacheRef.current.get(activeTabId) : undefined;
+    setDiffData(c?.diff ?? null);
+    setFileData(c?.file ?? null);
+    const diffMode =
+      activeTab?.mode === 'diff' || activeTab?.mode === 'commit-diff' || activeTab?.mode === 'compare-diff';
+    setDiffLoading(diffMode && !c?.diff);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTabId, activeTab?.mode]);
+
+  // Warm the viewer chunks so the first switch to a diff / editor tab does not wait on a download.
+  useEffect(() => {
+    const t = window.setTimeout(() => {
+      void import('./components/DiffViewer');
+      void import('./components/CodeEditor');
+    }, 1200);
+    return () => window.clearTimeout(t);
+  }, []);
 
   useEffect(() => {
     reloadActiveContent();
@@ -458,6 +512,7 @@ export function App() {
             reloadActiveContentRef.current();
           } else if (data.type === 'workspace_switched') {
             snapshotsRef.current.clear();
+            contentCacheRef.current.clear();
             setLiveEdits([]);
             setReview({});
             setPillDismissed(false);
@@ -570,6 +625,7 @@ export function App() {
   }, []);
 
   tabsRef.current = tabs;
+  reviewRef.current = review;
   gitStatusRef.current = gitStatus;
   followRef.current = followEdits;
 
@@ -606,6 +662,8 @@ export function App() {
         ranges: Array<{ from: number; to: number }>;
         /** Content before this edit, or null when it is not a trustworthy review baseline. */
         baseline: string | null;
+        /** Net change vs the review baseline (what the sidebar shows), when a baseline is known. */
+        total: { adds: number; dels: number } | null;
       }> = [];
       const currents = new Map<string, string>();
       for (const path of files) {
@@ -639,11 +697,13 @@ export function App() {
         while (snaps.size > 40) snaps.delete(snaps.keys().next().value as string);
         if (prev === undefined || prev === cur) continue;
 
+        // CRLF vs LF must not look like a whole-file rewrite (git stores LF, the working tree is CRLF).
+        const lf = (t: string) => t.replace(/\r\n/g, '\n');
         let adds = 0;
         let dels = 0;
         let line = 0;
         const ranges: Array<{ from: number; to: number }> = [];
-        for (const part of diffLines(prev, cur)) {
+        for (const part of diffLines(lf(prev), lf(cur))) {
           const n = part.count ?? 0;
           if (part.added) {
             adds += n;
@@ -655,7 +715,20 @@ export function App() {
             line += n;
           }
         }
-        if (adds || dels) results.push({ path, adds, dels, ranges, baseline: trusted ? prev : null });
+        if (adds || dels) {
+          const eolMatched =
+            cur.includes('\r\n') && !prev.includes('\r\n') ? prev.replace(/\n/g, '\r\n') : prev;
+          const base = reviewRef.current[path] ?? (trusted ? prev : null);
+          let total: { adds: number; dels: number } | null = null;
+          if (base !== null) {
+            total = { adds: 0, dels: 0 };
+            for (const part of diffLines(lf(base), lf(cur))) {
+              if (part.added) total.adds += part.count ?? 0;
+              else if (part.removed) total.dels += part.count ?? 0;
+            }
+          }
+          results.push({ path, adds, dels, ranges, baseline: trusted ? eolMatched : null, total });
+        }
       }
 
       // Files whose content is back to their review baseline are no longer pending.
@@ -698,8 +771,8 @@ export function App() {
           m.delete(r.path);
           m.set(r.path, {
             path: r.path,
-            adds: (old?.adds ?? 0) + r.adds,
-            dels: (old?.dels ?? 0) + r.dels,
+            adds: r.total ? r.total.adds : (old?.adds ?? 0) + r.adds,
+            dels: r.total ? r.total.dels : (old?.dels ?? 0) + r.dels,
             at: Date.now(),
           });
         }
@@ -871,6 +944,7 @@ export function App() {
   }, []);
 
   const closeTab = (id: string) => {
+    contentCacheRef.current.delete(id);
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
       if (activeTabId === id) {
@@ -1635,111 +1709,137 @@ export function App() {
               </Suspense>
             )}
 
-            {/* Live edit stream (watcher-driven; works for any agent) */}
-            {!pillDismissed &&
-              (pillVisible || pausedJump || reviewPaths.length > 0) &&
-              liveEdits.length > 0 && (
-              <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 max-w-[calc(100%-24px)] flex items-center gap-2 h-[30px] px-3 rounded-full border border-[var(--border)] bg-[var(--bg-elevated)] shadow-lg text-[11.5px] overflow-hidden">
-                <span className="live-dot w-1.5 h-1.5 rounded-full bg-[var(--added-fg)] shrink-0" />
-                <span className="shrink-0 font-medium text-[var(--text-primary)]">
-                  Live edits
-                  {liveEdits.length > 1 ? ` (${liveEdits.length} files)` : ''}
-                </span>
-                <div className="flex items-center gap-2 min-w-0 overflow-hidden">
-                  {liveEdits.slice(-4).map((e, i, arr) => {
-                    const name = e.path.split('/').pop() || e.path;
-                    const current = activeTab?.path === e.path;
-                    return (
-                      <button
-                        key={e.path}
-                        onClick={() => focusPath(e.path)}
-                        title={e.path}
-                        className={`flex items-center gap-1 shrink-0 cursor-pointer rounded px-1 hover:bg-[var(--bg-hover)] ${
-                          current ? 'text-[var(--text-primary)] bg-[var(--bg-active)]' : 'text-[var(--text-muted)]'
-                        } ${i === arr.length - 1 && tabPulse[e.path] !== undefined ? 'row-pulse-0' : ''}`}
-                      >
-                        <span className="font-mono">{name}</span>
-                        <span className="font-mono tabular-nums text-[var(--added-fg)]">+{e.adds}</span>
-                        <span className="font-mono tabular-nums text-[var(--removed-fg)]">-{e.dels}</span>
-                      </button>
-                    );
-                  })}
+            {/* Agent edits bar: docked under the viewer (never covers code), same chrome as the toolbars */}
+          </div>
+
+          {!pillDismissed &&
+            (pillVisible || pausedJump || reviewPaths.length > 0) &&
+            liveEdits.length > 0 && (
+              <div className="shrink-0 flex items-center gap-2 h-9 px-3 border-t border-[var(--border)] bg-[var(--bg-sidebar)] text-xs">
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="live-dot w-1.5 h-1.5 rounded-full bg-[var(--added-fg)]" />
+                  <span className="font-medium text-[var(--text-primary)]">Agent edits</span>
+                  <span className="text-[var(--text-dim)] tabular-nums">
+                    {liveEdits.length} {liveEdits.length === 1 ? 'file' : 'files'}
+                  </span>
                 </div>
-                {pausedJump && (
-                  <button
-                    onClick={() => focusPath(pausedJump)}
-                    className="shrink-0 px-2 h-5 rounded-full bg-[var(--accent)] text-[var(--accent-fg)] font-medium cursor-pointer"
-                  >
-                    Jump to live edit ↗
-                  </button>
-                )}
-                {reviewPaths.length > 0 && (
-                  <>
+                <span className="w-px h-4 bg-[var(--border)] shrink-0" />
+                <div className="flex items-center gap-0.5 min-w-0 flex-1 overflow-x-auto">
+                  {liveEdits
+                    .slice()
+                    .reverse()
+                    .map((e) => {
+                      const name = e.path.split('/').pop() || e.path;
+                      const current = activeTab?.path === e.path;
+                      return (
+                        <button
+                          key={e.path}
+                          onClick={() => focusPath(e.path)}
+                          title={e.path}
+                          className={`h-6 px-2 rounded-md flex items-center gap-1.5 shrink-0 cursor-pointer transition-colors ${
+                            current
+                              ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
+                              : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                          } ${
+                            tabPulse[e.path] !== undefined ? `row-pulse-${tabPulse[e.path] % 2}` : ''
+                          }`}
+                        >
+                          <FileIcon path={e.path} size={12} />
+                          <span>{name}</span>
+                          <span className="font-mono text-[11px] tabular-nums text-[var(--added-fg)]">
+                            +{e.adds}
+                          </span>
+                          <span className="font-mono text-[11px] tabular-nums text-[var(--removed-fg)]">
+                            -{e.dels}
+                          </span>
+                        </button>
+                      );
+                    })}
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {pausedJump && (
                     <button
-                      onClick={() =>
-                        openDiff(
-                          activeTab && reviewPaths.includes(activeTab.path)
-                            ? activeTab.path
-                            : reviewPaths[reviewPaths.length - 1]
-                        )
-                      }
-                      className="shrink-0 px-1.5 h-5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] cursor-pointer"
-                      title="Open the full side-by-side diff"
+                      onClick={() => focusPath(pausedJump)}
+                      className="h-6 px-2 rounded-md bg-[var(--accent)] text-[var(--accent-fg)] font-medium flex items-center gap-1.5 cursor-pointer hover:opacity-90"
                     >
-                      View diff
+                      Show latest
                     </button>
-                    <button
-                      onClick={keepAll}
-                      className="shrink-0 px-1.5 h-5 rounded border border-[var(--added-fg)]/60 text-[var(--added-fg)] hover:bg-[var(--added-bg)] cursor-pointer"
-                      title="Accept all agent edits"
-                    >
-                      Keep all
-                    </button>
-                    <button
-                      onClick={() => {
-                        if (!undoConfirm) {
-                          setUndoConfirm(true);
-                          window.setTimeout(() => setUndoConfirm(false), 3000);
-                        } else {
-                          setUndoConfirm(false);
-                          void undoAll();
+                  )}
+                  {reviewPaths.length > 0 && (
+                    <>
+                      <button
+                        onClick={() =>
+                          openDiff(
+                            activeTab && reviewPaths.includes(activeTab.path)
+                              ? activeTab.path
+                              : reviewPaths[reviewPaths.length - 1]
+                          )
                         }
-                      }}
-                      className="shrink-0 px-1.5 h-5 rounded border border-[var(--removed-fg)]/60 text-[var(--removed-fg)] hover:bg-[var(--removed-bg)] cursor-pointer"
-                      title="Revert every file to how it was before the agent's edits"
-                    >
-                      {undoConfirm ? 'Confirm undo?' : 'Undo all'}
-                    </button>
-                  </>
-                )}
-                <button
-                  onClick={toggleFollow}
-                  className={`shrink-0 px-1.5 h-5 rounded border cursor-pointer ${
-                    followEdits
-                      ? 'border-[var(--added-fg)]/60 text-[var(--added-fg)]'
-                      : 'border-[var(--border)] text-[var(--text-muted)]'
-                  }`}
-                  title={
-                    followEdits
-                      ? 'Following edits: the view jumps to what an agent just changed (pauses while you type or scroll)'
-                      : 'Follow edits is off'
-                  }
-                >
-                  Follow
-                </button>
-                <button
-                  onClick={() => {
-                    setPillDismissed(true);
-                    setPausedJump(null);
-                  }}
-                  className="shrink-0 p-0.5 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
-                  title="Dismiss"
-                >
-                  <X size={12} />
-                </button>
+                        className="h-6 px-2 rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 cursor-pointer transition-colors"
+                        title="Open the side-by-side diff"
+                      >
+                        <GitCompare size={12} />
+                        Diff
+                      </button>
+                      <button
+                        onClick={() => {
+                          if (!undoConfirm) {
+                            setUndoConfirm(true);
+                            window.setTimeout(() => setUndoConfirm(false), 3000);
+                          } else {
+                            setUndoConfirm(false);
+                            void undoAll();
+                          }
+                        }}
+                        className={`h-6 px-2 rounded-md border flex items-center gap-1.5 cursor-pointer transition-colors ${
+                          undoConfirm
+                            ? 'border-[var(--removed-fg)] bg-[var(--removed-bg)] text-[var(--removed-fg)]'
+                            : 'border-[var(--border)] bg-[var(--bg-elevated)] text-[var(--removed-fg)] hover:bg-[var(--removed-bg)]'
+                        }`}
+                        title="Revert every file to how it was before the agent's edits"
+                      >
+                        <RotateCcw size={12} />
+                        {undoConfirm ? 'Confirm undo' : 'Undo all'}
+                      </button>
+                      <button
+                        onClick={keepAll}
+                        className="h-6 px-2 rounded-md bg-[var(--accent)] text-[var(--accent-fg)] font-medium flex items-center gap-1.5 cursor-pointer hover:opacity-90"
+                        title="Accept all agent edits"
+                      >
+                        <Check size={12} />
+                        Keep all
+                      </button>
+                    </>
+                  )}
+                  <button
+                    onClick={toggleFollow}
+                    aria-pressed={followEdits}
+                    className={`h-6 w-6 rounded-md border flex items-center justify-center cursor-pointer transition-colors ${
+                      followEdits
+                        ? 'border-[var(--border)] bg-[var(--bg-active)] text-[var(--accent)]'
+                        : 'border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
+                    }`}
+                    title={
+                      followEdits
+                        ? 'Following edits (pauses while you type or scroll). Click to turn off.'
+                        : 'Follow edits is off. Click to turn on.'
+                    }
+                  >
+                    <Crosshair size={13} />
+                  </button>
+                  <button
+                    onClick={() => {
+                      setPillDismissed(true);
+                      setPausedJump(null);
+                    }}
+                    className="h-6 w-6 rounded-md flex items-center justify-center text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                    title="Hide"
+                  >
+                    <X size={13} />
+                  </button>
+                </div>
               </div>
             )}
-          </div>
 
           {/* Bottom Terminal */}
           {(showTerminal || terminalMountedRef.current) && (

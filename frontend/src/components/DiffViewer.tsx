@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { diffLines, diffWordsWithSpace } from 'diff';
 import {
   ArrowLeft,
@@ -403,6 +403,209 @@ function buildFoldedItems<T>(
   return items;
 }
 
+
+const ROW_ALT = 'opacity-0 group-hover:opacity-100 absolute right-1.5 top-0.5 px-1.5 py-0.5 text-[10px] font-sans rounded bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer transition-opacity';
+
+interface RowCommon {
+  cluster: number;
+  clusterStart: boolean;
+  isActive: boolean;
+  live: boolean;
+  liveClass: string;
+  pill: React.ReactNode;
+  wrapClass: string;
+  emptyBg: string;
+  onEnter: (cluster: number) => void;
+  registerRef: (cluster: number, el: HTMLTableRowElement | null) => void;
+  onAsk: (line: number | null, text: string) => void;
+}
+
+const SplitRowView = React.memo(function SplitRowView({
+  row,
+  leftSpans,
+  rightSpans,
+  cluster,
+  clusterStart,
+  isActive,
+  live,
+  liveClass,
+  pill,
+  wrapClass,
+  emptyBg,
+  onEnter,
+  registerRef,
+  onAsk,
+}: RowCommon & { row: SplitRow; leftSpans?: TokenSpan[]; rightSpans?: TokenSpan[] }) {
+  const leftRanges = useMemo(
+    () => (row.pairHighlight ? computeChangedRanges(row.left.text, row.right.text, 'left') : []),
+    [row]
+  );
+  const rightRanges = useMemo(
+    () => (row.pairHighlight ? computeChangedRanges(row.left.text, row.right.text, 'right') : []),
+    [row]
+  );
+  const leftBg =
+    row.left.type === 'remove' ? 'var(--removed-bg)' : row.left.type === 'empty' ? emptyBg : 'transparent';
+  const rightBg =
+    row.right.type === 'add' ? 'var(--added-bg)' : row.right.type === 'empty' ? emptyBg : 'transparent';
+  const gutter =
+    'select-none text-right pr-2.5 pl-1.5 text-[11px] tabular-nums text-[var(--text-dim)] border-r border-[var(--border)]/70 align-top';
+
+  return (
+    <tr
+      data-r="1"
+      ref={(el) => {
+        if (clusterStart) registerRef(cluster, el);
+      }}
+      data-live={live ? '1' : undefined}
+      onMouseEnter={cluster >= 0 ? () => onEnter(cluster) : undefined}
+      className={`group ${live ? liveClass : ''} ${
+        isActive ? 'outline outline-1 outline-[var(--accent)]/60' : ''
+      }`}
+    >
+      <td
+        className={gutter}
+        style={{
+          background: leftBg,
+          boxShadow: row.left.type === 'remove' ? 'inset 3px 0 0 var(--removed-fg)' : undefined,
+        }}
+      >
+        {row.left.line ?? ''}
+      </td>
+      <td
+        className={`px-2.5 border-r border-[var(--border)] align-top relative ${wrapClass}`}
+        style={{ background: leftBg }}
+      >
+        {row.left.type === 'remove' && (
+          <span className="select-none mr-1.5 font-semibold text-[var(--removed-fg)]">-</span>
+        )}
+        {row.left.type !== 'empty' &&
+          renderSyntaxSpans(row.left.text, leftSpans, leftRanges, 'var(--removed-word)')}
+        {row.left.type === 'remove' && (
+          <button
+            onClick={() => onAsk(row.left.line, row.left.text)}
+            className={ROW_ALT}
+            title="Quote this deleted line to Agent Chat"
+          >
+            Ask
+          </button>
+        )}
+      </td>
+      <td
+        className={gutter}
+        style={{
+          background: rightBg,
+          boxShadow: row.right.type === 'add' ? 'inset 3px 0 0 var(--added-fg)' : undefined,
+        }}
+      >
+        {row.right.line ?? ''}
+      </td>
+      <td className={`px-2.5 align-top relative ${wrapClass}`} style={{ background: rightBg }}>
+        {row.right.type === 'add' && (
+          <span className="select-none mr-1.5 font-semibold text-[var(--added-fg)]">+</span>
+        )}
+        {row.right.type !== 'empty' &&
+          renderSyntaxSpans(row.right.text, rightSpans, rightRanges, 'var(--added-word)')}
+        {pill}
+        {row.right.line !== null && !pill && (
+          <button
+            onClick={() => onAsk(row.right.line, row.right.text)}
+            className={ROW_ALT}
+            title="Quote this line to Agent Chat"
+          >
+            Ask
+          </button>
+        )}
+      </td>
+    </tr>
+  );
+});
+
+const UnifiedRowView = React.memo(function UnifiedRowView({
+  row,
+  spans,
+  cluster,
+  clusterStart,
+  isActive,
+  live,
+  liveClass,
+  pill,
+  wrapClass,
+  onEnter,
+  registerRef,
+  onAsk,
+}: Omit<RowCommon, 'emptyBg'> & { row: UnifiedRow; spans?: TokenSpan[] }) {
+  const changedRanges = useMemo(
+    () =>
+      row.pairedText !== undefined
+        ? row.type === 'remove'
+          ? computeChangedRanges(row.text, row.pairedText, 'left')
+          : computeChangedRanges(row.pairedText, row.text, 'right')
+        : [],
+    [row]
+  );
+  const wordBg = row.type === 'add' ? 'var(--added-word)' : 'var(--removed-word)';
+  const accentStripe =
+    row.type === 'add'
+      ? 'inset 3px 0 0 var(--added-fg)'
+      : row.type === 'remove'
+      ? 'inset 3px 0 0 var(--removed-fg)'
+      : undefined;
+
+  return (
+    <tr
+      data-r="1"
+      ref={(el) => {
+        if (clusterStart) registerRef(cluster, el);
+      }}
+      data-live={live ? '1' : undefined}
+      onMouseEnter={cluster >= 0 ? () => onEnter(cluster) : undefined}
+      className={`group ${live ? liveClass : ''} ${
+        isActive ? 'outline outline-1 outline-[var(--accent)]/60' : ''
+      }`}
+      style={{
+        background:
+          row.type === 'add' ? 'var(--added-bg)' : row.type === 'remove' ? 'var(--removed-bg)' : 'transparent',
+      }}
+    >
+      <td
+        className="w-12 select-none text-right pr-2.5 pl-1.5 text-[11px] tabular-nums text-[var(--text-dim)] border-r border-[var(--border)]/70 align-top"
+        style={{ boxShadow: accentStripe }}
+      >
+        {row.oldLine ?? ''}
+      </td>
+      <td className="w-12 select-none text-right pr-2.5 pl-1.5 text-[11px] tabular-nums text-[var(--text-dim)] border-r border-[var(--border)]/70 align-top">
+        {row.newLine ?? ''}
+      </td>
+      <td className="w-6 select-none text-center font-semibold align-top">
+        {row.type === 'add' ? (
+          <span className="text-[var(--added-fg)]">+</span>
+        ) : row.type === 'remove' ? (
+          <span className="text-[var(--removed-fg)]">-</span>
+        ) : (
+          ' '
+        )}
+      </td>
+      <td className={`px-2.5 relative align-top ${wrapClass}`}>
+        {renderSyntaxSpans(row.text, spans, changedRanges, wordBg)}
+        {pill}
+        {!pill && (
+          <button onClick={() => onAsk(row.newLine ?? row.oldLine, row.text)} className={ROW_ALT}>
+            Ask
+          </button>
+        )}
+      </td>
+    </tr>
+  );
+});
+
+/** Windowing: only rows near the viewport are mounted once a diff is long. */
+const VIRTUAL_MIN_ITEMS = 300;
+/** Above this, wrapping is off (fixed-height rows keep scrolling and tab switches fast). */
+const HUGE_ITEMS = 800;
+const OVERSCAN_PX = 900;
+const WINDOW_CHUNK = 24;
+
 export const DiffViewer: React.FC<DiffViewerProps> = ({
   diff,
   fileStatus,
@@ -426,10 +629,12 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   // (container-based, not viewport-based, because panes are user-resizable).
   const [rootEl, setRootEl] = useState<HTMLDivElement | null>(null);
   const [narrow, setNarrow] = useState(false);
+  const [rootW, setRootW] = useState(1200);
   useEffect(() => {
     if (!rootEl) return;
     const ro = new ResizeObserver((entries) => {
       const w = entries[0].contentRect.width;
+      setRootW(Math.round(w / 8) * 8);
       setNarrow((prev) => (prev ? w < 600 : w < 560));
     });
     ro.observe(rootEl);
@@ -437,7 +642,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   }, [rootEl]);
   const viewMode: 'split' | 'unified' = narrow ? 'unified' : preferredViewMode;
   const [compactMode, setCompactMode] = useState<boolean>(true);
-  const [wordWrap, setWordWrap] = useState<boolean>(false);
+  const [wordWrap, setWordWrap] = useState<boolean>(true);
   const [ignoreWhitespace, setIgnoreWhitespace] = useState<boolean>(false);
   const [expandedRanges, setExpandedRanges] = useState<Array<{ from: number; to: number }>>([]);
   const [activeHunk, setActiveHunk] = useState<number>(-1);
@@ -452,6 +657,8 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     setExpandedRanges([]);
     setActiveHunk(-1);
     hunkRefs.current = {};
+    scrollContainerRef.current?.scrollTo(0, 0);
+    setWin({ start: 0, end: WINDOW_CHUNK * 7 });
   }, [diff?.path, diff?.staged, commitContext?.hash]);
 
   const syntaxTokens = useMemo(() => {
@@ -459,10 +666,11 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
       return { oldLines: [] as TokenSpan[][], newLines: [] as TokenSpan[][] };
     }
     return {
-      oldLines: highlightLines(diff.original || '', diff.path, theme),
-      newLines: highlightLines(diff.modified || '', diff.path, theme),
+      oldLines: highlightLines((diff.original || '').replace(/\r\n/g, '\n'), diff.path, theme),
+      newLines: highlightLines((diff.modified || '').replace(/\r\n/g, '\n'), diff.path, theme),
     };
-  }, [diff, theme]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diff?.original, diff?.modified, diff?.path, diff?.binary, theme]);
 
   const computed = useMemo(() => {
     if (!diff || diff.binary) {
@@ -474,12 +682,19 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
         hunks: [] as HunkMeta[],
         adds: 0,
         dels: 0,
+        eolMismatch: false,
       };
     }
 
-    const changes = diffLines(diff.original || '', diff.modified || '', {
-      ignoreWhitespace,
-    });
+    // Index (LF) vs working tree (CRLF) would otherwise show every line as changed.
+    const rawOld = diff.original || '';
+    const rawNew = diff.modified || '';
+    const eolMismatch = rawOld.includes('\r\n') !== rawNew.includes('\r\n');
+    const changes = diffLines(
+      eolMismatch ? rawOld.replace(/\r\n/g, '\n') : rawOld,
+      eolMismatch ? rawNew.replace(/\r\n/g, '\n') : rawNew,
+      { ignoreWhitespace }
+    );
     const unified: UnifiedRow[] = [];
     const split: SplitRow[] = [];
 
@@ -629,8 +844,9 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     }
     if (cur) finish(unified.length - 1, hunks.length);
 
-    return { unified, split, unifiedChanged, splitChanged, hunks, adds, dels };
-  }, [diff, ignoreWhitespace]);
+    return { unified, split, unifiedChanged, splitChanged, hunks, adds, dels, eolMismatch };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [diff?.original, diff?.modified, diff?.path, diff?.binary, ignoreWhitespace]);
 
   const splitItems = useMemo(
     () =>
@@ -663,6 +879,138 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   );
   const unifiedScopeTexts = useMemo(() => computed.unified.map((r) => r.text), [computed.unified]);
 
+  const activeItems = viewMode === 'split' ? splitItems : unifiedItems;
+  // Windowing needs uniform row heights: true whenever nothing wraps. If every line fits its
+  // column, wrapping is moot, so long diffs are windowed even with wrap on.
+  const longestLine = useMemo(() => {
+    let m = 0;
+    for (const r of computed.unified) if (r.text.length > m) m = r.text.length;
+    return m + 2;
+  }, [computed.unified]);
+  const colPx =
+    viewMode === 'split' ? (rootW - 10 - 2 * 48 - 2 * 20) / 2 : rootW - 10 - 96 - 24 - 20;
+  const fitsOneLine = longestLine <= Math.floor(colPx / 8.2);
+  const large = activeItems.length > VIRTUAL_MIN_ITEMS;
+  const virtual = large && (fitsOneLine || !wordWrap || activeItems.length > HUGE_ITEMS);
+  // Wrapping is switched off only when a long diff has long lines (wrapped rows can't be windowed).
+  const huge = virtual && !fitsOneLine && wordWrap;
+  const effectiveWrap = wordWrap && !huge;
+
+  // Measured row / fold heights (rows are single-line when virtual, so heights are uniform).
+  const [dims, setDims] = useState({ row: 20, fold: 25 });
+  const offsets = useMemo(() => {
+    const o = new Float64Array(activeItems.length + 1);
+    for (let i = 0; i < activeItems.length; i++) {
+      o[i + 1] = o[i] + (activeItems[i].kind === 'fold' ? dims.fold : dims.row);
+    }
+    return o;
+  }, [activeItems, dims]);
+
+  const [win, setWin] = useState({ start: 0, end: WINDOW_CHUNK * 7 });
+  const recomputeWin = useCallback(() => {
+    const el = scrollContainerRef.current;
+    if (!el || !virtual) return;
+    const n = activeItems.length;
+    const find = (y: number) => {
+      let lo = 0;
+      let hi = n;
+      while (lo < hi) {
+        const m = (lo + hi) >> 1;
+        if (offsets[m + 1] <= y) lo = m + 1;
+        else hi = m;
+      }
+      return lo;
+    };
+    const top = el.scrollTop;
+    const start = Math.max(0, Math.floor(find(top - OVERSCAN_PX) / WINDOW_CHUNK) * WINDOW_CHUNK);
+    const end = Math.min(
+      n,
+      Math.ceil((find(top + el.clientHeight + OVERSCAN_PX) + 1) / WINDOW_CHUNK) * WINDOW_CHUNK
+    );
+    setWin((p) => (p.start === start && p.end === end ? p : { start, end }));
+  }, [virtual, offsets, activeItems.length]);
+
+  const scrollRafRef = useRef(0);
+  const onScrollerScroll = useCallback(() => {
+    if (scrollRafRef.current) return;
+    scrollRafRef.current = requestAnimationFrame(() => {
+      scrollRafRef.current = 0;
+      recomputeWin();
+    });
+  }, [recomputeWin]);
+
+  useLayoutEffect(() => {
+    recomputeWin();
+  }, [recomputeWin, diff?.path]);
+
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el || !virtual) return;
+    const ro = new ResizeObserver(() => recomputeWin());
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [virtual, recomputeWin, diff?.path]);
+
+  // Measure real row heights so spacer math never drifts (zoom, fonts, borders).
+  useEffect(() => {
+    if (!virtual) return;
+    const sc = scrollContainerRef.current;
+    if (!sc) return;
+    const r = sc.querySelector('tr[data-r]');
+    const f = sc.querySelector('tr[data-f]');
+    setDims((p) => {
+      const nr = r ? r.getBoundingClientRect().height : p.row;
+      const nf = f ? f.getBoundingClientRect().height : p.fold;
+      return Math.abs(nr - p.row) < 0.05 && Math.abs(nf - p.fold) < 0.05 ? p : { row: nr, fold: nf };
+    });
+  });
+
+  const scrollToItem = useCallback(
+    (idx: number, smooth: boolean) => {
+      const el = scrollContainerRef.current;
+      if (!el || idx < 0) return;
+      el.scrollTo({
+        top: Math.max(0, offsets[idx] - el.clientHeight / 2 + dims.row),
+        behavior: smooth ? 'smooth' : 'auto',
+      });
+    },
+    [offsets, dims.row]
+  );
+
+  // Live edits: scroll to the lines an agent just wrote (unless the user is busy scrolling/typing).
+  const handledFlashRef = useRef(0);
+  useEffect(() => {
+    if (!liveFlash || !followEdits || handledFlashRef.current === liveFlash.key) return;
+    const isLive = (line: number | null) =>
+      line !== null && liveFlash.ranges.some((r) => line >= r.from && line <= r.to);
+    const idx = activeItems.findIndex((it) => {
+      if (it.kind !== 'row') return false;
+      if (viewMode === 'split') {
+        const r = it.row as SplitRow;
+        return r.right.type === 'add' && isLive(r.right.line);
+      }
+      const r = it.row as UnifiedRow;
+      return r.type === 'add' && isLive(r.newLine);
+    });
+    if (idx < 0) return;
+    handledFlashRef.current = liveFlash.key;
+    if (userActivityRef && Date.now() - userActivityRef.current < 4000) return;
+    if (virtual) scrollToItem(idx, true);
+    else
+      requestAnimationFrame(() =>
+        scrollContainerRef.current
+          ?.querySelector('[data-live="1"]')
+          ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      );
+  }, [liveFlash, followEdits, activeItems, viewMode, virtual, scrollToItem, userActivityRef]);
+
+  const askLineRef = useRef<(line: number | null, text: string) => void>(() => {});
+  const onAsk = useCallback((line: number | null, text: string) => askLineRef.current(line, text), []);
+  const onEnterCluster = useCallback((c: number) => setHoverHunk(c), []);
+  const registerRef = useCallback((c: number, el: HTMLTableRowElement | null) => {
+    hunkRefs.current[c] = el;
+  }, []);
+
   const totalHunks = computed.hunks.length;
 
   const jumpHunk = (dir: -1 | 1) => {
@@ -674,22 +1022,15 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           : totalHunks - 1
         : (activeHunk + dir + totalHunks) % totalHunks;
     setActiveHunk(next);
-    const el = hunkRefs.current[next];
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    if (virtual) {
+      scrollToItem(
+        activeItems.findIndex((it) => it.kind === 'row' && it.clusterStart && it.cluster === next),
+        true
+      );
+    } else {
+      hunkRefs.current[next]?.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
   };
-
-  // Live edits: scroll to the lines an agent just wrote (unless the user is busy scrolling/typing).
-  const handledFlashRef = useRef(0);
-  useEffect(() => {
-    if (!liveFlash || !followEdits || handledFlashRef.current === liveFlash.key) return;
-    const el = scrollContainerRef.current?.querySelector('[data-live="1"]');
-    if (!el) return;
-    handledFlashRef.current = liveFlash.key;
-    if (userActivityRef && Date.now() - userActivityRef.current < 4000) return;
-    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-  }, [liveFlash, followEdits, diff, viewMode, userActivityRef]);
 
   // VS Code F7 / Shift+F7 hunk navigation shortcut
   useEffect(() => {
@@ -768,6 +1109,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   const canApplyHunks =
     !commitContext &&
     !ignoreWhitespace &&
+    !computed.eolMismatch &&
     !!onApplyHunk &&
     !!fileStatus &&
     !fileStatus.untracked;
@@ -812,6 +1154,8 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     );
   };
 
+  askLineRef.current = askAboutLine;
+
   const askAboutHunk = (hunk: HunkMeta) => {
     const first = computed.unified[hunk.firstRow];
     const lineNum = first ? first.newLine ?? first.oldLine : null;
@@ -850,7 +1194,7 @@ ${hunk.excerpt.slice(0, 3500)}
   const pathDir = pathSlash >= 0 ? diff.path.slice(0, pathSlash + 1) : '';
   const pathName = pathSlash >= 0 ? diff.path.slice(pathSlash + 1) : diff.path;
 
-  const cellWrapClass = wordWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre';
+  const cellWrapClass = effectiveWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre';
 
   const renderFoldRow = (
     item: { id: string; startIndex: number; endIndex: number; count: number },
@@ -859,7 +1203,7 @@ ${hunk.excerpt.slice(0, 3500)}
   ) => {
     const scope = findScopeLabel(scopeTexts, item.endIndex);
     return (
-      <tr key={item.id} className="select-none">
+      <tr key={item.id} data-f="1" className="select-none">
         <td
           colSpan={colSpan}
           className="h-6 px-3 text-[11px] font-sans text-[var(--text-muted)] border-y border-dashed border-[var(--border)]/60 bg-[var(--bg-sidebar)]/50"
@@ -1008,6 +1352,14 @@ ${hunk.excerpt.slice(0, 3500)}
           >
             {contextBadge}
           </span>
+          {computed.eolMismatch && (
+            <span
+              className="text-[10.5px] px-1.5 py-0.5 rounded border border-[var(--border)] text-[var(--text-muted)] shrink-0"
+              title="Line endings differ between the two sides (CRLF vs LF); they are ignored here and hunk actions are disabled"
+            >
+              EOL ignored
+            </span>
+          )}
           <div className="flex items-center gap-1.5 shrink-0 tabular-nums">
             <span className="text-xs font-mono font-medium text-[var(--added-fg)]">
               +{computed.adds}
@@ -1085,11 +1437,17 @@ ${hunk.excerpt.slice(0, 3500)}
           <button
             onClick={() => setWordWrap((v) => !v)}
             className={`p-1.5 rounded border border-[var(--border)] cursor-pointer ${
-              wordWrap
+              effectiveWrap
                 ? 'bg-[var(--bg-active)] text-[var(--accent)]'
                 : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
             }`}
-            title={wordWrap ? 'Word wrap ON (click to disable)' : 'Word wrap OFF (click to enable)'}
+            title={
+              huge
+                ? 'Wrap is paused for this large diff (keeps scrolling fast)'
+                : wordWrap
+                ? 'Word wrap ON (click to disable)'
+                : 'Word wrap OFF (click to enable)'
+            }
           >
             <WrapText size={13} />
           </button>
@@ -1218,261 +1576,103 @@ ${hunk.excerpt.slice(0, 3500)}
           <div
             ref={scrollContainerRef}
             onMouseLeave={() => setHoverHunk(-1)}
-            className="flex-1 overflow-auto font-mono text-[13px] leading-[1.6]"
+            onScroll={virtual ? onScrollerScroll : undefined}
+            className="flex-1 overflow-auto font-mono text-[13px] leading-[20px]"
           >
-            {viewMode === 'split' ? (
-              <table className={`w-full border-collapse ${wordWrap ? 'table-fixed' : 'min-w-full'}`}>
-                <colgroup>
-                  <col className="w-12" />
-                  <col className="w-1/2" />
-                  <col className="w-12" />
-                  <col className="w-1/2" />
-                </colgroup>
-                <tbody>
-                  {splitItems.map((item) => {
-                    if (item.kind === 'fold') {
-                      return renderFoldRow(item, 4, splitScopeTexts);
-                    }
+            {(() => {
+              const n = activeItems.length;
+              const start = virtual ? Math.min(win.start, n) : 0;
+              const end = virtual ? Math.min(win.end, n) : n;
+              const topPad = virtual ? offsets[start] : 0;
+              const botPad = virtual ? offsets[n] - offsets[end] : 0;
+              const spacer = (h: number, key: string) => (
+                <tr key={key} aria-hidden style={{ height: h }}>
+                  <td colSpan={4} style={{ padding: 0, border: 0 }} />
+                </tr>
+              );
+              const common = (cluster: number, clusterStart: boolean) => ({
+                cluster,
+                clusterStart,
+                isActive: clusterStart && cluster === activeHunk,
+                pill:
+                  clusterStart && (hoverHunk === cluster || activeHunk === cluster)
+                    ? renderHunkPill(cluster)
+                    : null,
+                liveClass,
+                wrapClass: cellWrapClass,
+                onEnter: onEnterCluster,
+                registerRef,
+                onAsk,
+              });
 
-                    const { row, index, cluster, clusterStart } = item;
-                    const leftRanges = row.pairHighlight
-                      ? computeChangedRanges(row.left.text, row.right.text, 'left')
-                      : [];
-                    const rightRanges = row.pairHighlight
-                      ? computeChangedRanges(row.left.text, row.right.text, 'right')
-                      : [];
-                    const leftSpans =
-                      row.left.line !== null
-                        ? syntaxTokens.oldLines[row.left.line - 1]
-                        : undefined;
-                    const rightSpans =
-                      row.right.line !== null
-                        ? syntaxTokens.newLines[row.right.line - 1]
-                        : undefined;
-                    const isActiveHunk = clusterStart && cluster === activeHunk;
-                    const showPill = clusterStart && (hoverHunk === cluster || activeHunk === cluster);
-                    const live = isLiveLine(row.right.line) && row.right.type === 'add';
+              if (viewMode === 'split') {
+                return (
+                  <table
+                    className={`w-full border-collapse ${effectiveWrap ? 'table-fixed' : 'min-w-full'}`}
+                  >
+                    <colgroup>
+                      <col className="w-12" />
+                      <col className="w-1/2" />
+                      <col className="w-12" />
+                      <col className="w-1/2" />
+                    </colgroup>
+                    <tbody>
+                      {topPad > 0 && spacer(topPad, 'pad-top')}
+                      {splitItems.slice(start, end).map((item) => {
+                        if (item.kind === 'fold') return renderFoldRow(item, 4, splitScopeTexts);
+                        const { row, index, cluster, clusterStart } = item;
+                        return (
+                          <SplitRowView
+                            key={index}
+                            row={row}
+                            leftSpans={
+                              row.left.line !== null ? syntaxTokens.oldLines[row.left.line - 1] : undefined
+                            }
+                            rightSpans={
+                              row.right.line !== null ? syntaxTokens.newLines[row.right.line - 1] : undefined
+                            }
+                            live={row.right.type === 'add' && isLiveLine(row.right.line)}
+                            emptyBg={emptyCellBg}
+                            {...common(cluster, clusterStart)}
+                          />
+                        );
+                      })}
+                      {botPad > 0 && spacer(botPad, 'pad-bottom')}
+                    </tbody>
+                  </table>
+                );
+              }
 
-                    return (
-                      <tr
-                        key={index}
-                        ref={(el) => {
-                          if (clusterStart) hunkRefs.current[cluster] = el;
-                        }}
-                        data-live={live ? '1' : undefined}
-                        onMouseEnter={cluster >= 0 ? () => setHoverHunk(cluster) : undefined}
-                        className={`group ${live ? liveClass : ''} ${
-                          isActiveHunk ? 'outline outline-1 outline-[var(--accent)]/60' : ''
-                        }`}
-                      >
-                        {/* Left gutter */}
-                        <td
-                          className="select-none text-right pr-2.5 pl-1.5 text-[11px] tabular-nums text-[var(--text-dim)] border-r border-[var(--border)]/70 align-top"
-                          style={{
-                            background:
-                              row.left.type === 'remove'
-                                ? 'var(--removed-bg)'
-                                : row.left.type === 'empty'
-                                ? emptyCellBg
-                                : 'transparent',
-                            boxShadow:
-                              row.left.type === 'remove'
-                                ? 'inset 3px 0 0 var(--removed-fg)'
-                                : undefined,
-                          }}
-                        >
-                          {row.left.line ?? ''}
-                        </td>
-
-                        {/* Left content */}
-                        <td
-                          className={`px-2.5 border-r border-[var(--border)] align-top relative ${cellWrapClass}`}
-                          style={{
-                            background:
-                              row.left.type === 'remove'
-                                ? 'var(--removed-bg)'
-                                : row.left.type === 'empty'
-                                ? emptyCellBg
-                                : 'transparent',
-                          }}
-                        >
-                          {row.left.type === 'remove' && (
-                            <span className="select-none mr-1.5 font-semibold text-[var(--removed-fg)]">
-                              -
-                            </span>
-                          )}
-                          {row.left.type !== 'empty' &&
-                            renderSyntaxSpans(
-                              row.left.text,
-                              leftSpans,
-                              leftRanges,
-                              'var(--removed-word)'
-                            )}
-                          {row.left.type === 'remove' && (
-                            <button
-                              onClick={() => askAboutLine(row.left.line, row.left.text)}
-                              className="opacity-0 group-hover:opacity-100 absolute right-1.5 top-0.5 px-1.5 py-0.5 text-[10px] font-sans rounded bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer transition-opacity"
-                              title="Quote this deleted line to Agent Chat"
-                            >
-                              Ask
-                            </button>
-                          )}
-                        </td>
-
-                        {/* Right gutter */}
-                        <td
-                          className="select-none text-right pr-2.5 pl-1.5 text-[11px] tabular-nums text-[var(--text-dim)] border-r border-[var(--border)]/70 align-top"
-                          style={{
-                            background:
-                              row.right.type === 'add'
-                                ? 'var(--added-bg)'
-                                : row.right.type === 'empty'
-                                ? emptyCellBg
-                                : 'transparent',
-                            boxShadow:
-                              row.right.type === 'add'
-                                ? 'inset 3px 0 0 var(--added-fg)'
-                                : undefined,
-                          }}
-                        >
-                          {row.right.line ?? ''}
-                        </td>
-
-                        {/* Right content */}
-                        <td
-                          className={`px-2.5 align-top relative ${cellWrapClass}`}
-                          style={{
-                            background:
-                              row.right.type === 'add'
-                                ? 'var(--added-bg)'
-                                : row.right.type === 'empty'
-                                ? emptyCellBg
-                                : 'transparent',
-                          }}
-                        >
-                          {row.right.type === 'add' && (
-                            <span className="select-none mr-1.5 font-semibold text-[var(--added-fg)]">
-                              +
-                            </span>
-                          )}
-                          {row.right.type !== 'empty' &&
-                            renderSyntaxSpans(
-                              row.right.text,
-                              rightSpans,
-                              rightRanges,
-                              'var(--added-word)'
-                            )}
-                          {showPill && renderHunkPill(cluster)}
-                          {row.right.line !== null && !showPill && (
-                            <button
-                              onClick={() => askAboutLine(row.right.line, row.right.text)}
-                              className="opacity-0 group-hover:opacity-100 absolute right-1.5 top-0.5 px-1.5 py-0.5 text-[10px] font-sans rounded bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer transition-opacity"
-                              title="Quote this line to Agent Chat"
-                            >
-                              Ask
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            ) : (
-              <table className="w-full border-collapse">
-                <tbody>
-                  {unifiedItems.map((item) => {
-                    if (item.kind === 'fold') {
-                      return renderFoldRow(item, 4, unifiedScopeTexts);
-                    }
-
-                    const { row, index, cluster, clusterStart } = item;
-                    const spans =
-                      row.type === 'remove'
-                        ? row.oldLine !== null
-                          ? syntaxTokens.oldLines[row.oldLine - 1]
-                          : undefined
-                        : row.newLine !== null
-                        ? syntaxTokens.newLines[row.newLine - 1]
-                        : undefined;
-
-                    const changedRanges =
-                      row.pairedText !== undefined
-                        ? row.type === 'remove'
-                          ? computeChangedRanges(row.text, row.pairedText, 'left')
-                          : computeChangedRanges(row.pairedText, row.text, 'right')
-                        : [];
-
-                    const wordBg =
-                      row.type === 'add' ? 'var(--added-word)' : 'var(--removed-word)';
-
-                    const accentStripe =
-                      row.type === 'add'
-                        ? 'inset 3px 0 0 var(--added-fg)'
-                        : row.type === 'remove'
-                        ? 'inset 3px 0 0 var(--removed-fg)'
-                        : undefined;
-
-                    const isActiveHunk = clusterStart && cluster === activeHunk;
-                    const showPill = clusterStart && (hoverHunk === cluster || activeHunk === cluster);
-                    const live = isLiveLine(row.newLine) && row.type === 'add';
-
-                    return (
-                      <tr
-                        key={index}
-                        ref={(el) => {
-                          if (clusterStart) hunkRefs.current[cluster] = el;
-                        }}
-                        data-live={live ? '1' : undefined}
-                        onMouseEnter={cluster >= 0 ? () => setHoverHunk(cluster) : undefined}
-                        className={`group ${live ? liveClass : ''} ${
-                          isActiveHunk ? 'outline outline-1 outline-[var(--accent)]/60' : ''
-                        }`}
-                        style={{
-                          background:
-                            row.type === 'add'
-                              ? 'var(--added-bg)'
-                              : row.type === 'remove'
-                              ? 'var(--removed-bg)'
-                              : 'transparent',
-                        }}
-                      >
-                        <td
-                          className="w-12 select-none text-right pr-2.5 pl-1.5 text-[11px] tabular-nums text-[var(--text-dim)] border-r border-[var(--border)]/70 align-top"
-                          style={{ boxShadow: accentStripe }}
-                        >
-                          {row.oldLine ?? ''}
-                        </td>
-                        <td className="w-12 select-none text-right pr-2.5 pl-1.5 text-[11px] tabular-nums text-[var(--text-dim)] border-r border-[var(--border)]/70 align-top">
-                          {row.newLine ?? ''}
-                        </td>
-                        <td className="w-6 select-none text-center font-semibold align-top">
-                          {row.type === 'add' ? (
-                            <span className="text-[var(--added-fg)]">+</span>
-                          ) : row.type === 'remove' ? (
-                            <span className="text-[var(--removed-fg)]">-</span>
-                          ) : (
-                            ' '
-                          )}
-                        </td>
-                        <td className={`px-2.5 relative align-top ${cellWrapClass}`}>
-                          {renderSyntaxSpans(row.text, spans, changedRanges, wordBg)}
-                          {showPill && renderHunkPill(cluster)}
-                          {!showPill && (
-                          <button
-                            onClick={() => askAboutLine(row.newLine ?? row.oldLine, row.text)}
-                            className="opacity-0 group-hover:opacity-100 absolute right-2 top-0.5 px-1.5 py-0.5 text-[10px] font-sans rounded bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer transition-opacity"
-                          >
-                            Ask
-                          </button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            )}
+              return (
+                <table className="w-full border-collapse">
+                  <tbody>
+                    {topPad > 0 && spacer(topPad, 'pad-top')}
+                    {unifiedItems.slice(start, end).map((item) => {
+                      if (item.kind === 'fold') return renderFoldRow(item, 4, unifiedScopeTexts);
+                      const { row, index, cluster, clusterStart } = item;
+                      const spans =
+                        row.type === 'remove'
+                          ? row.oldLine !== null
+                            ? syntaxTokens.oldLines[row.oldLine - 1]
+                            : undefined
+                          : row.newLine !== null
+                          ? syntaxTokens.newLines[row.newLine - 1]
+                          : undefined;
+                      return (
+                        <UnifiedRowView
+                          key={index}
+                          row={row}
+                          spans={spans}
+                          live={row.type === 'add' && isLiveLine(row.newLine)}
+                          {...common(cluster, clusterStart)}
+                        />
+                      );
+                    })}
+                    {botPad > 0 && spacer(botPad, 'pad-bottom')}
+                  </tbody>
+                </table>
+              );
+            })()}
           </div>
 
           {/* VS Code Overview Ruler (clickable proportional diff minimap) */}
