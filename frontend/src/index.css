@@ -1,0 +1,114 @@
+@import "tailwindcss";
+
+:root {
+  --bg-base: #1e1e1e;
+  --bg-sidebar: #252526;
+  --bg-activity: #181818;
+  --bg-panel: #1b1b1c;
+  --bg-elevated: #2d2d30;
+  --bg-hover: #2a2d2e;
+  --bg-active: #37373d;
+  --bg-input: #1e1e1e;
+  --border: #333337;
+  --text-primary: #d4d4d4;
+  --text-muted: #9da5b4;
+  --text-dim: #6e7681;
+  --accent: #007acc;
+  --accent-hover: #1f8ad2;
+  --accent-fg: #ffffff;
+  --added-bg: rgba(46, 160, 67, 0.16);
+  --added-word: rgba(46, 160, 67, 0.42);
+  --added-fg: #4ec9b0;
+  --removed-bg: rgba(248, 81, 73, 0.16);
+  --removed-word: rgba(248, 81, 73, 0.42);
+  --removed-fg: #f48771;
+  --modified-fg: #e2c08d;
+  --danger: #f14c4c;
+  --status-bar-bg: #007acc;
+  --status-bar-fg: #ffffff;
+  --font-mono: 'Cascadia Code', 'JetBrains Mono', 'Fira Code', Consolas, 'Courier New', monospace;
+  --font-sans: 'Segoe UI', -apple-system, BlinkMacSystemFont, Inter, Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+code,
+pre,
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+/* Thin VS Code-style scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(128, 128, 128, 0.28);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(128, 128, 128, 0.5);
+}
+
+/* CodeMirror sizing */
+.cm-editor {
+  height: 100%;
+  font-family: var(--font-mono) !important;
+  font-size: 13px;
+  background: var(--bg-base) !important;
+  color: var(--text-primary) !important;
+}
+
+.cm-scroller {
+  overflow: auto;
+  line-height: 1.55;
+}
+
+.cm-gutters {
+  background: var(--bg-base) !important;
+  color: var(--text-dim) !important;
+  border-right: 1px solid var(--border) !important;
+}
+
+.cm-activeLine {
+  background: rgba(128, 128, 128, 0.08) !important;
+}
+
+.cm-activeLineGutter {
+  background: rgba(128, 128, 128, 0.12) !important;
+  color: var(--text-primary) !important;
+}
+
+/* xterm sizing */
+.xterm {
+  height: 100%;
+  padding: 6px 8px;
+}
+
+.xterm-viewport {
+  overflow-y: auto !important;
+}

@@ -1,0 +1,1 @@
+{"root":["./src/app.tsx","./src/api.ts","./src/main.tsx","./src/themes.ts","./src/types.ts","./src/components/agentpanel.tsx","./src/components/codeeditor.tsx","./src/components/diffviewer.tsx","./src/components/quickopen.tsx","./src/components/sidebar.tsx","./src/components/terminalpanel.tsx"],"version":"5.9.3"}
