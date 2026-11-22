@@ -109,7 +109,11 @@ foreach ($tool in $spec.tools) {
     # The staged tool must actually start (catches a wrong layout before it reaches a release).
     $exe = Join-Path $toolsDir $tool.check[0]
     $checkArgs = @($tool.check | Select-Object -Skip 1)
-    $version = (& $exe @checkArgs 2>&1 | Select-Object -First 1)
+    # Capture all output before trimming: `| Select-Object -First 1` stops the pipeline early, so
+    # $LASTEXITCODE is never set and strict mode throws when it is read.
+    $global:LASTEXITCODE = 0
+    $checkOutput = @(& $exe @checkArgs 2>&1)
+    $version = $checkOutput | Select-Object -First 1
     if ($LASTEXITCODE -ne 0) { throw "$name failed its self-check ($exe): $version" }
     Write-Host "  $name OK: $version"
 
