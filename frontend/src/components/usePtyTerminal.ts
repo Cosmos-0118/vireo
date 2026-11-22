@@ -301,7 +301,21 @@ export function usePtyTerminal(
       // Return value means "let the terminal process this key" for xterm.js, but "I handled
       // it, skip default handling" for ghostty-web, so the two are inverted.
       const HANDLED = built.engine === 'ghostty';
+      const sendInput = (data: string) => {
+        if (!disposed && sock && sock.readyState === WebSocket.OPEN) {
+          sock.send(JSON.stringify({ type: 'input', data }));
+        }
+      };
       term.attachCustomKeyEventHandler((ev) => {
+        // The terminal encodes Shift+Enter as a plain CR, so CLI agents (Claude Code, Codex)
+        // submit instead of starting a new line. Send LF (Ctrl+J) instead: those CLIs treat it
+        // as "insert newline", and plain shells treat it like Enter, as before. Every event
+        // phase is swallowed so the keypress can't still emit a CR.
+        if (ev.key === 'Enter' && ev.shiftKey && !ev.ctrlKey && !ev.altKey && !ev.metaKey) {
+          ev.preventDefault();
+          if (ev.type === 'keydown') sendInput('\n');
+          return HANDLED;
+        }
         if (ev.type !== 'keydown') return !HANDLED;
         if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return !HANDLED;
         const key = ev.key.toLowerCase();
@@ -319,19 +333,14 @@ export function usePtyTerminal(
           // holds an image (no text), CLI agents read it from the OS clipboard themselves once
           // they get their image-paste key, so forward that instead of pasting nothing.
           const pasteImageKey = IS_WINDOWS ? '\x1bv' : '\x16'; // Alt+V on Windows, Ctrl+V elsewhere
-          const send = (data: string) => {
-            if (!disposed && sock && sock.readyState === WebSocket.OPEN) {
-              sock.send(JSON.stringify({ type: 'input', data }));
-            }
-          };
           navigator.clipboard
             ?.readText()
             .then((text) => {
               if (disposed) return;
               if (text) term.paste(text);
-              else send(pasteImageKey);
+              else sendInput(pasteImageKey);
             })
-            .catch(() => send(pasteImageKey));
+            .catch(() => sendInput(pasteImageKey));
           return HANDLED;
         }
         return !HANDLED;

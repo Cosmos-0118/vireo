@@ -48,6 +48,13 @@ lto = "fat"
 codegen-units = 1
 strip = true
 
+# CI smoke-test builds: release semantics (optimized, no debug assertions, GUI subsystem)
+# without fat LTO / single codegen unit, which dominate build time. Shipped builds use `release`.
+[profile.ci]
+inherits = "release"
+lto = false
+codegen-units = 16
+
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
 

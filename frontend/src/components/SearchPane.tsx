@@ -571,8 +571,8 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
     const body = text.slice(lead);
     let start = 0;
     let prefix = false;
-    if (ranges.length > 0 && ranges[0][0] > 28) {
-      start = ranges[0][0] - 18;
+    if (ranges.length > 0 && ranges[0][0] > 20) {
+      start = ranges[0][0] - 12;
       prefix = true;
     }
     const parts: React.ReactNode[] = [];
@@ -601,7 +601,7 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
         parts.push(
           <mark
             key={`m${i}`}
-            className="bg-[var(--accent)]/25 text-[var(--text-primary)] font-semibold rounded-[2px] px-[1px] ring-1 ring-[var(--accent)]/40"
+            className="bg-[var(--accent)]/30 text-[var(--text-primary)] rounded-[3px]"
           >
             {matched}
           </mark>
@@ -638,23 +638,29 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
           setActiveKey(key);
           setMenu({ x: e.clientX, y: e.clientY, group: g });
         }}
-        className={`group relative mx-1.5 flex items-center gap-1.5 h-[26px] px-2 rounded-md text-[12.5px] cursor-pointer select-none ${
+        className={`group relative mx-1.5 mt-0.5 first:mt-0 flex items-center gap-1.5 h-[26px] pl-1 pr-2 rounded-md text-[12.5px] cursor-pointer select-none ${
           isActive ? 'bg-[var(--bg-active)]' : 'hover:bg-[var(--bg-hover)]'
         }`}
+        title={g.path}
       >
-        {isCollapsed ? (
-          <ChevronRight size={13} className="shrink-0 text-[var(--text-muted)]" />
-        ) : (
-          <ChevronDown size={13} className="shrink-0 text-[var(--text-muted)]" />
-        )}
+        <ChevronRight
+          size={13}
+          className={`shrink-0 text-[var(--text-dim)] transition-transform duration-100 ${
+            isCollapsed ? '' : 'rotate-90'
+          }`}
+        />
         <FileIcon path={g.path} size={15} />
-        <span
-          className="font-medium truncate shrink-0 max-w-[60%]"
-          style={{ color: st ? fileStatusColor(st.badge) : 'var(--text-primary)' }}
-        >
-          {g.name}
+        <span className="flex-1 min-w-0 flex items-baseline gap-1.5 overflow-hidden">
+          <span
+            className="font-medium truncate min-w-[3ch] shrink"
+            style={{ color: st ? fileStatusColor(st.badge) : 'var(--text-primary)' }}
+          >
+            {g.name}
+          </span>
+          {g.dir && (
+            <span className="truncate shrink-[3] text-[11px] text-[var(--text-dim)]">{g.dir}</span>
+          )}
         </span>
-        <span className="truncate text-[11px] text-[var(--text-dim)] flex-1 min-w-0">{g.dir}</span>
         <div className="flex items-center gap-1.5 shrink-0 group-hover:hidden">
           {st && (
             <span
@@ -664,7 +670,7 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
               {st.badge}
             </span>
           )}
-          <span className="px-1.5 py-[0.5px] rounded-full bg-[var(--bg-elevated)] text-[var(--text-muted)] text-[10px] font-semibold tabular-nums">
+          <span className="min-w-[18px] h-[16px] px-1.5 flex items-center justify-center rounded-full bg-[var(--bg-elevated)] text-[var(--text-muted)] text-[10px] font-medium tabular-nums">
             {g.count}
           </span>
         </div>
@@ -738,12 +744,12 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
           setActiveKey(key);
           setMenu({ x: e.clientX, y: e.clientY, group: g, match: m });
         }}
-        className={`group relative mx-1.5 flex items-center gap-2 h-[24px] pl-7 pr-2 rounded-md text-[12px] font-mono cursor-pointer ${
+        className={`group relative mx-1.5 flex items-center gap-2 h-[22px] pl-[26px] pr-2 rounded-md text-[12px] cursor-pointer ${
           isActive ? 'bg-[var(--bg-active)]' : 'hover:bg-[var(--bg-hover)]'
         }`}
       >
-        <span className="absolute left-[18px] top-0 bottom-0 w-px bg-[var(--border)] opacity-50" />
-        <span className="w-7 shrink-0 text-right text-[11px] text-[var(--text-dim)] tabular-nums">
+        <span className="absolute left-[10px] top-0 bottom-0 w-px bg-[var(--border)]" />
+        <span className="min-w-[3ch] shrink-0 text-right font-mono text-[10.5px] text-[var(--text-dim)] tabular-nums">
           {m.line}
         </span>
         <span className="truncate flex-1 min-w-0 whitespace-pre text-[var(--text-muted)]">
@@ -935,8 +941,8 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
           </div>
         </div>
 
-        <div className="mt-1.5 pl-5 flex items-center justify-between gap-1">
-          <div className="flex items-center gap-1">
+        <div className="mt-2 pl-5 flex items-center justify-between gap-1">
+          <div className="flex items-center p-0.5 rounded-md bg-[var(--bg-input)] border border-[var(--border)]">
             {(['all', 'changed'] as const).map((s) => {
               const disabled = s === 'changed' && totalChanged === 0;
               return (
@@ -945,10 +951,10 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
                   type="button"
                   disabled={disabled}
                   onClick={() => setScope(s)}
-                  className={`h-[22px] px-2 rounded-md text-[11px] cursor-pointer disabled:opacity-40 disabled:cursor-default ${
+                  className={`h-[20px] px-2 rounded-[4px] text-[11px] whitespace-nowrap cursor-pointer disabled:opacity-40 disabled:cursor-default ${
                     scope === s
-                      ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
-                      : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                      ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium shadow-sm'
+                      : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
                   }`}
                 >
                   {s === 'all' ? 'All files' : `Changed (${totalChanged})`}
@@ -1005,28 +1011,40 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
 
       {/* Zone 3: summary */}
       {showSummary && (
-        <div className="flex items-center justify-between h-6 px-3 border-b border-[var(--border)]/60 shrink-0 text-[11px] tabular-nums">
-          <span
-            className={
-              results?.truncated && !searching
-                ? 'text-[var(--modified-fg)]'
-                : 'text-[var(--text-muted)]'
-            }
-          >
-            {searching && !results
-              ? 'Searching…'
-              : error
-                ? ''
-                : `${totalCount}${results?.truncated ? '+' : ''} result${totalCount === 1 ? '' : 's'} in ${groups.length} file${groups.length === 1 ? '' : 's'}${results?.truncated ? ' — refine query' : ''}`}
+        <div className="flex items-center gap-2 h-7 pl-3.5 pr-2 shrink-0 text-[11px] whitespace-nowrap">
+          <span className="min-w-0 truncate text-[var(--text-muted)] tabular-nums">
+            {searching && !results ? (
+              'Searching…'
+            ) : error ? (
+              ''
+            ) : (
+              <>
+                <span className="font-medium text-[var(--text-primary)]">
+                  {totalCount.toLocaleString()}
+                  {results?.truncated ? '+' : ''}
+                </span>{' '}
+                result{totalCount === 1 ? '' : 's'} in{' '}
+                <span className="font-medium text-[var(--text-primary)]">{groups.length}</span>{' '}
+                file{groups.length === 1 ? '' : 's'}
+              </>
+            )}
           </span>
+          {results?.truncated && !searching && !error && (
+            <span
+              className="shrink-0 px-1.5 h-[16px] leading-[16px] rounded bg-[var(--modified-fg)]/12 text-[var(--modified-fg)] text-[10px] font-medium"
+              title="Too many matches, only the first results are shown. Refine the query to narrow them down."
+            >
+              Capped
+            </span>
+          )}
           {groups.length > 0 && (
             <button
               onClick={sendList}
-              className="flex items-center gap-1 text-[var(--text-muted)] hover:text-[var(--accent-hover)] cursor-pointer"
+              className="ml-auto shrink-0 flex items-center gap-1 h-5 px-1.5 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
               title="Send these results to the Agent"
             >
-              <AtSign size={11.5} />
-              Send list
+              <AtSign size={11} />
+              Ask agent
             </button>
           )}
         </div>
