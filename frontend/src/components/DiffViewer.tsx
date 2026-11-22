@@ -911,7 +911,7 @@ ${hunk.excerpt.slice(0, 3500)}
       'px-1.5 h-[22px] text-[10.5px] font-sans flex items-center gap-1 cursor-pointer disabled:opacity-40 hover:bg-[var(--bg-hover)] text-[var(--text-primary)]';
     return (
       <div
-        className="absolute right-2 top-0.5 z-10 flex items-stretch rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] shadow-md overflow-hidden divide-x divide-[var(--border)]"
+        className="absolute right-2 top-0.5 z-10 flex w-max items-stretch whitespace-nowrap rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] shadow-md overflow-hidden divide-x divide-[var(--border)]"
         onClick={(e) => e.stopPropagation()}
       >
         {canApplyHunks &&
@@ -1458,12 +1458,14 @@ ${hunk.excerpt.slice(0, 3500)}
                         <td className={`px-2.5 relative align-top ${cellWrapClass}`}>
                           {renderSyntaxSpans(row.text, spans, changedRanges, wordBg)}
                           {showPill && renderHunkPill(cluster)}
+                          {!showPill && (
                           <button
                             onClick={() => askAboutLine(row.newLine ?? row.oldLine, row.text)}
                             className="opacity-0 group-hover:opacity-100 absolute right-2 top-0.5 px-1.5 py-0.5 text-[10px] font-sans rounded bg-[var(--bg-elevated)] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--accent)] hover:text-[var(--accent-fg)] cursor-pointer transition-opacity"
                           >
                             Ask
                           </button>
+                          )}
                         </td>
                       </tr>
                     );

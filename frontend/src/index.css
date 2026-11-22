@@ -240,3 +240,57 @@ svg.lucide {
   50% { opacity: 0.35; }
 }
 .live-dot { animation: live-dot 1.2s ease-in-out infinite; }
+
+/* ---- Inline agent-edit review (CodeEditor) ---- */
+.cm-review-add {
+  background: color-mix(in srgb, var(--added-fg) 10%, transparent);
+  box-shadow: inset 3px 0 0 var(--added-fg);
+}
+.cm-review-widget {
+  position: relative;
+}
+.cm-review-del {
+  background: var(--removed-bg);
+  box-shadow: inset 3px 0 0 var(--removed-fg);
+  color: var(--text-muted);
+  user-select: none;
+}
+.cm-review-del-line {
+  padding: 0 6px 0 6px;
+  white-space: pre;
+  text-decoration: line-through;
+  text-decoration-color: color-mix(in srgb, var(--removed-fg) 50%, transparent);
+}
+.cm-review-pill {
+  position: absolute;
+  right: 14px;
+  top: 2px;
+  z-index: 5;
+  display: flex;
+  font-family: var(--font-sans, system-ui, sans-serif);
+  font-size: 10.5px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-elevated);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+}
+.cm-review-pill button {
+  height: 20px;
+  padding: 0 7px;
+  cursor: pointer;
+  color: var(--text-primary);
+  white-space: nowrap;
+}
+.cm-review-pill button + button {
+  border-left: 1px solid var(--border);
+}
+.cm-review-pill button:first-child {
+  color: var(--added-fg);
+}
+.cm-review-pill button:last-child {
+  color: var(--removed-fg);
+}
+.cm-review-pill button:hover {
+  background: var(--bg-hover);
+}

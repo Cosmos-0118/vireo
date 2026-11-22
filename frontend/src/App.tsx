@@ -18,6 +18,7 @@ import {
   X,
   FileCode,
 } from 'lucide-react';
+import { diffLines } from 'diff';
 import { api, wsUrl } from './api';
 import {
   applyTheme,
@@ -178,7 +179,63 @@ export function App() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [diffData, setDiffData] = useState<GitDiffRes | null>(null);
   const [diffLoading, setDiffLoading] = useState(false);
-  const [fileData, setFileData] = useState<{ content: string; binary: boolean } | null>(null);
+  const [fileData, setFileData] = useState<{
+    path: string;
+    content: string;
+    binary: boolean;
+  } | null>(null);
+
+  // Live agent edits (driven by the file watcher, so it works for any agent or tool)
+  const [followEdits, setFollowEdits] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('vireo-follow-edits') !== '0';
+    } catch {
+      return true;
+    }
+  });
+  const [liveEdits, setLiveEdits] = useState<
+    Array<{ path: string; adds: number; dels: number; at: number }>
+  >([]);
+  const [pillVisible, setPillVisible] = useState(false);
+  const [pausedJump, setPausedJump] = useState<string | null>(null);
+  const [liveFlash, setLiveFlash] = useState<{
+    path: string;
+    key: number;
+    ranges: Array<{ from: number; to: number }>;
+  } | null>(null);
+  /** path -> pulse key; drives the short green pulse on tabs and explorer rows. */
+  const [tabPulse, setTabPulse] = useState<Record<string, number>>({});
+  /** path -> content before the agent's unreviewed edits (drives inline Keep / Undo). */
+  const [review, setReview] = useState<Record<string, string>>({});
+  const [pillDismissed, setPillDismissed] = useState(false);
+  const [undoConfirm, setUndoConfirm] = useState(false);
+  const userActivityRef = useRef(0);
+  const editorDirtyRef = useRef(false);
+  /** Last known on-disk content per path; the baseline for "what did the agent just change". */
+  const snapshotsRef = useRef<Map<string, string>>(new Map());
+  const inflightRef = useRef<Set<string>>(new Set());
+  const selfWriteRef = useRef<{ all: number; paths: Map<string, number> }>({
+    all: 0,
+    paths: new Map(),
+  });
+  const fsChainRef = useRef<Promise<void>>(Promise.resolve());
+  const fsChangedRef = useRef<(paths: string[], dirtyBefore: Set<string>) => void>(() => {});
+  const flashKeyRef = useRef(0);
+  const pillTimerRef = useRef<number | undefined>(undefined);
+  const tabsRef = useRef<OpenTab[]>([]);
+  const gitStatusRef = useRef<GitStatusRes | null>(null);
+  const followRef = useRef(followEdits);
+
+  /** Our own writes (save, discard, revert) must not be announced as agent edits. */
+  const markSelfWrite = useCallback((path: string | null) => {
+    const until = Date.now() + 1500;
+    if (path) {
+      selfWriteRef.current.paths.set(path, until);
+      snapshotsRef.current.delete(path);
+    } else {
+      selfWriteRef.current.all = until;
+    }
+  }, []);
 
   // Cross-panel triggers
   const [pendingCmd, setPendingCmd] = useState<{
@@ -262,6 +319,14 @@ export function App() {
       setDiffLoading(true);
       try {
         const d = await api.gitDiff(activeTab.path, !!activeTab.staged);
+        if (
+          !d.binary &&
+          !activeTab.staged &&
+          !snapshotsRef.current.has(activeTab.path) &&
+          !inflightRef.current.has(activeTab.path)
+        ) {
+          snapshotsRef.current.set(activeTab.path, d.modified);
+        }
         setDiffData(d);
       } catch {
         setDiffData(null);
@@ -299,7 +364,14 @@ export function App() {
     } else {
       try {
         const f = await api.readFile(activeTab.path);
-        setFileData({ content: f.content, binary: f.binary });
+        if (
+          !f.binary &&
+          !snapshotsRef.current.has(activeTab.path) &&
+          !inflightRef.current.has(activeTab.path)
+        ) {
+          snapshotsRef.current.set(activeTab.path, f.content);
+        }
+        setFileData({ path: activeTab.path, content: f.content, binary: f.binary });
       } catch {
         setFileData(null);
       }
@@ -377,10 +449,22 @@ export function App() {
         try {
           const data = JSON.parse(ev.data);
           if (data.type === 'fs_changed') {
+            fsChangedRef.current(
+              Array.isArray(data.paths) ? data.paths : [],
+              new Set(gitStatusRef.current?.files.map((f) => f.path) ?? [])
+            );
             setFsVersion((v) => v + 1);
             refreshGit();
             reloadActiveContentRef.current();
           } else if (data.type === 'workspace_switched') {
+            snapshotsRef.current.clear();
+            setLiveEdits([]);
+            setReview({});
+            setPillDismissed(false);
+            setTabPulse({});
+            setPausedJump(null);
+            setLiveFlash(null);
+            setPillVisible(false);
             setTabs([]);
             setActiveTabId(null);
             loadWorkspaceData();
@@ -484,6 +568,241 @@ export function App() {
     });
     setActiveTabId(path);
   }, []);
+
+  tabsRef.current = tabs;
+  gitStatusRef.current = gitStatus;
+  followRef.current = followEdits;
+
+  const focusPath = useCallback(
+    (path: string) => {
+      const existing = tabsRef.current.find(
+        (t) => t.path === path && (t.mode === 'diff' || t.mode === 'code')
+      );
+      if (existing) setActiveTabId(existing.id);
+      else openFile(path);
+      setPausedJump(null);
+    },
+    [openDiff, openFile]
+  );
+
+  // Watcher batch -> "what did the agent just change?" (works for any agent, CLI or built-in).
+  fsChangedRef.current = (paths: string[], dirtyBefore: Set<string>) => {
+    const lock =
+      /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|bun\.lockb?|composer\.lock|poetry\.lock|Gemfile\.lock)$/;
+    let files = paths
+      .map((p) => (p || '').replace(/\\/g, '/').replace(/^\.\//, ''))
+      .filter((p) => p && !p.includes(':') && !p.startsWith('.git/') && p !== 'cmd' && !p.endsWith('/'));
+    const source = files.filter((p) => !lock.test(p));
+    if (source.length) files = source;
+    files = files.slice(0, 8);
+    if (!files.length) return;
+    files.forEach((p) => inflightRef.current.add(p));
+
+    const run = async () => {
+      const results: Array<{
+        path: string;
+        adds: number;
+        dels: number;
+        ranges: Array<{ from: number; to: number }>;
+        /** Content before this edit, or null when it is not a trustworthy review baseline. */
+        baseline: string | null;
+      }> = [];
+      const currents = new Map<string, string>();
+      for (const path of files) {
+        let cur: string;
+        try {
+          const f = await api.readFile(path);
+          if (f.binary || f.size > 1_500_000) {
+            snapshotsRef.current.delete(path);
+            continue;
+          }
+          cur = f.content;
+          currents.set(path, f.content);
+        } catch {
+          snapshotsRef.current.delete(path);
+          continue;
+        }
+        let prev = snapshotsRef.current.get(path);
+        // Baseline taken from git HEAD is only a valid "before the agent" state if the file was clean.
+        let trusted = prev !== undefined || !dirtyBefore.has(path);
+        if (prev === undefined) {
+          try {
+            const d = await api.gitDiff(path, false);
+            if (!d.binary) prev = d.original;
+          } catch {
+            // not in a repo: no baseline
+          }
+        }
+        const snaps = snapshotsRef.current;
+        snaps.delete(path);
+        snaps.set(path, cur);
+        while (snaps.size > 40) snaps.delete(snaps.keys().next().value as string);
+        if (prev === undefined || prev === cur) continue;
+
+        let adds = 0;
+        let dels = 0;
+        let line = 0;
+        const ranges: Array<{ from: number; to: number }> = [];
+        for (const part of diffLines(prev, cur)) {
+          const n = part.count ?? 0;
+          if (part.added) {
+            adds += n;
+            if (n > 0) ranges.push({ from: line + 1, to: line + n });
+            line += n;
+          } else if (part.removed) {
+            dels += n;
+          } else {
+            line += n;
+          }
+        }
+        if (adds || dels) results.push({ path, adds, dels, ranges, baseline: trusted ? prev : null });
+      }
+
+      // Files whose content is back to their review baseline are no longer pending.
+      const norm = (t: string) => t.replace(/\r\n?/g, '\n');
+      setReview((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const [p, c] of currents) {
+          if (next[p] !== undefined && norm(next[p]) === norm(c)) {
+            delete next[p];
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+
+      const sup = selfWriteRef.current;
+      const now = Date.now();
+      const ui = results.filter((r) => !(sup.all > now || (sup.paths.get(r.path) ?? 0) > now));
+      if (!ui.length) return;
+
+      setPillDismissed(false);
+      setReview((prev) => {
+        let changed = false;
+        const next = { ...prev };
+        for (const r of ui) {
+          if (r.baseline !== null && next[r.path] === undefined) {
+            next[r.path] = r.baseline;
+            changed = true;
+          }
+        }
+        return changed ? next : prev;
+      });
+
+      const key = ++flashKeyRef.current;
+      setLiveEdits((prev) => {
+        const m = new Map(prev.map((e) => [e.path, e]));
+        for (const r of ui) {
+          const old = m.get(r.path);
+          m.delete(r.path);
+          m.set(r.path, {
+            path: r.path,
+            adds: (old?.adds ?? 0) + r.adds,
+            dels: (old?.dels ?? 0) + r.dels,
+            at: Date.now(),
+          });
+        }
+        return [...m.values()].slice(-6);
+      });
+      setPillVisible(true);
+      window.clearTimeout(pillTimerRef.current);
+      pillTimerRef.current = window.setTimeout(() => {
+        setPillVisible(false);
+        setPausedJump(null);
+      }, 10000);
+
+      setTabPulse((prev) => ({ ...prev, ...Object.fromEntries(ui.map((r) => [r.path, key])) }));
+      window.setTimeout(
+        () =>
+          setTabPulse((prev) => {
+            const next = { ...prev };
+            for (const r of ui) if (next[r.path] === key) delete next[r.path];
+            return next;
+          }),
+        1800
+      );
+
+      const target = ui[ui.length - 1];
+      setLiveFlash({ path: target.path, key, ranges: target.ranges });
+      window.setTimeout(() => setLiveFlash((f) => (f?.key === key ? null : f)), 2500);
+      if (followRef.current) {
+        const busy = editorDirtyRef.current || Date.now() - userActivityRef.current < 4000;
+        if (busy) setPausedJump(target.path);
+        else focusPath(target.path);
+      }
+    };
+
+    fsChainRef.current = fsChainRef.current
+      .then(run)
+      .catch(() => {})
+      .finally(() => files.forEach((p) => inflightRef.current.delete(p)));
+  };
+
+  useEffect(() => {
+    if (pausedJump && activeTab?.path === pausedJump) setPausedJump(null);
+  }, [pausedJump, activeTab]);
+
+  const toggleFollow = () => {
+    setFollowEdits((v) => {
+      const next = !v;
+      try {
+        localStorage.setItem('vireo-follow-edits', next ? '1' : '0');
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+    setPausedJump(null);
+  };
+
+  const reviewPaths = Object.keys(review);
+
+  const setReviewBaseFor = useCallback((path: string, b: string | null) => {
+    setReview((prev) => {
+      if (b === null) {
+        if (prev[path] === undefined) return prev;
+        const next = { ...prev };
+        delete next[path];
+        return next;
+      }
+      const eol = (prev[path] ?? '').includes('\r\n') ? '\r\n' : '\n';
+      return { ...prev, [path]: b.replace(/\r\n?/g, '\n').replace(/\n/g, eol) };
+    });
+  }, []);
+
+  const keepAll = () => {
+    setReview({});
+    setLiveEdits([]);
+    setPillVisible(false);
+    setPausedJump(null);
+  };
+
+  const undoAll = async () => {
+    const entries = Object.entries(review);
+    try {
+      for (const [path, base] of entries) {
+        markSelfWrite(path);
+        const st = gitStatusRef.current?.files.find((f) => f.path === path);
+        if (st?.untracked && base === '') {
+          await api.gitDiscard(path, true);
+          snapshotsRef.current.delete(path);
+        } else {
+          await api.writeFile(path, base);
+          snapshotsRef.current.set(path, base);
+        }
+      }
+      setReview({});
+      setLiveEdits([]);
+      setPillVisible(false);
+      setPausedJump(null);
+      await refreshGit();
+      reloadActiveContent();
+      showToast(`Reverted agent edits in ${entries.length} file${entries.length === 1 ? '' : 's'}`);
+    } catch (e: unknown) {
+      showToast(e instanceof Error ? e.message : 'Failed to undo agent edits', true);
+    }
+  };
 
   const openCommitDiff = useCallback(
     (
@@ -1033,6 +1352,7 @@ export function App() {
                 onRefreshGit={refreshGit}
                 onToast={showToast}
                 fsVersion={fsVersion}
+                recentPaths={tabPulse}
                 onAskAgent={handleAskAgent}
               />
             </div>
@@ -1053,7 +1373,11 @@ export function App() {
         <div className="flex-1 flex flex-col min-w-0 min-h-0">
           {/* Open Tabs Bar */}
           {tabs.length > 0 && (
-            <div className="flex items-center h-10 bg-[var(--bg-sidebar)] border-b border-[var(--border)] overflow-x-auto shrink-0">
+            <div
+              className="flex items-center h-10 bg-[var(--bg-sidebar)] border-b border-[var(--border)] overflow-x-auto shrink-0"
+              onWheelCapture={() => (userActivityRef.current = Date.now())}
+              onPointerDownCapture={() => (userActivityRef.current = Date.now())}
+            >
               {tabs.map((tab) => {
                 const active = tab.id === activeTabId;
                 const baseName = tab.path.split('/').pop() || tab.path;
@@ -1070,6 +1394,10 @@ export function App() {
                     key={tab.id}
                     onClick={() => setActiveTabId(tab.id)}
                     className={`group flex items-center gap-2 px-3.5 h-full text-[13px] border-r border-[var(--border)] cursor-pointer select-none shrink-0 transition-colors ${
+                      tabPulse[tab.path] !== undefined
+                        ? `tab-pulse-${tabPulse[tab.path] % 2}`
+                        : ''
+                    } ${
                       active
                         ? 'bg-[var(--bg-base)] text-[var(--text-primary)] font-medium border-t-2 border-t-[var(--accent)]'
                         : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
@@ -1085,6 +1413,19 @@ export function App() {
                       <FileIcon path={tab.path} size={14} />
                     )}
                     <span>{label}</span>
+                    {(tab.mode === 'diff' || tab.mode === 'code') &&
+                      (() => {
+                        const edit = liveEdits.find((e) => e.path === tab.path);
+                        return edit ? (
+                          <span
+                            className="font-mono text-[10px] tabular-nums"
+                            title="Changed by an agent this session"
+                          >
+                            <span className="text-[var(--added-fg)]">+{edit.adds}</span>{' '}
+                            <span className="text-[var(--removed-fg)]">-{edit.dels}</span>
+                          </span>
+                        ) : null;
+                      })()}
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -1102,7 +1443,12 @@ export function App() {
           )}
 
           {/* Main Viewer Stage */}
-          <div className="flex-1 flex flex-col min-h-0">
+          <div
+            className="flex-1 flex flex-col min-h-0 relative"
+            onWheelCapture={() => (userActivityRef.current = Date.now())}
+            onKeyDownCapture={() => (userActivityRef.current = Date.now())}
+            onPointerDownCapture={() => (userActivityRef.current = Date.now())}
+          >
             {!activeTab ? (
               <div className="flex-1 min-h-0 overflow-y-auto flex flex-col items-center justify-center-safe p-8 text-center gap-5">
                 <VireoLogo size={56} className="drop-shadow-lg" />
@@ -1202,6 +1548,7 @@ export function App() {
                     reloadActiveContent();
                   }}
                   onDiscard={async () => {
+                    markSelfWrite(activeTab.path);
                     await api.gitDiscard(activeTab.path, !!activeFileStatus?.untracked);
                     await refreshGit();
                     reloadActiveContent();
@@ -1211,6 +1558,7 @@ export function App() {
                     try {
                       const cached = action === 'stage' || action === 'unstage';
                       const reverse = action === 'unstage' || action === 'revert';
+                      if (action === 'revert') markSelfWrite(activeTab.path);
                       const res = await api.gitApplyPatch(patch, cached, reverse);
                       if (!res.ok) {
                         throw new Error(res.stderr || `Failed to ${action} hunk`);
@@ -1231,6 +1579,16 @@ export function App() {
                   onSwitchToCode={() => openFile(activeTab.path)}
                   onAskAgent={handleAskAgent}
                   onToast={showToast}
+                  liveFlash={
+                    liveFlash &&
+                    activeTab.mode === 'diff' &&
+                    !activeTab.staged &&
+                    diffData?.path === liveFlash.path
+                      ? { key: liveFlash.key, ranges: liveFlash.ranges }
+                      : null
+                  }
+                  followEdits={followEdits}
+                  userActivityRef={userActivityRef}
                 />
               </Suspense>
             ) : (
@@ -1243,8 +1601,20 @@ export function App() {
               >
                 <CodeEditor
                   path={activeTab.path}
-                  content={fileData?.content ?? ''}
-                  binary={fileData?.binary}
+                  content={fileData && fileData.path === activeTab.path ? fileData.content : ''}
+                  binary={fileData && fileData.path === activeTab.path ? fileData.binary : false}
+                  followEdits={followEdits}
+                  userActivityRef={userActivityRef}
+                  onDirtyChange={(d) => {
+                    editorDirtyRef.current = d;
+                  }}
+                  reviewBase={review[activeTab.path] ?? null}
+                  onReviewBaseChange={(b) => setReviewBaseFor(activeTab.path, b)}
+                  scrollTarget={
+                    liveFlash && liveFlash.path === activeTab.path && liveFlash.ranges.length > 0
+                      ? { key: liveFlash.key, line: liveFlash.ranges[0].from }
+                      : null
+                  }
                   theme={activeTheme}
                   hasDiff={!!activeFileStatus}
                   jumpToLine={activeTab.line}
@@ -1252,8 +1622,10 @@ export function App() {
                   jumpToEndColumn={activeTab.colEnd}
                   jumpKey={activeTab.jumpKey}
                   onSave={async (newContent) => {
+                    markSelfWrite(activeTab.path);
                     await api.writeFile(activeTab.path, newContent);
-                    setFileData({ content: newContent, binary: false });
+                    snapshotsRef.current.set(activeTab.path, newContent);
+                    setFileData({ path: activeTab.path, content: newContent, binary: false });
                     await refreshGit();
                     showToast(`Saved ${activeTab.path}`);
                   }}
@@ -1261,6 +1633,111 @@ export function App() {
                   onAskAgent={handleAskAgent}
                 />
               </Suspense>
+            )}
+
+            {/* Live edit stream (watcher-driven; works for any agent) */}
+            {!pillDismissed &&
+              (pillVisible || pausedJump || reviewPaths.length > 0) &&
+              liveEdits.length > 0 && (
+              <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-30 max-w-[calc(100%-24px)] flex items-center gap-2 h-[30px] px-3 rounded-full border border-[var(--border)] bg-[var(--bg-elevated)] shadow-lg text-[11.5px] overflow-hidden">
+                <span className="live-dot w-1.5 h-1.5 rounded-full bg-[var(--added-fg)] shrink-0" />
+                <span className="shrink-0 font-medium text-[var(--text-primary)]">
+                  Live edits
+                  {liveEdits.length > 1 ? ` (${liveEdits.length} files)` : ''}
+                </span>
+                <div className="flex items-center gap-2 min-w-0 overflow-hidden">
+                  {liveEdits.slice(-4).map((e, i, arr) => {
+                    const name = e.path.split('/').pop() || e.path;
+                    const current = activeTab?.path === e.path;
+                    return (
+                      <button
+                        key={e.path}
+                        onClick={() => focusPath(e.path)}
+                        title={e.path}
+                        className={`flex items-center gap-1 shrink-0 cursor-pointer rounded px-1 hover:bg-[var(--bg-hover)] ${
+                          current ? 'text-[var(--text-primary)] bg-[var(--bg-active)]' : 'text-[var(--text-muted)]'
+                        } ${i === arr.length - 1 && tabPulse[e.path] !== undefined ? 'row-pulse-0' : ''}`}
+                      >
+                        <span className="font-mono">{name}</span>
+                        <span className="font-mono tabular-nums text-[var(--added-fg)]">+{e.adds}</span>
+                        <span className="font-mono tabular-nums text-[var(--removed-fg)]">-{e.dels}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+                {pausedJump && (
+                  <button
+                    onClick={() => focusPath(pausedJump)}
+                    className="shrink-0 px-2 h-5 rounded-full bg-[var(--accent)] text-[var(--accent-fg)] font-medium cursor-pointer"
+                  >
+                    Jump to live edit ↗
+                  </button>
+                )}
+                {reviewPaths.length > 0 && (
+                  <>
+                    <button
+                      onClick={() =>
+                        openDiff(
+                          activeTab && reviewPaths.includes(activeTab.path)
+                            ? activeTab.path
+                            : reviewPaths[reviewPaths.length - 1]
+                        )
+                      }
+                      className="shrink-0 px-1.5 h-5 rounded border border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                      title="Open the full side-by-side diff"
+                    >
+                      View diff
+                    </button>
+                    <button
+                      onClick={keepAll}
+                      className="shrink-0 px-1.5 h-5 rounded border border-[var(--added-fg)]/60 text-[var(--added-fg)] hover:bg-[var(--added-bg)] cursor-pointer"
+                      title="Accept all agent edits"
+                    >
+                      Keep all
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (!undoConfirm) {
+                          setUndoConfirm(true);
+                          window.setTimeout(() => setUndoConfirm(false), 3000);
+                        } else {
+                          setUndoConfirm(false);
+                          void undoAll();
+                        }
+                      }}
+                      className="shrink-0 px-1.5 h-5 rounded border border-[var(--removed-fg)]/60 text-[var(--removed-fg)] hover:bg-[var(--removed-bg)] cursor-pointer"
+                      title="Revert every file to how it was before the agent's edits"
+                    >
+                      {undoConfirm ? 'Confirm undo?' : 'Undo all'}
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={toggleFollow}
+                  className={`shrink-0 px-1.5 h-5 rounded border cursor-pointer ${
+                    followEdits
+                      ? 'border-[var(--added-fg)]/60 text-[var(--added-fg)]'
+                      : 'border-[var(--border)] text-[var(--text-muted)]'
+                  }`}
+                  title={
+                    followEdits
+                      ? 'Following edits: the view jumps to what an agent just changed (pauses while you type or scroll)'
+                      : 'Follow edits is off'
+                  }
+                >
+                  Follow
+                </button>
+                <button
+                  onClick={() => {
+                    setPillDismissed(true);
+                    setPausedJump(null);
+                  }}
+                  className="shrink-0 p-0.5 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                  title="Dismiss"
+                >
+                  <X size={12} />
+                </button>
+              </div>
             )}
           </div>
 

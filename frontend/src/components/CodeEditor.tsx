@@ -4,6 +4,7 @@ import {
   Decoration,
   DecorationSet,
   EditorView,
+  WidgetType,
   keymap,
   lineNumbers,
   highlightActiveLine,
@@ -12,7 +13,7 @@ import {
 import { diffLines } from 'diff';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { syntaxHighlighting } from '@codemirror/language';
-import { Code2, Eye, GitCompare, MessageSquarePlus, Save } from 'lucide-react';
+import { Check, Code2, Eye, GitCompare, MessageSquarePlus, RotateCcw, Save } from 'lucide-react';
 import { buildHighlightStyle, getLanguageSupport, isMarkdownPath, semanticHighlighting } from '../syntax';
 import { MarkdownMessage } from './MarkdownView';
 import type { LiteTheme } from '../themes';
@@ -37,6 +38,151 @@ interface CodeEditorProps {
   /** Timestamp (ms) of the user's last scroll / key / pointer activity. */
   userActivityRef?: React.MutableRefObject<number>;
   onDirtyChange?: (dirty: boolean) => void;
+  /** Content before the agent's unreviewed edits; changes against it are shown inline. */
+  reviewBase?: string | null;
+  /** New baseline after Keep (string) or review finished (null). */
+  onReviewBaseChange?: (base: string | null) => void;
+  /** Scroll (without stealing focus) to this line when following an edit. */
+  scrollTarget?: { key: number; line: number } | null;
+}
+
+interface ReviewHunk {
+  oldFrom: number;
+  oldTo: number;
+  newFrom: number;
+  newTo: number;
+  removed: string;
+  added: string;
+}
+
+interface ReviewHandlers {
+  keep: (view: EditorView, h: ReviewHunk) => void;
+  undo: (view: EditorView, h: ReviewHunk) => void;
+}
+
+const setReviewBase = StateEffect.define<string | null>();
+
+function computeReviewHunks(base: string, doc: string): ReviewHunk[] {
+  if (base.length + doc.length > 600000) return [];
+  const hunks: ReviewHunk[] = [];
+  let o = 0;
+  let n = 0;
+  let cur: ReviewHunk | null = null;
+  for (const part of diffLines(base, doc)) {
+    const len = part.value.length;
+    if (part.added || part.removed) {
+      if (!cur) cur = { oldFrom: o, oldTo: o, newFrom: n, newTo: n, removed: '', added: '' };
+      if (part.added) {
+        cur.added += part.value;
+        n += len;
+        cur.newTo = n;
+      } else {
+        cur.removed += part.value;
+        o += len;
+        cur.oldTo = o;
+      }
+    } else {
+      if (cur) {
+        hunks.push(cur);
+        cur = null;
+      }
+      o += len;
+      n += len;
+    }
+  }
+  if (cur) hunks.push(cur);
+  return hunks;
+}
+
+class ReviewWidget extends WidgetType {
+  constructor(
+    readonly h: ReviewHunk,
+    readonly handlers: { current: ReviewHandlers | null }
+  ) {
+    super();
+  }
+  eq(o: ReviewWidget) {
+    return (
+      o.h.oldFrom === this.h.oldFrom &&
+      o.h.newFrom === this.h.newFrom &&
+      o.h.removed === this.h.removed &&
+      o.h.added === this.h.added
+    );
+  }
+  toDOM(view: EditorView) {
+    const wrap = document.createElement('div');
+    wrap.className = 'cm-review-widget';
+    if (this.h.removed) {
+      const del = document.createElement('div');
+      del.className = 'cm-review-del';
+      for (const line of this.h.removed.replace(/\n$/, '').split('\n')) {
+        const l = document.createElement('div');
+        l.className = 'cm-review-del-line';
+        l.textContent = line || ' ';
+        del.append(l);
+      }
+      wrap.append(del);
+    }
+    const pill = document.createElement('div');
+    pill.className = 'cm-review-pill';
+    const mk = (label: string, title: string, run: () => void) => {
+      const b = document.createElement('button');
+      b.textContent = label;
+      b.title = title;
+      b.addEventListener('mousedown', (e) => e.preventDefault());
+      b.addEventListener('click', (e) => {
+        e.preventDefault();
+        run();
+      });
+      pill.append(b);
+    };
+    mk('\u2713 Keep', 'Accept this change', () => this.handlers.current?.keep(view, this.h));
+    mk('\u21ba Undo', 'Revert this change on disk', () => this.handlers.current?.undo(view, this.h));
+    wrap.append(pill);
+    return wrap;
+  }
+  ignoreEvent() {
+    return true;
+  }
+}
+
+type ReviewState = { base: string | null; hunks: ReviewHunk[]; deco: DecorationSet };
+
+function makeReviewField(handlers: { current: ReviewHandlers | null }) {
+  return StateField.define<ReviewState>({
+    create: () => ({ base: null, hunks: [], deco: Decoration.none }),
+    update(v, tr) {
+      let base = v.base;
+      let changed = tr.docChanged;
+      for (const e of tr.effects) {
+        if (e.is(setReviewBase)) {
+          base = e.value === null ? null : e.value.replace(/\r\n?/g, '\n');
+          changed = true;
+        }
+      }
+      if (!changed) return v;
+      if (base === null) return { base, hunks: [], deco: Decoration.none };
+      const doc = tr.state.doc;
+      const hunks = computeReviewHunks(base, doc.toString());
+      const ranges = [];
+      for (const h of hunks) {
+        const start = doc.lineAt(Math.min(h.newFrom, doc.length));
+        ranges.push(
+          Decoration.widget({ widget: new ReviewWidget(h, handlers), block: true, side: -1 }).range(
+            start.from
+          )
+        );
+        if (h.added) {
+          const last = doc.lineAt(Math.min(Math.max(h.newFrom, h.newTo - 1), doc.length));
+          for (let l = start.number; l <= last.number && l - start.number < 800; l++) {
+            ranges.push(Decoration.line({ class: 'cm-review-add' }).range(doc.line(l).from));
+          }
+        }
+      }
+      return { base, hunks, deco: Decoration.set(ranges, true) };
+    },
+    provide: (f) => EditorView.decorations.from(f, (v) => v.deco),
+  });
 }
 
 /** Marks transactions that apply on-disk content (so they don't count as user edits). */
@@ -146,6 +292,9 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   followEdits,
   userActivityRef,
   onDirtyChange,
+  reviewBase,
+  onReviewBaseChange,
+  scrollTarget,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -158,6 +307,13 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const carryRef = useRef<{ path: string; doc: string; anchor: number } | null>(null);
   const contentRef = useRef(content);
   contentRef.current = content;
+  const reviewHandlersRef = useRef<ReviewHandlers | null>(null);
+  const reviewFieldRef = useRef<StateField<ReviewState> | null>(null);
+  const reviewBaseRef = useRef(reviewBase);
+  reviewBaseRef.current = reviewBase;
+  const onReviewBaseChangeRef = useRef(onReviewBaseChange);
+  onReviewBaseChangeRef.current = onReviewBaseChange;
+  const [reviewCount, setReviewCount] = useState(0);
 
   useEffect(() => {
     dirtyRef.current = dirty;
@@ -217,11 +373,15 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     const carried = carryRef.current && carryRef.current.path === path ? carryRef.current : null;
     carryRef.current = null;
 
+    const reviewField = makeReviewField(reviewHandlersRef);
+    reviewFieldRef.current = reviewField;
+
     const state = EditorState.create({
       doc: carried ? carried.doc : normalizeNewlines(contentRef.current),
       selection: carried ? { anchor: Math.min(carried.anchor, carried.doc.length) } : undefined,
       extensions: [
         flashField,
+        reviewField,
         lineNumbers(),
         highlightActiveLine(),
         highlightActiveLineGutter(),
@@ -237,6 +397,16 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           if (u.docChanged && !u.transactions.some((t) => t.annotation(externalChange))) {
             setDirty(true);
           }
+          const rv = u.state.field(reviewField);
+          if (
+            u.docChanged ||
+            u.transactions.some((t) => t.effects.some((e) => e.is(setReviewBase)))
+          ) {
+            setReviewCount(rv.hunks.length);
+            if (rv.base !== null && rv.hunks.length === 0) {
+              queueMicrotask(() => onReviewBaseChangeRef.current?.(null));
+            }
+          }
         }),
       ],
     });
@@ -246,6 +416,9 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       parent: containerRef.current,
     });
     viewRef.current = view;
+    if (reviewBaseRef.current != null) {
+      view.dispatch({ effects: setReviewBase.of(reviewBaseRef.current) });
+    }
     if (!carried) setDirty(false);
     setPendingExternal(null);
 
@@ -292,6 +465,61 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [content, binary]);
 
+  // Keep the inline review baseline in sync with the app's state.
+  useEffect(() => {
+    const view = viewRef.current;
+    const field = reviewFieldRef.current;
+    if (!view || !field) return;
+    const cur = view.state.field(field).base;
+    const next = reviewBase == null ? null : reviewBase.replace(/\r\n?/g, '\n');
+    if (cur !== next) view.dispatch({ effects: setReviewBase.of(next) });
+  }, [reviewBase, path, theme]);
+
+  const handledScrollRef = useRef(0);
+  useEffect(() => {
+    const view = viewRef.current;
+    if (!view || !scrollTarget || !followEdits || handledScrollRef.current === scrollTarget.key) return;
+    if (scrollTarget.line < 1 || scrollTarget.line > view.state.doc.lines) return;
+    handledScrollRef.current = scrollTarget.key;
+    if (dirtyRef.current || (userActivityRef && Date.now() - userActivityRef.current < 4000)) return;
+    view.dispatch({
+      effects: EditorView.scrollIntoView(view.state.doc.line(scrollTarget.line).from, { y: 'center' }),
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollTarget, content, followEdits]);
+
+  reviewHandlersRef.current = {
+    keep: (view, h) => {
+      const field = reviewFieldRef.current;
+      const base = field ? view.state.field(field).base : null;
+      if (base === null) return;
+      const nb = base.slice(0, h.oldFrom) + h.added + base.slice(h.oldTo);
+      view.dispatch({ effects: setReviewBase.of(nb) });
+      onReviewBaseChangeRef.current?.(nb);
+    },
+    undo: (view, h) => {
+      const wasDirty = dirtyRef.current;
+      view.dispatch({
+        changes: { from: h.newFrom, to: h.newTo, insert: h.removed },
+        annotations: externalChange.of(true),
+      });
+      if (!wasDirty) void handleSave();
+    },
+  };
+
+  const undoFile = () => {
+    const view = viewRef.current;
+    const field = reviewFieldRef.current;
+    const base = view && field ? view.state.field(field).base : null;
+    if (!view || base === null) return;
+    const wasDirty = dirtyRef.current;
+    view.dispatch({
+      changes: { from: 0, to: view.state.doc.length, insert: base },
+      annotations: externalChange.of(true),
+    });
+    if (!wasDirty) void handleSave();
+  };
+
   const reloadFromDisk = () => {
     const view = viewRef.current;
     if (!view || pendingExternal === null) return;
@@ -328,6 +556,29 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
             <span className="text-[10.5px] px-1.5 py-0.5 rounded bg-[var(--modified-fg)] text-black font-semibold">
               UNSAVED
             </span>
+          )}
+          {reviewCount > 0 && (
+            <div className="flex items-center rounded border border-[var(--border)] overflow-hidden text-[10.5px] shrink-0">
+              <span className="px-1.5 text-[var(--text-muted)]">
+                {reviewCount} agent change{reviewCount > 1 ? 's' : ''}
+              </span>
+              <button
+                onClick={() => onReviewBaseChange?.(null)}
+                className="px-1.5 h-5 flex items-center gap-1 border-l border-[var(--border)] hover:bg-[var(--bg-hover)] text-[var(--added-fg)] cursor-pointer"
+                title="Keep all changes in this file"
+              >
+                <Check size={10.5} />
+                Keep file
+              </button>
+              <button
+                onClick={undoFile}
+                className="px-1.5 h-5 flex items-center gap-1 border-l border-[var(--border)] hover:bg-[var(--bg-hover)] text-[var(--removed-fg)] cursor-pointer"
+                title="Revert this file to before the agent's edits"
+              >
+                <RotateCcw size={10.5} />
+                Undo file
+              </button>
+            </div>
           )}
           {liveAt > 0 && (
             <span className="flex items-center gap-1.5 text-[10.5px] px-1.5 py-0.5 rounded border border-[var(--added-fg)]/50 text-[var(--added-fg)] font-medium shrink-0">
