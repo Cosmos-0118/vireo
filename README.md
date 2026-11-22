@@ -170,17 +170,26 @@ Vireo is an open-source project and its Windows binaries are currently **unsigne
 
 <!-- This block is updated automatically by the release workflow (scripts/update-release-integrity.ps1). Do not edit it by hand. -->
 <!-- release-integrity:start -->
-- **Latest release:** Check the [Releases page](https://github.com/Cosmos-0118/vireo/releases) once the first tagged release is published.
-- **Verify locally** once downloaded:
+- **Latest release:** [Vireo 0.1.0](https://github.com/Cosmos-0118/vireo/releases/tag/v0.1.0)
+- **SHA256 checksums:**
+
+  | File | SHA256 |
+  | --- | --- |
+  | `Vireo-0.1.0-win-x64.zip` | `a884d560f9856d3f08bcda3802f7c34a3879b1bc6998c642ed990094ccfab843` |
+  | `Vireo-Setup-0.1.0.exe` | `59b8a02a646b605ee4a0def73e72e4221adebecde6f062a8c1fc9db815577d1f` |
+
+  The same values are published as `SHA256SUMS.txt` on the release page.
+
+- **Verify locally** (run in the folder you downloaded to):
 
   ```powershell
-  Get-FileHash .\Vireo-Setup-<version>.exe -Algorithm SHA256
+  (Get-FileHash .\Vireo-Setup-0.1.0.exe -Algorithm SHA256).Hash -eq '59b8a02a646b605ee4a0def73e72e4221adebecde6f062a8c1fc9db815577d1f'
   ```
 
 - **Verify build provenance** (with [GitHub CLI](https://cli.github.com/)):
 
   ```powershell
-  gh attestation verify Vireo-Setup-<version>.exe --repo Cosmos-0118/vireo
+  gh attestation verify Vireo-Setup-0.1.0.exe --repo Cosmos-0118/vireo
   ```
 <!-- release-integrity:end -->
 
