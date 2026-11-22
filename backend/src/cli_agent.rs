@@ -293,7 +293,8 @@ fn map_claude_tool(name: &str, input: &Value, ws: &Path) -> (String, Value) {
         "Edit" | "MultiEdit" => ("edit_file".to_string(), json!({ "path": path_of("file_path") })),
         "NotebookEdit" => ("edit_file".to_string(), json!({ "path": path_of("notebook_path") })),
         "Write" => ("write_file".to_string(), json!({ "path": path_of("file_path") })),
-        "Bash" => {
+        // Claude Code runs shell commands through `PowerShell` on Windows and `Bash` elsewhere.
+        "Bash" | "PowerShell" => {
             let cmd = input["command"].as_str().unwrap_or("");
             map_vx(cmd, ws).unwrap_or_else(|| ("run_command".to_string(), json!({ "command": cmd })))
         }
@@ -709,6 +710,21 @@ mod tests {
             Out::ToolResult { id: "tu1".into(), name: "edit_file".into(), result: "ok".into() }
         );
         assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn claude_powershell_maps_to_run_command() {
+        let out = feed_all(
+            CliKind::Claude,
+            r"C:\proj",
+            &[
+                r#"{"type":"assistant","message":{"model":"claude-x","content":[{"type":"tool_use","id":"tu2","name":"PowerShell","input":{"command":"Get-ChildItem"}}]}}"#,
+            ],
+        );
+        assert_eq!(
+            out[0],
+            Out::ToolCall { id: "tu2".into(), name: "run_command".into(), args: json!({"command": "Get-ChildItem"}) }
+        );
     }
 
     #[test]

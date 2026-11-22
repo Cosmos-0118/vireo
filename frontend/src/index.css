@@ -241,6 +241,34 @@ svg.lucide {
 }
 .live-dot { animation: live-dot 1.2s ease-in-out infinite; }
 
+/* ---- Agent activity: shimmering label for the step in progress ---- */
+@keyframes agent-shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
+}
+.agent-shimmer {
+  background-image: linear-gradient(
+    90deg,
+    var(--text-muted) 0%,
+    var(--text-muted) 35%,
+    var(--text-primary) 50%,
+    var(--text-muted) 65%,
+    var(--text-muted) 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation: agent-shimmer 1.8s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-shimmer {
+    animation: none;
+    background: none;
+    color: var(--text-primary);
+  }
+}
+
 /* ---- Inline agent-edit review (CodeEditor) ---- */
 .cm-review-add {
   background: color-mix(in srgb, var(--added-fg) 10%, transparent);

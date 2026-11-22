@@ -1,28 +1,24 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
-  AlertCircle,
   ArrowRight,
   ArrowUp,
   ArrowUpRight,
+  ArrowDown,
   AtSign,
   Bug,
   Check,
   ChevronDown,
-  ChevronRight,
   FileCode,
   FolderOpen,
   GitBranch,
   GitCompare,
   History,
-  Loader2,
   Plus,
   RotateCcw,
   Undo2,
-  Search,
   Settings,
   Square,
   Terminal as TerminalIcon,
-  Wrench,
   X,
   Zap,
 } from 'lucide-react';
@@ -34,12 +30,22 @@ import type {
   Checkpoint,
   GitFileStatus,
   LocalModelsInfo,
+  MessagePart,
   RollbackRes,
   ToastAction,
-  ToolCallTrace,
   UiChatMessage,
 } from '../types';
 import { MarkdownMessage } from './MarkdownView';
+import {
+  ActivityGroup,
+  DiffStat,
+  LiveStatus,
+  baseName,
+  editedPaths,
+  formatDur,
+  normPath,
+  type ChangeLookup,
+} from './AgentActivity';
 
 const DEFAULT_CONFIG: AgentConfig = {
   provider: 'openai',
@@ -113,12 +119,7 @@ function usePopoverClose(open: boolean, onClose: () => void, trigger?: string) {
   return ref;
 }
 
-const baseName = (p: string) => p.split(/[\\/]/).pop() || p;
-const normPath = (p: string) => p.replace(/\\/g, '/').replace(/^\.\//, '');
-
 const shortModel = (m: string) => (m === 'default' ? '' : m.replace(/-\d{8}$/, ''));
-
-const formatDur = (ms: number) => `${Math.round(ms / 100) / 10}s`;
 
 function timeAgo(ts: number): string {
   const s = (Date.now() - ts) / 1000;
@@ -169,193 +170,6 @@ const threadTitle = (ms: UiChatMessage[]) => {
   return first ? first.content.replace(/\s+/g, ' ').trim().slice(0, 60) : 'New thread';
 };
 
-// ---------------------------------------------------------------------------------------------
-// Tool trace
-// ---------------------------------------------------------------------------------------------
-
-interface ToolView {
-  Icon: React.ComponentType<{ size?: number; className?: string }>;
-  verb: string;
-  subject: string;
-  meta?: string;
-  /** Workspace file this call touched (clicking opens it in the diff viewer). */
-  path?: string;
-  edits: boolean;
-}
-
-function describeTool(t: ToolCallTrace): ToolView {
-  const str = (k: string) => (typeof t.args?.[k] === 'string' ? (t.args[k] as string) : '');
-  const num = (k: string) => (typeof t.args?.[k] === 'number' ? (t.args[k] as number) : undefined);
-  switch (t.name) {
-    case 'read_file': {
-      const s = num('start_line');
-      const e = num('end_line');
-      const path = str('path');
-      return {
-        Icon: FileCode,
-        verb: 'Read',
-        subject: path,
-        meta: str('symbol') || (s || e ? `L${s ?? 1}–${e ?? ''}` : undefined),
-        path,
-        edits: false,
-      };
-    }
-    case 'outline':
-      return { Icon: FileCode, verb: 'Outline', subject: str('path'), path: str('path'), edits: false };
-    case 'repo_map':
-      return { Icon: FolderOpen, verb: 'Mapped', subject: str('query') || str('dir') || 'repo', edits: false };
-    case 'symbol_edit': {
-      const mode = str('mode');
-      const mut = mode === 'replace' || mode === 'insert_after' || mode === 'delete';
-      return { Icon: mut ? GitCompare : FileCode, verb: mut ? 'Edited' : 'Read', subject: str('path'), meta: str('symbol'), path: str('path'), edits: mut };
-    }
-    case 'ast':
-      return { Icon: Search, verb: str('rewrite') ? 'Rewrote' : 'AST', subject: str('pattern'), edits: !!str('rewrite') };
-    case 'verify':
-      return { Icon: TerminalIcon, verb: 'Verified', subject: str('command') || 'build', edits: false };
-    case 'search_code':
-      return { Icon: Search, verb: 'Searched', subject: `"${str('query')}"`, edits: false };
-    case 'list_files':
-      return { Icon: FolderOpen, verb: 'Listed', subject: str('dir') || 'workspace root', edits: false };
-    case 'edit_file':
-      return { Icon: GitCompare, verb: 'Edited', subject: str('path'), path: str('path'), edits: true };
-    case 'write_file':
-      return { Icon: GitCompare, verb: 'Wrote', subject: str('path'), path: str('path'), edits: true };
-    case 'run_command':
-      return { Icon: TerminalIcon, verb: 'Ran', subject: str('command'), edits: false };
-    default:
-      return { Icon: Wrench, verb: t.name.replace(/_/g, ' '), subject: str('path'), edits: false };
-  }
-}
-
-const isFailed = (t: ToolCallTrace) => t.result !== undefined && /^error/i.test(t.result.trim());
-
-/** Files a turn successfully modified (deduplicated, original path spelling kept). */
-function editedPaths(tools: ToolCallTrace[] | undefined): string[] {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const t of tools ?? []) {
-    const v = describeTool(t);
-    if (!v.edits || !v.path || t.result === undefined || isFailed(t)) continue;
-    const key = normPath(v.path);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(v.path);
-  }
-  return out;
-}
-
-type ChangeLookup = (path: string) => GitFileStatus | undefined;
-
-const DiffStat: React.FC<{ adds: number; dels: number }> = ({ adds, dels }) => (
-  <span className="shrink-0 font-mono text-[11px] tabular-nums">
-    <span className="text-[var(--added-fg)]">+{adds}</span>{' '}
-    <span className="text-[var(--removed-fg)]">-{dels}</span>
-  </span>
-);
-
-const ToolRow: React.FC<{
-  tool: ToolCallTrace;
-  turnActive: boolean;
-  open: boolean;
-  onToggle: () => void;
-  onOpenDiff: (path: string) => void;
-  changeFor: ChangeLookup;
-}> = ({ tool, turnActive, open, onToggle, onOpenDiff, changeFor }) => {
-  const v = describeTool(tool);
-  const done = tool.result !== undefined;
-  const failed = isFailed(tool);
-  const detail =
-    tool.name === 'run_command'
-      ? `$ ${v.subject}${tool.result ? `\n\n${tool.result}` : ''}`
-      : tool.result || '';
-  const change = v.edits && v.path ? changeFor(v.path) : undefined;
-  const opensDiff = v.edits && !!v.path && done && !failed;
-  return (
-    <div>
-      <div
-        onClick={() => (opensDiff ? onOpenDiff(v.path!) : detail && onToggle())}
-        className="group flex items-center gap-1.5 h-6 pr-1 rounded cursor-pointer hover:bg-[var(--bg-hover)] text-[12px] text-[var(--text-muted)]"
-        title={opensDiff ? 'Open diff' : v.subject}
-      >
-        <span className="w-3 shrink-0 flex items-center justify-center">
-          {!done && turnActive ? (
-            <Loader2 size={12} className="animate-spin text-[var(--accent)]" />
-          ) : failed ? (
-            <AlertCircle size={12} className="text-[var(--danger)]" />
-          ) : done ? (
-            <Check size={12} className="text-[var(--added-fg)]" />
-          ) : (
-            <v.Icon size={12} className="text-[var(--text-dim)]" />
-          )}
-        </span>
-        <span className="w-[52px] shrink-0 truncate">{v.verb}</span>
-        <span className="font-mono text-[11.5px] truncate min-w-0 text-[var(--text-primary)]/90" title={v.subject}>
-          {v.path ? baseName(v.subject) : v.subject}
-        </span>
-        <span className="flex-1" />
-        {change ? (
-          <DiffStat adds={change.additions} dels={change.deletions} />
-        ) : (
-          v.meta && <span className="shrink-0 font-mono text-[11px] text-[var(--text-dim)] truncate max-w-[40%]">{v.meta}</span>
-        )}
-        {detail && (
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onToggle();
-            }}
-            className="shrink-0 text-[var(--text-dim)] hover:text-[var(--text-primary)] opacity-0 group-hover:opacity-100 cursor-pointer"
-            title="Show output"
-          >
-            {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-          </button>
-        )}
-      </div>
-      {open && detail && (
-        <pre className="my-1 ml-5 p-2 rounded bg-[var(--bg-panel)] border border-[var(--border)]/70 text-[11px] font-mono text-[var(--text-muted)] max-h-40 overflow-auto whitespace-pre-wrap break-words">
-          {detail.length > 4000 ? `${detail.slice(0, 4000)}\n… (truncated)` : detail}
-        </pre>
-      )}
-    </div>
-  );
-};
-
-const ToolGroup: React.FC<{
-  tools: ToolCallTrace[];
-  turnActive: boolean;
-  durationMs?: number;
-  expanded: Record<string, boolean>;
-  onToggle: (id: string) => void;
-  onOpenDiff: (path: string) => void;
-  changeFor: ChangeLookup;
-}> = ({ tools, turnActive, durationMs, expanded, onToggle, onOpenDiff, changeFor }) => {
-  const doneCount = tools.filter((t) => t.result !== undefined).length;
-  const working = turnActive && doneCount < tools.length;
-  return (
-    <div className="border-l-2 border-[var(--border)] pl-2.5 my-1.5">
-      <div className="flex items-center justify-between h-5 text-[11px] text-[var(--text-dim)]">
-        <span>
-          {working
-            ? `Working · ${doneCount}/${tools.length} steps`
-            : `${tools.length} step${tools.length === 1 ? '' : 's'} completed`}
-        </span>
-        {!turnActive && durationMs !== undefined && durationMs >= 100 && <span>{formatDur(durationMs)}</span>}
-      </div>
-      {tools.map((t) => (
-        <ToolRow
-          key={t.id}
-          tool={t}
-          turnActive={turnActive}
-          open={!!expanded[t.id]}
-          onToggle={() => onToggle(t.id)}
-          onOpenDiff={onOpenDiff}
-          changeFor={changeFor}
-        />
-      ))}
-    </div>
-  );
-};
 
 const TouchedFiles: React.FC<{
   paths: string[];
@@ -536,12 +350,17 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
+  // Activity groups the user opened/closed by hand, keyed `${messageId}:${partIndex}`.
+  // Untouched groups follow the default: open while they are the live step, collapsed after.
+  const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>({});
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const stickRef = useRef(true);
+  const [atBottom, setAtBottom] = useState(true);
   // Context chips: the active file is on by default (per-path dismiss); changes are opt-in.
   const [dismissedActive, setDismissedActive] = useState<string | null>(null);
   const [includeChanges, setIncludeChanges] = useState(false);
   const [extraFiles, setExtraFiles] = useState<string[]>([]);
   const abortRef = useRef<AbortController | null>(null);
-  const endRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const settingsRef = usePopoverClose(showSettings, () => setShowSettings(false), 'settings');
@@ -650,6 +469,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     setRunning(false);
     setMessages([]);
     setExpandedTools({});
+    setGroupOpen({});
     setThreadId(newThreadId());
     setThreadStore({ ws: workspacePath, list: loadThreads(workspacePath) });
   }, [workspacePath, threadStore.ws]);
@@ -671,9 +491,28 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     }
   }, [draftAppend]);
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: 'smooth' });
+  // Follow new output only while the user is parked at the bottom; never yank them back up/down
+  // while they read earlier steps. (scrollIntoView would also scroll the IDE's outer panes.)
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el && stickRef.current) el.scrollTop = el.scrollHeight;
   }, [messages]);
+
+  const onTimelineScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    stickRef.current = near;
+    if (near !== atBottom) setAtBottom(near);
+  };
+
+  const jumpToLatest = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickRef.current = true;
+    setAtBottom(true);
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  };
 
   // Auto-growing composer: 44px up to 180px.
   useLayoutEffect(() => {
@@ -775,6 +614,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     setInput('');
     setAtRange(null);
     setRunning(true);
+    stickRef.current = true;
+    setAtBottom(true);
 
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -790,18 +631,28 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             patchAssistant(assistantId, (m) => ({
               ...m,
               content: m.content ? `${m.content}\n\n${text}` : text,
+              parts: [...(m.parts ?? []), { kind: 'text', text }],
               firstOutputAt: m.firstOutputAt ?? Date.now(),
             })),
           onToolCall: (call) =>
-            patchAssistant(assistantId, (m) => ({
-              ...m,
-              tools: [...(m.tools || []), { id: call.id, name: call.name, args: call.args }],
-              firstOutputAt: m.firstOutputAt ?? Date.now(),
-            })),
+            patchAssistant(assistantId, (m) => {
+              const parts = [...(m.parts ?? [])];
+              const last = parts[parts.length - 1];
+              if (last?.kind === 'tools') parts[parts.length - 1] = { kind: 'tools', ids: [...last.ids, call.id] };
+              else parts.push({ kind: 'tools', ids: [call.id] });
+              return {
+                ...m,
+                tools: [...(m.tools || []), { id: call.id, name: call.name, args: call.args, startedAt: Date.now() }],
+                parts,
+                firstOutputAt: m.firstOutputAt ?? Date.now(),
+              };
+            }),
           onToolResult: (res) => {
             patchAssistant(assistantId, (m) => ({
               ...m,
-              tools: (m.tools || []).map((t) => (t.id === res.id ? { ...t, result: res.result } : t)),
+              tools: (m.tools || []).map((t) =>
+                t.id === res.id ? { ...t, result: res.result, endedAt: Date.now() } : t
+              ),
             }));
             if (['write_file', 'edit_file', 'symbol_edit', 'ast'].includes(res.name)) {
               onRefreshGit();
@@ -841,6 +692,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     setRunning(false);
     setMessages([]);
     setExpandedTools({});
+    setGroupOpen({});
     setThreadId(newThreadId());
     setShowThreads(false);
   };
@@ -850,6 +702,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     setRunning(false);
     setMessages(t.messages);
     setExpandedTools({});
+    setGroupOpen({});
     setThreadId(t.id);
     setShowThreads(false);
   };
@@ -1174,7 +1027,12 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       )}
 
       {/* Zone 2: timeline */}
-      <div className="flex-1 min-h-0 overflow-y-auto px-3 py-2.5 flex flex-col">
+      <div className="relative flex-1 min-h-0 flex flex-col">
+        <div
+          ref={scrollRef}
+          onScroll={onTimelineScroll}
+          className="flex-1 min-h-0 overflow-y-auto px-3 py-2.5 flex flex-col"
+        >
         {messages.length === 0 ? (
           // Zone 2A: ready state, anchored to the composer instead of floating mid-panel.
           <div className="mt-auto space-y-3">
@@ -1267,35 +1125,50 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               }
 
               const tools = m.tools ?? [];
-              const pending = tools.some((t) => t.result === undefined);
-              const thoughtMs =
-                m.startedAt !== undefined && m.firstOutputAt !== undefined ? m.firstOutputAt - m.startedAt : 0;
+              const pending = !!m.streaming && tools.some((t) => t.result === undefined);
               const touched = !m.streaming ? editedPaths(tools) : [];
+              const byId = new Map(tools.map((t) => [t.id, t]));
+              // Older saved threads have no `parts`: show their steps first, then the reply.
+              const parts: MessagePart[] =
+                m.parts ??
+                [
+                  ...(tools.length ? [{ kind: 'tools' as const, ids: tools.map((t) => t.id) }] : []),
+                  ...(m.content ? [{ kind: 'text' as const, text: m.content }] : []),
+                ];
+              const worked =
+                !m.streaming && tools.length > 0 && m.startedAt !== undefined && m.endedAt !== undefined
+                  ? m.endedAt - m.startedAt
+                  : undefined;
               return (
                 <div key={m.id} className="space-y-2">
-                  {thoughtMs >= 1000 && (
-                    <div className="flex items-center h-6 text-[12px] text-[var(--text-dim)]">
-                      Thought for {formatDur(thoughtMs)}
-                    </div>
-                  )}
-
-                  {tools.length > 0 && (
-                    <ToolGroup
-                      tools={tools}
-                      turnActive={!!m.streaming}
-                      durationMs={m.startedAt !== undefined && m.endedAt !== undefined ? m.endedAt - m.startedAt : undefined}
-                      expanded={expandedTools}
-                      onToggle={(id) => setExpandedTools((prev) => ({ ...prev, [id]: !prev[id] }))}
-                      onOpenDiff={onOpenDiff}
-                      changeFor={changeFor}
-                    />
-                  )}
-
-                  {m.content && <MarkdownMessage content={m.content} theme={theme} />}
+                  {parts.map((p, i) => {
+                    if (p.kind === 'text') {
+                      return <MarkdownMessage key={`t${i}`} content={p.text} theme={theme} />;
+                    }
+                    const key = `${m.id}:${i}`;
+                    const groupTools = p.ids.map((id) => byId.get(id)).filter((t): t is NonNullable<typeof t> => !!t);
+                    return (
+                      <ActivityGroup
+                        key={key}
+                        tools={groupTools}
+                        turnActive={!!m.streaming}
+                        open={groupOpen[key] ?? (!!m.streaming && i === parts.length - 1)}
+                        onOpenChange={(open) => setGroupOpen((prev) => ({ ...prev, [key]: open }))}
+                        expanded={expandedTools}
+                        onToggleTool={(id) => setExpandedTools((prev) => ({ ...prev, [id]: !prev[id] }))}
+                        onOpenDiff={onOpenDiff}
+                        changeFor={changeFor}
+                      />
+                    );
+                  })}
 
                   {m.streaming && !pending && (
-                    <div className="flex items-center h-6 text-[12px] text-[var(--text-dim)] animate-pulse">
-                      Thinking…
+                    <LiveStatus label={parts.length ? 'Thinking' : 'Starting'} since={m.startedAt} />
+                  )}
+
+                  {worked !== undefined && worked >= 1000 && (
+                    <div className="pl-[3px] text-[11px] text-[var(--text-dim)]">
+                      Worked for {formatDur(worked)} · {tools.length} step{tools.length === 1 ? '' : 's'}
                     </div>
                   )}
 
@@ -1322,7 +1195,16 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             })}
           </div>
         )}
-        <div ref={endRef} />
+        </div>
+        {!atBottom && messages.length > 0 && (
+          <button
+            onClick={jumpToLatest}
+            className="absolute left-1/2 -translate-x-1/2 bottom-2 z-10 flex items-center gap-1 h-6 pl-2 pr-2.5 rounded-full border border-[var(--border)] bg-[var(--bg-elevated)] shadow-lg text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+          >
+            <ArrowDown size={12} />
+            {running ? 'Live activity below' : 'Jump to latest'}
+          </button>
+        )}
       </div>
 
       {/* Zone 3: live change bar */}

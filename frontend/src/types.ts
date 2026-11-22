@@ -249,13 +249,21 @@ export interface ToolCallTrace {
   name: string;
   args: Record<string, unknown>;
   result?: string;
+  /** Client-side timing (epoch ms), stamped when the call and its result arrive. */
+  startedAt?: number;
+  endedAt?: number;
 }
+
+/** Chronological layout of an assistant turn: prose and tool runs in the order they happened. */
+export type MessagePart = { kind: 'text'; text: string } | { kind: 'tools'; ids: string[] };
 
 export interface UiChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   tools?: ToolCallTrace[];
+  /** Assistant turns: render order. Older saved threads lack it and fall back to tools-then-text. */
+  parts?: MessagePart[];
   checkpoint?: Checkpoint;
   error?: string;
   streaming?: boolean;
