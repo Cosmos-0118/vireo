@@ -37,6 +37,8 @@ interface SidebarProps {
   onAskAgent: (text: string) => void;
   /** path -> pulse key for files an agent just changed. */
   recentPaths?: Record<string, number>;
+  /** Render only the icon rail (panel collapsed) so the icons stay reachable. */
+  railOnly?: boolean;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -56,6 +58,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   fsVersion,
   onAskAgent,
   recentPaths,
+  railOnly = false,
 }) => {
   const totalChanged = gitStatus?.files.length ?? 0;
 
@@ -115,6 +118,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Sidebar Pane Content */}
+      {!railOnly && (
       <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
         {activeTab === 'changes' && (
           <SourceControlPane
@@ -162,6 +166,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           />
         </div>
       </div>
+      )}
     </div>
   );
 };

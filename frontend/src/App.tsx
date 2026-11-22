@@ -1517,6 +1517,34 @@ export function App() {
           </>
         )}
 
+        {/* Collapsed sidebar: keep the icon rail so the panel can be reopened from it */}
+        {!widths.sidebarVisible && (
+          <div className="shrink-0 h-full overflow-hidden">
+            <Sidebar
+              railOnly
+              activeTab={sidebarTab}
+              onTabChange={(t) => {
+                setSidebarTab(t);
+                if (showSidebar) setPanelPriority('sidebar');
+                else setShowSidebar(true);
+              }}
+              gitStatus={gitStatus}
+              selectedPath={null}
+              selectedTabId={null}
+              workspacePath={workspace.path}
+              onOpenDiff={openDiff}
+              onOpenFile={openFile}
+              onOpenCommitDiff={openCommitDiff}
+              onOpenCompareDiff={openCompareDiff}
+              onOpenGraphTab={openGraphTab}
+              onRefreshGit={refreshGit}
+              onToast={showToast}
+              fsVersion={fsVersion}
+              onAskAgent={handleAskAgent}
+            />
+          </div>
+        )}
+
         {/* Center Column: Diff/Code/Graph + Bottom Terminal */}
         <div className="flex-1 flex flex-col min-w-0 min-h-0">
           {/* Open Tabs Bar */}
