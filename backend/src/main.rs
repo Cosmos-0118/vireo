@@ -343,6 +343,7 @@ fn build_router(
         .route("/api/agent/permission", post(cli_agent::answer_permission))
         .route("/api/agent/cli-tools", get(pty::list_cli_tools))
         .route("/api/agent/models", get(agent::list_models))
+        .route("/api/agent/api-models", post(agent::list_api_models))
         .route("/api/secrets", get(secrets::get_secrets))
         .route("/api/secrets/{name}", axum::routing::put(secrets::put_secret))
         .route("/ws/pty", get(pty::ws_pty))

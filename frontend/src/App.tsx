@@ -25,11 +25,13 @@ import {
   RotateCcw,
   Plus,
   Search,
+  Settings,
   Upload,
   X,
   FileCode,
 } from 'lucide-react';
 import { diffLines } from 'diff';
+import { AgentSettingsProvider } from './agentSettings';
 import { api, wsUrl } from './api';
 import {
   applyTheme,
@@ -65,6 +67,9 @@ import {
 
 const DiffViewer = lazy(() =>
   import('./components/DiffViewer').then((m) => ({ default: m.DiffViewer }))
+);
+const SettingsPage = lazy(() =>
+  import('./components/SettingsPage').then((m) => ({ default: m.SettingsPage }))
 );
 const CommitGraphView = lazy(() =>
   import('./components/CommitGraphView').then((m) => ({ default: m.CommitGraphView }))
@@ -361,7 +366,7 @@ export function App() {
       setFileData(null);
       return;
     }
-    if (activeTab.mode === 'graph') {
+    if (activeTab.mode === 'graph' || activeTab.mode === 'settings') {
       return;
     }
     const id = activeTab.id;
@@ -1070,6 +1075,12 @@ export function App() {
     setActiveTabId(id);
   }, []);
 
+  const openSettingsTab = useCallback(() => {
+    const id = 'settings';
+    setTabs((prev) => (prev.some((t) => t.id === id) ? prev : [...prev, { id, path: 'Settings', mode: 'settings' }]));
+    setActiveTabId(id);
+  }, []);
+
   const closeTab = (id: string) => {
     contentCacheRef.current.delete(id);
     setTabs((prev) => {
@@ -1331,6 +1342,7 @@ export function App() {
   })();
 
   return (
+    <AgentSettingsProvider onToast={showToast}>
     <div className="h-screen w-screen flex flex-col overflow-hidden bg-[var(--bg-base)] text-[var(--text-primary)]">
       {/* Title Bar (custom, frameless window) */}
       <header
@@ -1653,6 +1665,8 @@ export function App() {
                 const label =
                   tab.mode === 'graph'
                     ? 'Git Graph'
+                    : tab.mode === 'settings'
+                    ? 'Settings'
                     : tab.mode === 'commit-diff'
                     ? `${baseName} (${tab.commitShortHash})`
                     : tab.mode === 'compare-diff'
@@ -1684,6 +1698,8 @@ export function App() {
                   >
                     {tab.mode === 'graph' ? (
                       <GitFork size={14} className="text-[var(--accent)] shrink-0" />
+                    ) : tab.mode === 'settings' ? (
+                      <Settings size={14} className="text-[var(--accent)] shrink-0" />
                     ) : tab.mode === 'commit-diff' ? (
                       <GitCommitHorizontal size={14} className="text-[var(--accent)] shrink-0" />
                     ) : tab.mode === 'diff' || tab.mode === 'compare-diff' ? (
@@ -1788,6 +1804,16 @@ export function App() {
                   </button>
                 </div>
               </div>
+            ) : activeTab.mode === 'settings' ? (
+              <Suspense
+                fallback={
+                  <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-dim)]">
+                    Loading Settings...
+                  </div>
+                }
+              >
+                <SettingsPage />
+              </Suspense>
             ) : activeTab.mode === 'graph' ? (
               <Suspense
                 fallback={
@@ -2096,6 +2122,7 @@ export function App() {
                 onOpenDiff={(p) => openDiff(p)}
                 onRefreshGit={refreshGit}
                 onToast={showToast}
+                onOpenSettings={openSettingsTab}
               />
               </Suspense>
             </div>
@@ -2238,6 +2265,7 @@ export function App() {
         </Suspense>
       )}
     </div>
+    </AgentSettingsProvider>
   );
 }
 

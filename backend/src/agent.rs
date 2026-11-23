@@ -582,6 +582,92 @@ pub async fn list_models(
     Json(json!({ "ollama": ollama, "codex": codex, "antigravity": antigravity }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ApiModelsReq {
+    pub provider: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+/// Live model list from an API provider, so the picker never shows hand-maintained (stale) ids.
+pub async fn list_api_models(
+    State(state): State<AppState>,
+    Json(req): Json<ApiModelsReq>,
+) -> Result<Json<Value>, (axum::http::StatusCode, String)> {
+    let bad = |m: String| (axum::http::StatusCode::BAD_GATEWAY, m);
+    let key = req.api_key.as_deref().unwrap_or("").trim().to_string();
+    let base = req.base_url.as_deref().map(|b| b.trim().trim_end_matches('/')).filter(|b| !b.is_empty());
+    let client = state.http_client.clone();
+    let timeout = Duration::from_secs(8);
+
+    let (builder, id_field) = match req.provider.as_str() {
+        "anthropic" => (
+            client
+                .get(format!("{}/v1/models?limit=100", base.unwrap_or("https://api.anthropic.com")))
+                .header("x-api-key", &key)
+                .header("anthropic-version", "2023-06-01"),
+            "id",
+        ),
+        "gemini" => (
+            client.get(format!(
+                "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key={key}"
+            )),
+            "name",
+        ),
+        "openai" => {
+            let mut b = client.get(format!("{}/models", base.unwrap_or("https://api.openai.com/v1")));
+            if !key.is_empty() {
+                b = b.bearer_auth(&key);
+            }
+            (b, "id")
+        }
+        other => return Err(bad(format!("Unsupported provider: {other}"))),
+    };
+    if req.provider != "openai" && key.is_empty() {
+        return Err(bad("Add an API key to load models.".into()));
+    }
+
+    let resp = builder
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| bad(format!("Could not reach the provider: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(bad(format!("Provider returned {}", resp.status())));
+    }
+    let body: Value = resp.json().await.map_err(|e| bad(e.to_string()))?;
+    let items = body["data"].as_array().or_else(|| body["models"].as_array());
+    let mut models: Vec<String> = items
+        .map(|a| {
+            a.iter()
+                .filter(|m| {
+                    // Gemini lists embedding/vision-only models too.
+                    req.provider != "gemini"
+                        || m["supportedGenerationMethods"]
+                            .as_array()
+                            .is_some_and(|g| g.iter().any(|x| x.as_str() == Some("generateContent")))
+                })
+                .filter_map(|m| m[id_field].as_str())
+                .map(|s| s.trim_start_matches("models/").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if req.provider == "openai" && base.is_none() {
+        // The official endpoint also lists embeddings, audio, image and moderation models.
+        models.retain(|m| {
+            (m.starts_with("gpt-") || m.starts_with('o') || m.starts_with("chatgpt"))
+                && !["embedding", "audio", "realtime", "tts", "transcribe", "image", "moderation", "search", "instruct"]
+                    .iter()
+                    .any(|x| m.contains(x))
+        });
+    }
+    models.sort();
+    models.dedup();
+    Ok(Json(json!({ "models": models })))
+}
+
 pub(crate) async fn send_sse(tx: &mpsc::Sender<Result<Event, Infallible>>, event: &str, payload: Value) {
     let _ = tx
         .send(Ok(Event::default()
