@@ -206,26 +206,26 @@ Vireo is an open-source project and its Windows binaries are currently **unsigne
 
 <!-- This block is updated automatically by the release workflow (scripts/update-release-integrity.ps1). Do not edit it by hand. -->
 <!-- release-integrity:start -->
-- **Latest release:** [Vireo 0.3.1](https://github.com/Cosmos-0118/vireo/releases/tag/v0.3.1)
+- **Latest release:** [Vireo 0.4.0](https://github.com/Cosmos-0118/vireo/releases/tag/v0.4.0)
 - **SHA256 checksums:**
 
   | File | SHA256 |
   | --- | --- |
-  | `Vireo-0.3.1-win-x64.zip` | `b7d450cfbd9a43755b4e698759c5aa955eb73353286417c24f1362743f68a60a` |
-  | `Vireo-Setup-0.3.1.exe` | `e934cc1c6d3c518551326aa4af0be9694c30c0187dd07b1e3bfa690568e2ee24` |
+  | `Vireo-0.4.0-win-x64.zip` | `c53fa890eee14b2f7b8a86deb87c915188035c3a287602e4c8b94a10a5d7419e` |
+  | `Vireo-Setup-0.4.0.exe` | `b97c6c4019fc6f6edd452f3cdc22442bffe0eec55b4d722bdb7ddb43ca04f25a` |
 
   The same values are published as `SHA256SUMS.txt` on the release page.
 
 - **Verify locally** (run in the folder you downloaded to):
 
   ```powershell
-  (Get-FileHash .\Vireo-Setup-0.3.1.exe -Algorithm SHA256).Hash -eq 'e934cc1c6d3c518551326aa4af0be9694c30c0187dd07b1e3bfa690568e2ee24'
+  (Get-FileHash .\Vireo-Setup-0.4.0.exe -Algorithm SHA256).Hash -eq 'b97c6c4019fc6f6edd452f3cdc22442bffe0eec55b4d722bdb7ddb43ca04f25a'
   ```
 
 - **Verify build provenance** (with [GitHub CLI](https://cli.github.com/)):
 
   ```powershell
-  gh attestation verify Vireo-Setup-0.3.1.exe --repo Cosmos-0118/vireo
+  gh attestation verify Vireo-Setup-0.4.0.exe --repo Cosmos-0118/vireo
   ```
 <!-- release-integrity:end -->
 
