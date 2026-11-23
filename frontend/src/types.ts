@@ -43,10 +43,31 @@ export interface ReplaceRes {
   skipped: string[];
 }
 
+export type TaskCategory = 'run' | 'build' | 'test' | 'check' | 'other';
+
 export interface TaskItem {
+  /** Stable id: `pkg:frontend:dev`, `custom:my-task`, `local:my-task`, `file:<path>`. */
+  id: string;
   name: string;
   command: string;
   source: string;
+  /** Working directory relative to the workspace root ('' = root). */
+  cwd: string;
+  category: TaskCategory;
+  /** Backend-assigned rank; higher = more likely the primary run target. */
+  score: number;
+  /** Defined in .vireo/tasks.json. */
+  custom: boolean;
+  /** Personal task stored on this machine only. */
+  local?: boolean;
+  env: Record<string, string>;
+  /** Ids of tasks to start together with this one (compound tasks). */
+  depends_on: string[];
+}
+
+export interface TasksRes {
+  tasks: TaskItem[];
+  default_task: string | null;
 }
 
 /** Optional button shown inside a toast (e.g. "Redo" after an undo). */

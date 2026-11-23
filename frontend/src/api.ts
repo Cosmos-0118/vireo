@@ -20,7 +20,7 @@ import type {
   ReplaceRes,
   SearchOptions,
   SearchRes,
-  TaskItem,
+  TasksRes,
   TreeEntry,
   WorkspaceInfo,
 } from './types';
@@ -89,7 +89,24 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(opts),
     }),
-  getTasks: () => jsonFetch<TaskItem[]>('/api/tasks'),
+  getTasks: () => jsonFetch<TasksRes>('/api/tasks'),
+  saveCustomTask: (task: {
+    id?: string;
+    name: string;
+    command: string;
+    cwd?: string;
+    category?: string;
+    env?: Record<string, string>;
+    make_default?: boolean;
+  }) =>
+    jsonFetch<{ ok: boolean; id: string }>('/api/tasks/custom', {
+      method: 'POST',
+      body: JSON.stringify(task),
+    }),
+  deleteCustomTask: (id: string) =>
+    jsonFetch<{ ok: boolean }>(`/api/tasks/custom?id=${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
 
   gitStatus: () => jsonFetch<GitStatusRes>('/api/git/status'),
   gitDiff: (path: string, staged = false) =>

@@ -42,6 +42,52 @@ pub struct PtyQuery {
     pub cmd: Option<String>,
     /// Stable client-chosen session id; reconnecting with the same id re-attaches to the shell.
     pub sid: Option<String>,
+    /// Working directory relative to the workspace root (tasks run inside sub-packages).
+    pub cwd: Option<String>,
+    /// JSON object of extra environment variables for the spawned shell.
+    pub env: Option<String>,
+}
+
+/// Per-session spawn options beyond the shell command: sub-directory and environment.
+#[derive(Default, Clone)]
+struct SpawnExtra {
+    cwd: Option<PathBuf>,
+    env: Vec<(String, String)>,
+}
+
+impl SpawnExtra {
+    fn apply(&self, c: &mut CommandBuilder) {
+        if let Some(dir) = &self.cwd {
+            c.cwd(dir);
+        }
+        for (k, v) in &self.env {
+            c.env(k, v);
+        }
+    }
+
+    fn from_query(workspace: &Path, q: &PtyQuery) -> Self {
+        let cwd = q
+            .cwd
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != ".")
+            .and_then(|rel| crate::state::resolve_safe_path(workspace, rel).ok())
+            .filter(|p| p.is_dir());
+        let env = q
+            .env
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<std::collections::HashMap<String, String>>(raw).ok())
+            .map(|m| {
+                m.into_iter()
+                    .filter(|(k, _)| {
+                        !k.is_empty()
+                            && k.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self { cwd, env }
+    }
 }
 
 #[derive(Deserialize)]
@@ -824,6 +870,7 @@ fn spawn_session(
     rows: u16,
     workspace: &Path,
     custom_cmd: Option<&str>,
+    extra: &SpawnExtra,
 ) -> Result<Arc<PtySession>, String> {
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -841,24 +888,28 @@ fn spawn_session(
     let spawn_result = {
         let has_pwsh = find_command_in_path("pwsh.exe", &path_env).is_some();
         if has_pwsh {
-            let pwsh_cmd = build_windows_shell("pwsh.exe", workspace, &path_env, custom_cmd);
+            let mut pwsh_cmd = build_windows_shell("pwsh.exe", workspace, &path_env, custom_cmd);
+            extra.apply(&mut pwsh_cmd);
             match pair.slave.spawn_command(pwsh_cmd) {
                 Ok(child) => Ok(child),
                 Err(_) => {
-                    let ps_cmd =
+                    let mut ps_cmd =
                         build_windows_shell("powershell.exe", workspace, &path_env, custom_cmd);
+                    extra.apply(&mut ps_cmd);
                     pair.slave.spawn_command(ps_cmd)
                 }
             }
         } else {
-            let ps_cmd = build_windows_shell("powershell.exe", workspace, &path_env, custom_cmd);
+            let mut ps_cmd = build_windows_shell("powershell.exe", workspace, &path_env, custom_cmd);
+            extra.apply(&mut ps_cmd);
             pair.slave.spawn_command(ps_cmd)
         }
     };
 
     #[cfg(not(windows))]
     let spawn_result = {
-        let cmd = build_unix_shell(workspace, &path_env, custom_cmd);
+        let mut cmd = build_unix_shell(workspace, &path_env, custom_cmd);
+        extra.apply(&mut cmd);
         pair.slave.spawn_command(cmd)
     };
 
@@ -978,6 +1029,7 @@ fn get_or_create(
     rows: u16,
     workspace: &Path,
     custom_cmd: Option<&str>,
+    extra: &SpawnExtra,
 ) -> Result<Arc<PtySession>, String> {
     let mut map = sessions().lock().unwrap();
     if let Some(existing) = map.get(sid) {
@@ -985,7 +1037,7 @@ fn get_or_create(
             return Ok(existing.clone());
         }
     }
-    let session = spawn_session(sid, cols, rows, workspace, custom_cmd)?;
+    let session = spawn_session(sid, cols, rows, workspace, custom_cmd, extra)?;
     map.insert(sid.to_string(), session.clone());
     Ok(session)
 }
@@ -1058,10 +1110,11 @@ async fn handle_pty_socket(socket: WebSocket, q: PtyQuery, state: AppState) {
         None => format!("anon-{}", NEXT_ANON.fetch_add(1, Ordering::Relaxed)),
     };
     let custom_cmd = q.cmd.clone();
+    let extra = SpawnExtra::from_query(&workspace, &q);
 
     let created = tokio::task::spawn_blocking({
         let sid = sid.clone();
-        move || get_or_create(&sid, cols, rows, &workspace, custom_cmd.as_deref())
+        move || get_or_create(&sid, cols, rows, &workspace, custom_cmd.as_deref(), &extra)
     })
     .await;
 

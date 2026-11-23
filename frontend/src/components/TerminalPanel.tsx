@@ -32,6 +32,27 @@ export interface TermTabSpec {
   kind?: 'shell' | 'agent';
   /** Bumped to restart the tab's process (new backend session). */
   runKey?: number;
+  /** Working directory relative to the workspace root. */
+  cwd?: string;
+  env?: Record<string, string>;
+  /** Set for tabs started from a Run task (one reusable tab per task). */
+  taskId?: string;
+}
+
+export interface TaskLaunch {
+  taskId: string;
+  name: string;
+  command: string;
+  cwd?: string;
+  env?: Record<string, string>;
+  /** Open a separate tab instead of reusing/restarting the task's tab. */
+  newTab?: boolean;
+}
+
+export interface PendingTaskCommand {
+  id: number;
+  action: 'run' | 'stop';
+  tasks: TaskLaunch[];
 }
 
 const ptySid = (workspace: string, tab: TermTabSpec) =>
@@ -76,6 +97,8 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
   const { termRef } = usePtyTerminal(hostRef, {
     sessionKey: ptySid(workspaceKey, tab),
     cmd: tab.cmd,
+    cwd: tab.cwd,
+    env: tab.env,
     active,
     visible,
     theme,
@@ -274,7 +297,9 @@ const LauncherMenu: React.FC<LauncherMenuProps> = ({ anchor, tools, onLaunch, on
 interface TerminalPanelProps {
   theme: LiteTheme;
   workspacePath: string;
-  pendingCommand: { id: number; name: string; command: string } | null;
+  pendingCommand: PendingTaskCommand | null;
+  /** Reports which tasks currently own a terminal tab (task ids). */
+  onTaskTabsChange?: (taskIds: string[]) => void;
   /** Increment to open the "Launch CLI agent" menu (e.g. from the Agent Chat header). */
   launcherSignal?: number;
   maximized?: boolean;
@@ -289,6 +314,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   theme,
   workspacePath,
   pendingCommand,
+  onTaskTabsChange,
   launcherSignal = 0,
   maximized = false,
   onToggleMaximize,
@@ -310,15 +336,51 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     else delete readersRef.current[id];
   }, []);
 
+  // Run tasks reuse one tab per task id: re-running restarts the process in the same tab
+  // instead of piling up dead tabs. `newTab` opts out; `stop` closes the task's tab.
+  const handledCmdRef = useRef(0);
   useEffect(() => {
-    if (!pendingCommand) return;
-    const id = `task-${pendingCommand.id}`;
-    setTabs((prev) => [
-      ...prev,
-      { id, title: pendingCommand.name, cmd: pendingCommand.command, kind: 'shell' },
-    ]);
-    setActiveId(id);
+    if (!pendingCommand || handledCmdRef.current === pendingCommand.id) return;
+    handledCmdRef.current = pendingCommand.id;
+
+    if (pendingCommand.action === 'stop') {
+      for (const task of pendingCommand.tasks) {
+        for (const t of tabs.filter((x) => x.taskId === task.taskId)) closeTab(t.id);
+      }
+      return;
+    }
+
+    let next = tabs;
+    let lastId = '';
+    pendingCommand.tasks.forEach((task, i) => {
+      const id = task.newTab
+        ? `task::${task.taskId}#${pendingCommand.id}-${i}`
+        : `task::${task.taskId}`;
+      lastId = id;
+      const spec: Partial<TermTabSpec> = {
+        title: task.name,
+        cmd: task.command,
+        cwd: task.cwd || undefined,
+        env: task.env && Object.keys(task.env).length > 0 ? task.env : undefined,
+      };
+      const existing = next.find((t) => t.id === id);
+      if (existing) {
+        killPtySession(ptySid(workspacePath, existing));
+        next = next.map((t) =>
+          t.id === id ? { ...t, ...spec, runKey: (t.runKey ?? 0) + 1 } : t
+        );
+      } else {
+        next = [...next, { id, kind: 'shell', taskId: task.taskId, title: task.name, ...spec }];
+      }
+    });
+    setTabs(next);
+    if (lastId) setActiveId(lastId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [pendingCommand]);
+
+  useEffect(() => {
+    onTaskTabsChange?.(tabs.flatMap((t) => (t.taskId ? [t.taskId] : [])));
+  }, [tabs, onTaskTabsChange]);
 
   const openMenu = () => {
     const rect = launcherBtnRef.current?.getBoundingClientRect();

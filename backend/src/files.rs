@@ -126,13 +126,6 @@ pub struct ReplaceRes {
     pub skipped: Vec<String>,
 }
 
-#[derive(Serialize)]
-pub struct TaskItem {
-    pub name: String,
-    pub command: String,
-    pub source: String,
-}
-
 pub async fn get_workspace(State(state): State<AppState>) -> Json<WorkspaceInfo> {
     let ws = state.workspace_path().await;
     let name = ws
@@ -788,82 +781,4 @@ pub async fn replace_in_files(
         replacements,
         skipped,
     }))
-}
-
-pub async fn get_tasks(State(state): State<AppState>) -> Json<Vec<TaskItem>> {
-    let ws = state.workspace_path().await;
-    let mut tasks = Vec::new();
-
-    // Check package.json
-    let pkg_path = ws.join("package.json");
-    if let Ok(raw) = tokio::fs::read_to_string(&pkg_path).await {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
-                for (name, _) in scripts {
-                    tasks.push(TaskItem {
-                        name: format!("npm: {}", name),
-                        command: format!("npm run {}", name),
-                        source: "package.json".to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    // Check frontend/package.json (common monorepo layout)
-    let fe_pkg = ws.join("frontend").join("package.json");
-    if let Ok(raw) = tokio::fs::read_to_string(&fe_pkg).await {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-            if let Some(scripts) = json.get("scripts").and_then(|s| s.as_object()) {
-                for (name, _) in scripts {
-                    tasks.push(TaskItem {
-                        name: format!("frontend: {}", name),
-                        command: format!("npm --prefix frontend run {}", name),
-                        source: "frontend/package.json".to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    // Check Cargo.toml
-    if ws.join("Cargo.toml").exists() {
-        for (name, cmd) in [
-            ("cargo check", "cargo check"),
-            ("cargo test", "cargo test"),
-            ("cargo build", "cargo build"),
-            ("cargo run", "cargo run"),
-        ] {
-            tasks.push(TaskItem {
-                name: name.to_string(),
-                command: cmd.to_string(),
-                source: "Cargo.toml".to_string(),
-            });
-        }
-    }
-
-    // Check backend/Cargo.toml
-    if ws.join("backend").join("Cargo.toml").exists() {
-        tasks.push(TaskItem {
-            name: "backend: cargo check".to_string(),
-            command: "cargo check --manifest-path backend/Cargo.toml".to_string(),
-            source: "backend/Cargo.toml".to_string(),
-        });
-        tasks.push(TaskItem {
-            name: "backend: cargo test".to_string(),
-            command: "cargo test --manifest-path backend/Cargo.toml".to_string(),
-            source: "backend/Cargo.toml".to_string(),
-        });
-    }
-
-    // Check Python
-    if ws.join("pyproject.toml").exists() || ws.join("pytest.ini").exists() {
-        tasks.push(TaskItem {
-            name: "pytest".to_string(),
-            command: "pytest".to_string(),
-            source: "python".to_string(),
-        });
-    }
-
-    Json(tasks)
 }

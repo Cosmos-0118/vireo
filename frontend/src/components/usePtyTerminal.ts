@@ -78,6 +78,10 @@ export interface PtyTerminalOptions {
    */
   sessionKey: string;
   cmd?: string;
+  /** Working directory relative to the workspace root. */
+  cwd?: string;
+  /** Extra environment variables for the spawned shell. */
+  env?: Record<string, string>;
   active: boolean;
   /** False while the whole terminal dock is collapsed (tabs stay mounted but must go idle). */
   visible?: boolean;
@@ -371,6 +375,9 @@ export function usePtyTerminal(
           sid: sessionKey,
         });
         if (cmd) params.set('cmd', cmd);
+        if (options.cwd) params.set('cwd', options.cwd);
+        if (options.env && Object.keys(options.env).length > 0)
+          params.set('env', JSON.stringify(options.env));
         const s = new WebSocket(wsUrl(`/ws/pty?${params.toString()}`));
         s.binaryType = 'arraybuffer';
         sock = s;

@@ -49,7 +49,7 @@ export const QuickOpen: React.FC<QuickOpenProps> = ({
       const out: PaletteEntry[] = [];
       for (const t of tasks) {
         if (!sub || t.name.toLowerCase().includes(sub) || t.command.toLowerCase().includes(sub)) {
-          out.push({ kind: 'task', label: `Run: ${t.name}`, subtitle: t.command, task: t });
+          out.push({ kind: 'task', label: `Run: ${t.name}`, subtitle: `${t.cwd ? `${t.cwd}/ · ` : ''}${t.command}  ·  ${t.source}`, task: t });
         }
       }
       for (const th of themes) {

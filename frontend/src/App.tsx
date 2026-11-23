@@ -4,6 +4,7 @@ import React, {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from 'react';
@@ -48,6 +49,15 @@ import type {
   ToastAction,
   WorkspaceInfo,
 } from './types';
+import { RunMenu, type TaskDraft } from './components/RunMenu';
+import type { PendingTaskCommand, TaskLaunch } from './components/TerminalPanel';
+import {
+  activeFileTask,
+  expandVars,
+  rankTasks,
+  slugify,
+  useTaskPrefs,
+} from './utils/tasks';
 import { Sidebar, SidebarTab } from './components/Sidebar';
 import { AgentEditsStrip } from './components/AgentEditsStrip';
 import { FileIcon } from './components/FileIcon';
@@ -64,6 +74,10 @@ import {
   solveWidths,
   type PanelSide,
 } from './layout';
+
+/** Files whose changes can add, remove or rename Run tasks. */
+const TASK_SOURCE_RE =
+  /(^|\/)(package\.json|Cargo\.toml|pyproject\.toml|go\.mod|[Mm]akefile|justfile|Taskfile\.ya?ml|(docker-)?compose\.ya?ml|deno\.jsonc?|tasks\.json|[^/]+\.(ps1|sh|bat|cmd))$/;
 
 const DiffViewer = lazy(() =>
   import('./components/DiffViewer').then((m) => ({ default: m.DiffViewer }))
@@ -143,6 +157,11 @@ export function App() {
   const [fsVersion, setFsVersion] = useState(0);
   const [allFiles, setAllFiles] = useState<string[]>([]);
   const [tasks, setTasks] = useState<TaskItem[]>([]);
+  const [projectDefaultTask, setProjectDefaultTask] = useState<string | null>(null);
+  const [runningTaskIds, setRunningTaskIds] = useState<string[]>([]);
+  const { prefs: taskPrefs, setPinned, recordRun, saveLocal, removeLocal } = useTaskPrefs(
+    workspace.path
+  );
   const [liveConnected, setLiveConnected] = useState(false);
 
   // Native window state for the custom title bar (null = running in a browser)
@@ -317,11 +336,7 @@ export function App() {
   }, []);
 
   // Cross-panel triggers
-  const [pendingCmd, setPendingCmd] = useState<{
-    id: number;
-    name: string;
-    command: string;
-  } | null>(null);
+  const [pendingCmd, setPendingCmd] = useState<PendingTaskCommand | null>(null);
   const [agentDraftAppend, setAgentDraftAppend] = useState<{
     id: number;
     text: string;
@@ -376,7 +391,8 @@ export function App() {
         setGitStatus(status);
       }
       setAllFiles(files);
-      setTasks(taskList);
+      setTasks(taskList.tasks);
+      setProjectDefaultTask(taskList.default_task);
 
       // Auto-open the first modified file's diff if nothing is open yet
       setTabs((prev) => {
@@ -568,6 +584,18 @@ export function App() {
     [showToast]
   );
 
+  const refreshTasks = useCallback(() => {
+    api
+      .getTasks()
+      .then((res) => {
+        setTasks(res.tasks);
+        setProjectDefaultTask(res.default_task);
+      })
+      .catch(() => {});
+  }, []);
+  const refreshTasksRef = useRef(refreshTasks);
+  refreshTasksRef.current = refreshTasks;
+
   // Live file-watcher WebSocket so diffs auto-refresh as agents code!
   useEffect(() => {
     let closed = false;
@@ -591,6 +619,9 @@ export function App() {
       pendingPaths.clear();
       coarse = false;
       fsChangedRef.current(paths, new Set(gitStatusRef.current?.files.map((f) => f.path) ?? []));
+      if (paths.length === 0 || paths.some((p) => TASK_SOURCE_RE.test(p))) {
+        refreshTasksRef.current();
+      }
       setFsVersion((v) => v + 1);
       refreshGit();
       reloadActiveContentRef.current();
@@ -1330,11 +1361,132 @@ export function App() {
     ];
   };
 
-  const handleRunTask = (task: TaskItem) => {
-    setShowRunMenu(false);
-    setShowTerminal(true);
-    setPendingCmd({ id: Date.now(), name: task.name, command: task.command });
+  const activeFilePath =
+    activeTab && (activeTab.mode === 'code' || activeTab.mode === 'diff') ? activeTab.path : null;
+  const fileTask = useMemo(() => activeFileTask(activeFilePath), [activeFilePath]);
+  const rankedTasks = useMemo(
+    () =>
+      rankTasks([...tasks, ...taskPrefs.local], {
+        prefs: taskPrefs,
+        projectDefault: projectDefaultTask,
+        activeFile: activeFilePath,
+      }),
+    [tasks, taskPrefs, projectDefaultTask, activeFilePath]
+  );
+
+  const launchTasks = (launches: TaskLaunch[], action: 'run' | 'stop' = 'run') => {
+    if (launches.length === 0) return;
+    if (action === 'run') setShowTerminal(true);
+    setPendingCmd({ id: Date.now(), action, tasks: launches });
   };
+
+  const handleRunTask = (task: TaskItem, opts?: { newTab?: boolean }) => {
+    setShowRunMenu(false);
+    const byId = new Map<string, TaskItem>(
+      [...rankedTasks, ...(fileTask ? [fileTask] : [])].map((t) => [t.id, t])
+    );
+    const varCtx = { workspacePath: workspace.path, activeFile: activeFilePath };
+    const launches: TaskLaunch[] = [];
+    const seen = new Set<string>();
+    // Dependencies start together with the task (compound tasks), each in its own tab.
+    const collect = (t: TaskItem): boolean => {
+      if (seen.has(t.id)) return true;
+      seen.add(t.id);
+      for (const depId of t.depends_on) {
+        const dep = byId.get(depId);
+        if (!dep) {
+          showToast(`Task "${t.name}" depends on unknown task "${depId}"`, true);
+          return false;
+        }
+        if (!collect(dep)) return false;
+      }
+      if (t.command.trim()) {
+        const command = expandVars(t.command, varCtx, (v) =>
+          showToast('${' + v + '} needs an open file', true)
+        );
+        if (command === null) return false;
+        launches.push({
+          taskId: t.id,
+          name: t.name,
+          command,
+          cwd: t.cwd,
+          env: t.env,
+          newTab: opts?.newTab,
+        });
+      }
+      return true;
+    };
+    if (!collect(task)) return;
+    recordRun(task.id);
+    launchTasks(launches);
+  };
+
+  const handleStopTask = (task: TaskItem) => {
+    const ids = [task.id, ...task.depends_on];
+    launchTasks(
+      ids.map((taskId) => ({ taskId, name: task.name, command: '' })),
+      'stop'
+    );
+  };
+
+  const handleRunAdHoc = (command: string) => {
+    const taskId = `adhoc:${command}`;
+    launchTasks([
+      { taskId, name: command.length > 24 ? `${command.slice(0, 24)}…` : command, command },
+    ]);
+  };
+
+  const handleSaveTask = async (draft: TaskDraft) => {
+    const cwd = draft.cwd.trim();
+    if (draft.scope === 'personal') {
+      const id = draft.id?.startsWith('local:') ? draft.id : `local:${slugify(draft.name)}`;
+      saveLocal({
+        id,
+        name: draft.name.trim(),
+        command: draft.command.trim(),
+        source: 'personal',
+        cwd,
+        category: draft.category,
+        score: 150,
+        custom: false,
+        local: true,
+        env: {},
+        depends_on: [],
+      });
+      return;
+    }
+    const existing = draft.id?.startsWith('custom:')
+      ? tasks.find((t) => t.id === draft.id)
+      : undefined;
+    await api.saveCustomTask({
+      id: existing?.id,
+      name: draft.name.trim(),
+      command: draft.command.trim(),
+      cwd,
+      category: draft.category,
+      env: existing?.env,
+    });
+    refreshTasks();
+  };
+
+  const handleDeleteTask = async (task: TaskItem) => {
+    if (task.local) {
+      removeLocal(task.id);
+      return;
+    }
+    try {
+      await api.deleteCustomTask(task.id);
+      refreshTasks();
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : 'Failed to delete task', true);
+    }
+  };
+
+  const handleTaskTabsChange = useCallback((ids: string[]) => {
+    setRunningTaskIds((prev) =>
+      prev.length === ids.length && prev.every((id, i) => id === ids[i]) ? prev : ids
+    );
+  }, []);
 
   const handleAskAgent = (text: string) => {
     setShowAgent(true);
@@ -1604,48 +1756,26 @@ export function App() {
         <div className="flex items-center justify-end h-full min-w-0">
           <div className="flex items-center gap-0.5 pr-2">
             {/* Run Scripts */}
-            <div className="relative" data-no-drag>
-              <button
-                onClick={() => {
-                  setShowRunMenu((v) => !v);
+            <RunMenu
+              open={showRunMenu}
+              onOpenChange={(v) => {
+                setShowRunMenu(v);
+                if (v) {
                   setShowThemeMenu(false);
-                }}
-                className={`h-7 px-2 text-[12.5px] rounded-md flex items-center gap-1.5 cursor-pointer transition-colors ${
-                  showRunMenu
-                    ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
-                    : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
-                }`}
-                title="Run a project task"
-              >
-                <Play size={13} className="text-[var(--added-fg)]" />
-                <span className="hidden lg:inline">Run</span>
-              </button>
-              {showRunMenu && (
-                <div className="absolute right-0 top-full mt-1.5 w-68 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 py-1.5">
-                  <div className="px-3 py-1 text-[11px] uppercase font-semibold tracking-wider text-[var(--text-dim)]">
-                    Project Tasks
-                  </div>
-                  {tasks.length === 0 ? (
-                    <div className="px-3 py-2 text-[13px] text-[var(--text-dim)]">
-                      No tasks found in package.json or Cargo.toml.
-                    </div>
-                  ) : (
-                    tasks.map((t) => (
-                      <button
-                        key={`${t.source}-${t.name}`}
-                        onClick={() => handleRunTask(t)}
-                        className="w-full text-left px-3 py-2 hover:bg-[var(--bg-hover)] flex flex-col cursor-pointer"
-                      >
-                        <span className="text-[13px] text-[var(--text-primary)]">{t.name}</span>
-                        <span className="text-[11px] font-mono text-[var(--text-dim)] truncate">
-                          {t.command}
-                        </span>
-                      </button>
-                    ))
-                  )}
-                </div>
-              )}
-            </div>
+                  refreshTasks();
+                }
+              }}
+              tasks={rankedTasks}
+              prefs={taskPrefs}
+              fileTask={fileTask}
+              runningIds={runningTaskIds}
+              onRun={handleRunTask}
+              onRunAdHoc={handleRunAdHoc}
+              onStop={handleStopTask}
+              onTogglePin={(t) => setPinned(taskPrefs.pinned === t.id ? null : t.id)}
+              onSave={handleSaveTask}
+              onDelete={handleDeleteTask}
+            />
 
             {/* Theme Picker */}
             <div className="relative" data-no-drag>
@@ -2287,6 +2417,7 @@ export function App() {
                     theme={activeTheme}
                     workspacePath={workspace.path}
                     pendingCommand={pendingCmd}
+                    onTaskTabsChange={handleTaskTabsChange}
                     launcherSignal={launcherSignal}
                     maximized={terminalMaximized}
                     onToggleMaximize={() => setTerminalMaximized((v) => !v)}
@@ -2469,7 +2600,7 @@ export function App() {
             open={quickOpenVisible}
             files={allFiles}
             themes={themes}
-            tasks={tasks}
+            tasks={rankedTasks}
             onClose={() => setQuickOpenVisible(false)}
             onSelectFile={(p) => openFile(p)}
             onSelectTheme={(id) => setThemeId(id)}

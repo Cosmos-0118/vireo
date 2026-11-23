@@ -10,6 +10,7 @@ mod git;
 mod pty;
 mod secrets;
 mod state;
+mod tasks;
 mod watcher;
 
 use axum::{
@@ -303,7 +304,11 @@ fn build_router(
         .route("/api/files/write", post(files::write_file))
         .route("/api/files/search", post(files::search_files))
         .route("/api/files/replace", post(files::replace_in_files))
-        .route("/api/tasks", get(files::get_tasks))
+        .route("/api/tasks", get(tasks::get_tasks))
+        .route(
+            "/api/tasks/custom",
+            post(tasks::save_custom_task).delete(tasks::delete_custom_task),
+        )
         .route("/api/git/status", get(git::get_status))
         .route("/api/git/diff", get(git::get_diff))
         .route("/api/git/stage", post(git::stage_files))
@@ -389,7 +394,7 @@ async fn require_workspace(
     let path = req.uri().path();
     let needs_ws = path.starts_with("/api/files")
         || path.starts_with("/api/git")
-        || path == "/api/tasks"
+        || path.starts_with("/api/tasks")
         || path == "/api/agent/chat"
         || path == "/api/agent/session/prepare"
         || path == "/ws/pty";
