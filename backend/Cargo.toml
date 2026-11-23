@@ -45,6 +45,14 @@ xxhash-rust = { version = "0.8.21", features = ["xxh32"] }
 # In-process structural search/rewrite over the grammars above (replaces a 55 MB ast-grep.exe).
 ast-grep-core = { version = "0.51.1", default-features = false, features = ["tree-sitter"] }
 ignore = "0.4"
+tree-sitter-c-sharp = "0.24"
+tree-sitter-java = "0.23"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-php = "0.25"
+tree-sitter-kotlin-ng = "1.1"
+tree-sitter-bash = "0.25"
 
 [profile.release]
 lto = "fat"

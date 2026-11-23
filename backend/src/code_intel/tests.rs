@@ -1,6 +1,6 @@
 use super::check::{compress_plain, parse_diags, render_diags, test_summary};
 use super::search::builtin_search;
-use super::symbols::find_symbol;
+use super::symbols::{find_symbol, qualified};
 use super::*;
 use std::path::PathBuf;
 
@@ -678,4 +678,129 @@ fn warning_text_does_not_hide_the_real_failure() {
     let raw = "warning: unused variable `expected`\n  --> src/a.rs:3:9\nwarning: field never read, error type\nerror[E0308]: mismatched types\n  --> src/a.rs:9:5\n";
     let out = compress_plain(raw);
     assert!(out.contains("E0308"), "{out}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Languages beyond rs/ts/js/py/go
+// ---------------------------------------------------------------------------------------------
+
+/// `(container, name)` pairs of every symbol, e.g. `Foo.bar`, `baz` for top level.
+fn names(lang: Lang, src: &str) -> Vec<String> {
+    symbols(lang, src).iter().map(|s| qualified(s).replace("::", ".")).collect()
+}
+
+fn assert_has(lang: Lang, src: &str, expected: &[&str]) {
+    let got = names(lang, src);
+    for e in expected {
+        assert!(got.iter().any(|g| g == e), "{lang:?}: missing `{e}` in {got:?}");
+    }
+}
+
+#[test]
+fn extensions_map_to_languages() {
+    use super::symbols::lang_for;
+    for (file, lang) in [
+        ("A.cs", Lang::CSharp),
+        ("A.java", Lang::Java),
+        ("a.c", Lang::C),
+        ("a.cpp", Lang::Cpp),
+        ("a.h", Lang::Cpp),
+        ("a.hpp", Lang::Cpp),
+        ("a.rb", Lang::Ruby),
+        ("a.php", Lang::Php),
+        ("a.kt", Lang::Kotlin),
+        ("a.sh", Lang::Bash),
+    ] {
+        assert_eq!(lang_for(file), Some(lang), "{file}");
+    }
+}
+
+#[test]
+fn csharp_outline_includes_namespaces_members_and_attributes() {
+    let src = "namespace App.Core;\n\n/// <summary>Doc</summary>\n[Serializable]\npublic class Foo : Bar\n{\n    public int X { get; set; }\n\n    [Fact]\n    public void M(int a)\n    {\n    }\n\n    public Foo() { }\n\n    enum E { A, B }\n}\n\nnamespace Other\n{\n    public struct S { public void N() { } }\n    public interface I { void Q(); }\n    public record R(int A);\n}\n";
+    assert_has(
+        Lang::CSharp,
+        src,
+        &["Foo", "Foo.X", "Foo.M", "Foo.Foo", "Foo.E", "Other", "Other.S", "S.N", "Other.I", "I.Q", "Other.R"],
+    );
+    let syms = symbols(Lang::CSharp, src);
+    let foo = syms.iter().find(|s| s.name == "Foo" && s.container.is_none()).unwrap();
+    assert_eq!(foo.start, 2, "doc comment and attribute belong to the class");
+    let m = syms.iter().find(|s| s.name == "M").unwrap();
+    assert_eq!(m.sig, "public void M(int a)", "attribute line is skipped in the signature");
+}
+
+#[test]
+fn csharp_symbol_replace_keeps_the_file_valid() {
+    let ws = tmp("cs-replace");
+    std::fs::write(ws.join("A.cs"), "class A\n{\n    int F() { return 1; }\n}\n").unwrap();
+    let r = symbol_op(&ws, "A.cs", "A.F", "replace", "    int F() { return 2; }").unwrap();
+    assert!(r.contains("Replaced"), "{r}");
+    assert!(std::fs::read_to_string(ws.join("A.cs")).unwrap().contains("return 2;"));
+    let broken = symbol_op(&ws, "A.cs", "A.F", "replace", "    int F() { return 3;").unwrap();
+    assert!(broken.to_lowercase().contains("syntax"), "syntax check must run for C#: {broken}");
+}
+
+#[test]
+fn java_outline() {
+    let src = "package a;\n\n/** Doc */\n@Entity\npublic class Foo {\n    @Override\n    public void m(int a) {}\n    Foo() {}\n    enum E { A, B; void x() {} }\n    interface I { void q(); }\n    record R(int a) {}\n}\n";
+    assert_has(Lang::Java, src, &["Foo", "Foo.m", "Foo.Foo", "Foo.E", "E.x", "Foo.I", "I.q", "Foo.R"]);
+    let syms = symbols(Lang::Java, src);
+    assert_eq!(syms.iter().find(|s| s.name == "m").unwrap().sig, "public void m(int a) {}");
+}
+
+#[test]
+fn c_outline() {
+    let src = "#include <x.h>\n#define M(x) x\nstruct Foo { int a; };\nstruct Fwd;\ntypedef struct { int b; } Bar;\nenum E { A };\nstatic int *foo(int a) { return 0; }\nint proto(int);\n#ifdef X\nvoid g(void) {}\n#endif\n";
+    let got = names(Lang::C, src);
+    for e in ["M", "Foo", "Bar", "E", "foo", "g"] {
+        assert!(got.iter().any(|g| g == e), "missing `{e}` in {got:?}");
+    }
+    assert!(!got.iter().any(|g| g == "Fwd" || g == "proto"), "forward declarations and prototypes are not symbols: {got:?}");
+}
+
+#[test]
+fn cpp_outline() {
+    let src = "namespace n { class Foo : public B { public: void m() {} Foo(); int x; }; template<typename T> class Tpl { void q() {} }; }\nvoid Foo::m() {}\ntemplate<typename T> T add(T a, T b) { return a; }\nextern \"C\" { void cf() {} }\nstruct S { void z() {} };\n";
+    assert_has(Lang::Cpp, src, &["n", "n.Foo", "Foo.m", "n.Tpl", "Tpl.q", "add", "cf", "S", "S.z"]);
+}
+
+#[test]
+fn ruby_outline() {
+    let src = "# doc\nmodule M\n  class Foo < Bar\n    def a(x); end\n    def self.b; end\n  end\nend\ndef top; end\n";
+    assert_has(Lang::Ruby, src, &["M", "M.Foo", "Foo.a", "Foo.b", "top"]);
+}
+
+#[test]
+fn php_outline() {
+    let src = "<?php\nnamespace A;\n/** doc */\nclass Foo extends B { public function m($a) {} }\ninterface I { function q(); }\ntrait T { function t() {} }\nenum E { case A; }\nfunction top() {}\n";
+    assert_has(Lang::Php, src, &["Foo", "Foo.m", "I", "I.q", "T", "T.t", "E", "top"]);
+}
+
+#[test]
+fn kotlin_outline() {
+    let src = "package a\n\n/** doc */\nclass Foo(val x: Int) : Bar() {\n    fun m(a: Int): Int = a\n    val p = 1\n    companion object {\n        fun c() {\n        }\n    }\n}\n\nobject O {\n    fun o() {\n    }\n}\n\nfun top() {\n}\n\nval tv = 1\ntypealias TA = Int\n";
+    assert_has(Lang::Kotlin, src, &["Foo", "Foo.m", "Foo.p", "Foo.Companion", "Companion.c", "O", "O.o", "top", "tv", "TA"]);
+}
+
+#[test]
+fn bash_outline() {
+    assert_has(Lang::Bash, "# doc\nfoo() { echo hi; }\nfunction bar { echo; }\n", &["foo", "bar"]);
+}
+
+#[test]
+fn repo_map_lists_new_languages() {
+    let ws = tmp("map-langs");
+    std::fs::write(ws.join("Svc.cs"), "class Svc { void Run() { } }\n").unwrap();
+    std::fs::write(ws.join("App.java"), "class App { void go() { } }\n").unwrap();
+    let m = repo_map(&ws, None, None).unwrap();
+    assert!(m.contains("Svc.cs") && m.contains("App.java"), "{m}");
+}
+
+#[test]
+fn structural_search_works_in_csharp_and_java() {
+    let ws = tmp("ast-cs");
+    std::fs::write(ws.join("A.cs"), "class A { void F() { Console.WriteLine(1); } }\n").unwrap();
+    let r = edit::ast(&ws, "Console.WriteLine($A)", Some("csharp"), None, None, false).unwrap();
+    assert!(r.contains("A.cs"), "{r}");
 }

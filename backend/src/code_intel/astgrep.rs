@@ -24,8 +24,8 @@ impl SgLang {
     /// this placeholder before parsing (same choice as ast-grep's own language definitions).
     fn expando(self) -> char {
         match self.0 {
-            Lang::Rust | Lang::Py | Lang::Go => 'µ',
-            Lang::Ts | Lang::Tsx | Lang::Js | Lang::Json => '$',
+            Lang::Rust | Lang::Py | Lang::Go | Lang::CSharp | Lang::Java | Lang::C | Lang::Cpp | Lang::Ruby | Lang::Php | Lang::Kotlin => 'µ',
+            Lang::Ts | Lang::Tsx | Lang::Js | Lang::Json | Lang::Bash => '$',
         }
     }
 }
@@ -79,15 +79,7 @@ impl LanguageExt for SgLang {
     }
 }
 
-const ALL: [Lang; 7] = [
-    Lang::Rust,
-    Lang::Ts,
-    Lang::Tsx,
-    Lang::Js,
-    Lang::Py,
-    Lang::Go,
-    Lang::Json,
-];
+const ALL: [Lang; Lang::ALL.len()] = Lang::ALL;
 
 /// Map an ast-grep `-l` name to built-in languages. `None` = not built in (use the external CLI).
 pub(crate) fn builtin_langs(name: Option<&str>) -> Option<Vec<Lang>> {
@@ -102,6 +94,14 @@ pub(crate) fn builtin_langs(name: Option<&str>) -> Option<Vec<Lang>> {
         "python" | "py" => vec![Lang::Py],
         "go" | "golang" => vec![Lang::Go],
         "json" => vec![Lang::Json],
+        "csharp" | "c#" | "cs" => vec![Lang::CSharp],
+        "java" => vec![Lang::Java],
+        "c" => vec![Lang::C],
+        "cpp" | "c++" | "cc" | "cxx" => vec![Lang::Cpp],
+        "ruby" | "rb" => vec![Lang::Ruby],
+        "php" => vec![Lang::Php],
+        "kotlin" | "kt" => vec![Lang::Kotlin],
+        "bash" | "sh" | "shell" => vec![Lang::Bash],
         _ => return None,
     })
 }

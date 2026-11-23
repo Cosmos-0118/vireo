@@ -19,6 +19,35 @@ pub enum Lang {
     Py,
     Go,
     Json,
+    CSharp,
+    Java,
+    C,
+    Cpp,
+    Ruby,
+    Php,
+    Kotlin,
+    Bash,
+}
+
+impl Lang {
+    /// Every language with a built-in grammar, in discriminant order.
+    pub const ALL: [Lang; 15] = [
+        Lang::Rust,
+        Lang::Ts,
+        Lang::Tsx,
+        Lang::Js,
+        Lang::Py,
+        Lang::Go,
+        Lang::Json,
+        Lang::CSharp,
+        Lang::Java,
+        Lang::C,
+        Lang::Cpp,
+        Lang::Ruby,
+        Lang::Php,
+        Lang::Kotlin,
+        Lang::Bash,
+    ];
 }
 
 pub fn lang_for(path: &str) -> Option<Lang> {
@@ -31,6 +60,15 @@ pub fn lang_for(path: &str) -> Option<Lang> {
         "py" => Lang::Py,
         "go" => Lang::Go,
         "json" => Lang::Json,
+        "cs" => Lang::CSharp,
+        "java" => Lang::Java,
+        "c" => Lang::C,
+        // `.h` is ambiguous; the C++ grammar is a superset that also reads plain C headers.
+        "cc" | "cpp" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h" | "ipp" => Lang::Cpp,
+        "rb" | "rake" | "gemspec" => Lang::Ruby,
+        "php" | "phtml" => Lang::Php,
+        "kt" | "kts" => Lang::Kotlin,
+        "sh" | "bash" | "zsh" => Lang::Bash,
         _ => return None,
     })
 }
@@ -44,6 +82,14 @@ pub(crate) fn ts_language(l: Lang) -> Language {
         Lang::Py => tree_sitter_python::LANGUAGE.into(),
         Lang::Go => tree_sitter_go::LANGUAGE.into(),
         Lang::Json => tree_sitter_json::LANGUAGE.into(),
+        Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+        Lang::Java => tree_sitter_java::LANGUAGE.into(),
+        Lang::C => tree_sitter_c::LANGUAGE.into(),
+        Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+        Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+        Lang::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+        Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+        Lang::Bash => tree_sitter_bash::LANGUAGE.into(),
     }
 }
 
@@ -51,7 +97,7 @@ fn parse_tree(l: Lang, src: &str) -> Option<tree_sitter::Tree> {
     // One parser per language per thread: allocating + configuring a C parser for every file
     // dominated repo_map on large repos.
     thread_local! {
-        static PARSERS: std::cell::RefCell<[Option<Parser>; 7]> = const { std::cell::RefCell::new([None, None, None, None, None, None, None]) };
+        static PARSERS: std::cell::RefCell<[Option<Parser>; Lang::ALL.len()]> = const { std::cell::RefCell::new([const { None }; Lang::ALL.len()]) };
     }
     PARSERS.with(|cell| {
         let mut parsers = cell.borrow_mut();
@@ -123,7 +169,16 @@ fn field_text(n: Node, field: &str, src: &[u8]) -> String {
 }
 
 fn sig_of(n: Node, src: &[u8]) -> String {
-    let first = ntext(n, src).lines().next().unwrap_or("").trim();
+    // Skip attribute-only lines (`[Fact]`, `@Override`) so the signature shows the declaration itself.
+    let text = ntext(n, src);
+    let mut lines = text.lines().map(str::trim);
+    let mut first = lines.next().unwrap_or("");
+    while (first.starts_with('[') && first.ends_with(']')) || (first.starts_with('@') && (first.ends_with(')') || !first.contains(' '))) {
+        match lines.next() {
+            Some(next) if !next.is_empty() => first = next,
+            _ => break,
+        }
+    }
     let first = first.trim_end_matches('{').trim_end();
     let mut s: String = first.chars().take(120).collect();
     if first.chars().count() > 120 {
@@ -152,6 +207,131 @@ fn extend_start(n: Node, doc_kinds: &[&str]) -> usize {
 
 fn strip_generics(s: &str) -> String {
     s.split('<').next().unwrap_or(s).trim().to_string()
+}
+
+/// Which node kinds make up the outline of a declaration-oriented language handled by [`Walk::generic`].
+struct Spec {
+    /// Declarations that are listed and whose body is walked for members.
+    containers: &'static [&'static str],
+    /// Declarations that are listed but not entered.
+    leaves: &'static [&'static str],
+    /// Wrappers that are walked through without being listed (templates, `#ifdef`, `extern "C"`, ...).
+    transparent: &'static [&'static str],
+    /// Sibling comment kinds that belong to the declaration below them.
+    docs: &'static [&'static str],
+}
+
+const CSHARP: Spec = Spec {
+    containers: &["namespace_declaration", "class_declaration", "struct_declaration", "interface_declaration", "record_declaration", "record_struct_declaration"],
+    leaves: &["method_declaration", "constructor_declaration", "destructor_declaration", "property_declaration", "enum_declaration", "delegate_declaration"],
+    transparent: &[],
+    docs: &["comment"],
+};
+
+const JAVA: Spec = Spec {
+    containers: &["class_declaration", "interface_declaration", "enum_declaration", "record_declaration", "annotation_type_declaration"],
+    leaves: &["method_declaration", "constructor_declaration", "compact_constructor_declaration"],
+    transparent: &["enum_body_declarations"],
+    docs: &["line_comment", "block_comment"],
+};
+
+const C_LANG: Spec = Spec {
+    containers: &[],
+    leaves: &["function_definition", "struct_specifier", "union_specifier", "enum_specifier", "type_definition", "preproc_function_def"],
+    transparent: &["preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "linkage_specification", "declaration_list", "declaration"],
+    docs: &["comment"],
+};
+
+const CPP: Spec = Spec {
+    containers: &["namespace_definition", "class_specifier", "struct_specifier", "union_specifier"],
+    leaves: &["function_definition", "enum_specifier", "type_definition", "alias_declaration", "preproc_function_def"],
+    transparent: &["template_declaration", "preproc_if", "preproc_ifdef", "preproc_else", "preproc_elif", "linkage_specification", "declaration_list", "declaration"],
+    docs: &["comment"],
+};
+
+const RUBY: Spec = Spec {
+    containers: &["module", "class", "singleton_class"],
+    leaves: &["method", "singleton_method"],
+    transparent: &[],
+    docs: &["comment"],
+};
+
+const PHP: Spec = Spec {
+    containers: &["class_declaration", "interface_declaration", "trait_declaration", "enum_declaration"],
+    leaves: &["function_definition", "method_declaration"],
+    transparent: &["namespace_definition", "compound_statement"],
+    docs: &["comment"],
+};
+
+const KOTLIN: Spec = Spec {
+    containers: &["class_declaration", "object_declaration", "companion_object"],
+    leaves: &["function_declaration", "property_declaration", "type_alias"],
+    transparent: &[],
+    docs: &["block_comment", "line_comment", "multiline_comment", "comment"],
+};
+
+const BASH: Spec = Spec {
+    containers: &[],
+    leaves: &["function_definition"],
+    transparent: &[],
+    docs: &["comment"],
+};
+
+/// Name of a declaration plus the scope it names explicitly (`Foo` for C++ `Foo::bar`).
+fn declarator_name(mut cur: Node, src: &[u8]) -> (String, Option<String>) {
+    loop {
+        match cur.kind() {
+            "qualified_identifier" => {
+                let scope = cur.child_by_field_name("scope").map(|s| strip_generics(ntext(s, src).trim_end_matches("::"))).filter(|s| !s.is_empty());
+                return match cur.child_by_field_name("name") {
+                    Some(inner) => {
+                        let (name, inner_scope) = declarator_name(inner, src);
+                        (name, inner_scope.or(scope))
+                    }
+                    None => (ntext(cur, src).to_string(), None),
+                };
+            }
+            k if k.ends_with("_declarator") => match cur.child_by_field_name("declarator").or_else(|| cur.named_child(0)) {
+                Some(d) => cur = d,
+                None => return (String::new(), None),
+            },
+            _ => return (ntext(cur, src).trim().to_string(), None),
+        }
+    }
+}
+
+fn decl_name(n: Node, src: &[u8]) -> (String, Option<String>) {
+    if let Some(nm) = n.child_by_field_name("name") {
+        return declarator_name(nm, src);
+    }
+    if let Some(d) = n.child_by_field_name("declarator") {
+        return declarator_name(d, src);
+    }
+    match n.kind() {
+        "companion_object" => return ("Companion".into(), None),
+        // `typealias Name = Type`: the grammar labels the alias name `type`.
+        "type_alias" => return (field_text(n, "type", src), None),
+        _ => {}
+    }
+    // Kotlin: the name is an unlabelled child (`val x` wraps it in `variable_declaration`).
+    let mut c = n.walk();
+    for ch in n.named_children(&mut c) {
+        match ch.kind() {
+            "identifier" | "simple_identifier" | "type_identifier" => return (ntext(ch, src).to_string(), None),
+            "variable_declaration" => return decl_name(ch, src),
+            _ => {}
+        }
+    }
+    (String::new(), None)
+}
+
+fn body_of(n: Node) -> Node {
+    if let Some(b) = n.child_by_field_name("body") {
+        return b;
+    }
+    let mut c = n.walk();
+    let found = n.named_children(&mut c).find(|ch| matches!(ch.kind(), "class_body" | "enum_class_body" | "body_statement"));
+    found.unwrap_or(n)
 }
 
 struct Walk<'a> {
@@ -301,6 +481,39 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// Table-driven walker for the C family and other declaration-oriented grammars.
+    fn generic(&mut self, parent: Node, container: Option<&str>, depth: usize, spec: &Spec) {
+        let mut c = parent.walk();
+        for n in parent.named_children(&mut c) {
+            let kind = n.kind();
+            if spec.transparent.contains(&kind) {
+                self.generic(n, container, depth, spec);
+                continue;
+            }
+            let is_container = spec.containers.contains(&kind);
+            if !is_container && !spec.leaves.contains(&kind) {
+                continue;
+            }
+            // `struct Foo;` / `class Foo;` forward declarations and `struct Foo x;` uses carry no body.
+            if kind.ends_with("_specifier") && n.child_by_field_name("body").is_none() {
+                continue;
+            }
+            let (name, scope) = decl_name(n, self.src);
+            if name.is_empty() {
+                // Anonymous namespace / `class << self`: members belong to the enclosing scope.
+                if is_container {
+                    self.generic(body_of(n), container, depth, spec);
+                }
+                continue;
+            }
+            let owner = scope.as_deref().or(container);
+            self.push(name.clone(), n, n, owner, depth, spec.docs);
+            if is_container {
+                self.generic(body_of(n), Some(&name), depth + 1, spec);
+            }
+        }
+    }
+
     fn go(&mut self, parent: Node) {
         const DOCS: &[&str] = &["comment"];
         let mut c = parent.walk();
@@ -351,6 +564,14 @@ pub fn symbols(lang: Lang, src: &str) -> Vec<Sym> {
         Lang::Py => w.py(root, None, 0),
         Lang::Go => w.go(root),
         Lang::Json => {}
+        Lang::CSharp => w.generic(root, None, 0, &CSHARP),
+        Lang::Java => w.generic(root, None, 0, &JAVA),
+        Lang::C => w.generic(root, None, 0, &C_LANG),
+        Lang::Cpp => w.generic(root, None, 0, &CPP),
+        Lang::Ruby => w.generic(root, None, 0, &RUBY),
+        Lang::Php => w.generic(root, None, 0, &PHP),
+        Lang::Kotlin => w.generic(root, None, 0, &KOTLIN),
+        Lang::Bash => w.generic(root, None, 0, &BASH),
     }
     w.out
 }
@@ -381,6 +602,8 @@ pub(crate) fn find_symbol<'a>(syms: &'a [Sym], query: &str) -> Result<&'a Sym, S
     for kw in [
         "pub(crate) ", "pub ", "async ", "export ", "default ", "fn ", "func ", "def ", "function ", "class ",
         "struct ", "enum ", "trait ", "interface ", "type ", "const ", "let ", "mod ", "abstract ",
+        "public ", "private ", "protected ", "internal ", "static ", "final ", "namespace ", "record ", "module ",
+        "object ", "fun ", "sealed ", "override ", "virtual ",
     ] {
         while let Some(r) = q.strip_prefix(kw) {
             q = r.trim_start();
@@ -621,7 +844,7 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
         }
     }
     if entries.is_empty() {
-        return Ok("No supported source files found (rs, ts, tsx, js, py, go).".into());
+        return Ok("No supported source files found (rs, ts, tsx, js, py, go, cs, java, c/cpp, rb, php, kt, sh).".into());
     }
     // Cheap "PageRank": a file matters if other files mention its top-level symbols.
     let mut mentions: HashMap<u64, usize> = HashMap::new();
