@@ -101,7 +101,7 @@ const CommitMenuItem: React.FC<{
 
 const GRAPH_ROW_H = 24;
 const GRAPH_LANE_W = 12;
-const GRAPH_MAX_LANES = 6;
+const GRAPH_MAX_LANES = 8;
 import { GitActionModal, type GitModalState } from './GitActionModal';
 import { FileIcon } from './FileIcon';
 import { PublishDialog, type PublishMode } from './PublishDialog';
@@ -1811,6 +1811,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                             >
                               <GraphRails
                                 lanes={row.output}
+                                maxLanes={graphLayout.maxLanes}
                                 laneWidth={GRAPH_LANE_W}
                                 maxVisibleLanes={GRAPH_MAX_LANES}
                               />
