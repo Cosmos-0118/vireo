@@ -558,7 +558,12 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
       {/* Terminal viewport */}
       <div className="flex-1 min-h-0 relative">
-        {tabs.map((tab) => (
+        {!workspacePath && (
+          <div className="absolute inset-0 flex items-center justify-center text-xs text-[var(--text-dim)]">
+            Open a folder to start a terminal.
+          </div>
+        )}
+        {workspacePath && tabs.map((tab) => (
           <SingleTerminal
             key={`${workspacePath}::${tab.id}::${tab.runKey ?? 0}`}
             tab={tab}

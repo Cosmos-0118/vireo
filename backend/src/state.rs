@@ -106,6 +106,32 @@ impl AppState {
     }
 }
 
+fn last_workspace_file() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("XDG_STATE_HOME"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state"))
+        })?;
+    Some(base.join("Vireo").join("last_workspace.txt"))
+}
+
+/// Remembers the open folder so the next launch reopens it. Best effort: failures are ignored.
+pub fn save_last_workspace(path: &Path) {
+    let Some(file) = last_workspace_file() else { return };
+    if let Some(dir) = file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(file, path.to_string_lossy().as_bytes());
+}
+
+/// The folder remembered by `save_last_workspace`, if it still exists.
+pub fn load_last_workspace() -> Option<PathBuf> {
+    let raw = std::fs::read_to_string(last_workspace_file()?).ok()?;
+    let path = PathBuf::from(raw.trim());
+    (!raw.trim().is_empty() && path.is_dir()).then_some(path)
+}
+
 pub fn resolve_safe_path(workspace: &Path, rel: &str) -> Result<PathBuf, String> {
     let cleaned = rel.trim().replace('\\', "/");
     let rel_path = Path::new(&cleaned);

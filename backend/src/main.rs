@@ -255,9 +255,13 @@ fn parse_args() -> CliArgs {
         port = 4317;
     }
 
-    // No folder is opened unless one is passed explicitly: the launch directory is the install
-    // dir (or System32) for a normally started app, so it must never be used as a workspace.
-    // An empty path means "no workspace"; the user opens one from the UI.
+    // The launch directory is the install dir (or System32) for a normally started app, so it is
+    // never used as a workspace. Without an explicit folder the desktop app reopens the last one
+    // it had open; otherwise the path stays empty ("no workspace") and the user opens one from
+    // the UI. Server-only mode stays explicit.
+    if dir.is_none() && !server_only {
+        dir = state::load_last_workspace();
+    }
     let Some(workspace) = dir else {
         return CliArgs {
             port,
