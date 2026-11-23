@@ -49,7 +49,17 @@ export async function uploadDropped(file: File): Promise<string> {
   return (await api.saveAttachment(file, fileExt(file), stem)).path;
 }
 
-/** Quotes a path for pasting into a shell prompt when it needs it. */
+/**
+ * Quotes a path for pasting into a shell prompt when it needs it. Windows paths (drive letter
+ * or UNC) target PowerShell, everything else a POSIX shell. Both use single quotes, inside
+ * which nothing (including backslashes, `$` and backticks) is interpreted.
+ */
 export function shellQuote(p: string): string {
-  return /[\s"'&()$;`]/.test(p) ? `"${p.replace(/"/g, '\\"')}"` : p;
+  if (/^(?:[A-Za-z]:[\\/]|\\\\)/.test(p)) {
+    if (/^[\w.:\\/+-]+$/.test(p)) return p;
+    // PowerShell also treats the typographic single quotes as quote characters.
+    return `'${p.replace(/['‘’‚‛]/g, (q) => q + q)}'`;
+  }
+  if (/^[\w@%+=:,./-]+$/.test(p)) return p;
+  return `'${p.replace(/'/g, `'\\''`)}'`;
 }
