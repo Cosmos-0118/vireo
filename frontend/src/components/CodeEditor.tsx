@@ -1,20 +1,40 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Annotation, EditorState, Extension, StateEffect, StateField } from '@codemirror/state';
+import {
+  Annotation,
+  EditorState,
+  Extension,
+  RangeSet,
+  RangeSetBuilder,
+  StateEffect,
+  StateField,
+} from '@codemirror/state';
 import {
   Decoration,
   DecorationSet,
   EditorView,
+  GutterMarker,
   ViewPlugin,
   WidgetType,
+  gutter,
   keymap,
   lineNumbers,
   highlightActiveLine,
   highlightActiveLineGutter,
 } from '@codemirror/view';
-import { diffLines } from 'diff';
+import { diffLines, diffWordsWithSpace } from 'diff';
 import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
 import { syntaxHighlighting } from '@codemirror/language';
-import { Check, Code2, Eye, GitCompare, MessageSquarePlus, RotateCcw, Save } from 'lucide-react';
+import {
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Code2,
+  Eye,
+  GitCompare,
+  MessageSquarePlus,
+  RotateCcw,
+  Save,
+} from 'lucide-react';
 import { buildHighlightStyle, getLanguageSupport, isMarkdownPath, semanticHighlighting } from '../syntax';
 import { MarkdownMessage } from './MarkdownView';
 import type { LiteTheme } from '../themes';
@@ -45,8 +65,21 @@ interface CodeEditorProps {
   onReviewBaseChange?: (base: string | null) => void;
   /** "Undo file" ran: the content it replaced and the baseline it restored (for Redo). */
   onFileUndone?: (before: string, base: string) => void;
-  /** Scroll (without stealing focus) to this line when following an edit. */
-  scrollTarget?: { key: number; line: number } | null;
+  /** True until `content` holds this file's real text (it is '' meanwhile). */
+  loading?: boolean;
+  /**
+   * An agent edit to reveal: flash `ranges` (1-based new-doc lines) and scroll to `line`
+   * (without stealing focus). Scrolling follows `followEdits` and pauses while the user is busy,
+   * unless `reveal` is set (the user asked for it, e.g. clicked the file in the edits bar).
+   */
+  scrollTarget?: {
+    key: number;
+    line: number;
+    ranges?: Array<{ from: number; to: number }>;
+    reveal?: boolean;
+    /** Text (LF) right after the edit; when given, wait until the editor shows exactly this. */
+    text?: string;
+  } | null;
 }
 
 interface ReviewHunk {
@@ -56,6 +89,49 @@ interface ReviewHunk {
   newTo: number;
   removed: string;
   added: string;
+  /** Changed word ranges inside `removed` / `added` (offsets relative to those strings). */
+  delWords?: Array<[number, number]>;
+  addWords?: Array<[number, number]>;
+}
+
+/** Word diffs only for small modified hunks, where they help instead of painting everything. */
+const WORD_DIFF_MAX_CHARS = 4000;
+const WORD_DIFF_MAX_LINES = 40;
+
+function lineCount(t: string) {
+  let n = 0;
+  for (let i = 0; i < t.length; i++) if (t.charCodeAt(i) === 10) n++;
+  return t.endsWith('\n') ? n : n + 1;
+}
+
+function addWordDiff(h: ReviewHunk) {
+  const { removed, added } = h;
+  if (!removed || !added) return;
+  if (removed.length > WORD_DIFF_MAX_CHARS || added.length > WORD_DIFF_MAX_CHARS) return;
+  if (lineCount(removed) > WORD_DIFF_MAX_LINES || lineCount(added) > WORD_DIFF_MAX_LINES) return;
+  const del: Array<[number, number]> = [];
+  const add: Array<[number, number]> = [];
+  let ro = 0;
+  let ao = 0;
+  let changed = 0;
+  for (const part of diffWordsWithSpace(removed, added)) {
+    const len = part.value.length;
+    if (part.added) {
+      if (part.value.trim()) add.push([ao, ao + len]);
+      changed += len;
+      ao += len;
+    } else if (part.removed) {
+      if (part.value.trim()) del.push([ro, ro + len]);
+      ro += len;
+    } else {
+      ro += len;
+      ao += len;
+    }
+  }
+  // Mostly rewritten: word marks would just repaint the whole hunk.
+  if (changed > added.length * 0.6) return;
+  h.delWords = del;
+  h.addWords = add;
 }
 
 interface ReviewHandlers {
@@ -98,7 +174,39 @@ function computeReviewHunks(base: string, doc: string): ReviewHunk[] {
     }
   }
   if (cur) hunks.push(cur);
+  for (const h of hunks) addWordDiff(h);
   return hunks;
+}
+
+/** Deleted lines shown inline before "Show N more" (big deletions must not take over the view). */
+const DEL_LINES_SHOWN = 12;
+/** Approximate row height (14.5px font x 1.65 line-height), for CodeMirror's height estimates. */
+const ROW_PX = 24;
+const INS_HEADER_PX = 22;
+
+/** One deleted line, with its changed words marked. `start` is its offset inside `removed`. */
+function renderDelLine(text: string, start: number, words: Array<[number, number]> | undefined) {
+  const l = document.createElement('div');
+  l.className = 'cm-review-del-line';
+  if (!text) {
+    l.textContent = ' ';
+    return l;
+  }
+  const end = start + text.length;
+  let pos = start;
+  for (const [a, b] of words ?? []) {
+    if (b <= pos || a >= end) continue;
+    const s = Math.max(a, pos);
+    const e = Math.min(b, end);
+    if (s > pos) l.append(text.slice(pos - start, s - start));
+    const span = document.createElement('span');
+    span.className = 'cm-review-word-del';
+    span.textContent = text.slice(s - start, e - start);
+    l.append(span);
+    pos = e;
+  }
+  if (pos < end) l.append(text.slice(pos - start));
+  return l;
 }
 
 class ReviewWidget extends WidgetType {
@@ -116,19 +224,49 @@ class ReviewWidget extends WidgetType {
       o.h.added === this.h.added
     );
   }
+  get estimatedHeight() {
+    if (!this.h.removed) return INS_HEADER_PX;
+    const n = lineCount(this.h.removed);
+    return Math.min(n, DEL_LINES_SHOWN) * ROW_PX + (n > DEL_LINES_SHOWN ? INS_HEADER_PX : 0);
+  }
   toDOM(view: EditorView) {
     const wrap = document.createElement('div');
-    wrap.className = 'cm-review-widget';
     if (this.h.removed) {
+      wrap.className = 'cm-review-widget';
       const del = document.createElement('div');
       del.className = 'cm-review-del';
-      for (const line of this.h.removed.replace(/\n$/, '').split('\n')) {
-        const l = document.createElement('div');
-        l.className = 'cm-review-del-line';
-        l.textContent = line || ' ';
-        del.append(l);
+      const lines = this.h.removed.replace(/\n$/, '').split('\n');
+      const starts: number[] = [];
+      for (let i = 0, off = 0; i < lines.length; i++) {
+        starts.push(off);
+        off += lines[i].length + 1;
+      }
+      const words = this.h.delWords;
+      const shown = lines.length > DEL_LINES_SHOWN + 2 ? DEL_LINES_SHOWN : lines.length;
+      for (let i = 0; i < shown; i++) del.append(renderDelLine(lines[i], starts[i], words));
+      if (shown < lines.length) {
+        const more = document.createElement('button');
+        more.className = 'cm-review-more';
+        more.textContent = `Show ${lines.length - shown} more deleted lines`;
+        more.addEventListener('mousedown', (e) => e.preventDefault());
+        more.addEventListener('click', (e) => {
+          e.preventDefault();
+          const frag = document.createDocumentFragment();
+          for (let i = shown; i < lines.length; i++) frag.append(renderDelLine(lines[i], starts[i], words));
+          more.replaceWith(frag);
+          view.requestMeasure();
+        });
+        del.append(more);
       }
       wrap.append(del);
+    } else {
+      // Pure insertion: an in-flow header row, so the buttons never cover the inserted code.
+      wrap.className = 'cm-review-widget cm-review-ins';
+      const label = document.createElement('span');
+      label.className = 'cm-review-ins-label';
+      const n = lineCount(this.h.added);
+      label.textContent = `+${n} line${n === 1 ? '' : 's'}`;
+      wrap.append(label);
     }
     const pill = document.createElement('div');
     pill.className = 'cm-review-pill';
@@ -153,11 +291,38 @@ class ReviewWidget extends WidgetType {
   }
 }
 
-type ReviewState = { base: string | null; hunks: ReviewHunk[]; deco: DecorationSet };
+class ReviewGutterMarker extends GutterMarker {
+  readonly elementClass: string;
+  constructor(readonly kind: 'add' | 'mod' | 'del') {
+    super();
+    this.elementClass = `cm-review-gutter-${kind}`;
+  }
+  eq(o: ReviewGutterMarker) {
+    return o.kind === this.kind;
+  }
+}
+const gutterAdd = new ReviewGutterMarker('add');
+const gutterMod = new ReviewGutterMarker('mod');
+const gutterDel = new ReviewGutterMarker('del');
+const reviewAddLine = Decoration.line({ class: 'cm-review-add' });
+const reviewWordAdd = Decoration.mark({ class: 'cm-review-word-add' });
+const agentFlashLine = Decoration.line({ class: 'cm-agent-flash' });
+
+type ReviewState = {
+  base: string | null;
+  hunks: ReviewHunk[];
+  deco: DecorationSet;
+  gutter: RangeSet<GutterMarker>;
+};
+
+/** Start line (1-based) of each hunk in the current document. */
+function hunkLines(state: EditorState, hunks: ReviewHunk[]) {
+  return hunks.map((h) => state.doc.lineAt(Math.min(h.newFrom, state.doc.length)).number);
+}
 
 function makeReviewField(handlers: { current: ReviewHandlers | null }) {
   return StateField.define<ReviewState>({
-    create: () => ({ base: null, hunks: [], deco: Decoration.none }),
+    create: () => ({ base: null, hunks: [], deco: Decoration.none, gutter: RangeSet.empty }),
     update(v, tr) {
       let base = v.base;
       let changed = tr.docChanged;
@@ -173,7 +338,7 @@ function makeReviewField(handlers: { current: ReviewHandlers | null }) {
         }
       }
       if (!changed) return v;
-      if (base === null) return { base, hunks: [], deco: Decoration.none };
+      if (base === null) return { base, hunks: [], deco: Decoration.none, gutter: RangeSet.empty };
       const doc = tr.state.doc;
       if (!forced && base.length + doc.length > SYNC_REVIEW_DIFF_LIMIT) {
         // Big file while typing: keep the previous hunks (re-anchored) until the debounced
@@ -183,10 +348,12 @@ function makeReviewField(handlers: { current: ReviewHandlers | null }) {
           base,
           hunks: v.hunks.map((h) => ({ ...h, newFrom: map(h.newFrom, -1), newTo: map(h.newTo, 1) })),
           deco: v.deco.map(tr.changes),
+          gutter: v.gutter.map(tr.changes),
         };
       }
       const hunks = computeReviewHunks(base, doc.toString());
       const ranges = [];
+      const marks = new RangeSetBuilder<GutterMarker>();
       for (const h of hunks) {
         const start = doc.lineAt(Math.min(h.newFrom, doc.length));
         ranges.push(
@@ -196,12 +363,22 @@ function makeReviewField(handlers: { current: ReviewHandlers | null }) {
         );
         if (h.added) {
           const last = doc.lineAt(Math.min(Math.max(h.newFrom, h.newTo - 1), doc.length));
+          const marker = h.removed ? gutterMod : gutterAdd;
           for (let l = start.number; l <= last.number && l - start.number < 800; l++) {
-            ranges.push(Decoration.line({ class: 'cm-review-add' }).range(doc.line(l).from));
+            const from = doc.line(l).from;
+            ranges.push(reviewAddLine.range(from));
+            marks.add(from, from, marker);
           }
+          for (const [a, b] of h.addWords ?? []) {
+            const from = Math.min(h.newFrom + a, doc.length);
+            const to = Math.min(h.newFrom + b, doc.length);
+            if (to > from) ranges.push(reviewWordAdd.range(from, to));
+          }
+        } else {
+          marks.add(start.from, start.from, gutterDel);
         }
       }
-      return { base, hunks, deco: Decoration.set(ranges, true) };
+      return { base, hunks, deco: Decoration.set(ranges, true), gutter: marks.finish() };
     },
     provide: (f) => EditorView.decorations.from(f, (v) => v.deco),
   });
@@ -217,7 +394,7 @@ const flashField = StateField.define<DecorationSet>({
     for (const e of tr.effects) {
       if (e.is(setFlash)) {
         deco = Decoration.set(
-          e.value.map((pos) => Decoration.line({ class: 'cm-agent-flash' }).range(pos)),
+          e.value.map((pos) => agentFlashLine.range(pos)),
           true
         );
       }
@@ -318,6 +495,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   onReviewBaseChange,
   onFileUndone,
   scrollTarget,
+  loading,
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -339,6 +517,27 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   const onFileUndoneRef = useRef(onFileUndone);
   onFileUndoneRef.current = onFileUndone;
   const [reviewCount, setReviewCount] = useState(0);
+  /** Hunk start lines + doc length, for the overview ruler and the change stepper. */
+  const [reviewMarks, setReviewMarks] = useState<{
+    lines: Array<{ line: number; span: number; kind: 'add' | 'mod' | 'del' }>;
+    total: number;
+  }>({ lines: [], total: 1 });
+  const [navIdx, setNavIdx] = useState(-1);
+  /** The view has shown at least one hunk since its baseline was set (see the auto-clear). */
+  const hadHunksRef = useRef(false);
+  /** The view holds this file's real text (not the '' placeholder shown while loading). */
+  const readyRef = useRef(false);
+  const flashTimerRef = useRef(0);
+  const navRef = useRef<(dir: 1 | -1) => boolean>(() => false);
+
+  /** The agent-edit glow is one finite animation; drop its decorations once it has played. */
+  const armFlashClear = () => {
+    window.clearTimeout(flashTimerRef.current);
+    flashTimerRef.current = window.setTimeout(() => {
+      viewRef.current?.dispatch({ effects: setFlash.of([]) });
+    }, 2100);
+  };
+  useEffect(() => () => window.clearTimeout(flashTimerRef.current), []);
 
   useEffect(() => {
     dirtyRef.current = dirty;
@@ -352,23 +551,21 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   );
   useEffect(() => {
     if (!liveAt) return;
-    const clearFlash = setTimeout(() => {
-      const view = viewRef.current;
-      if (view) view.dispatch({ effects: setFlash.of([]) });
-    }, 1600);
     const t = setTimeout(() => setLiveAt(0), 3500);
-    return () => {
-      clearTimeout(clearFlash);
-      clearTimeout(t);
-    };
+    return () => clearTimeout(t);
   }, [liveAt]);
   const isMarkdown = isMarkdownPath(path);
-  const [mode, setMode] = useState<'source' | 'preview'>(isMarkdown && !jumpToLine ? 'preview' : 'source');
+  // Markdown opens rendered, except for a jump-to-line or unreviewed agent edits (the preview
+  // would hide the inline review and its Keep / Undo buttons).
+  const initialMode = (): 'source' | 'preview' =>
+    isMarkdown && !jumpToLine && reviewBase == null ? 'preview' : 'source';
+  const [mode, setMode] = useState<'source' | 'preview'>(initialMode);
+  const modeRef = useRef(mode);
+  modeRef.current = mode;
   const [previewText, setPreviewText] = useState(content);
 
-  // Markdown opens rendered; everything else (and jump-to-line) opens as source.
   useEffect(() => {
-    setMode(isMarkdown && !jumpToLine ? 'preview' : 'source');
+    setMode(initialMode());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [path]);
 
@@ -434,11 +631,17 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
         reviewField,
         reviewDebounce,
         lineNumbers(),
+        gutter({
+          class: 'cm-review-gutter',
+          markers: (v) => v.state.field(reviewField).gutter,
+        }),
         highlightActiveLine(),
         highlightActiveLineGutter(),
         history(),
         keymap.of([
           { key: 'Mod-s', run: saveRef },
+          { key: 'Alt-]', run: () => navRef.current(1) },
+          { key: 'Alt-[', run: () => navRef.current(-1) },
           ...defaultKeymap,
           ...historyKeymap,
         ]),
@@ -454,9 +657,31 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
             u.transactions.some((t) => t.effects.some((e) => e.is(setReviewBase) || e.is(recomputeReview)))
           ) {
             setReviewCount(rv.hunks.length);
-            if (rv.base !== null && rv.hunks.length === 0) {
+            const starts = hunkLines(u.state, rv.hunks);
+            const lines = rv.hunks.map((h, i) => ({
+              line: starts[i],
+              span: h.added ? Math.max(1, lineCount(h.added)) : 1,
+              kind: (!h.added ? 'del' : h.removed ? 'mod' : 'add') as 'add' | 'mod' | 'del',
+            }));
+            const total = u.state.doc.lines;
+            // Same marks: keep the old object so a keystroke doesn't re-render the editor.
+            setReviewMarks((prev) =>
+              (lines.length === 0 && prev.lines.length === 0) ||
+              (prev.total === total &&
+                prev.lines.length === lines.length &&
+                prev.lines.every(
+                  (m, i) => m.line === lines[i].line && m.span === lines[i].span && m.kind === lines[i].kind
+                ))
+                ? prev
+                : { total, lines }
+            );
+            // Review finished: every hunk was kept or undone. Only on a real "had hunks -> none"
+            // transition: a baseline applied to stale or not-yet-loaded content can produce zero
+            // hunks for a moment, and must not wipe the review before the fresh text arrives.
+            if (rv.base !== null && rv.hunks.length === 0 && hadHunksRef.current) {
               queueMicrotask(() => onReviewBaseChangeRef.current?.(null));
             }
+            hadHunksRef.current = rv.base !== null && rv.hunks.length > 0;
           }
         }),
       ],
@@ -467,13 +692,16 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       parent: containerRef.current,
     });
     viewRef.current = view;
-    if (reviewBaseRef.current != null) {
+    hadHunksRef.current = false;
+    readyRef.current = !!carried || !loading;
+    setNavIdx(-1);
+    if (readyRef.current && reviewBaseRef.current != null) {
       view.dispatch({ effects: setReviewBase.of(reviewBaseRef.current) });
     }
     if (!carried) setDirty(false);
     setPendingExternal(null);
 
-    if (jumpToLine) jumpTo(view, jumpToLine, jumpToColumn, jumpToEndColumn);
+    if (jumpToLine && readyRef.current) jumpTo(view, jumpToLine, jumpToColumn, jumpToEndColumn);
 
     return () => {
       carryRef.current = {
@@ -491,9 +719,27 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
   // Apply content that changed on disk without destroying the editor (keeps scroll, cursor, undo).
   useEffect(() => {
     const view = viewRef.current;
-    if (!view || binary) return;
+    if (!view || binary || loading) return;
     const next = normalizeNewlines(content);
     const cur = view.state.doc.toString();
+    if (!readyRef.current) {
+      // First real text for a view created while loading: replace silently, no flash (an agent
+      // edit that caused this open is revealed by `scrollTarget`).
+      readyRef.current = true;
+      if (dirtyRef.current) {
+        // Typed into the placeholder while loading: don't drop it, offer the disk text instead.
+        if (cur !== next) setPendingExternal(next);
+        return;
+      }
+      if (cur !== next) {
+        view.dispatch({
+          changes: { from: 0, to: view.state.doc.length, insert: next },
+          annotations: externalChange.of(true),
+        });
+      }
+      if (jumpToLine) jumpTo(view, jumpToLine, jumpToColumn, jumpToEndColumn);
+      return;
+    }
     if (cur === next) {
       setPendingExternal(null);
       return;
@@ -502,42 +748,117 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       setPendingExternal(next);
       return;
     }
-    if (cur === '') {
-      // First load of a file: replace silently, no flash.
-      view.dispatch({
-        changes: { from: 0, to: 0, insert: next },
-        annotations: externalChange.of(true),
-      });
-      if (jumpToLine) jumpTo(view, jumpToLine, jumpToColumn, jumpToEndColumn);
-      return;
-    }
     const busy = !!userActivityRef && Date.now() - userActivityRef.current < 4000;
-    if (applyExternalContent(view, next, !!followEdits && !busy)) setLiveAt(Date.now());
+    if (applyExternalContent(view, next, !!followEdits && !busy)) {
+      setLiveAt(Date.now());
+      armFlashClear();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [content, binary]);
+  }, [content, binary, loading]);
 
-  // Keep the inline review baseline in sync with the app's state.
+  // Keep the inline review baseline in sync with the app's state (only once the real text is in:
+  // diffing a baseline against the '' placeholder would paint the whole file as deleted).
   useEffect(() => {
     const view = viewRef.current;
     const field = reviewFieldRef.current;
-    if (!view || !field) return;
+    if (!view || !field || loading || !readyRef.current) return;
     const cur = view.state.field(field).base;
     const next = reviewBase == null ? null : reviewBase.replace(/\r\n?/g, '\n');
     if (cur !== next) view.dispatch({ effects: setReviewBase.of(next) });
-  }, [reviewBase, path, theme]);
+  }, [reviewBase, path, theme, loading]);
 
   const handledScrollRef = useRef(0);
   useEffect(() => {
     const view = viewRef.current;
-    if (!view || !scrollTarget || !followEdits || handledScrollRef.current === scrollTarget.key) return;
-    if (scrollTarget.line < 1 || scrollTarget.line > view.state.doc.lines) return;
+    if (!view || loading || !readyRef.current || !scrollTarget) return;
+    if (handledScrollRef.current === scrollTarget.key) return;
+    const doc = view.state.doc;
+    // The edit's text is not in the view yet (fresh content still loading): wait for it.
+    if (scrollTarget.line < 1 || scrollTarget.line > doc.lines) return;
+    const t = scrollTarget.text;
+    // Not showing the edited text yet (fresh read in flight) or never will (unsaved edits keep
+    // it out): don't glow or scroll on lines that are not the ones the agent wrote.
+    if (t !== undefined && (doc.length !== t.length || doc.toString() !== t)) return;
     handledScrollRef.current = scrollTarget.key;
-    if (dirtyRef.current || (userActivityRef && Date.now() - userActivityRef.current < 4000)) return;
-    view.dispatch({
-      effects: EditorView.scrollIntoView(view.state.doc.line(scrollTarget.line).from, { y: 'center' }),
-    });
+    const busy =
+      dirtyRef.current || (!!userActivityRef && Date.now() - userActivityRef.current < 4000);
+
+    // Arrival glow for the lines just written, unless the in-place patch above already did it.
+    const ranges = scrollTarget.ranges ?? [];
+    if (ranges.length && !dirtyRef.current && (scrollTarget.reveal || view.state.field(flashField).size === 0)) {
+      const starts: number[] = [];
+      for (const r of ranges) {
+        for (let l = Math.max(1, r.from); l <= Math.min(r.to, doc.lines) && starts.length < 500; l++) {
+          starts.push(doc.line(l).from);
+        }
+      }
+      if (starts.length) {
+        view.dispatch({ effects: setFlash.of(starts) });
+        armFlashClear();
+      }
+    }
+
+    if (!scrollTarget.reveal && (!followEdits || busy)) return;
+    const pos = doc.line(scrollTarget.line).from;
+    const go = () => {
+      if (viewRef.current !== view) return;
+      view.dispatch({ effects: EditorView.scrollIntoView(pos, { y: 'center' }) });
+    };
+    if (isMarkdown && modeRef.current === 'preview') {
+      // The editor is hidden behind the preview: show the source, then scroll once it is laid out.
+      setMode('source');
+      requestAnimationFrame(() => {
+        view.requestMeasure();
+        go();
+      });
+    } else {
+      go();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scrollTarget, content, followEdits]);
+  }, [scrollTarget, content, followEdits, loading]);
+
+  /** Move the cursor to the next / previous agent change (wraps around). */
+  navRef.current = (dir) => {
+    const view = viewRef.current;
+    const field = reviewFieldRef.current;
+    if (!view || !field) return false;
+    const rv = view.state.field(field);
+    if (rv.base === null || rv.hunks.length === 0) return false;
+    const lines = hunkLines(view.state, rv.hunks);
+    const cur = view.state.doc.lineAt(view.state.selection.main.head).number;
+    let idx: number;
+    if (dir === 1) {
+      idx = lines.findIndex((l) => l > cur);
+      if (idx < 0) idx = 0;
+    } else {
+      idx = -1;
+      for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i] < cur) {
+          idx = i;
+          break;
+        }
+      }
+      if (idx < 0) idx = lines.length - 1;
+    }
+    goToHunk(idx);
+    return true;
+  };
+
+  const goToHunk = (idx: number) => {
+    const view = viewRef.current;
+    const field = reviewFieldRef.current;
+    if (!view || !field) return;
+    const rv = view.state.field(field);
+    const h = rv.hunks[idx];
+    if (!h) return;
+    const pos = view.state.doc.lineAt(Math.min(h.newFrom, view.state.doc.length)).from;
+    view.dispatch({
+      selection: { anchor: pos },
+      effects: EditorView.scrollIntoView(pos, { y: 'center' }),
+    });
+    view.focus();
+    setNavIdx(idx);
+  };
 
   reviewHandlersRef.current = {
     keep: (view, h) => {
@@ -612,8 +933,24 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           )}
           {reviewCount > 0 && (
             <div className="flex items-center rounded border border-[var(--border)] overflow-hidden text-[10.5px] shrink-0">
-              <span className="px-1.5 text-[var(--text-muted)]">
-                {reviewCount} agent change{reviewCount > 1 ? 's' : ''}
+              <button
+                onClick={() => navRef.current(-1)}
+                className="h-5 px-1 flex items-center hover:bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-pointer"
+                title="Previous agent change (Alt+[)"
+              >
+                <ChevronUp size={11} />
+              </button>
+              <button
+                onClick={() => navRef.current(1)}
+                className="h-5 px-1 flex items-center border-l border-[var(--border)] hover:bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-pointer"
+                title="Next agent change (Alt+])"
+              >
+                <ChevronDown size={11} />
+              </button>
+              <span className="px-1.5 border-l border-[var(--border)] text-[var(--text-muted)] tabular-nums">
+                {navIdx >= 0 && navIdx < reviewCount
+                  ? `${navIdx + 1} / ${reviewCount}`
+                  : `${reviewCount} agent change${reviewCount > 1 ? 's' : ''}`}
               </span>
               <button
                 onClick={() => onReviewBaseChange?.(null)}
@@ -719,9 +1056,27 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
         </div>
       )}
       <div
-        ref={containerRef}
-        className={`flex-1 min-h-0 overflow-hidden ${isMarkdown && mode === 'preview' ? 'hidden' : ''}`}
-      />
+        className={`relative flex-1 min-h-0 ${isMarkdown && mode === 'preview' ? 'hidden' : 'flex flex-col'}`}
+      >
+        <div ref={containerRef} className="flex-1 min-h-0 overflow-hidden" />
+        {reviewCount > 0 && reviewMarks.lines.length > 0 && (
+          // Overview ruler: where the unreviewed agent changes are in the whole file.
+          <div className="cm-review-ruler" aria-hidden="true">
+            {reviewMarks.lines.map((m, i) => (
+              <div
+                key={i}
+                className={`cm-review-tick cm-review-tick-${m.kind}`}
+                style={{
+                  top: `${((m.line - 1) / Math.max(1, reviewMarks.total)) * 100}%`,
+                  height: `max(3px, ${(m.span / Math.max(1, reviewMarks.total)) * 100}%)`,
+                }}
+                onClick={() => goToHunk(i)}
+                title={`Change ${i + 1} of ${reviewMarks.lines.length}`}
+              />
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   );
 };

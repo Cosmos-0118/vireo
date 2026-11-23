@@ -1,6 +1,6 @@
 use crate::state::{is_ignored_dir_name, WorkspaceEvent};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
@@ -127,7 +127,10 @@ pub fn spawn_watcher(
             watch_workspace(w, &current_ws);
         }
 
-        let mut pending: HashSet<String> = HashSet::new();
+        // path -> sequence number of its latest event, so a batch is reported oldest-first and
+        // its last entry is the most recently written file (the UI follows that one).
+        let mut pending: HashMap<String, u64> = HashMap::new();
+        let mut seq: u64 = 0;
         let mut overflow = false;
         let mut first_event: Option<Instant> = None;
         let mut last_event: Option<Instant> = None;
@@ -186,11 +189,12 @@ pub fn spawn_watcher(
                             overflow = true;
                             continue;
                         }
+                        seq += 1;
                         let rel = p
                             .strip_prefix(&current_ws)
                             .map(|r| r.to_string_lossy().replace('\\', "/"))
                             .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"));
-                        pending.insert(rel);
+                        pending.insert(rel, seq);
                     }
                 }
                 Some(Msg::Fs(Err(_))) | None => {}
@@ -202,7 +206,9 @@ pub fn spawn_watcher(
                     let paths: Vec<String> = if overflow || pending.len() > MAX_REPORTED_PATHS {
                         Vec::new()
                     } else {
-                        pending.drain().collect()
+                        let mut ordered: Vec<(String, u64)> = pending.drain().collect();
+                        ordered.sort_unstable_by_key(|(_, s)| *s);
+                        ordered.into_iter().map(|(p, _)| p).collect()
                     };
                     pending.clear();
                     overflow = false;

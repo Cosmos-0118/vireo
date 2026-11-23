@@ -101,6 +101,10 @@ export interface LiveFlash {
   key: number;
   /** 1-based inclusive line ranges on the new (right) side. */
   ranges: Array<{ from: number; to: number }>;
+  /** New-side line the edit is at; locates pure deletions, which have no added lines. */
+  anchor?: number;
+  /** Scroll even when following is off or the user is busy (they asked to see this edit). */
+  reveal?: boolean;
 }
 
 const CONTEXT_LINES = 3;
@@ -976,6 +980,47 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     });
   }, [virtual, win.start, win.end, activeItems, effectiveWrap]);
 
+  /** Rows marked for the live edit: its added rows ('add'), or for a pure deletion the removed
+   * rows at its anchor line ('del'; removed rows have no new-side line number to match), or just
+   * the anchor row ('at': scroll target only, no glow). */
+  const liveRows = useMemo(() => {
+    const live = new Map<number, 'add' | 'del' | 'at'>();
+    if (!liveFlash) return live;
+    const newLine = (it: (typeof activeItems)[number]) => {
+      if (it.kind !== 'row') return null;
+      return viewMode === 'split' ? (it.row as SplitRow).right.line : (it.row as UnifiedRow).newLine;
+    };
+    const isAdd = (it: (typeof activeItems)[number]) =>
+      it.kind === 'row' &&
+      (viewMode === 'split' ? (it.row as SplitRow).right.type === 'add' : (it.row as UnifiedRow).type === 'add');
+    const isRemoveOnly = (it: (typeof activeItems)[number]) =>
+      it.kind === 'row' &&
+      (viewMode === 'split'
+        ? (it.row as SplitRow).left.type === 'remove' && (it.row as SplitRow).right.type === 'empty'
+        : (it.row as UnifiedRow).type === 'remove');
+    for (const it of activeItems) {
+      if (it.kind !== 'row' || !isAdd(it)) continue;
+      const l = newLine(it);
+      if (l !== null && liveFlash.ranges.some((r) => l >= r.from && l <= r.to)) live.set(it.index, 'add');
+    }
+    if (live.size === 0 && liveFlash.anchor) {
+      const at = activeItems.findIndex((it) => newLine(it) === liveFlash.anchor);
+      if (at >= 0) {
+        // Deleted rows sit just above the anchor line (or just below it at the end of the file).
+        for (let i = at - 1; i >= 0 && isRemoveOnly(activeItems[i]); i--) {
+          live.set((activeItems[i] as { index: number }).index, 'del');
+        }
+        if (live.size === 0) {
+          for (let i = at + 1; i < activeItems.length && isRemoveOnly(activeItems[i]); i++) {
+            live.set((activeItems[i] as { index: number }).index, 'del');
+          }
+        }
+        if (live.size === 0) live.set((activeItems[at] as { index: number }).index, 'at');
+      }
+    }
+    return live;
+  }, [liveFlash, activeItems, viewMode]);
+
   const scrollToItem = useCallback(
     (idx: number, smooth: boolean) => {
       const el = scrollContainerRef.current;
@@ -991,21 +1036,12 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   // Live edits: scroll to the lines an agent just wrote (unless the user is busy scrolling/typing).
   const handledFlashRef = useRef(0);
   useEffect(() => {
-    if (!liveFlash || !followEdits || handledFlashRef.current === liveFlash.key) return;
-    const isLive = (line: number | null) =>
-      line !== null && liveFlash.ranges.some((r) => line >= r.from && line <= r.to);
-    const idx = activeItems.findIndex((it) => {
-      if (it.kind !== 'row') return false;
-      if (viewMode === 'split') {
-        const r = it.row as SplitRow;
-        return r.right.type === 'add' && isLive(r.right.line);
-      }
-      const r = it.row as UnifiedRow;
-      return r.type === 'add' && isLive(r.newLine);
-    });
+    if (!liveFlash || handledFlashRef.current === liveFlash.key) return;
+    if (!followEdits && !liveFlash.reveal) return;
+    const idx = activeItems.findIndex((it) => it.kind === 'row' && liveRows.has(it.index));
     if (idx < 0) return;
     handledFlashRef.current = liveFlash.key;
-    if (userActivityRef && Date.now() - userActivityRef.current < 4000) return;
+    if (!liveFlash.reveal && userActivityRef && Date.now() - userActivityRef.current < 4000) return;
     if (virtual) scrollToItem(idx, true);
     else
       requestAnimationFrame(() =>
@@ -1013,7 +1049,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
           ?.querySelector('[data-live="1"]')
           ?.scrollIntoView({ behavior: 'smooth', block: 'center' })
       );
-  }, [liveFlash, followEdits, activeItems, viewMode, virtual, scrollToItem, userActivityRef]);
+  }, [liveFlash, followEdits, activeItems, liveRows, virtual, scrollToItem, userActivityRef]);
 
   const askLineRef = useRef<(line: number | null, text: string) => void>(() => {});
   const onAsk = useCallback((line: number | null, text: string) => askLineRef.current(line, text), []);
@@ -1314,9 +1350,13 @@ ${hunk.excerpt.slice(0, 3500)}
     );
   };
 
-  const isLiveLine = (line: number | null): boolean =>
-    !!liveFlash && line !== null && liveFlash.ranges.some((r) => line >= r.from && line <= r.to);
   const liveClass = liveFlash ? `live-flash-${liveFlash.key % 2}` : '';
+  const liveDelClass = liveFlash ? `live-flash-del-${liveFlash.key % 2}` : '';
+  /** Glow class per live row kind; the 'at' anchor row is only a scroll target. */
+  const liveRowClass = (index: number) => {
+    const k = liveRows.get(index);
+    return k === 'add' ? liveClass : k === 'del' ? liveDelClass : '';
+  };
 
   return (
     <div ref={setRootEl} className="@container flex-1 flex flex-col min-h-0 min-w-0 bg-[var(--bg-base)]">
@@ -1646,9 +1686,10 @@ ${hunk.excerpt.slice(0, 3500)}
                             rightSpans={
                               row.right.line !== null ? syntaxTokens.newLines[row.right.line - 1] : undefined
                             }
-                            live={row.right.type === 'add' && isLiveLine(row.right.line)}
+                            live={liveRows.has(index)}
                             emptyBg={emptyCellBg}
                             {...common(cluster, clusterStart)}
+                            liveClass={liveRowClass(index)}
                           />
                         );
                       })}
@@ -1678,8 +1719,9 @@ ${hunk.excerpt.slice(0, 3500)}
                           key={index}
                           row={row}
                           spans={spans}
-                          live={row.type === 'add' && isLiveLine(row.newLine)}
+                          live={liveRows.has(index)}
                           {...common(cluster, clusterStart)}
+                          liveClass={liveRowClass(index)}
                         />
                       );
                     })}

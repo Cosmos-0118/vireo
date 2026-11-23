@@ -202,10 +202,34 @@ svg.lucide {
 }
 .live-flash-0 > td,
 .live-flash-1 > td {
-  animation: live-glow-row 1.6s ease-out;
+  animation: live-glow-row 2s ease-out;
 }
 .live-flash-1 > td {
   animation-name: live-glow-row-b;
+}
+/* Rows the agent just deleted: same pulse in the removed colour. */
+.live-flash-del-0 > td,
+.live-flash-del-1 > td {
+  animation: live-glow-row-del 2s ease-out;
+}
+.live-flash-del-1 > td {
+  animation-name: live-glow-row-del-b;
+}
+@keyframes live-glow-row-del {
+  from {
+    background-color: color-mix(in srgb, var(--removed-fg) 38%, transparent);
+  }
+  to {
+    background-color: var(--removed-bg);
+  }
+}
+@keyframes live-glow-row-del-b {
+  from {
+    background-color: color-mix(in srgb, var(--removed-fg) 38%, transparent);
+  }
+  to {
+    background-color: var(--removed-bg);
+  }
 }
 @keyframes live-glow-row-b {
   from {
@@ -232,15 +256,15 @@ svg.lucide {
     box-shadow: inset 3px 0 0 var(--added-fg);
   }
   to {
-    background-color: color-mix(in srgb, var(--added-fg) 10%, transparent);
+    background-color: color-mix(in srgb, var(--added-fg) 14%, transparent);
     box-shadow: inset 3px 0 0 var(--added-fg);
   }
 }
 .cm-agent-flash {
-  animation: cm-agent-glow 1.6s ease-out forwards;
+  animation: cm-agent-glow 2s ease-out forwards;
 }
 .cm-review-add.cm-agent-flash {
-  animation: cm-review-agent-glow 1.6s ease-out forwards;
+  animation: cm-review-agent-glow 2s ease-out forwards;
 }
 
 @keyframes tab-pulse-a {
@@ -301,7 +325,7 @@ svg.lucide {
 
 /* ---- Inline agent-edit review (CodeEditor) ---- */
 .cm-review-add {
-  background: color-mix(in srgb, var(--added-fg) 10%, transparent);
+  background: color-mix(in srgb, var(--added-fg) 14%, transparent);
   box-shadow: inset 3px 0 0 var(--added-fg);
 }
 .cm-review-widget {
@@ -318,6 +342,98 @@ svg.lucide {
   white-space: pre;
   text-decoration: line-through;
   text-decoration-color: color-mix(in srgb, var(--removed-fg) 50%, transparent);
+}
+/* Pure insertion: a slim in-flow header that carries the Keep / Undo buttons. */
+.cm-review-ins {
+  height: 22px;
+  display: flex;
+  align-items: center;
+  padding-left: 8px;
+  border-top: 1px dashed color-mix(in srgb, var(--added-fg) 40%, transparent);
+  font-family: var(--font-sans, system-ui, sans-serif);
+  user-select: none;
+}
+.cm-review-ins-label {
+  font-size: 10.5px;
+  color: var(--added-fg);
+}
+.cm-review-ins .cm-review-pill {
+  top: 1px;
+  box-shadow: none;
+}
+.cm-review-word-add {
+  background: color-mix(in srgb, var(--added-fg) 30%, transparent);
+  border-radius: 2px;
+}
+.cm-review-word-del {
+  background: color-mix(in srgb, var(--removed-fg) 32%, transparent);
+  border-radius: 2px;
+  color: var(--text-primary);
+}
+.cm-review-more {
+  display: block;
+  margin: 2px 6px 3px;
+  padding: 0 6px;
+  height: 18px;
+  font-family: var(--font-sans, system-ui, sans-serif);
+  font-size: 10.5px;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  cursor: pointer;
+}
+.cm-review-more:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+/* Change markers next to the line numbers. */
+.cm-review-gutter {
+  width: 4px;
+}
+.cm-review-gutter .cm-gutterElement {
+  padding: 0 !important;
+}
+.cm-review-gutter-add {
+  box-shadow: inset 3px 0 0 var(--added-fg);
+}
+.cm-review-gutter-mod {
+  box-shadow: inset 3px 0 0 var(--modified-fg);
+}
+.cm-review-gutter-del {
+  background: linear-gradient(to bottom, var(--removed-fg) 0 3px, transparent 3px);
+}
+/* Overview ruler: one tick per unreviewed change, over the editor's scrollbar track. */
+.cm-review-ruler {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 6px;
+  pointer-events: none;
+  z-index: 6;
+}
+.cm-review-tick {
+  position: absolute;
+  right: 0;
+  width: 6px;
+  min-height: 3px;
+  border-radius: 1px;
+  pointer-events: auto;
+  cursor: pointer;
+  opacity: 0.85;
+}
+.cm-review-tick:hover {
+  opacity: 1;
+}
+.cm-review-tick-add {
+  background: var(--added-fg);
+}
+.cm-review-tick-mod {
+  background: var(--modified-fg);
+}
+.cm-review-tick-del {
+  background: var(--removed-fg);
 }
 .cm-review-pill {
   position: absolute;

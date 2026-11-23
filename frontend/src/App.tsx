@@ -104,6 +104,10 @@ function trimToBudget<V>(map: Map<string, V>, sizeOf: (v: V) => number, budget =
 const ZOOM_MIN = 0.7;
 const ZOOM_MAX = 2.0;
 const ZOOM_STEP = 0.1;
+/** Minimum time between automatic follow-edits tab switches. */
+const FOLLOW_SWITCH_DWELL_MS = 700;
+/** Dirty files whose current text is captured up front as their pre-agent snapshot. */
+const SEED_SNAPSHOT_LIMIT = 40;
 
 function clampZoom(z: number): number {
   const rounded = Math.round(z * 10) / 10;
@@ -237,7 +241,14 @@ export function App() {
   const [liveFlash, setLiveFlash] = useState<{
     path: string;
     key: number;
+    /** 1-based new-side lines the edit added. */
     ranges: Array<{ from: number; to: number }>;
+    /** New-side line where the edit is (valid for pure deletions too). */
+    anchor: number;
+    /** The user asked to see it: scroll even when not following / busy. */
+    reveal?: boolean;
+    /** File text (LF) right after the edit: the editor waits until it shows exactly this. */
+    text?: string;
   } | null>(null);
   /** path -> pulse key; drives the short green pulse on tabs and explorer rows. */
   const [tabPulse, setTabPulse] = useState<Record<string, number>>({});
@@ -266,6 +277,22 @@ export function App() {
   const fsChainRef = useRef<Promise<void>>(Promise.resolve());
   const fsChangedRef = useRef<(paths: string[], dirtyBefore: Set<string>) => void>(() => {});
   const flashKeyRef = useRef(0);
+  /** path -> where the agent's latest edit to it is, so revisiting the file lands on it. */
+  const lastEditRef = useRef<Map<string, { ranges: Array<{ from: number; to: number }>; anchor: number }>>(
+    new Map()
+  );
+  /** Follow-edits tab switching is rate limited so a multi-file burst doesn't strobe the editor. */
+  const followSwitchRef = useRef<{ at: number; timer: number; path: string | null }>({
+    at: 0,
+    timer: 0,
+    path: null,
+  });
+  /**
+   * Files that were already dirty when first seen (path -> when their text was captured as the
+   * pre-agent snapshot). Without this, the first agent edit to such a file falls back to git HEAD
+   * as "before" and paints the user's own uncommitted work as agent changes.
+   */
+  const seededRef = useRef<Map<string, number>>(new Map());
   const pillTimerRef = useRef<number | undefined>(undefined);
   const tabsRef = useRef<OpenTab[]>([]);
   const gitStatusRef = useRef<GitStatusRes | null>(null);
@@ -360,6 +387,24 @@ export function App() {
 
   activeTabIdRef.current = activeTabId;
 
+  /** Store a tab's freshly loaded content (LRU, bounded by count and total size). */
+  const rememberContent = useCallback(
+    (id: string, patch: { diff?: GitDiffRes; file?: { path: string; content: string; binary: boolean } }) => {
+      const cache = contentCacheRef.current;
+      const prev = cache.get(id);
+      cache.delete(id);
+      cache.set(id, { ...prev, ...patch });
+      while (cache.size > 30) cache.delete(cache.keys().next().value as string);
+      trimToBudget(
+        cache,
+        (c) =>
+          (c.diff ? c.diff.original.length + c.diff.modified.length + (c.diff.patch?.length ?? 0) : 0) +
+          (c.file?.content.length ?? 0)
+      );
+    },
+    []
+  );
+
   const reloadActiveContent = useCallback(async () => {
     if (!activeTab) {
       setDiffData(null);
@@ -372,18 +417,8 @@ export function App() {
     const id = activeTab.id;
     const cache = contentCacheRef.current;
     const isCurrent = () => activeTabIdRef.current === id;
-    const remember = (patch: { diff?: GitDiffRes; file?: { path: string; content: string; binary: boolean } }) => {
-      const prev = cache.get(id);
-      cache.delete(id);
-      cache.set(id, { ...prev, ...patch });
-      while (cache.size > 30) cache.delete(cache.keys().next().value as string);
-      trimToBudget(
-        cache,
-        (c) =>
-          (c.diff ? c.diff.original.length + c.diff.modified.length + (c.diff.patch?.length ?? 0) : 0) +
-          (c.file?.content.length ?? 0)
-      );
-    };
+    const remember = (patch: { diff?: GitDiffRes; file?: { path: string; content: string; binary: boolean } }) =>
+      rememberContent(id, patch);
     const sameDiff = (a: GitDiffRes | null, b: GitDiffRes) =>
       !!a &&
       a.path === b.path &&
@@ -448,7 +483,7 @@ export function App() {
         if (isCurrent()) setFileData(null);
       }
     }
-  }, [activeTab]);
+  }, [activeTab, rememberContent]);
 
   // Switching tabs: paint the cached content immediately (before the browser paints), then revalidate.
   useLayoutEffect(() => {
@@ -543,8 +578,9 @@ export function App() {
       const now = Date.now();
       if (!firstAt) firstAt = now;
       window.clearTimeout(flushTimer);
-      // trailing 250 ms debounce, but never later than 1 s after the first event of the burst
-      flushTimer = window.setTimeout(flush, Math.max(0, Math.min(250, firstAt + 1000 - now)));
+      // The backend watcher already debounces; this only merges back-to-back messages (watcher
+      // batch + tool notification). Trailing 80 ms, never later than 400 ms after the first.
+      flushTimer = window.setTimeout(flush, Math.max(0, Math.min(80, firstAt + 400 - now)));
     };
     const onVisible = () => {
       if (!document.hidden && dirty) scheduleFlush();
@@ -579,6 +615,10 @@ export function App() {
             setTabPulse({});
             setPausedJump(null);
             setLiveFlash(null);
+            lastEditRef.current.clear();
+            seededRef.current.clear();
+            window.clearTimeout(followSwitchRef.current.timer);
+            followSwitchRef.current.path = null;
             setPillVisible(false);
             setTabs([]);
             setActiveTabId(null);
@@ -691,17 +731,31 @@ export function App() {
   gitStatusRef.current = gitStatus;
   followRef.current = followEdits;
 
+  /** Glow + scroll to the agent's latest edit in `path` (for "Show latest" / edits-bar clicks). */
+  const revealEdit = useCallback((path: string) => {
+    const e = lastEditRef.current.get(path);
+    if (!e) return;
+    const key = ++flashKeyRef.current;
+    setLiveFlash({ path, key, ranges: e.ranges, anchor: e.anchor, reveal: true });
+    window.setTimeout(() => setLiveFlash((f) => (f?.key === key ? null : f)), 2500);
+  }, []);
+
+  /** Bring `path` up in a view that shows working-tree agent edits (inline review or unstaged diff). */
   const focusPath = useCallback(
-    (path: string) => {
+    (path: string, reveal = false) => {
       const existing = tabsRef.current.find(
         (t) => t.path === path && (t.mode === 'diff' || t.mode === 'code')
       );
-      if (existing) setActiveTabId(existing.id);
+      // A staged diff shows the index, not the agent's working-tree edits, and gets no highlights.
+      if (existing?.mode === 'diff' && existing.staged) openDiff(path, false);
+      else if (existing) setActiveTabId(existing.id);
       else openFile(path);
       setPausedJump(null);
+      if (reveal) revealEdit(path);
     },
-    [openDiff, openFile]
+    [openDiff, openFile, revealEdit]
   );
+  const focusAndReveal = useCallback((path: string) => focusPath(path, true), [focusPath]);
 
   // Watcher batch -> "what did the agent just change?" (works for any agent, CLI or built-in).
   fsChangedRef.current = (paths: string[], dirtyBefore: Set<string>) => {
@@ -709,10 +763,21 @@ export function App() {
       /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|bun\.lockb?|composer\.lock|poetry\.lock|Gemfile\.lock)$/;
     let files = paths
       .map((p) => (p || '').replace(/\\/g, '/').replace(/^\.\//, ''))
-      .filter((p) => p && !p.includes(':') && !p.startsWith('.git/') && p !== 'cmd' && !p.endsWith('/'));
+      // `cmd` / `cli` / `ast` are tool notifications without a path (the watcher reports the files).
+      .filter(
+        (p) =>
+          p &&
+          !p.includes(':') &&
+          !p.startsWith('.git/') &&
+          p !== 'cmd' &&
+          p !== 'cli' &&
+          p !== 'ast' &&
+          !p.endsWith('/')
+      );
     const source = files.filter((p) => !lock.test(p));
     if (source.length) files = source;
-    files = files.slice(0, 8);
+    // Paths arrive oldest-first; keep the most recent ones (the last is the one to follow).
+    files = files.slice(-24);
     if (!files.length) return;
     files.forEach((p) => inflightRef.current.add(p));
 
@@ -722,6 +787,9 @@ export function App() {
         adds: number;
         dels: number;
         ranges: Array<{ from: number; to: number }>;
+        /** First changed new-side line (also set for pure deletions, which have no ranges). */
+        anchor: number;
+        textLf: string;
         /** Content before this edit, or null when it is not a trustworthy review baseline. */
         baseline: string | null;
         /** Net change vs the review baseline (what the sidebar shows), when a baseline is known. */
@@ -741,6 +809,12 @@ export function App() {
         } catch {
           snapshotsRef.current.delete(path);
           continue;
+        }
+        const seededAt = seededRef.current.get(path);
+        if (seededAt !== undefined && Date.now() - seededAt < 2500 && snapshotsRef.current.get(path) === cur) {
+          // The up-front snapshot was read after this very write (it raced the watcher batch):
+          // it is not a "before" state.
+          snapshotsRef.current.delete(path);
         }
         let prev = snapshotsRef.current.get(path);
         // Baseline taken from git HEAD is only a valid "before the agent" state if the file was clean.
@@ -765,9 +839,12 @@ export function App() {
         let adds = 0;
         let dels = 0;
         let line = 0;
+        let anchor = 0;
         const ranges: Array<{ from: number; to: number }> = [];
-        for (const part of diffLines(lf(prev), lf(cur))) {
+        const curLf = lf(cur);
+        for (const part of diffLines(lf(prev), curLf)) {
           const n = part.count ?? 0;
+          if ((part.added || part.removed) && n > 0 && !anchor) anchor = line + 1;
           if (part.added) {
             adds += n;
             if (n > 0) ranges.push({ from: line + 1, to: line + n });
@@ -778,6 +855,10 @@ export function App() {
             line += n;
           }
         }
+        // A deletion at the end of the file sits after the last line: clamp into the document.
+        const nl = (curLf.match(/\n/g) ?? []).length;
+        const lastLine = Math.max(1, curLf.endsWith('\n') ? nl : nl + 1);
+        anchor = Math.min(Math.max(1, anchor), lastLine);
         if (adds || dels) {
           const eolMatched =
             cur.includes('\r\n') && !prev.includes('\r\n') ? prev.replace(/\n/g, '\r\n') : prev;
@@ -790,7 +871,7 @@ export function App() {
               else if (part.removed) total.dels += part.count ?? 0;
             }
           }
-          results.push({ path, adds, dels, ranges, baseline: trusted ? eolMatched : null, total });
+          results.push({ path, adds, dels, ranges, anchor, textLf: curLf, baseline: trusted ? eolMatched : null, total });
         }
       }
 
@@ -808,10 +889,25 @@ export function App() {
         return changed ? next : prev;
       });
 
+      // Fresh text for the edited files' tabs, so switching to one paints the new content at once
+      // (no '' placeholder, no second read) and its inline review lines up with it.
+      const cacheText = (p: string) => {
+        const c = currents.get(p);
+        if (c !== undefined) rememberContent(p, { file: { path: p, content: c, binary: false } });
+      };
+      for (const p of currents.keys()) if (tabsRef.current.some((t) => t.id === p)) cacheText(p);
+
       const sup = selfWriteRef.current;
       const now = Date.now();
       const ui = results.filter((r) => !(sup.all > now || (sup.paths.get(r.path) ?? 0) > now));
       if (!ui.length) return;
+      for (const r of ui) {
+        lastEditRef.current.delete(r.path);
+        lastEditRef.current.set(r.path, { ranges: r.ranges, anchor: r.anchor });
+      }
+      while (lastEditRef.current.size > 200) {
+        lastEditRef.current.delete(lastEditRef.current.keys().next().value as string);
+      }
 
       setPillDismissed(false);
       setReview((prev) => {
@@ -843,10 +939,9 @@ export function App() {
       });
       setPillVisible(true);
       window.clearTimeout(pillTimerRef.current);
-      pillTimerRef.current = window.setTimeout(() => {
-        setPillVisible(false);
-        setPausedJump(null);
-      }, 10000);
+      // The bar hides after a while, but a pending "Show latest" keeps it up until it is used,
+      // the file is opened, or the bar is dismissed.
+      pillTimerRef.current = window.setTimeout(() => setPillVisible(false), 10000);
 
       setTabPulse((prev) => ({ ...prev, ...Object.fromEntries(ui.map((r) => [r.path, key])) }));
       window.setTimeout(
@@ -859,13 +954,44 @@ export function App() {
         1800
       );
 
-      const target = ui[ui.length - 1];
-      setLiveFlash({ path: target.path, key, ranges: target.ranges });
-      window.setTimeout(() => setLiveFlash((f) => (f?.key === key ? null : f)), 1650);
+      // Follow target: stay on the active file when the agent edited it, else the latest file.
+      const activePath = tabsRef.current.find((t) => t.id === activeTabIdRef.current)?.path;
+      const target = ui.find((r) => r.path === activePath) ?? ui[ui.length - 1];
+      cacheText(target.path);
+      setLiveFlash({
+        path: target.path,
+        key,
+        ranges: target.ranges,
+        anchor: target.anchor,
+        text: target.textLf,
+      });
+      window.setTimeout(() => setLiveFlash((f) => (f?.key === key ? null : f)), 2500);
       if (followRef.current) {
         const busy = editorDirtyRef.current || Date.now() - userActivityRef.current < 4000;
         if (busy) setPausedJump(target.path);
-        else focusPath(target.path);
+        else if (target.path !== activePath) {
+          const fs = followSwitchRef.current;
+          const wait = fs.at + FOLLOW_SWITCH_DWELL_MS - Date.now();
+          window.clearTimeout(fs.timer);
+          if (wait <= 0) {
+            fs.at = Date.now();
+            focusPath(target.path);
+          } else {
+            // Switched moments ago: switch once more when the dwell ends, to whatever is latest.
+            fs.path = target.path;
+            fs.timer = window.setTimeout(() => {
+              const p = fs.path;
+              fs.path = null;
+              if (!p || !followRef.current) return;
+              if (editorDirtyRef.current || Date.now() - userActivityRef.current < 4000) {
+                setPausedJump(p);
+                return;
+              }
+              fs.at = Date.now();
+              focusPath(p, true);
+            }, wait);
+          }
+        }
       }
     };
 
@@ -906,6 +1032,47 @@ export function App() {
       return { ...prev, [path]: b.replace(/\r\n?/g, '\n').replace(/\n/g, eol) };
     });
   }, []);
+
+  // Capture the current text of files that are already dirty, so the first agent edit to one of
+  // them diffs against the user's own work instead of git HEAD (see seededRef).
+  useEffect(() => {
+    if (!gitStatus?.is_repo) return;
+    const todo = gitStatus.files
+      .map((f) => f.path.replace(/\\/g, '/'))
+      .filter(
+        (p) =>
+          !p.endsWith('/') &&
+          !seededRef.current.has(p) &&
+          !snapshotsRef.current.has(p) &&
+          !inflightRef.current.has(p)
+      )
+      .slice(0, Math.max(0, SEED_SNAPSHOT_LIMIT - seededRef.current.size));
+    if (!todo.length) return;
+    let cancelled = false;
+    (async () => {
+      for (const p of todo) {
+        if (cancelled) return;
+        seededRef.current.set(p, Date.now());
+        try {
+          const f = await api.readFile(p);
+          if (cancelled) {
+            seededRef.current.delete(p); // retried by the next status update
+            return;
+          }
+          if (f.binary || f.size > 1_500_000) continue;
+          if (snapshotsRef.current.has(p) || inflightRef.current.has(p)) continue;
+          seededRef.current.set(p, Date.now());
+          snapshotsRef.current.set(p, f.content);
+          trimToBudget(snapshotsRef.current, (t) => t.length);
+        } catch {
+          // deleted / unreadable: nothing to snapshot
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [gitStatus]);
 
   // Committed, stashed or reverted files have no pending changes left: drop them from the
   // agent-edits bar and from the review baselines (so "Undo all" can't roll back committed work).
@@ -1897,7 +2064,12 @@ export function App() {
                     activeTab.mode === 'diff' &&
                     !activeTab.staged &&
                     diffData?.path === liveFlash.path
-                      ? { key: liveFlash.key, ranges: liveFlash.ranges }
+                      ? {
+                          key: liveFlash.key,
+                          ranges: liveFlash.ranges,
+                          anchor: liveFlash.anchor,
+                          reveal: liveFlash.reveal,
+                        }
                       : null
                   }
                   followEdits={followEdits}
@@ -1924,9 +2096,16 @@ export function App() {
                   reviewBase={review[activeTab.path] ?? null}
                   onReviewBaseChange={(b) => setReviewBaseFor(activeTab.path, b)}
                   onFileUndone={(before, base) => handleFileUndone(activeTab.path, before, base)}
+                  loading={!(fileData && fileData.path === activeTab.path)}
                   scrollTarget={
-                    liveFlash && liveFlash.path === activeTab.path && liveFlash.ranges.length > 0
-                      ? { key: liveFlash.key, line: liveFlash.ranges[0].from }
+                    liveFlash && liveFlash.path === activeTab.path
+                      ? {
+                          key: liveFlash.key,
+                          line: liveFlash.ranges.length ? liveFlash.ranges[0].from : liveFlash.anchor,
+                          ranges: liveFlash.ranges,
+                          reveal: liveFlash.reveal,
+                          text: liveFlash.text,
+                        }
                       : null
                   }
                   theme={activeTheme}
@@ -1960,12 +2139,12 @@ export function App() {
                   edits={liveEdits}
                   activePath={activeTab?.path ?? null}
                   tabPulse={tabPulse}
-                  onFocus={focusPath}
+                  onFocus={focusAndReveal}
                 />
                 <div className="flex items-center gap-1.5 shrink-0">
                   {pausedJump && (
                     <button
-                      onClick={() => focusPath(pausedJump)}
+                      onClick={() => focusPath(pausedJump, true)}
                       className="h-6 px-2 rounded-md bg-[var(--accent)] text-[var(--accent-fg)] font-medium flex items-center gap-1.5 cursor-pointer hover:opacity-90"
                     >
                       Show latest
