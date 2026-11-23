@@ -63,6 +63,7 @@ import { AgentEditsStrip } from './components/AgentEditsStrip';
 import { FileIcon } from './components/FileIcon';
 import { FloatingContextMenu, type ContextMenuItem } from './components/CommitContextMenu';
 import { VireoLogo } from './components/VireoLogo';
+import Toast, { type ToastData } from './components/Toast';
 import ResizeHandle from './components/ResizeHandle';
 import {
   AGENT,
@@ -230,7 +231,7 @@ export function App() {
   const [showThemeMenu, setShowThemeMenu] = useState(false);
   const [showRunMenu, setShowRunMenu] = useState(false);
   const [quickOpenVisible, setQuickOpenVisible] = useState(false);
-  const [toast, setToast] = useState<{ msg: string; isError?: boolean; action?: ToastAction } | null>(null);
+  const [toast, setToast] = useState<ToastData | null>(null);
 
   // Tabs & Active content
   const [tabs, setTabs] = useState<OpenTab[]>([]);
@@ -344,9 +345,9 @@ export function App() {
 
   const themeFileInputRef = useRef<HTMLInputElement>(null);
 
+  const toastSeq = useRef(0);
   const showToast = useCallback((msg: string, isError = false, action?: ToastAction) => {
-    setToast({ msg, isError, action });
-    setTimeout(() => setToast((cur) => (cur?.msg === msg ? null : cur)), action ? 10000 : 3600);
+    setToast({ id: ++toastSeq.current, msg, isError, action });
   }, []);
 
   const refreshGit = useCallback(async () => {
@@ -2568,30 +2569,7 @@ export function App() {
       </footer>
 
       {/* Toast Notification */}
-      {toast && (
-        <div
-          className="fixed bottom-9 right-4 z-50 px-3 py-2 rounded-md border shadow-lg text-xs font-medium"
-          style={{
-            background: toast.isError ? 'var(--danger)' : 'var(--bg-elevated)',
-            borderColor: 'var(--border)',
-            color: toast.isError ? '#ffffff' : 'var(--text-primary)',
-          }}
-        >
-          {toast.msg}
-          {toast.action && (
-            <button
-              onClick={() => {
-                const run = toast.action!.run;
-                setToast(null);
-                run();
-              }}
-              className="ml-3 underline underline-offset-2 cursor-pointer"
-            >
-              {toast.action.label}
-            </button>
-          )}
-        </div>
-      )}
+      {toast && <Toast key={toast.id} toast={toast} onDismiss={() => setToast((cur) => (cur?.id === toast.id ? null : cur))} />}
 
       {/* Quick Open Modal */}
       {quickOpenVisible && (

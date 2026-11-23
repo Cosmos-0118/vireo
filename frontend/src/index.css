@@ -493,3 +493,142 @@ html.app-hidden *::after {
 input:not([type="checkbox"]):not([type="radio"]) {
   text-overflow: ellipsis;
 }
+
+/* ---- Toast notifications ---- */
+.vx-toast-wrap {
+  position: fixed;
+  right: 20px;
+  bottom: 44px; /* clears the status bar */
+  z-index: 60;
+  width: min(420px, calc(100vw - 40px));
+  pointer-events: none;
+}
+.vx-toast {
+  --toast-tone: var(--accent);
+  position: relative;
+  overflow: hidden;
+  pointer-events: auto;
+  border-radius: 12px;
+  border: 1px solid color-mix(in srgb, var(--toast-tone) 28%, var(--border));
+  background:
+    linear-gradient(135deg, color-mix(in srgb, var(--toast-tone) 9%, transparent), transparent 55%),
+    var(--bg-elevated);
+  box-shadow:
+    0 16px 40px -8px rgba(0, 0, 0, 0.55),
+    0 4px 12px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  animation: vx-toast-in 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.vx-toast-leave {
+  animation: vx-toast-out 170ms ease-in both;
+}
+.vx-toast-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 14px 12px 15px 14px;
+}
+.vx-toast-icon {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 9px;
+  color: var(--toast-tone);
+  background: color-mix(in srgb, var(--toast-tone) 16%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--toast-tone) 30%, transparent);
+}
+.vx-toast-text {
+  flex: 1;
+  min-width: 0;
+  padding-top: 1px;
+}
+.vx-toast-title {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.35;
+  color: var(--text-primary);
+}
+.vx-toast-msg {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.45;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+  max-height: 7.5em;
+  overflow-y: auto;
+}
+.vx-toast-msg-sub {
+  margin-top: 2px;
+  font-weight: 400;
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+.vx-toast-action {
+  margin-top: 10px;
+  padding: 5px 12px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--toast-tone);
+  background: color-mix(in srgb, var(--toast-tone) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--toast-tone) 32%, transparent);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.vx-toast-action:hover {
+  background: color-mix(in srgb, var(--toast-tone) 24%, transparent);
+  border-color: color-mix(in srgb, var(--toast-tone) 50%, transparent);
+}
+.vx-toast-close {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  margin-top: 3px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text-dim);
+  transition: background 120ms ease, color 120ms ease;
+}
+.vx-toast-close:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+}
+.vx-toast-track {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 3px;
+  background: color-mix(in srgb, var(--toast-tone) 10%, transparent);
+}
+.vx-toast-progress {
+  height: 100%;
+  transform-origin: left center;
+  background: var(--toast-tone);
+  opacity: 0.85;
+  animation-name: vx-toast-countdown;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+.vx-toast:hover .vx-toast-progress {
+  animation-play-state: paused;
+}
+@keyframes vx-toast-in {
+  from { opacity: 0; transform: translateY(14px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes vx-toast-out {
+  from { opacity: 1; transform: translateY(0) scale(1); }
+  to { opacity: 0; transform: translateY(8px) scale(0.98); }
+}
+@keyframes vx-toast-countdown {
+  from { transform: scaleX(1); }
+  to { transform: scaleX(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .vx-toast, .vx-toast-leave { animation: none; }
+}

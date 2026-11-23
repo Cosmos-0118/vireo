@@ -323,9 +323,19 @@ pub fn check_failed(report: &str) -> bool {
     report.lines().any(|l| l.starts_with('✖'))
 }
 
+/// Label for a user-supplied command: the full command line, shortened so long ones stay readable.
+fn short_label(cmd: &str) -> String {
+    let one_line = cmd.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= 60 {
+        one_line
+    } else {
+        format!("{}…", one_line.chars().take(59).collect::<String>())
+    }
+}
+
 pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64, opts: CheckOpts) -> Result<String, String> {
     let jobs: Vec<(String, String, String)> = match cmd.map(str::trim).filter(|c| !c.is_empty()) {
-        Some(c) => vec![(String::new(), c.to_string(), c.split_whitespace().take(2).collect::<Vec<_>>().join(" "))],
+        Some(c) => vec![(String::new(), c.to_string(), short_label(c))],
         None => detect_checks(ws),
     };
     if jobs.is_empty() {

@@ -129,6 +129,13 @@ fn join_shell_cmd(pos: &[String]) -> Option<String> {
     Some(parts.join(" "))
 }
 
+/// True when `a` is shaped like a CLI flag (`-x`, `--long-name`, `--name=value`). Dash-prefixed
+/// text containing regex or punctuation (`--foo|--bar`, `-\d+`) is a pattern, not a flag.
+fn looks_like_flag(a: &str) -> bool {
+    let name = a.split_once('=').map_or(a, |(k, _)| k);
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 fn flag_takes_value(cmd: &str, flag: &str) -> bool {
     match (cmd, flag) {
         ("check", "-w") => false,
@@ -217,6 +224,7 @@ fn main() {
         } else if a.starts_with('-')
             && a.len() > 1
             && !a.chars().nth(1).map(|c| c.is_ascii_digit()).unwrap_or(false)
+            && looks_like_flag(a)
         {
             // Support `--flag=value` syntax too!
             if let Some((k, v)) = a.split_once('=') {
@@ -284,8 +292,13 @@ fn main() {
                 .find(|a| a.trim_start_matches('-').starts_with(name.trim_start_matches('-')) && name.len() > 2);
             let list = if allowed.is_empty() { "no flags".to_string() } else { allowed.join(" ") };
             let did = hint.map(|h| format!(" Did you mean `{h}`?")).unwrap_or_default();
+            let dashes = if matches!(cmd, "search" | "replace") {
+                " To search for text that starts with dashes, put `--` before it."
+            } else {
+                ""
+            };
             fail(&format!(
-                "Error: unknown flag `{name}` for `vx {cmd}` (accepts: {list}).{did} Nothing was changed.\n{USAGE}"
+                "Error: unknown flag `{name}` for `vx {cmd}` (accepts: {list}).{did}{dashes} Nothing was changed.\n{USAGE}"
             ));
         }
     }
@@ -536,6 +549,15 @@ mod vx_tests {
         assert_eq!(decode_input(&le_raw), "fn main() {}");
     }
 
+    #[test]
+    fn dash_prefixed_regex_is_not_a_flag() {
+        assert!(looks_like_flag("--glob"));
+        assert!(looks_like_flag("-C"));
+        assert!(looks_like_flag("--limit=5"));
+        assert!(!looks_like_flag("--success|--warning"));
+        assert!(!looks_like_flag("-(a|b)+"));
+        assert!(!looks_like_flag("--foo.bar"));
+    }
     #[test]
     fn mcp_initialize_list_and_call() {
         let ws = std::env::temp_dir().join(format!("vireo-mcp-{}", std::process::id()));
