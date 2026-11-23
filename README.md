@@ -21,6 +21,7 @@ native Tauri v2 + Rust backend, live diffs, persistent terminals, Git checkpoint
 <br />
 
 **[⬇️ Download](https://github.com/Cosmos-0118/vireo/releases/latest)** &nbsp;·&nbsp;
+**[🖼️ Screenshots](#screenshots)** &nbsp;·&nbsp;
 **[✨ Features](#features)** &nbsp;·&nbsp;
 **[🏗️ Architecture](#architecture)** &nbsp;·&nbsp;
 **[🛠️ Build](#build-from-source)** &nbsp;·&nbsp;
@@ -28,60 +29,91 @@ native Tauri v2 + Rust backend, live diffs, persistent terminals, Git checkpoint
 
 </div>
 
+
 ---
+
+<div align="center">
+  <img src="docs/screenshots/diff.png" alt="Vireo showing a live side-by-side diff, the Git graph, and an integrated terminal" width="100%" />
+</div>
 
 ## Why Vireo?
 
-Working with coding agents means spending most of your time reviewing diffs, steering tool calls, running checks in a terminal, and rolling back turns that went sideways. Heavy IDEs get in the way; raw terminals hide the diff. Vireo puts the agent, the live diff, the editor, Git, and the terminal in one fast native window.
+Working with coding agents means reviewing diffs, steering tool calls, running checks, and rolling back turns that went sideways. Heavy IDEs get in the way; raw terminals hide the diff. Vireo puts the agent, the live diff, the editor, Git, and the terminal in one fast native window.
 
-| | |
-| :--- | :--- |
-| ⚡ **Fast & lightweight** | Native Tauri v2 window backed by a single Rust binary (`vireo.exe`) with the React/Vite UI embedded inside — no Electron runtime overhead. |
-| 🔀 **Live diff-first workflow** | Side-by-side and unified diffs with word-level highlights refresh automatically as files change on disk. Stage, unstage, discard, or send any diff/line to the agent in one click. |
-| 🤖 **Built-in & CLI agents** | Use the built-in multi-provider Agent Chat (with per-turn Git checkpoints) or run external CLI agents (`claude`, `codex`, `gemini`, `agy`, `opencode`, `cursor`, `copilot`, `amp`, `qwen`, `aider`, `cline`, `kilo`) right beside your diff. |
-| 🧰 **Token-lean `vx` code tools** | Ships the companion `vx` CLI alongside `vireo` so external CLI agents can inspect repo maps, outlines, anchored line ranges, symbol edits, and compressed compiler diagnostics without wasting context tokens. |
+- ⚡ **Light and native.** Tauri v2 and a single Rust binary with the React UI embedded. No Electron, no language-server farm.
+- 🔀 **Diff-first.** Diffs refresh as files change on disk. Stage, discard, or send any hunk or line to the agent in a click.
+- 🤖 **Bring any agent.** A built-in multi-provider chat with per-turn Git checkpoints, or 12 CLI agents running right beside your diff.
+- 🧰 **Token-lean code tools.** The bundled `vx` CLI gives agents repo maps, anchored edits, and compressed compiler errors.
 
-## Get started
+## Screenshots
 
-**Windows 10 (build 19041 / version 2004) or later · x64.** Uses the built-in WebView2 runtime; no Electron or extra runtime installation is required. Git ([MinGit](https://github.com/git-for-windows/git), with Git Credential Manager), [ripgrep](https://github.com/BurntSushi/ripgrep) and the [GitHub CLI](https://cli.github.com/) ship inside the app (`tools\`), so nothing else needs installing; if you already have any of them on `PATH`, your installed copy is used instead. Only the external coding-agent CLIs you want to use (`claude`, `codex`, …) are installed separately.
-
-| | Download | How to use it |
-| :--- | :--- | :--- |
-| 💿 | **Installer**<br /><sub>`Vireo-Setup-<version>.exe`</sub> | Download from [the latest release](https://github.com/Cosmos-0118/vireo/releases/latest). Installs per-user by default (no administrator prompt required; all-users install is also available), adds a Start Menu entry, and optionally adds `vireo` and `vx` to your `PATH`. |
-| 🗂️ | **Portable**<br /><sub>`Vireo-<version>-win-x64.zip`</sub> | Extract the archive into a folder and run `vireo.exe`. Keep `vx.exe` and the `tools\` folder next to it so agent shells find them automatically on `PATH`. |
-
-> [!TIP]
-> Vireo binaries are unsigned, so Windows SmartScreen may show a warning on first launch. Every release ships `SHA256SUMS.txt` and a GitHub build provenance attestation — see [Download integrity](#download-integrity-and-verification) to verify your copy.
-
-Once installed (with `PATH` enabled), open any repository from your terminal:
-
-```powershell
-# Open the current directory in the native desktop app
-vireo .
-
-# Open a specific repository
-vireo --dir "C:\path\to\your\repo"
-
-# Run in browser/server-only mode instead of the desktop window
-vireo --dir "C:\path\to\your\repo" --server-only --port 4317
-```
+<table>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/commit-graph.png" alt="Full commit graph view" /><br /><sub><b>Commit graph</b>: browse history, branches, and uncommitted work in one lane view.</sub></td>
+    <td width="50%"><img src="docs/screenshots/search.png" alt="Workspace search with ripgrep" /><br /><sub><b>Workspace search</b>: ripgrep-powered, with results grouped by file.</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/agent.png" alt="Agent panel next to the diff and terminal" /><br /><sub><b>Agent panel</b>: chat or run a CLI agent next to the diff and terminal.</sub></td>
+    <td width="50%"><img src="docs/screenshots/theme-light.png" alt="GitHub Light theme" /><br /><sub><b>Themes</b>: six built-in themes, plus VS Code <code>.json</code> import.</sub></td>
+  </tr>
+</table>
 
 ## Features
 
-| Area | What you can do |
+### Review and edit
+
+- **Live diff viewer.** Side-by-side or unified, with word-level highlights and filesystem watching. Stage, unstage, or discard per file, and send selected hunks or lines to the agent.
+- **Code editor.** CodeMirror 6 with multi-language highlighting, `Ctrl+S` to save, and instant switching between code and diff.
+- **Quick Open and search.** `Ctrl+P` opens files, themes, and tasks. `Ctrl+Shift+F` searches the workspace with ripgrep.
+- **Themes.** *VS Code Dark+*, *Tokyo Night*, *Catppuccin Mocha*, *One Dark Pro*, *GitHub Dark Dimmed*, *GitHub Light*, and VS Code theme import.
+
+### Agents
+
+- **Agent Chat.** A built-in agent that reads, edits, searches, and runs commands. Works with OpenAI, OpenRouter, DeepSeek, Anthropic Claude, Google Gemini, Ollama, and OpenAI-compatible endpoints. Every turn creates a Git checkpoint for one-click undo and redo.
+- **CLI agents.** Embedded ConPTY runners for `claude`, `codex`, `gemini`, `agy` (Antigravity), `opencode`, `cursor-agent`, `copilot`, `amp`, `qwen`, `aider`, `cline`, and `kilo`, with permission prompts and a unified tool-activity view.
+
+### Git and terminal
+
+- **Git and commit graph.** Stage, commit, stash, push, pull, fetch, branch, cherry-pick, revert, merge, tag, and publish to GitHub. Browse history in the commit graph, and roll back agent checkpoints.
+- **Integrated terminal.** Multi-tab `xterm.js` (WebGL) on Rust `portable-pty`, with an instant switch to Ghostty (WASM). Shells survive hiding and reloads, project tasks are auto-detected, and output can go straight to the agent.
+
+### `vx` code intelligence
+
+`vx` is a tree-sitter powered, token-lean CLI placed on `PATH` for agents. It covers Rust, TypeScript, JavaScript, Python, Go, C#, Java, Kotlin, C, C++, Ruby, PHP, Bash, and JSON.
+
+| Command | What it does |
 | :--- | :--- |
-| **Live diff viewer** | Side-by-side and unified diffs with word-level highlights that refresh automatically via filesystem watching. Stage, unstage, or discard per file, and send selected hunks or lines directly to the agent. |
-| **Code editor** | CodeMirror 6 with multi-language syntax highlighting, `Ctrl+S` to save, and instant switching between code and diff views. |
-| **Agent Chat** | Built-in coding agent that reads, edits, searches, lists files, and runs commands. Supports OpenAI, OpenRouter, DeepSeek, Anthropic Claude, Google Gemini, Ollama, and OpenAI-compatible endpoints. Every turn creates a Git checkpoint for one-click undo/redo. |
-| **CLI Agent panel** | First-class integration and embedded PTY runners (Windows ConPTY) for `claude`, `codex`, `gemini`, `agy` (Antigravity), `opencode`, `cursor-agent`, `copilot`, `amp`, `qwen`, `aider`, `cline`, and `kilo`, with permission prompts and unified tool activity views. |
-| **`vx` code intelligence CLI** | Tree-sitter powered (`Rust`, `TypeScript`, `JavaScript`, `Python`, `Go`, `C#`, `Java`, `Kotlin`, `C`, `C++`, `Ruby`, `PHP`, `Bash`, `JSON`) token-lean CLI automatically placed on `PATH` for agents: `vx map`, `vx outline`, `vx view`, `vx edit` (hashline-anchored), `vx symbol`, `vx create`, `vx search`, `vx ast` (built-in ast-grep engine; an installed `ast-grep` CLI is used only for other languages), and `vx check`. |
-| **Integrated terminal** | Multi-tab terminal powered by `xterm.js` (WebGL) and Rust `portable-pty`, with an instant switch to Ghostty (WASM). Shells stay alive when hidden or reloaded, project tasks (`package.json`, `Cargo.toml`, Python) are auto-detected, and output can be sent straight to the agent. |
-| **Git & Commit Graph** | Stage, unstage, discard, stash, commit, push, pull, fetch, switch/create/delete branches, cherry-pick, revert, merge, tag, browse commit history & commit graph, publish to GitHub, and roll back agent checkpoints. |
-| **Themes & Quick Open** | Six built-in themes (*VS Code Dark+*, *Tokyo Night*, *Catppuccin Mocha*, *One Dark Pro*, *GitHub Dark Dimmed*, *GitHub Light*) plus VS Code `.json` theme import. `Ctrl+P` opens files, themes, and tasks; `Ctrl+Shift+F` searches the workspace with ripgrep. |
+| `vx map` | Ranked file and symbol map of the repo |
+| `vx outline` / `vx view` | Symbol outlines and anchored line ranges |
+| `vx edit` / `vx symbol` | Hashline-anchored edits and whole-symbol replacement |
+| `vx create` | Create new files |
+| `vx search` | Search with ripgrep |
+| `vx ast` | Structural search and rewrite (built-in ast-grep engine; an installed `ast-grep` is used only for other languages) |
+| `vx check` | Run cargo, tsc, go, or any command with compressed diagnostics |
+
+## Get started
+
+**Windows 10 (build 19041 / 2004) or later, x64.** Vireo uses the built-in WebView2 runtime. Git ([MinGit](https://github.com/git-for-windows/git) with Git Credential Manager), [ripgrep](https://github.com/BurntSushi/ripgrep), and the [GitHub CLI](https://cli.github.com/) ship inside the app (`tools\`), so nothing else needs installing. If you already have any of them on `PATH`, your copy is used. Only the CLI agents you want to run (`claude`, `codex`, …) are installed separately.
+
+| | Download | How to use it |
+| :--- | :--- | :--- |
+| 💿 | **Installer**<br /><sub>`Vireo-Setup-<version>.exe`</sub> | Get it from [the latest release](https://github.com/Cosmos-0118/vireo/releases/latest). Installs per-user by default (no admin prompt; all-users is available), adds a Start Menu entry, and can add `vireo` and `vx` to your `PATH`. |
+| 🗂️ | **Portable**<br /><sub>`Vireo-<version>-win-x64.zip`</sub> | Extract and run `vireo.exe`. Keep `vx.exe` and `tools\` next to it so agent shells find them on `PATH`. |
+
+> [!TIP]
+> Vireo binaries are unsigned, so Windows SmartScreen may warn on first launch. Every release ships `SHA256SUMS.txt` and a build provenance attestation. See [Download integrity](#download-integrity-and-verification) to verify your copy.
+
+With `PATH` enabled, open any repository from a terminal:
+
+```powershell
+vireo .                                   # open the current directory
+vireo --dir "C:\path\to\your\repo"        # open a specific repository
+vireo --dir "C:\path\to\your\repo" --server-only --port 4317   # browser mode at http://127.0.0.1:4317
+```
 
 ## Architecture
 
-Vireo compiles the React/Vite frontend into `frontend/dist` and embeds it directly into the `vireo` Rust binary via `rust-embed`. At runtime, `vireo` binds an Axum HTTP/WebSocket server on `127.0.0.1` and opens a native frameless Tauri v2 WebView pointing at it (or serves it to any browser with `--server-only`).
+The React/Vite frontend is compiled into `frontend/dist` and embedded in the `vireo` Rust binary via `rust-embed`. At runtime `vireo` binds an Axum HTTP/WebSocket server on `127.0.0.1` and opens a frameless Tauri v2 WebView pointing at it, or serves it to any browser with `--server-only`.
 
 ```mermaid
 flowchart LR
@@ -96,37 +128,33 @@ flowchart LR
 
 | Path | Responsibility |
 | :--- | :--- |
-| [`backend/`](backend/) | Rust + Tauri v2 app (`vireo`), embedded Axum API/WebSocket server, Git & checkpoint engine, agent/CLI runners, PTY manager, and `vx` code-intelligence CLI (`backend/src/bin/vx.rs`). |
-| [`frontend/`](frontend/) | React 19 + TypeScript + Vite + Tailwind CSS v4 UI: diff viewer, CodeMirror 6 editor, commit graph, agent activity panel, terminal tabs, themes. |
-| [`installer/`](installer/) | Inno Setup 6 installer definition (`Vireo.iss`), build script (`build.ps1`), and automated install/health/uninstall smoke test (`smoke-test.ps1`). |
-| [`scripts/`](scripts/) | Release staging (`stage-release.ps1`), pinned bundled-tool manifest and SHA256-verified downloader (`bundled-tools.json`, `fetch-tools.ps1`), and checksum/README integrity updater (`update-release-integrity.ps1`). |
+| [`backend/`](backend/) | Rust + Tauri v2 app (`vireo`), Axum API/WebSocket server, Git and checkpoint engine, agent/CLI runners, PTY manager, and the `vx` CLI (`backend/src/bin/vx.rs`). |
+| [`frontend/`](frontend/) | React 19, TypeScript, Vite, and Tailwind CSS v4 UI: diff viewer, CodeMirror 6 editor, commit graph, agent panel, terminal tabs, themes. |
+| [`installer/`](installer/) | Inno Setup 6 installer (`Vireo.iss`), build script, and install/health/uninstall smoke test. |
+| [`scripts/`](scripts/) | Release staging, the pinned bundled-tool manifest with its SHA256-verified downloader, and the checksum/README integrity updater. |
 | [`.github/`](.github/) | CI, release, and CodeQL workflows, Dependabot config, and issue/PR templates. |
 
 ## Build from source
 
-**Requirements:** Windows 10 (build 19041) or later (x64), [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (*Desktop development with C++*), [Rust](https://rustup.rs/) (stable), [Node.js](https://nodejs.org/) 22+, and Git.
-
-**Build and launch (recommended):**
+**Requirements:** Windows 10 (build 19041) or later x64, [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (*Desktop development with C++*), [Rust](https://rustup.rs/) stable, [Node.js](https://nodejs.org/) 22+, and Git.
 
 ```powershell
 git clone https://github.com/Cosmos-0118/vireo.git
 cd vireo
 
-.\build-and-run.ps1 "C:\path\to\your\repo"
+.\build-and-run.ps1 "C:\path\to\your\repo"   # build and launch
+.\vireo.ps1 "C:\path\to\your\repo"           # launch an existing build
 ```
 
-Optional flags: `-CleanAll` runs a full `cargo clean` first, and `-BuildOnly` builds without launching. `build-and-run.ps1` automatically locates the Visual Studio C++ toolchain via [`msvc-env.ps1`](msvc-env.ps1), so it works from a plain PowerShell window.
+`build-and-run.ps1` finds the Visual Studio C++ toolchain through [`msvc-env.ps1`](msvc-env.ps1), so it works from a plain PowerShell window. Pass `-CleanAll` for a full `cargo clean`, or `-BuildOnly` to skip launching.
 
-**Launch an existing build:**
+<details>
+<summary><b>Build, test, and run manually</b></summary>
 
-```powershell
-.\vireo.ps1 "C:\path\to\your\repo"
-```
-
-**Build, test, and run manually:**
+<br />
 
 ```powershell
-# Load MSVC toolchain into the current PowerShell session
+# Load the MSVC toolchain into this PowerShell session
 . .\msvc-env.ps1; Enter-MsvcEnv
 
 # 1. Install dependencies and build the frontend bundle
@@ -142,18 +170,20 @@ cargo run --release --manifest-path backend/Cargo.toml -- --dir "C:\path\to\your
 
 Add `--server-only --port 4317` to use Vireo in a browser at `http://127.0.0.1:4317`.
 
-Development builds use the Git/ripgrep/GitHub CLI already on your `PATH`. To exercise the bundled copies instead, stage them next to the binary (downloads are pinned and SHA256-verified, and cached in `artifacts/tools-cache`):
+Development builds use the Git, ripgrep, and GitHub CLI already on your `PATH`. To exercise the bundled copies, stage them next to the binary (downloads are pinned, SHA256-verified, and cached in `artifacts/tools-cache`):
 
 ```powershell
 pwsh scripts/fetch-tools.ps1 -Output backend/target/release
 ```
 
+</details>
+
 <details>
-<summary><b>Build the Windows installer and portable package locally</b></summary>
+<summary><b>Build the Windows installer and portable package</b></summary>
 
 <br />
 
-Install [Inno Setup 6](https://jrsoftware.org/isinfo.php) (CI pins `6.7.1`), build the frontend and Rust release binaries (`cargo build --release --bins --manifest-path backend/Cargo.toml --locked`), then stage and package (staging also downloads and verifies the bundled tools listed in [`scripts/bundled-tools.json`](scripts/bundled-tools.json)):
+Install [Inno Setup 6](https://jrsoftware.org/isinfo.php) (CI pins `6.7.1`), build the frontend and the Rust release binaries (`cargo build --release --bins --manifest-path backend/Cargo.toml --locked`), then stage and package. Staging also downloads and verifies the bundled tools listed in [`scripts/bundled-tools.json`](scripts/bundled-tools.json).
 
 ```powershell
 pwsh scripts/stage-release.ps1 -Output artifacts/publish
@@ -161,7 +191,7 @@ pwsh installer/build.ps1 -Version 0.2.0 -PublishDir artifacts/publish -OutDir ar
 pwsh installer/smoke-test.ps1 -Setup artifacts/Vireo-Setup-0.2.0.exe
 ```
 
-Pushing a version tag such as `v0.2.0` triggers [`.github/workflows/release.yml`](.github/workflows/release.yml), which runs all tests, builds the portable ZIP and Inno Setup installer, smoke-tests the installer, generates `SHA256SUMS.txt` and GitHub build provenance attestations, and publishes the GitHub Release.
+Pushing a version tag such as `v0.2.0` triggers [`release.yml`](.github/workflows/release.yml). It runs all tests, builds the portable ZIP and installer, smoke-tests the installer, generates `SHA256SUMS.txt` and provenance attestations, and publishes the GitHub Release.
 
 </details>
 
