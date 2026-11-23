@@ -341,6 +341,11 @@ fn build_router(
         .route("/api/git/rollback", post(checkpoint::rollback_checkpoint))
         .route("/api/git/redo", post(checkpoint::redo_checkpoint))
         .route("/api/agent/chat", post(agent::chat))
+        .route(
+            "/api/agent/attachment",
+            post(files::save_attachment)
+                .layer(axum::extract::DefaultBodyLimit::max(files::ATTACHMENT_MAX_BYTES)),
+        )
         .route("/api/agent/permission", post(cli_agent::answer_permission))
         .route("/api/agent/question", post(agent_session::answer_question))
         .route("/api/agent/session/prepare", post(agent_session::prepare_session))

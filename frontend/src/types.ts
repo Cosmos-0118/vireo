@@ -340,6 +340,8 @@ export interface UiChatMessage {
   /** User turns: context attached by the composer (shown as badges, never as raw text). */
   ctxFiles?: string[];
   ctxChanges?: number;
+  /** User turns: number of pasted images attached (the paths ride in the prompt, not the bubble). */
+  ctxImages?: number;
   /** Assistant turns: timing (epoch ms) for the "Thought for Ns" row. */
   startedAt?: number;
   firstOutputAt?: number;

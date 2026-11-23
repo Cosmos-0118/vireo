@@ -365,6 +365,44 @@ pub async fn write_file(
     Ok(Json(serde_json::json!({ "ok": true, "path": req.path })))
 }
 
+/// Largest pasted/dropped chat image accepted (bytes).
+pub const ATTACHMENT_MAX_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Deserialize)]
+pub struct AttachmentQuery {
+    pub ext: Option<String>,
+}
+
+/// Saves a pasted chat image (raw request body) to a temp folder and returns its absolute
+/// path, so the agent can be pointed at it. Only common image extensions are accepted.
+pub async fn save_attachment(
+    Query(q): Query<AttachmentQuery>,
+    body: axum::body::Bytes,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    if body.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "empty image".into()));
+    }
+    let ext = q
+        .ext
+        .as_deref()
+        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
+        .filter(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"))
+        .unwrap_or_else(|| "png".into());
+    let dir = std::env::temp_dir().join("vireo-attachments");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let full = dir.join(format!("paste-{nanos}.{ext}"));
+    tokio::fs::write(&full, &body)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "path": full.to_string_lossy() })))
+}
+
 const SEARCH_MAX_TOTAL: usize = 500;
 const SEARCH_MAX_PER_FILE: usize = 50;
 const SEARCH_MAX_TEXT_UNITS: usize = 500;

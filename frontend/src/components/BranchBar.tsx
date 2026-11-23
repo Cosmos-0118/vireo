@@ -6,6 +6,7 @@ import {
   ArrowUp,
   Check,
   ChevronDown,
+  CircleCheck,
   Cloud,
   CloudOff,
   CloudUpload,
@@ -356,11 +357,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
       statusText = `${sync.ahead} to push to ${upstreamLabel}`;
       break;
     default:
-      statusIcon = (
-        <span className="flex items-center justify-center w-[11px] shrink-0">
-          <span className="w-[6px] h-[6px] rounded-full bg-[var(--added-fg)] shadow-[0_0_0_3px_color-mix(in_srgb,var(--added-fg)_16%,transparent)]" />
-        </span>
-      );
+      statusIcon = <CircleCheck size={12} strokeWidth={2.25} className="shrink-0 text-[var(--added-fg)]" />;
       statusText = (
         <>
           <span className="text-[var(--text-muted)]">Up to date</span>
@@ -548,7 +545,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
       {/* One-line status: where this branch stands relative to its remote */}
       {statusText && !isLarge && (
         <div
-          className={`flex items-center gap-1.5 h-[20px] mt-1 px-0.5 text-[11px] ${statusTone}`}
+          className={`flex items-center gap-1.5 h-[20px] mt-1 px-[9px] text-[11px] leading-none ${statusTone}`}
           title={fetched ? `Last ${fetched}` : undefined}
         >
           {statusIcon}

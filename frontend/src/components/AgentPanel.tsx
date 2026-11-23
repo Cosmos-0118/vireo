@@ -13,6 +13,7 @@ import {
   GitBranch,
   GitCompare,
   History,
+  Image as ImageIcon,
   Lock,
   Plus,
   RotateCcw,
@@ -125,6 +126,13 @@ function loadThreads(ws: string): AgentThread[] {
   } catch {
     return [];
   }
+}
+
+interface PastedImage {
+  id: string;
+  url: string;
+  path?: string;
+  status: 'uploading' | 'ready' | 'error';
 }
 
 function slimMessages(ms: UiChatMessage[]): UiChatMessage[] {
@@ -344,8 +352,35 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const [dismissedActive, setDismissedActive] = useState<string | null>(null);
   const [includeChanges, setIncludeChanges] = useState(false);
   const [extraFiles, setExtraFiles] = useState<string[]>([]);
+  // Pasted images: previewed via an object URL, uploaded to disk so the agent can read the file.
+  const [images, setImages] = useState<PastedImage[]>([]);
+  const imagesRef = useRef<PastedImage[]>([]);
+  imagesRef.current = images;
+  useEffect(() => () => imagesRef.current.forEach((i) => URL.revokeObjectURL(i.url)), []);
   const abortRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const addImages = (files: File[]) => {
+    for (const file of files) {
+      const id = `img-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const ext = (file.type.split('/')[1] || 'png').replace('jpeg', 'jpg').replace(/[^a-z0-9]/gi, '');
+      setImages((prev) => [...prev, { id, url: URL.createObjectURL(file), status: 'uploading' }]);
+      api
+        .saveAttachment(file, ext)
+        .then(({ path }) =>
+          setImages((prev) => prev.map((i) => (i.id === id ? { ...i, path, status: 'ready' } : i)))
+        )
+        .catch(() => setImages((prev) => prev.map((i) => (i.id === id ? { ...i, status: 'error' } : i))));
+    }
+  };
+  const removeImage = (id: string) =>
+    setImages((prev) => {
+      const gone = prev.find((i) => i.id === id);
+      if (gone) URL.revokeObjectURL(gone.url);
+      return prev.filter((i) => i.id !== id);
+    });
+  const imagesBusy = images.some((i) => i.status === 'uploading');
+  const readyImages = images.filter((i) => i.status === 'ready' && i.path);
 
   const sessionEngine = supportsSessions(config.provider);
   const loadCommands = React.useCallback(() => {
@@ -563,15 +598,24 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
   const sendPrompt = async () => {
     const trimmed = input.trim();
-    if (!trimmed || running) return;
+    if ((!trimmed && readyImages.length === 0) || running || imagesBusy) return;
+
+    const imagePaths = readyImages.map((i) => i.path as string);
+    const imageNote = imagePaths.length
+      ? `[Attached image${imagePaths.length > 1 ? 's' : ''} — open and view ${
+          imagePaths.length > 1 ? 'them' : 'it'
+        }: ${imagePaths.join(', ')}]\n\n`
+      : '';
+    const shownText = trimmed || (imagePaths.length > 1 ? 'See attached images.' : 'See attached image.');
 
     const now = Date.now();
     const userMsg: UiChatMessage = {
       id: `u-${now}`,
       role: 'user',
-      content: trimmed,
+      content: shownText,
       ctxFiles: [...(activeChip ? [activeChip] : []), ...extraFiles],
       ctxChanges: includeChanges && changedFileCount > 0 ? changedFileCount : undefined,
+      ctxImages: imagePaths.length || undefined,
     };
     const assistantId = `a-${now + 1}`;
     const assistantMsg: UiChatMessage = {
@@ -586,11 +630,13 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
     const historyPayload = [
       ...messages.map((m) => ({ role: m.role, content: m.content })),
-      { role: 'user', content: buildContextPrefix() + trimmed },
+      { role: 'user', content: buildContextPrefix() + imageNote + shownText },
     ];
 
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
     setInput('');
+    images.forEach((i) => URL.revokeObjectURL(i.url));
+    setImages([]);
     setAtRange(null);
     setRunning(true);
     stickRef.current = true;
@@ -1046,7 +1092,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 const ctx = m.ctxFiles ?? [];
                 return (
                   <div key={m.id} className="flex flex-col items-end">
-                    {(ctx.length > 0 || m.ctxChanges) && (
+                    {(ctx.length > 0 || m.ctxChanges || m.ctxImages) && (
                       <div className="flex flex-wrap justify-end gap-1 mb-1">
                         {ctx.map((f) => (
                           <ContextBadge
@@ -1056,6 +1102,12 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                             title={f}
                           />
                         ))}
+                        {!!m.ctxImages && (
+                          <ContextBadge
+                            icon={<ImageIcon size={10} className="shrink-0" />}
+                            label={m.ctxImages > 1 ? `${m.ctxImages} images` : 'Image'}
+                          />
+                        )}
                         {!!m.ctxChanges && (
                           <ContextBadge
                             icon={<GitCompare size={10} className="shrink-0" />}
@@ -1225,6 +1277,30 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       {/* Zone 4: composer + quiet mode footer */}
       <div className="px-3 pb-3 pt-2 shrink-0">
         <div className="relative rounded-lg border border-[var(--border)] bg-[var(--bg-input)] focus-within:border-[var(--accent)] transition-colors">
+          {/* Pasted image thumbnails */}
+          {images.length > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5 px-2.5 pt-2">
+              {images.map((img) => (
+                <div
+                  key={img.id}
+                  className={`group relative w-12 h-12 rounded-md overflow-hidden border bg-[var(--bg-elevated)] ${
+                    img.status === 'error' ? 'border-[var(--danger)]' : 'border-[var(--border)]'
+                  }`}
+                  title={img.status === 'error' ? 'Upload failed — remove and paste again' : 'Pasted image'}
+                >
+                  <img src={img.url} alt="Pasted" className={`w-full h-full object-cover ${img.status === 'ready' ? '' : 'opacity-50'}`} />
+                  <button
+                    onClick={() => removeImage(img.id)}
+                    className="absolute top-0.5 right-0.5 w-4 h-4 flex items-center justify-center rounded-full bg-black/65 text-white opacity-0 group-hover:opacity-100 focus:opacity-100 cursor-pointer transition-opacity"
+                    title="Remove image"
+                  >
+                    <X size={10} />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
           {/* Row 1: context chips, only when something is attached */}
           {hasContext && (
             <div className="flex flex-wrap items-center gap-1 px-2.5 pt-2">
@@ -1390,10 +1466,16 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 stopGeneration();
               }
             }}
+            onPaste={(e) => {
+              const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith('image/'));
+              if (files.length === 0) return;
+              e.preventDefault();
+              addImages(files);
+            }}
             rows={1}
             style={{ minHeight: 44 }}
             placeholder="Chat with Agent"
-            className={`block w-full px-2.5 ${hasContext ? 'pt-1.5' : 'pt-2.5'} pb-1.5 text-[12.5px] leading-[1.45] bg-transparent text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none`}
+            className={`block w-full px-2.5 ${hasContext || images.length > 0 ? 'pt-1.5' : 'pt-2.5'} pb-1.5 text-[12.5px] leading-[1.45] bg-transparent text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none`}
           />
 
           {/* Row 2: composer toolbar */}
@@ -1570,7 +1652,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               ) : (
                 <button
                   onClick={sendPrompt}
-                  disabled={!input.trim()}
+                  disabled={(!input.trim() && readyImages.length === 0) || imagesBusy}
                   className="w-6 h-6 flex items-center justify-center rounded-md bg-[var(--accent)] text-white disabled:opacity-40 cursor-pointer hover:opacity-95 transition-opacity"
                   title="Send (Enter)"
                 >

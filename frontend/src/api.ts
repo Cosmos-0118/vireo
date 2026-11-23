@@ -328,6 +328,16 @@ export const api = {
     if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
     return ((await res.json()) as { models: string[] }).models;
   },
+  /** Stores a pasted image on disk and returns its absolute path for the agent to read. */
+  saveAttachment: async (blob: Blob, ext: string): Promise<{ path: string }> => {
+    const res = await fetch(`/api/agent/attachment?ext=${encodeURIComponent(ext)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': blob.type || 'application/octet-stream' },
+      body: blob,
+    });
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+    return res.json();
+  },
   agentModels: (ollamaBase?: string) =>
     jsonFetch<LocalModelsInfo>(
       `/api/agent/models${ollamaBase ? `?ollama_base=${encodeURIComponent(ollamaBase)}` : ''}`
