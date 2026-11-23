@@ -383,8 +383,13 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   }, [tabs, onTaskTabsChange]);
 
   const openMenu = () => {
-    const rect = launcherBtnRef.current?.getBoundingClientRect();
-    if (!rect) return;
+    // The button can be unmounted or display:none (dock just revealed); fall back to the
+    // bottom-left corner instead of silently refusing to open the menu.
+    const measured = launcherBtnRef.current?.getBoundingClientRect();
+    const rect =
+      measured && (measured.width > 0 || measured.height > 0)
+        ? measured
+        : new DOMRect(12, window.innerHeight - 40, 0, 0);
     api
       .cliTools()
       .then((list) => setCliTools(list))

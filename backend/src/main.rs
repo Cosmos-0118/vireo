@@ -490,6 +490,9 @@ fn main() {
             .decorations(false)
             .shadow(true)
             .zoom_hotkeys_enabled(false)
+            // Tauri's native file-drop handler swallows HTML5 drag events on Windows, which
+            // breaks in-app drags (explorer -> agent/terminal) and OS file drops in the webview.
+            .disable_drag_drop_handler()
             .background_color(tauri::window::Color(27, 28, 31, 255))
             .additional_browser_args(WEBVIEW2_ARGS)
             .center()

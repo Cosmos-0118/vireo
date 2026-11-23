@@ -105,7 +105,8 @@ impl ActiveTurnEntry {
         }
     }
 
-    pub fn has_queued(&self) -> bool {
+    #[cfg(test)]
+    fn has_queued(&self) -> bool {
         self.state.lock().map(|s| !s.queue.is_empty()).unwrap_or(false)
     }
 

@@ -1,14 +1,19 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import {
+  AlertTriangle,
   ChevronDown,
   ExternalLink,
+  Laptop,
   Pencil,
   Play,
   Plus,
   RotateCw,
   Square,
   Star,
+  Terminal,
   Trash2,
+  Users,
   X,
 } from 'lucide-react';
 import type { TaskCategory, TaskItem } from '../types';
@@ -49,6 +54,10 @@ const CATEGORY_LABEL: Record<TaskCategory, string> = {
   other: 'Other',
 };
 const CATEGORY_ORDER: TaskCategory[] = ['run', 'build', 'test', 'check', 'other'];
+const COMMAND_VARS = ['${relativeFile}', '${workspaceFolder}', '${input:Label:default}'];
+const fieldLabel = 'block text-[11px] font-medium text-[var(--text-muted)]';
+const fieldInput =
+  'w-full px-2.5 py-2 text-xs rounded-md bg-[var(--bg-input)] border border-[var(--border)] text-[var(--text-primary)] outline-none focus:border-[var(--accent)] placeholder:text-[var(--text-dim)]';
 
 const emptyDraft = (cwd = ''): TaskDraft => ({
   name: '',
@@ -80,6 +89,7 @@ export const RunMenu: React.FC<RunMenuProps> = ({
 }) => {
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const commandRef = useRef<HTMLInputElement>(null);
   const [filter, setFilter] = useState('');
   const [idx, setIdx] = useState(0);
   const [draft, setDraft] = useState<TaskDraft | null>(null);
@@ -97,6 +107,7 @@ export const RunMenu: React.FC<RunMenuProps> = ({
     setFormError('');
     setTimeout(() => inputRef.current?.focus(), 10);
     const onDown = (e: MouseEvent) => {
+      if ((e.target as HTMLElement | null)?.closest?.('[data-run-modal]')) return;
       if (rootRef.current && !rootRef.current.contains(e.target as Node)) onOpenChange(false);
     };
     document.addEventListener('mousedown', onDown);
@@ -190,6 +201,27 @@ export const RunMenu: React.FC<RunMenuProps> = ({
     } finally {
       setSaving(false);
     }
+  };
+
+  useEffect(() => {
+    if (!draft) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setDraft(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [draft]);
+
+  const insertVar = (v: string) => {
+    if (!draft) return;
+    const el = commandRef.current;
+    const s = el?.selectionStart ?? draft.command.length;
+    const e = el?.selectionEnd ?? s;
+    setDraft({ ...draft, command: draft.command.slice(0, s) + v + draft.command.slice(e) });
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(s + v.length, s + v.length);
+    });
   };
 
   const runAndClose = (t: TaskItem, opts?: { newTab?: boolean }) => {
@@ -359,49 +391,132 @@ export const RunMenu: React.FC<RunMenuProps> = ({
         </button>
       </div>
 
-      {open && (
+      {open && !draft && (
         <div className="absolute right-0 top-full mt-1.5 w-[360px] max-w-[90vw] rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 flex flex-col max-h-[70vh]">
-          {draft ? (
-            <div className="p-3 flex flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <span className="text-[12px] font-semibold text-[var(--text-primary)]">
-                  {draft.id ? 'Edit command' : 'New custom command'}
-                </span>
-                <button className={iconBtn} onClick={() => setDraft(null)} title="Cancel">
-                  <X size={13} />
+          <div className="p-2 border-b border-[var(--border)]">
+            <input
+              ref={inputRef}
+              className={inputCls}
+              value={filter}
+              placeholder="Filter, or type a command to run…"
+              onChange={(e) => setFilter(e.target.value)}
+              onKeyDown={onFilterKey}
+            />
+          </div>
+          <div className="overflow-y-auto py-1">
+            {flat.length === 0 ? (
+              <div className="px-3 py-3 text-[12.5px] text-[var(--text-dim)]">
+                {q ? (
+                  <>
+                    <span className="font-mono text-[var(--text-primary)]">{filter.trim()}</span>
+                    <div className="mt-1">
+                      Enter runs it in a terminal. Ctrl+Enter saves it as a custom command.
+                    </div>
+                  </>
+                ) : (
+                  'No tasks detected (package.json, Cargo.toml, pyproject, go.mod, Makefile, justfile, compose, scripts…). Add a custom command below.'
+                )}
+              </div>
+            ) : (
+              sections.map((s) => (
+                <div key={s.key}>
+                  <SectionLabel>{s.title}</SectionLabel>
+                  {s.items.map(renderRow)}
+                </div>
+              ))
+            )}
+          </div>
+          <div className="border-t border-[var(--border)] p-1">
+            <button
+              className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-[12.5px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
+              onClick={() => openForm(emptyDraft())}
+            >
+              <Plus size={13} />
+              New custom command…
+            </button>
+          </div>
+        </div>
+      )}
+
+      {open &&
+        draft &&
+        createPortal(
+          <div
+            data-run-modal
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 backdrop-blur-[1px] p-4"
+            onMouseDown={(e) => {
+              if (e.target === e.currentTarget) setDraft(null);
+            }}
+          >
+            <form
+              className="w-full max-w-[480px] rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl overflow-hidden text-[var(--text-primary)]"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void submitDraft();
+              }}
+            >
+              <div className="flex items-center justify-between px-4 py-3 border-b border-[var(--border)]">
+                <div className="flex items-center gap-2 font-semibold text-sm">
+                  <Terminal size={16} className="text-[var(--accent)]" />
+                  {draft.id ? 'Edit custom command' : 'New custom command'}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDraft(null)}
+                  className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-muted)] cursor-pointer"
+                  aria-label="Close"
+                >
+                  <X size={15} />
                 </button>
               </div>
-              <label className="text-[11px] text-[var(--text-dim)]">
-                Name
-                <input
-                  className={inputCls}
-                  autoFocus
-                  value={draft.name}
-                  placeholder="Dev Server (Watch)"
-                  onChange={(e) => setDraft({ ...draft, name: e.target.value })}
-                />
-              </label>
-              <label className="text-[11px] text-[var(--text-dim)]">
-                Command{' '}
-                <span className="font-mono">
-                  (supports {'${relativeFile}'}, {'${workspaceFolder}'}, {'${input:Label:default}'})
-                </span>
-                <input
-                  className={`${inputCls} font-mono`}
-                  value={draft.command}
-                  placeholder="cargo watch -x run"
-                  onChange={(e) => setDraft({ ...draft, command: e.target.value })}
-                  onKeyDown={(e) => e.key === 'Enter' && void submitDraft()}
-                />
-              </label>
-              <div className="flex gap-2">
-                <label className="text-[11px] text-[var(--text-dim)] flex-1">
-                  Working directory
+
+              <div className="p-4 space-y-3.5 text-xs">
+                <div className="space-y-1">
+                  <label className={fieldLabel}>Name</label>
                   <input
-                    className={inputCls}
+                    className={fieldInput}
+                    autoFocus
+                    value={draft.name}
+                    placeholder="e.g. Dev Server (Watch)"
+                    onChange={(e) => setDraft({ ...draft, name: e.target.value })}
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <label className={fieldLabel}>Command</label>
+                  <input
+                    ref={commandRef}
+                    className={`${fieldInput} font-mono`}
+                    value={draft.command}
+                    placeholder="cargo watch -x run"
+                    spellCheck={false}
+                    onChange={(e) => setDraft({ ...draft, command: e.target.value })}
+                  />
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span className="text-[11px] text-[var(--text-dim)]">Insert</span>
+                    {COMMAND_VARS.map((v) => (
+                      <button
+                        key={v}
+                        type="button"
+                        onClick={() => insertVar(v)}
+                        className="px-1.5 py-0.5 rounded border border-[var(--border)] bg-[var(--bg-input)] font-mono text-[10.5px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:border-[var(--accent)] cursor-pointer"
+                      >
+                        {v}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className={fieldLabel}>
+                    Working directory <span className="font-normal text-[var(--text-dim)]">(optional)</span>
+                  </label>
+                  <input
+                    className={`${fieldInput} font-mono`}
                     list="vireo-run-dirs"
                     value={draft.cwd}
-                    placeholder="(workspace root)"
+                    placeholder="Workspace root"
+                    spellCheck={false}
                     onChange={(e) => setDraft({ ...draft, cwd: e.target.value })}
                   />
                   <datalist id="vireo-run-dirs">
@@ -409,98 +524,104 @@ export const RunMenu: React.FC<RunMenuProps> = ({
                       <option key={d} value={d} />
                     ))}
                   </datalist>
-                </label>
-                <label className="text-[11px] text-[var(--text-dim)]">
-                  Type
-                  <select
-                    className={inputCls}
-                    value={draft.category}
-                    onChange={(e) => setDraft({ ...draft, category: e.target.value as TaskCategory })}
-                  >
+                </div>
+
+                <div className="space-y-1">
+                  <label className={fieldLabel}>Type</label>
+                  <div className="flex p-0.5 gap-0.5 rounded-md border border-[var(--border)] bg-[var(--bg-input)]">
                     {CATEGORY_ORDER.map((c) => (
-                      <option key={c} value={c}>
+                      <button
+                        key={c}
+                        type="button"
+                        onClick={() => setDraft({ ...draft, category: c })}
+                        className={`flex-1 py-1 rounded text-[11.5px] capitalize cursor-pointer transition-colors ${
+                          draft.category === c
+                            ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
+                            : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
                         {c}
-                      </option>
+                      </button>
                     ))}
-                  </select>
-                </label>
+                  </div>
+                </div>
+
+                <div className="space-y-1">
+                  <label className={fieldLabel}>Save to</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {(
+                      [
+                        {
+                          id: 'project',
+                          title: 'Project',
+                          desc: '.vireo/tasks.json, shareable',
+                          icon: Users,
+                        },
+                        {
+                          id: 'personal',
+                          title: 'Personal',
+                          desc: 'This machine only',
+                          icon: Laptop,
+                        },
+                      ] as const
+                    ).map((opt) => {
+                      const active = draft.scope === opt.id;
+                      const Icon = opt.icon;
+                      return (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setDraft({ ...draft, scope: opt.id })}
+                          className={`flex items-start gap-2 p-2.5 rounded-lg border text-left cursor-pointer transition-colors ${
+                            active
+                              ? 'border-[var(--accent)] bg-[var(--bg-active)]/50'
+                              : 'border-[var(--border)] hover:bg-[var(--bg-hover)]'
+                          }`}
+                        >
+                          <Icon
+                            size={14}
+                            className={`mt-0.5 shrink-0 ${active ? 'text-[var(--accent)]' : 'text-[var(--text-muted)]'}`}
+                          />
+                          <span className="min-w-0">
+                            <span className="block font-medium text-[var(--text-primary)]">{opt.title}</span>
+                            <span className="block text-[11px] text-[var(--text-muted)] mt-0.5 truncate">
+                              {opt.desc}
+                            </span>
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {formError && (
+                  <div className="flex items-start gap-2 p-2.5 rounded-md bg-[var(--removed-bg)] border border-[var(--removed-fg)]/40 text-[11px] text-[var(--removed-fg)]">
+                    <AlertTriangle size={14} className="shrink-0 mt-0.5" />
+                    <span>{formError}</span>
+                  </div>
+                )}
               </div>
-              <label className="text-[11px] text-[var(--text-dim)]">
-                Save to
-                <select
-                  className={inputCls}
-                  value={draft.scope}
-                  onChange={(e) => setDraft({ ...draft, scope: e.target.value as TaskDraft['scope'] })}
-                >
-                  <option value="project">Project (.vireo/tasks.json, shareable)</option>
-                  <option value="personal">Personal (this machine only)</option>
-                </select>
-              </label>
-              {formError && <div className="text-[11.5px] text-[var(--danger)]">{formError}</div>}
-              <div className="flex justify-end gap-2 pt-1">
+
+              <div className="flex justify-end gap-2 px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-sidebar)]/50">
                 <button
-                  className="h-7 px-3 rounded-md text-[12px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                  type="button"
                   onClick={() => setDraft(null)}
+                  className="px-3 py-1.5 text-xs rounded-md border border-[var(--border)] hover:bg-[var(--bg-hover)] cursor-pointer"
                 >
                   Cancel
                 </button>
                 <button
-                  disabled={saving}
-                  className="h-7 px-3 rounded-md text-[12px] bg-[var(--accent)] text-white hover:opacity-90 cursor-pointer disabled:opacity-50"
-                  onClick={() => void submitDraft()}
+                  type="submit"
+                  disabled={saving || !draft.name.trim() || !draft.command.trim()}
+                  className="px-3.5 py-1.5 text-xs font-medium rounded-md bg-[var(--accent)] text-[var(--accent-fg)] hover:opacity-90 disabled:opacity-40 cursor-pointer"
                 >
-                  Save
+                  {saving ? 'Saving…' : 'Save'}
                 </button>
               </div>
-            </div>
-          ) : (
-            <>
-              <div className="p-2 border-b border-[var(--border)]">
-                <input
-                  ref={inputRef}
-                  className={inputCls}
-                  value={filter}
-                  placeholder="Filter, or type a command to run…"
-                  onChange={(e) => setFilter(e.target.value)}
-                  onKeyDown={onFilterKey}
-                />
-              </div>
-              <div className="overflow-y-auto py-1">
-                {flat.length === 0 ? (
-                  <div className="px-3 py-3 text-[12.5px] text-[var(--text-dim)]">
-                    {q ? (
-                      <>
-                        <span className="font-mono text-[var(--text-primary)]">{filter.trim()}</span>
-                        <div className="mt-1">
-                          Enter runs it in a terminal. Ctrl+Enter saves it as a custom command.
-                        </div>
-                      </>
-                    ) : (
-                      'No tasks detected (package.json, Cargo.toml, pyproject, go.mod, Makefile, justfile, compose, scripts…). Add a custom command below.'
-                    )}
-                  </div>
-                ) : (
-                  sections.map((s) => (
-                    <div key={s.key}>
-                      <SectionLabel>{s.title}</SectionLabel>
-                      {s.items.map(renderRow)}
-                    </div>
-                  ))
-                )}
-              </div>
-              <div className="border-t border-[var(--border)] p-1">
-                <button
-                  className="w-full flex items-center gap-2 px-2 py-1.5 rounded-md text-[12.5px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
-                  onClick={() => openForm(emptyDraft())}
-                >
-                  <Plus size={13} />
-                  New custom command…
-                </button>
-              </div>
-            </>
-          )}
-        </div>
-      )}
+            </form>
+          </div>,
+          document.body
+        )}
     </div>
   );
 };
