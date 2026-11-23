@@ -69,7 +69,14 @@ pub(crate) fn map_claude_tool(name: &str, input: &Value, ws: &Path) -> (String, 
         // Claude Code runs shell commands through `PowerShell` on Windows and `Bash` elsewhere.
         "Bash" | "PowerShell" | "bash" => {
             let cmd = input["command"].as_str().or_else(|| input["cmd"].as_str()).unwrap_or("");
-            map_vx(cmd, ws).unwrap_or_else(|| ("run_command".to_string(), json!({ "command": cmd })))
+            map_vx(cmd, ws).unwrap_or_else(|| {
+                let mut args = json!({ "command": cmd });
+                // Claude's human-readable intent for the command ("Show working tree status").
+                if let Some(d) = input["description"].as_str().map(str::trim).filter(|d| !d.is_empty()) {
+                    args["description"] = json!(d);
+                }
+                ("run_command".to_string(), args)
+            })
         }
         "Grep" | "grep" => (
             "search_code".to_string(),

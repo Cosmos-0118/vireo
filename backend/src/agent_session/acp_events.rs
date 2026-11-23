@@ -80,7 +80,14 @@ impl AcpEvents {
             Some("search") => ("search_code".into(), json!({ "query": title })),
             Some("execute") => {
                 let command = v["rawInput"]["command"].as_str().unwrap_or(title).to_string();
-                map_vx(&command, &self.ws).unwrap_or_else(|| ("run_command".into(), json!({ "command": command })))
+                map_vx(&command, &self.ws).unwrap_or_else(|| {
+                    let mut args = json!({ "command": command });
+                    // ACP titles are often the agent's own description of the command.
+                    if let Some(d) = intent_of(v, &command) {
+                        args["description"] = json!(d);
+                    }
+                    ("run_command".into(), args)
+                })
             }
             _ => (title.to_string(), if v["rawInput"].is_object() { v["rawInput"].clone() } else { json!({}) }),
         }
@@ -93,7 +100,11 @@ impl AcpEvents {
         match tc["kind"].as_str() {
             Some("execute") => {
                 let command = tc["rawInput"]["command"].as_str().unwrap_or(title);
-                (shell_label().to_string(), json!({ "command": command }))
+                let mut input = json!({ "command": command });
+                if let Some(d) = intent_of(tc, command) {
+                    input["description"] = json!(d);
+                }
+                (shell_label().to_string(), input)
             }
             Some("edit") | Some("delete") | Some("move") => {
                 ("Edit".to_string(), json!({ "file_path": self.path_of(tc), "title": title }))
@@ -101,6 +112,18 @@ impl AcpEvents {
             _ => (title.to_string(), if tc["rawInput"].is_object() { tc["rawInput"].clone() } else { json!({}) }),
         }
     }
+}
+
+/// Human-readable intent of a tool call: `rawInput.description`, else the title when it isn't just the command.
+fn intent_of(v: &Value, command: &str) -> Option<String> {
+    let clean = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty() && s != command.trim()).then(|| s.to_string())
+    };
+    v["rawInput"]["description"]
+        .as_str()
+        .and_then(clean)
+        .or_else(|| v["title"].as_str().and_then(clean))
 }
 
 fn shell_label() -> &'static str {
@@ -183,7 +206,7 @@ mod tests {
         assert_eq!(
             outs,
             vec![
-                Out::ToolCall { id: "c1".into(), name: "run_command".into(), args: json!({ "command": "echo hello-acp" }) },
+                Out::ToolCall { id: "c1".into(), name: "run_command".into(), args: json!({ "command": "echo hello-acp", "description": "x" }) },
                 Out::ToolResult {
                     id: "c1".into(),
                     name: "run_command".into(),

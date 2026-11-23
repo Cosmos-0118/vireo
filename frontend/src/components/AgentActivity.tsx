@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Bot,
   Check,
+  ChevronDown,
   ChevronRight,
   Copy,
   FilePlus2,
@@ -46,7 +47,9 @@ export interface ToolView {
   verb: string;
   /** Present progressive, shown while the step runs ("Reading"). */
   active: string;
-  /** Main object of the step: file name, command, query. Rendered in mono. */
+  /** Human-readable purpose the agent gave the step ("Show working tree status"). Leads the row when present. */
+  intent?: string;
+  /** Main object of the step: file name, command, query. Rendered in a mono pill. */
   subject: string;
   /** Full form of the subject for tooltips. */
   title?: string;
@@ -176,6 +179,7 @@ export function describeTool(t: ToolCallTrace): ToolView {
         kind: 'command',
         verb: 'Ran',
         active: 'Running',
+        intent: str('description').trim() || undefined,
         subject: firstLine(str('command')),
         title: str('command'),
         edits: false,
@@ -382,8 +386,9 @@ const ToolStep: React.FC<{
   onToggle: () => void;
   onOpenDiff: (path: string) => void;
   changeFor: ChangeLookup;
-  rail: boolean;
-}> = ({ tool, turnActive, open, onToggle, onOpenDiff, changeFor, rail }) => {
+  /** Position in a group's tree: draws the connector. Omitted for a standalone step. */
+  tree?: 'mid' | 'last';
+}> = ({ tool, turnActive, open, onToggle, onOpenDiff, changeFor, tree }) => {
   const v = describeTool(tool);
   const status = toolStatus(tool, turnActive);
   const bad = status === 'failed' || status === 'blocked';
@@ -398,11 +403,19 @@ const ToolStep: React.FC<{
   const output = isCmd ? (tool.result ?? '').replace(EXIT_RE, '').replace(/^\r?\n/, '') : body;
 
   return (
-    <div className="relative">
-      {rail && <span aria-hidden className="absolute left-[9.5px] top-[22px] bottom-[-2px] w-px bg-[var(--border)]" />}
+    <div className={`relative ${tree ? 'pl-[16px]' : ''}`}>
+      {tree && (
+        <>
+          <span
+            aria-hidden
+            className={`absolute left-0 top-0 w-px bg-[var(--border)] ${tree === 'last' ? 'h-[13px]' : 'h-full'}`}
+          />
+          <span aria-hidden className="absolute left-0 top-[13px] w-[11px] h-px bg-[var(--border)]" />
+        </>
+      )}
       <div
         onClick={() => (opensDiff ? onOpenDiff(v.path!) : hasDetail && onToggle())}
-        className={`group relative flex items-center gap-2 h-[26px] pl-[3px] pr-1 rounded-md text-[12px] ${
+        className={`group relative flex items-center gap-2 h-[26px] pl-1 pr-1 rounded-md text-[12px] ${
           opensDiff || hasDetail ? 'cursor-pointer hover:bg-[var(--bg-hover)]' : ''
         }`}
         title={opensDiff ? `Open diff · ${v.title ?? v.subject}` : v.title ?? v.subject}
@@ -410,14 +423,24 @@ const ToolStep: React.FC<{
         <span className="w-[14px] h-[14px] shrink-0 flex items-center justify-center">
           <StatusIcon status={status} Icon={v.Icon} />
         </span>
-        <span className="flex items-baseline gap-1.5 min-w-0 flex-1">
-          <span className={`shrink-0 ${status === 'running' ? 'agent-shimmer' : 'text-[var(--text-muted)]'}`}>
-            {status === 'running' ? v.active : v.verb}
-          </span>
+        <span className="flex items-center gap-1.5 min-w-0 flex-1">
+          {v.intent ? (
+            <span
+              className={`min-w-0 truncate ${status === 'running' ? 'agent-shimmer' : 'text-[var(--text-muted)]'}`}
+            >
+              {v.intent}
+            </span>
+          ) : (
+            <span className={`shrink-0 ${status === 'running' ? 'agent-shimmer' : 'text-[var(--text-muted)]'}`}>
+              {status === 'running' ? v.active : v.verb}
+            </span>
+          )}
           {v.subject && (
             <span
-              className={`font-mono text-[11.5px] truncate min-w-0 ${
-                status === 'stopped' ? 'text-[var(--text-dim)]' : 'text-[var(--text-primary)]'
+              className={`px-1.5 py-px rounded bg-[var(--bg-elevated)] font-mono text-[11px] truncate ${
+                v.intent ? 'shrink-0 max-w-[46%]' : 'min-w-0'
+              } ${
+                status === 'stopped' || v.intent ? 'text-[var(--text-dim)]' : 'text-[var(--text-primary)]'
               } ${opensDiff ? 'group-hover:text-[var(--accent)]' : ''}`}
             >
               {v.kind === 'search' && tool.name === 'search_code' ? `“${v.subject}”` : v.subject}
@@ -452,7 +475,7 @@ const ToolStep: React.FC<{
       {bad && !open && (
         <div
           onClick={onToggle}
-          className={`ml-[25px] mr-1 -mt-0.5 mb-0.5 text-[11px] leading-[16px] truncate cursor-pointer ${
+          className={`ml-[22px] mr-1 -mt-0.5 mb-0.5 text-[11px] leading-[16px] truncate cursor-pointer ${
             status === 'blocked' ? 'text-[var(--modified-fg)]/80' : 'text-[var(--danger)]/85'
           }`}
           title={tool.result}
@@ -462,7 +485,7 @@ const ToolStep: React.FC<{
       )}
 
       {open && hasDetail && (
-        <div className="ml-[25px] mr-1 mt-0.5 mb-1.5 rounded-md border border-[var(--border)] bg-[var(--bg-panel)] overflow-hidden">
+        <div className="ml-[22px] mr-1 mt-0.5 mb-1.5 rounded-md border border-[var(--border)] bg-[var(--bg-panel)] overflow-hidden">
           {isCmd && (
             <div className="flex items-start gap-2 px-2.5 py-1.5 border-b border-[var(--border)] bg-[var(--bg-elevated)]/50">
               <span className="font-mono text-[11px] text-[var(--text-dim)] select-none">$</span>
@@ -513,7 +536,18 @@ const ToolStep: React.FC<{
 // Group: one run of consecutive tool calls
 // ---------------------------------------------------------------------------------------------
 
-export const ActivityGroup: React.FC<{
+const GROUP_ICON: Record<ToolKind, IconT> = {
+  read: FileText,
+  search: Search,
+  edit: SquarePen,
+  command: TerminalIcon,
+  web: Globe,
+  plan: ListChecks,
+  task: Bot,
+  other: Wrench,
+};
+
+type GroupProps = {
   tools: ToolCallTrace[];
   turnActive: boolean;
   open: boolean;
@@ -522,30 +556,36 @@ export const ActivityGroup: React.FC<{
   onToggleTool: (id: string) => void;
   onOpenDiff: (path: string) => void;
   changeFor: ChangeLookup;
-}> = ({ tools, turnActive, open, onOpenChange, expanded, onToggleTool, onOpenDiff, changeFor }) => {
-  if (tools.length === 0) return null;
+};
 
-  const statuses = tools.map((t) => toolStatus(t, turnActive));
-  const rows = (
-    <div className="py-0.5">
-      {tools.map((t, i) => (
-        <ToolStep
-          key={t.id}
-          tool={t}
-          turnActive={turnActive}
-          open={!!expanded[t.id]}
-          onToggle={() => onToggleTool(t.id)}
-          onOpenDiff={onOpenDiff}
-          changeFor={changeFor}
-          rail={i < tools.length - 1}
-        />
-      ))}
-    </div>
+/** A borderless, collapsible run of steps drawn as a tree. */
+const GroupTree: React.FC<GroupProps> = ({
+  tools,
+  turnActive,
+  open,
+  onOpenChange,
+  expanded,
+  onToggleTool,
+  onOpenDiff,
+  changeFor,
+}) => {
+  const step = (t: ToolCallTrace, tree?: 'mid' | 'last') => (
+    <ToolStep
+      key={t.id}
+      tool={t}
+      turnActive={turnActive}
+      open={!!expanded[t.id]}
+      onToggle={() => onToggleTool(t.id)}
+      onOpenDiff={onOpenDiff}
+      changeFor={changeFor}
+      tree={tree}
+    />
   );
 
   // A lone step needs no group chrome.
-  if (tools.length === 1) return rows;
+  if (tools.length === 1) return <div className="py-0.5">{step(tools[0])}</div>;
 
+  const statuses = tools.map((t) => toolStatus(t, turnActive));
   const views = tools.map(describeTool);
   const runningIdx = statuses.lastIndexOf('running');
   const running = runningIdx >= 0;
@@ -556,40 +596,41 @@ export const ActivityGroup: React.FC<{
   const ends = tools.map((t) => t.endedAt).filter((x): x is number => x !== undefined);
   const span = !running && starts.length && ends.length ? Math.max(...ends) - Math.min(...starts) : undefined;
   const cur = running ? views[runningIdx] : undefined;
+  const kinds = new Set(views.map((v) => v.kind));
+  const GroupIcon = kinds.size === 1 ? GROUP_ICON[views[0].kind] : ListTree;
+  const [verb, ...restWords] = summarize(views).split(' ');
 
   return (
-    <div
-      className={`rounded-lg border transition-colors ${
-        open ? 'border-[var(--border)] bg-[var(--bg-elevated)]/25' : 'border-transparent'
-      }`}
-    >
+    <div>
       <button
         onClick={() => onOpenChange(!open)}
-        className={`group w-full flex items-center gap-2 h-7 pl-[5px] pr-2 rounded-lg text-left text-[12px] cursor-pointer hover:bg-[var(--bg-hover)] ${
-          open ? 'rounded-b-none' : ''
-        }`}
+        className="group w-full flex items-center gap-1.5 h-7 pl-1 pr-1.5 rounded-md text-left text-[12px] cursor-pointer hover:bg-[var(--bg-hover)]"
         aria-expanded={open}
       >
-        <ChevronRight
-          size={13}
-          className={`shrink-0 text-[var(--text-dim)] group-hover:text-[var(--text-muted)] transition-transform duration-150 ${
-            open ? 'rotate-90' : ''
-          }`}
-        />
-        <span className="flex items-baseline gap-1.5 min-w-0 flex-1">
-          {cur ? (
-            <>
-              <span className="shrink-0 agent-shimmer">{cur.active}</span>
-              {cur.subject && (
-                <span className="font-mono text-[11.5px] truncate min-w-0 text-[var(--text-primary)]">{cur.subject}</span>
-              )}
-            </>
+        <span className="w-[14px] h-[14px] shrink-0 flex items-center justify-center">
+          {running ? (
+            <Loader2 size={13} className="animate-spin text-[var(--accent)]" />
           ) : (
-            <span className="truncate text-[var(--text-muted)] group-hover:text-[var(--text-primary)]">
-              {summarize(views)}
-            </span>
+            <GroupIcon size={13} className="text-[var(--text-dim)]" />
           )}
         </span>
+        <span className="min-w-0 truncate">
+          {cur ? (
+            <span className="agent-shimmer">{cur.intent || `${cur.active} ${cur.subject}`.trim()}</span>
+          ) : (
+            <>
+              <span className="font-medium text-[var(--text-primary)]">{verb}</span>{' '}
+              <span className="text-[var(--text-muted)]">{restWords.join(' ')}</span>
+            </>
+          )}
+        </span>
+        <ChevronDown
+          size={12}
+          className={`shrink-0 text-[var(--text-dim)] group-hover:text-[var(--text-muted)] transition-transform duration-150 ${
+            open ? '' : '-rotate-90'
+          }`}
+        />
+        <span className="flex-1" />
         {blocked > 0 && (
           <span className="shrink-0 flex items-center gap-1 text-[10.5px] text-[var(--modified-fg)]">
             <ShieldAlert size={11} />
@@ -602,12 +643,52 @@ export const ActivityGroup: React.FC<{
             {failed}
           </span>
         )}
-        <span className="shrink-0 text-[10.5px] tabular-nums text-[var(--text-dim)]">
-          {running ? `${doneCount}/${tools.length}` : `${tools.length} steps`}
-          {span !== undefined && span >= 1000 && ` · ${formatDur(span)}`}
-        </span>
+        {running && (
+          <span className="shrink-0 text-[10.5px] tabular-nums text-[var(--text-dim)]">
+            {doneCount}/{tools.length}
+          </span>
+        )}
+        {span !== undefined && span >= 2000 && (
+          <span className="shrink-0 text-[10.5px] tabular-nums text-[var(--text-dim)] opacity-0 group-hover:opacity-100 transition-opacity">
+            {formatDur(span)}
+          </span>
+        )}
       </button>
-      {open && <div className="px-1.5 pb-1">{rows}</div>}
+      {open && (
+        <div className="ml-[8px] py-0.5">
+          {tools.map((t, i) => step(t, i === tools.length - 1 ? 'last' : 'mid'))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+export const ActivityGroup: React.FC<GroupProps> = (props) => {
+  const { tools, turnActive } = props;
+  if (tools.length === 0) return null;
+
+  // Steps still in flight at the tail sit below the (collapsible) completed group so it is obvious
+  // where execution is right now without expanding past history.
+  let split = tools.length;
+  while (split > 0 && toolStatus(tools[split - 1], turnActive) === 'running') split--;
+  if (split === 0 || split === tools.length) return <GroupTree {...props} />;
+
+  return (
+    <div>
+      <GroupTree {...props} tools={tools.slice(0, split)} />
+      <div className="py-0.5">
+        {tools.slice(split).map((t) => (
+          <ToolStep
+            key={t.id}
+            tool={t}
+            turnActive={turnActive}
+            open={!!props.expanded[t.id]}
+            onToggle={() => props.onToggleTool(t.id)}
+            onOpenDiff={props.onOpenDiff}
+            changeFor={props.changeFor}
+          />
+        ))}
+      </div>
     </div>
   );
 };

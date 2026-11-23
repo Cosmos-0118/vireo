@@ -144,9 +144,10 @@ export const AgentSettingsProvider: React.FC<{
   });
   const [showQuickActions, setShowQuickActionsState] = useState(() => {
     try {
-      return localStorage.getItem(QUICK_ACTIONS_KEY) === '1';
+      // On unless the user switched it off, so a new thread never opens onto a blank panel.
+      return localStorage.getItem(QUICK_ACTIONS_KEY) !== '0';
     } catch {
-      return false;
+      return true;
     }
   });
   const setShowQuickActions = useCallback((v: boolean) => {

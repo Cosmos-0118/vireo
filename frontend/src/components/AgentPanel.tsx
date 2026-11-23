@@ -204,8 +204,7 @@ const CheckpointDivider: React.FC<{
   const btn =
     'shrink-0 px-1.5 py-0.5 rounded text-[var(--accent)] hover:bg-[var(--bg-hover)] cursor-pointer';
   return (
-    <div className="flex items-center gap-2 my-1 text-[11px] text-[var(--text-dim)]">
-      <div className="flex-1 h-px bg-[var(--border)]" />
+    <div className="flex items-center gap-2 pl-1 text-[11px] text-[var(--text-dim)]">
       <span
         className="flex items-center gap-1 min-w-0 truncate"
         title={checkpoint.files?.map((f) => f.path).join('\n')}
@@ -246,7 +245,6 @@ const CheckpointDivider: React.FC<{
           Redo turn
         </button>
       )}
-      <div className="w-4 h-px bg-[var(--border)]" />
     </div>
   );
 };
@@ -413,6 +411,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     activeFilePath && activeFilePath !== dismissedActive && !extraFiles.includes(activeFilePath)
       ? activeFilePath
       : null;
+  const hasContext = !!activeChip || extraFiles.length > 0 || (includeChanges && changedFileCount > 0);
 
   // Engine readiness, shown as a dot in the composer and as the status card in the empty state.
   const engineName = cliToolId
@@ -582,6 +581,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       tools: [],
       streaming: true,
       startedAt: now,
+      engine: engineShort,
     };
 
     const historyPayload = [
@@ -698,6 +698,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       if (!rules.includes(p.rule)) threadRulesRef.current[threadId] = [...rules, p.rule];
     }
     api.answerPermission(p.turn_id, p.request_id, allow, remember).catch(() => {});
+  };
+
+  const allowAllPermissions = () => {
+    for (const r of permRequests) answerPermission(r, true);
   };
 
   const answerQuestion = (q: QuestionRequest, answers: Record<string, string[]>) => {
@@ -994,13 +998,28 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         {messages.length === 0 ? (
           // Zone 2A: ready state, anchored to the composer instead of floating mid-panel.
           <div className="mt-auto space-y-3">
+            <div className="flex items-center gap-2 min-w-0 text-[12px]">
+              <span
+                className="w-1.5 h-1.5 rounded-full shrink-0"
+                style={{ background: engineStatus.ok ? OK_DOT : WARN_DOT }}
+              />
+              <span className="shrink-0 text-[var(--text-primary)]">{engineName}</span>
+              <span className="truncate text-[var(--text-dim)]">
+                {engineStatus.ok ? `· ${engineStatus.text} · ${workspaceName}` : `· ${engineStatus.text}`}
+              </span>
+              {!engineStatus.ok && (
+                <button onClick={onOpenSettings} className="shrink-0 text-[var(--accent)] hover:underline cursor-pointer">
+                  Configure →
+                </button>
+              )}
+            </div>
             {showQuickActions && (
             <div>
               <div className="mb-1 text-[10.5px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">
                 Quick actions
               </div>
               <div className="rounded-md border border-[var(--border)] overflow-hidden">
-                {quickActions.map((a, i) => (
+                {quickActions.slice(0, 3).map((a, i) => (
                   <button
                     key={a.label}
                     onClick={a.run}
@@ -1026,12 +1045,9 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               if (m.role === 'user') {
                 const ctx = m.ctxFiles ?? [];
                 return (
-                  <div
-                    key={m.id}
-                    className="rounded-md px-3 py-2 bg-[var(--bg-elevated)] border border-[var(--border)]"
-                  >
+                  <div key={m.id} className="flex flex-col items-end">
                     {(ctx.length > 0 || m.ctxChanges) && (
-                      <div className="flex flex-wrap gap-1 mb-1.5">
+                      <div className="flex flex-wrap justify-end gap-1 mb-1">
                         {ctx.map((f) => (
                           <ContextBadge
                             key={f}
@@ -1048,7 +1064,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                         )}
                       </div>
                     )}
-                    <div className="text-[13px] leading-[1.5] text-[var(--text-primary)] whitespace-pre-wrap break-words">
+                    <div className="max-w-[85%] w-fit rounded-xl px-3 py-1.5 bg-[var(--bg-elevated)] text-[12.5px] leading-[1.45] text-[var(--text-primary)] whitespace-pre-wrap break-words">
                       {m.content}
                     </div>
                   </div>
@@ -1070,8 +1086,17 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 !m.streaming && tools.length > 0 && m.startedAt !== undefined && m.endedAt !== undefined
                   ? m.endedAt - m.startedAt
                   : undefined;
+              const thought =
+                m.startedAt !== undefined && m.firstOutputAt !== undefined ? m.firstOutputAt - m.startedAt : undefined;
               return (
                 <div key={m.id} className="space-y-2">
+                  {(m.engine || (thought !== undefined && thought >= 1000)) && (
+                    <div className="pl-1 text-[11px] text-[var(--text-dim)] truncate">
+                      {m.engine}
+                      {m.engine && thought !== undefined && thought >= 1000 && ' · '}
+                      {thought !== undefined && thought >= 1000 && `Thought for ${formatDur(thought)}`}
+                    </div>
+                  )}
                   {parts.map((p, i) => {
                     if (p.kind === 'text') {
                       return <MarkdownMessage key={`t${i}`} content={p.text} theme={theme} />;
@@ -1083,7 +1108,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                         key={key}
                         tools={groupTools}
                         turnActive={!!m.streaming}
-                        open={groupOpen[key] ?? (!!m.streaming && i === parts.length - 1)}
+                        open={groupOpen[key] ?? false}
                         onOpenChange={(open) => setGroupOpen((prev) => ({ ...prev, [key]: open }))}
                         expanded={expandedTools}
                         onToggleTool={(id) => setExpandedTools((prev) => ({ ...prev, [id]: !prev[id] }))}
@@ -1124,12 +1149,21 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 </div>
               );
             })}
-            {permRequests.map((p) => (
-              <PermissionCard key={p.request_id} request={p} onAnswer={answerPermission} />
-            ))}
-            {questions.map((q) => (
-              <QuestionCard key={q.request_id} request={q} onSubmit={answerQuestion} onDismiss={dismissQuestion} />
-            ))}
+            {(permRequests.length > 0 || questions.length > 0) && (
+              <div className="flex items-center gap-2 h-6 pl-1 text-[12px]">
+                <Lock size={12} className="shrink-0 text-[var(--accent)]" />
+                {permRequests.length > 0 ? (
+                  <span>
+                    <span className="text-[var(--text-primary)]">
+                      {permRequests.length} confirmation{permRequests.length === 1 ? '' : 's'}
+                    </span>{' '}
+                    <span className="text-[var(--text-muted)]">pending</span>
+                  </span>
+                ) : (
+                  <span className="text-[var(--text-muted)]">Waiting for your answer</span>
+                )}
+              </div>
+            )}
           </div>
         )}
         </div>
@@ -1144,7 +1178,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         )}
       </div>
 
-      {/* Zone 3: live change bar */}
+      {/* Live change bar */}
       {liveEdits.length > 0 && (
         <div className="flex items-center gap-2 h-7 px-3 shrink-0 border-t border-[var(--border)] bg-[var(--bg-elevated)]/90 text-[11.5px] text-[var(--text-muted)]">
           <GitBranch size={12} className="shrink-0" />
@@ -1174,11 +1208,26 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         </div>
       )}
 
-      {/* Zone 4: composer */}
+      {/* Zone 3: docked confirmations, kept out of the scrolling timeline */}
+      {(permRequests.length > 0 || questions.length > 0) && (
+        <div className="shrink-0 pt-2 max-h-[60%] overflow-y-auto">
+          {permRequests.length > 0 && (
+            <PermissionCard requests={permRequests} onAnswer={answerPermission} onAllowAll={allowAllPermissions} />
+          )}
+          {questions.map((q) => (
+            <div key={q.request_id} className="mx-3 mb-2">
+              <QuestionCard request={q} onSubmit={answerQuestion} onDismiss={dismissQuestion} />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Zone 4: composer + quiet mode footer */}
       <div className="px-3 pb-3 pt-2 shrink-0">
         <div className="relative rounded-lg border border-[var(--border)] bg-[var(--bg-input)] focus-within:border-[var(--accent)] transition-colors">
-          {/* Row 1: context strip */}
-          <div className="flex flex-wrap items-center gap-1 px-2.5 pt-2">
+          {/* Row 1: context chips, only when something is attached */}
+          {hasContext && (
+            <div className="flex flex-wrap items-center gap-1 px-2.5 pt-2">
             {activeChip && (
               <span className="flex items-center gap-1 max-w-full h-5 pl-1.5 pr-1 rounded bg-[var(--bg-elevated)] text-[11px] text-[var(--text-primary)]">
                 <FileCode size={11} className="shrink-0 text-[var(--text-muted)]" />
@@ -1212,39 +1261,37 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 </button>
               </span>
             ))}
-            {changedFileCount > 0 && (
-              <button
-                onClick={() => setIncludeChanges((v) => !v)}
-                className={`h-5 px-1.5 rounded border text-[11px] cursor-pointer transition-colors ${
-                  includeChanges
-                    ? 'border-[var(--accent)] bg-[var(--bg-active)] text-[var(--text-primary)]'
-                    : 'border-[var(--border)] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
-                }`}
-                title="Tell the agent about uncommitted changes"
-              >
-                ± {changedFileCount} changed
-              </button>
-            )}
-            <button
-              data-pop="picker"
-              onClick={() => {
-                setFileQuery('');
-                setAtRange(null);
-                setShowFilePicker((v) => !v);
-              }}
-              className="flex items-center gap-1 h-5 px-1.5 rounded border border-[var(--border)] text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
-              title="Add a file to the context (or type @)"
-            >
-              <Plus size={10} />
-              Context
-            </button>
-          </div>
+              {includeChanges && changedFileCount > 0 && (
+                <span className="flex items-center gap-1 h-5 pl-1.5 pr-1 rounded bg-[var(--bg-elevated)] text-[11px] text-[var(--text-primary)]">
+                  <GitCompare size={11} className="shrink-0 text-[var(--text-muted)]" />
+                  {changedFileCount} changed
+                  <button
+                    onClick={() => setIncludeChanges(false)}
+                    className="text-[var(--text-dim)] hover:text-[var(--text-primary)] cursor-pointer"
+                    title="Remove from context"
+                  >
+                    <X size={11} />
+                  </button>
+                </span>
+              )}
+            </div>
+          )}
 
           {pickerOpen && (
             <div
               ref={pickerRef}
               className="absolute left-2 right-2 bottom-full mb-1 z-40 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl overflow-hidden"
             >
+              {!atRange && changedFileCount > 0 && (
+                <div
+                  onClick={() => setIncludeChanges((v) => !v)}
+                  className="flex items-center gap-2 h-[28px] px-3 text-[12px] cursor-pointer hover:bg-[var(--bg-hover)] text-[var(--text-primary)] border-b border-[var(--border)]"
+                >
+                  <GitCompare size={12} className="shrink-0 text-[var(--text-muted)]" />
+                  <span className="flex-1 truncate">± {changedFileCount} uncommitted changes</span>
+                  {includeChanges && <Check size={12} className="text-[var(--accent)] shrink-0" />}
+                </div>
+              )}
               {!atRange && (
                 <input
                   autoFocus
@@ -1345,226 +1392,173 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             }}
             rows={1}
             style={{ minHeight: 44 }}
-            placeholder={
-              sessionEngine
-                ? 'Ask anything, edit files, or explain diffs… (@ for files, / for commands)'
-                : 'Ask anything, edit files, or explain diffs… (@ to add a file)'
-            }
-            className="block w-full px-2.5 py-1.5 text-[13px] leading-[1.5] bg-transparent text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none"
+            placeholder="Chat with Agent"
+            className={`block w-full px-2.5 ${hasContext ? 'pt-1.5' : 'pt-2.5'} pb-1.5 text-[12.5px] leading-[1.45] bg-transparent text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none`}
           />
 
-          {/* Row 3: control bar */}
+          {/* Row 2: composer toolbar */}
           <div className="flex items-center justify-between gap-2 h-7 px-2 pb-1.5 box-content">
-            <div className="relative min-w-0">
+            <div className="flex items-center gap-1 min-w-0">
               <button
-                data-pop="engine"
-                onClick={() => setShowModelMenu((v) => !v)}
-                className="flex items-center gap-1.5 max-w-full h-6 px-1.5 rounded-md text-[11.5px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
-                title={`${engineName} · ${config.model} — ${engineStatus.text}`}
+                data-pop="picker"
+                onClick={() => {
+                  setFileQuery('');
+                  setAtRange(null);
+                  setShowFilePicker((v) => !v);
+                }}
+                className="w-6 h-6 shrink-0 flex items-center justify-center rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
+                title="Add context: files or uncommitted changes (or type @)"
               >
-                <span
-                  className="w-1.5 h-1.5 rounded-full shrink-0"
-                  style={{ background: engineStatus.ok ? OK_DOT : WARN_DOT }}
-                />
-                <span className="truncate">{engineShort}</span>
-                <ChevronDown size={11} className="shrink-0" />
+                <Plus size={14} />
               </button>
-              {showModelMenu && (
-                <div
-                  ref={modelRef}
-                  className="absolute left-0 bottom-full mb-1 z-40 w-[280px] max-w-[calc(100vw-32px)] max-h-[70vh] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl py-1 text-[12px]"
+              <div className="relative min-w-0">
+                <button
+                  data-pop="engine"
+                  onClick={() => setShowModelMenu((v) => !v)}
+                  className="flex items-center gap-1.5 max-w-full h-6 px-1.5 rounded-md text-[11.5px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
+                  title={`${engineName} · ${config.model} — ${engineStatus.text}`}
                 >
-                  <div className={menuHead}>Installed CLI agents · no API key</div>
-                  {orderedCliProviders.map((p) => {
-                    const installed = cliTools.find((t) => t.id === CLI_PROVIDER_TOOL[p])?.installed;
-                    return (
-                      <div key={p} onClick={() => chooseCli(p)} className={menuRow}>
-                        <span
-                          className="w-1.5 h-1.5 rounded-full shrink-0 border"
-                          style={
-                            installed === false
-                              ? { borderColor: 'var(--text-dim)' }
-                              : { background: OK_DOT, borderColor: OK_DOT }
-                          }
-                        />
-                        <span className="flex-1 truncate">{PROVIDER_LABEL[p]} CLI</span>
-                        <span className="text-[11px] text-[var(--text-dim)]">
-                          {installed === false ? 'Not found' : installed ? 'Installed' : ''}
-                        </span>
-                        {config.provider === p && <Check size={12} className="text-[var(--accent)] shrink-0" />}
-                      </div>
-                    );
-                  })}
-
-                  <div className="my-1 border-t border-[var(--border)]" />
-                  <div className={menuHead}>
-                    Local models · Ollama {localModels ? (localModels.ollama.running ? '(running)' : '(not running)') : ''}
-                  </div>
-                  {ollamaModels.length === 0 ? (
-                    <div className="px-3 py-1 text-[11.5px] text-[var(--text-dim)]">
-                      {localModels?.ollama.running ? 'No models pulled yet.' : 'Start Ollama to list local models.'}
-                    </div>
-                  ) : (
-                    ollamaModels.map((m) => (
-                      <div key={m} onClick={() => chooseOllamaModel(m)} className={menuRow}>
-                        <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: OK_DOT }} />
-                        <span className="flex-1 truncate font-mono text-[11.5px]">{m}</span>
-                        {config.provider === 'ollama' && config.model === m && (
-                          <Check size={12} className="text-[var(--accent)] shrink-0" />
-                        )}
-                      </div>
-                    ))
+                  {!engineStatus.ok && (
+                    <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: WARN_DOT }} />
                   )}
-
-                  <div className="my-1 border-t border-[var(--border)]" />
-                  <div className={menuHead}>Direct API key</div>
-                  {API_PROVIDERS.map((p) => {
-                    const hasKey = !!(apiKeys[p] ?? '').trim();
-                    return (
-                      <div key={p} onClick={() => chooseApi(p)} className={menuRow}>
-                        <span
-                          className="w-1.5 h-1.5 rounded-full shrink-0 border"
-                          style={
-                            hasKey
-                              ? { background: OK_DOT, borderColor: OK_DOT }
-                              : { borderColor: 'var(--text-dim)' }
-                          }
-                        />
-                        <span className="flex-1 truncate">
-                          {PROVIDER_LABEL[p]} {PROVIDER_PRESETS[p].model && <span className="text-[var(--text-dim)]">· {PROVIDER_PRESETS[p].model}</span>}
-                        </span>
-                        {config.provider === p && hasKey ? (
-                          <Check size={12} className="text-[var(--accent)] shrink-0" />
-                        ) : (
-                          !hasKey && <span className="text-[11px] text-[var(--accent)] shrink-0">Set key →</span>
-                        )}
-                      </div>
-                    );
-                  })}
-
-                  {config.provider !== 'ollama' && (
+                  <span className="truncate">{PROVIDER_LABEL[config.provider]}</span>
+                  {shortModel(config.model) && (
                     <>
-                      <div className="my-1 border-t border-[var(--border)]" />
-                      <div className={menuHead}>Model · {PROVIDER_LABEL[config.provider]}</div>
-                      {modelOptions.map((m) => (
-                        <div
-                          key={m}
-                          onClick={() => {
-                            setConfig((prev) => ({ ...prev, model: m }));
-                            setShowModelMenu(false);
-                          }}
-                          className={menuRow}
-                        >
-                          <span className="truncate flex-1 font-mono text-[11.5px]">{m}</span>
-                          {config.model === m && <Check size={12} className="text-[var(--accent)] shrink-0" />}
-                        </div>
-                      ))}
+                      <span className="text-[var(--border)]">│</span>
+                      <span className="truncate text-[var(--text-dim)]">{shortModel(config.model)}</span>
                     </>
                   )}
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault();
-                      const v = customModel.trim();
-                      if (!v) return;
-                      setConfig((prev) => ({ ...prev, model: v }));
-                      setCustomModel('');
-                      setShowModelMenu(false);
-                    }}
-                    className="px-2 py-1"
-                  >
-                    <input
-                      value={customModel}
-                      onChange={(e) => setCustomModel(e.target.value)}
-                      placeholder="Custom model id…"
-                      className="w-full px-2 py-1 text-[11.5px] font-mono rounded bg-[var(--bg-input)] border border-[var(--border)] text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none focus:border-[var(--accent)]"
-                    />
-                  </form>
-
-                  <div className="my-1 border-t border-[var(--border)]" />
+                  <ChevronDown size={11} className="shrink-0" />
+                </button>
+                {showModelMenu && (
                   <div
-                    onClick={() => {
-                      setShowModelMenu(false);
-                      onOpenSettings();
-                    }}
-                    className={`${menuRow} !text-[var(--text-muted)]`}
+                    ref={modelRef}
+                    className="absolute left-0 bottom-full mb-1 z-40 w-[280px] max-w-[calc(100vw-32px)] max-h-[70vh] overflow-y-auto rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl py-1 text-[12px]"
                   >
-                    <Settings size={12} />
-                    <span className="flex-1">Configure paths & API keys…</span>
+                    <div className={menuHead}>Installed CLI agents · no API key</div>
+                    {orderedCliProviders.map((p) => {
+                      const installed = cliTools.find((t) => t.id === CLI_PROVIDER_TOOL[p])?.installed;
+                      return (
+                        <div key={p} onClick={() => chooseCli(p)} className={menuRow}>
+                          <span
+                            className="w-1.5 h-1.5 rounded-full shrink-0 border"
+                            style={
+                              installed === false
+                                ? { borderColor: 'var(--text-dim)' }
+                                : { background: OK_DOT, borderColor: OK_DOT }
+                            }
+                          />
+                          <span className="flex-1 truncate">{PROVIDER_LABEL[p]} CLI</span>
+                          <span className="text-[11px] text-[var(--text-dim)]">
+                            {installed === false ? 'Not found' : installed ? 'Installed' : ''}
+                          </span>
+                          {config.provider === p && <Check size={12} className="text-[var(--accent)] shrink-0" />}
+                        </div>
+                      );
+                    })}
+  
+                    <div className="my-1 border-t border-[var(--border)]" />
+                    <div className={menuHead}>
+                      Local models · Ollama {localModels ? (localModels.ollama.running ? '(running)' : '(not running)') : ''}
+                    </div>
+                    {ollamaModels.length === 0 ? (
+                      <div className="px-3 py-1 text-[11.5px] text-[var(--text-dim)]">
+                        {localModels?.ollama.running ? 'No models pulled yet.' : 'Start Ollama to list local models.'}
+                      </div>
+                    ) : (
+                      ollamaModels.map((m) => (
+                        <div key={m} onClick={() => chooseOllamaModel(m)} className={menuRow}>
+                          <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: OK_DOT }} />
+                          <span className="flex-1 truncate font-mono text-[11.5px]">{m}</span>
+                          {config.provider === 'ollama' && config.model === m && (
+                            <Check size={12} className="text-[var(--accent)] shrink-0" />
+                          )}
+                        </div>
+                      ))
+                    )}
+  
+                    <div className="my-1 border-t border-[var(--border)]" />
+                    <div className={menuHead}>Direct API key</div>
+                    {API_PROVIDERS.map((p) => {
+                      const hasKey = !!(apiKeys[p] ?? '').trim();
+                      return (
+                        <div key={p} onClick={() => chooseApi(p)} className={menuRow}>
+                          <span
+                            className="w-1.5 h-1.5 rounded-full shrink-0 border"
+                            style={
+                              hasKey
+                                ? { background: OK_DOT, borderColor: OK_DOT }
+                                : { borderColor: 'var(--text-dim)' }
+                            }
+                          />
+                          <span className="flex-1 truncate">
+                            {PROVIDER_LABEL[p]} {PROVIDER_PRESETS[p].model && <span className="text-[var(--text-dim)]">· {PROVIDER_PRESETS[p].model}</span>}
+                          </span>
+                          {config.provider === p && hasKey ? (
+                            <Check size={12} className="text-[var(--accent)] shrink-0" />
+                          ) : (
+                            !hasKey && <span className="text-[11px] text-[var(--accent)] shrink-0">Set key →</span>
+                          )}
+                        </div>
+                      );
+                    })}
+  
+                    {config.provider !== 'ollama' && (
+                      <>
+                        <div className="my-1 border-t border-[var(--border)]" />
+                        <div className={menuHead}>Model · {PROVIDER_LABEL[config.provider]}</div>
+                        {modelOptions.map((m) => (
+                          <div
+                            key={m}
+                            onClick={() => {
+                              setConfig((prev) => ({ ...prev, model: m }));
+                              setShowModelMenu(false);
+                            }}
+                            className={menuRow}
+                          >
+                            <span className="truncate flex-1 font-mono text-[11.5px]">{m}</span>
+                            {config.model === m && <Check size={12} className="text-[var(--accent)] shrink-0" />}
+                          </div>
+                        ))}
+                      </>
+                    )}
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        const v = customModel.trim();
+                        if (!v) return;
+                        setConfig((prev) => ({ ...prev, model: v }));
+                        setCustomModel('');
+                        setShowModelMenu(false);
+                      }}
+                      className="px-2 py-1"
+                    >
+                      <input
+                        value={customModel}
+                        onChange={(e) => setCustomModel(e.target.value)}
+                        placeholder="Custom model id…"
+                        className="w-full px-2 py-1 text-[11.5px] font-mono rounded bg-[var(--bg-input)] border border-[var(--border)] text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none focus:border-[var(--accent)]"
+                      />
+                    </form>
+  
+                    <div className="my-1 border-t border-[var(--border)]" />
+                    <div
+                      onClick={() => {
+                        setShowModelMenu(false);
+                        onOpenSettings();
+                      }}
+                      className={`${menuRow} !text-[var(--text-muted)]`}
+                    >
+                      <Settings size={12} />
+                      <span className="flex-1">Configure paths & API keys…</span>
+                    </div>
                   </div>
-                </div>
-              )}
+                )}
+              </div>
+  
             </div>
 
             <div className="flex items-center gap-1 shrink-0">
-              {CLI_PROVIDERS.includes(config.provider) && (
-                <div className="relative">
-                  <button
-                    data-pop="perm"
-                    onClick={() => setShowPermMenu((v) => !v)}
-                    className="flex items-center gap-1 h-6 px-1.5 rounded-md text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
-                    title="What the agent may do without asking"
-                  >
-                    {(() => {
-                      const Icon = PERM_MODES[config.permissionMode ?? 'auto_edit'].icon;
-                      return <Icon size={11} />;
-                    })()}
-                    {PERM_MODES[config.permissionMode ?? 'auto_edit'].label}
-                  </button>
-                  {showPermMenu && (
-                    <div
-                      ref={permMenuRef}
-                      className="absolute right-0 bottom-full mb-1 z-40 w-[260px] max-w-[calc(100vw-32px)] rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl py-1 text-[12px]"
-                    >
-                      {(Object.keys(PERM_MODES) as PermissionMode[]).map((mode) => {
-                        const m = PERM_MODES[mode];
-                        const Icon = m.icon;
-                        const note =
-                          config.provider === 'claude-cli'
-                            ? m.claudeNote
-                            : config.provider === 'codex-cli'
-                              ? m.codexNote
-                              : m.cliNote;
-                        return (
-                          <div
-                            key={mode}
-                            onClick={() => {
-                              setConfig((prev) => ({ ...prev, permissionMode: mode }));
-                              setShowPermMenu(false);
-                            }}
-                            className="flex items-start gap-2 px-3 py-1.5 cursor-pointer hover:bg-[var(--bg-hover)] text-[var(--text-primary)]"
-                          >
-                            <Icon size={12} className="mt-0.5 shrink-0" />
-                            <div className="flex-1 min-w-0">
-                              <div>{m.label}</div>
-                              <div className="text-[11px] text-[var(--text-dim)]">{note}</div>
-                            </div>
-                            {(config.permissionMode ?? 'auto_edit') === mode && <Check size={12} className="mt-0.5" />}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </div>
-              )}
-              <button
-                onClick={onLaunchCliAgent}
-                className="w-6 h-6 flex items-center justify-center rounded-md text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
-                title="Open an interactive CLI agent in the terminal dock"
-              >
-                <TerminalIcon size={13} />
-              </button>
-              <button
-                onClick={() => setConfig((prev) => ({ ...prev, autoCheckpoint: !prev.autoCheckpoint }))}
-                className={`flex items-center gap-0.5 h-6 px-1.5 rounded-md text-[11px] cursor-pointer transition-colors ${
-                  config.autoCheckpoint
-                    ? 'text-[var(--text-primary)] bg-[var(--bg-hover)]'
-                    : 'text-[var(--text-dim)] hover:bg-[var(--bg-hover)]'
-                }`}
-                title={`Auto-checkpoint before agent edits: ${config.autoCheckpoint ? 'on' : 'off'}`}
-              >
-                <Zap size={11} />
-                Auto
-              </button>
               {running ? (
                 <button
                   onClick={stopGeneration}
@@ -1585,6 +1579,82 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               )}
             </div>
           </div>
+        </div>
+
+        {/* Quiet mode footer */}
+        <div className="flex items-center gap-1.5 px-1 h-6 mt-1 text-[11px] text-[var(--text-dim)]">
+          <button
+            onClick={onLaunchCliAgent}
+            className="flex items-center gap-1 h-5 px-1 rounded hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
+            title="Open an interactive CLI agent in the terminal dock"
+          >
+            <TerminalIcon size={11} />
+            Interactive
+          </button>
+          {CLI_PROVIDERS.includes(config.provider) && (
+            <>
+              <span className="text-[var(--border)]">│</span>
+              <div className="relative">
+                <button
+                  data-pop="perm"
+                  onClick={() => setShowPermMenu((v) => !v)}
+                  className="flex items-center gap-1 h-5 px-1 rounded text-[11px] text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
+                  title="What the agent may do without asking"
+                >
+                  {(() => {
+                    const Icon = PERM_MODES[config.permissionMode ?? 'auto_edit'].icon;
+                    return <Icon size={11} />;
+                  })()}
+                  {PERM_MODES[config.permissionMode ?? 'auto_edit'].label}
+                </button>
+                {showPermMenu && (
+                  <div
+                    ref={permMenuRef}
+                    className="absolute left-0 bottom-full mb-1 z-40 w-[260px] max-w-[calc(100vw-32px)] rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl py-1 text-[12px]"
+                  >
+                    {(Object.keys(PERM_MODES) as PermissionMode[]).map((mode) => {
+                      const m = PERM_MODES[mode];
+                      const Icon = m.icon;
+                      const note =
+                        config.provider === 'claude-cli'
+                          ? m.claudeNote
+                          : config.provider === 'codex-cli'
+                            ? m.codexNote
+                            : m.cliNote;
+                      return (
+                        <div
+                          key={mode}
+                          onClick={() => {
+                            setConfig((prev) => ({ ...prev, permissionMode: mode }));
+                            setShowPermMenu(false);
+                          }}
+                          className="flex items-start gap-2 px-3 py-1.5 cursor-pointer hover:bg-[var(--bg-hover)] text-[var(--text-primary)]"
+                        >
+                          <Icon size={12} className="mt-0.5 shrink-0" />
+                          <div className="flex-1 min-w-0">
+                            <div>{m.label}</div>
+                            <div className="text-[11px] text-[var(--text-dim)]">{note}</div>
+                          </div>
+                          {(config.permissionMode ?? 'auto_edit') === mode && <Check size={12} className="mt-0.5" />}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            </>
+          )}
+          <span className="text-[var(--border)]">│</span>
+          <button
+            onClick={() => setConfig((prev) => ({ ...prev, autoCheckpoint: !prev.autoCheckpoint }))}
+            className={`flex items-center gap-1 h-5 px-1 rounded cursor-pointer transition-colors hover:bg-[var(--bg-hover)] ${
+              config.autoCheckpoint ? 'text-[var(--text-primary)]' : 'hover:text-[var(--text-primary)]'
+            }`}
+            title={`Auto-checkpoint before agent edits: ${config.autoCheckpoint ? 'on' : 'off'}`}
+          >
+            <Zap size={11} />
+            Checkpoints {config.autoCheckpoint ? 'on' : 'off'}
+          </button>
         </div>
       </div>
     </div>

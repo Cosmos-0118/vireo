@@ -343,6 +343,8 @@ export interface UiChatMessage {
   /** Assistant turns: timing (epoch ms) for the "Thought for Ns" row. */
   startedAt?: number;
   firstOutputAt?: number;
+  /** Engine label ("Claude Code · sonnet") the turn ran on, for the turn header. */
+  engine?: string;
   endedAt?: number;
 }
 
