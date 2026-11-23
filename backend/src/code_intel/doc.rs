@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use xxhash_rust::xxh32::xxh32;
 
-use super::util::{find_path_candidates, missing_path_err, rel_of, resolve, resolve_with_cwd};
+use super::util::{missing_path_err, rel_of, resolve, resolve_existing};
 
 pub fn line_hash(s: &str) -> String {
     format!("{:02x}", xxh32(s.trim().as_bytes(), 0) & 0xff)
@@ -94,6 +94,27 @@ impl Doc {
     }
 }
 
+/// `⚠ {what} at N#hh: msg` plus the offending line (marked `>`) and its neighbours, so the agent
+/// can fix it without another read. A tree-sitter MISSING token usually means an unclosed or extra
+/// bracket/tag nearby, which the bare token name doesn't convey.
+pub(crate) fn syntax_note(doc: &Doc, row: usize, msg: &str, what: &str) -> String {
+    let n = doc.lines.len();
+    if n == 0 {
+        return format!("⚠ {what}: {msg}");
+    }
+    let row = row.min(n - 1);
+    let hint = if msg.starts_with("missing ") {
+        " (parser expected it here: look for an unclosed or extra bracket, tag or quote at or just above this line)"
+    } else {
+        ""
+    };
+    let mut out = format!("⚠ {what} at {}: {msg}{hint}", doc.anchor(row));
+    for i in row.saturating_sub(1)..=(row + 1).min(n - 1) {
+        out.push_str(&format!("\n{} {}", if i == row { ">" } else { " " }, hl(i + 1, &doc.lines[i])));
+    }
+    out
+}
+
 fn load_doc_at(ws: &Path, full: PathBuf) -> Result<(PathBuf, String, Doc), String> {
     let rel = rel_of(ws, &full);
     if full.is_dir() {
@@ -117,27 +138,17 @@ pub(crate) fn read_doc(ws: &Path, path: &str) -> Result<(PathBuf, String, Doc), 
     load_doc_at(ws, full)
 }
 
-/// Read-only smart file load: resolves exact path (cwd or ws) first; if missing, auto-resolves
-/// when there is a single unambiguous suffix/basename match in the workspace (returning a 1-line note).
+/// File load for reads and writes alike: resolves the exact path (cwd or ws) first; if missing,
+/// auto-resolves a single unambiguous suffix/basename match in the workspace (returning a 1-line
+/// note), so `view` and `edit` accept exactly the same paths.
 pub(crate) fn read_doc_smart(
     ws: &Path,
     path: &str,
     cwd: Option<&Path>,
 ) -> Result<(PathBuf, String, Doc, Option<String>), String> {
-    let full = resolve_with_cwd(ws, cwd, path)?;
-    if full.exists() {
-        let (f, rel, doc) = load_doc_at(ws, full)?;
-        return Ok((f, rel, doc, None));
-    }
-    let rel_attempt = rel_of(ws, &full);
-    let cands = find_path_candidates(ws, &rel_attempt, true, false);
-    if cands.len() == 1 {
-        let resolved_full = resolve(ws, &cands[0])?;
-        let (f, rel, doc) = load_doc_at(ws, resolved_full)?;
-        let note = format!("(resolved `{rel_attempt}` -> `{rel}`)");
-        return Ok((f, rel, doc, Some(note)));
-    }
-    Err(missing_path_err(ws, &rel_attempt, true, false))
+    let (full, note) = resolve_existing(ws, cwd, path, true, false)?;
+    let (f, rel, doc) = load_doc_at(ws, full)?;
+    Ok((f, rel, doc, note))
 }
 
 pub(crate) fn parse_anchor(s: &str) -> Result<(usize, String), String> {

@@ -1,14 +1,14 @@
 //! Single-file anchor edits, file creation, and ast-grep structural search/rewrite.
 
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
 use super::patch::apply_patch;
-use super::doc::{line_hash, locate, parse_anchor_in_doc, read_doc, splice, text_to_lines, Doc};
+use super::doc::{line_hash, locate, parse_anchor_in_doc, read_doc_smart, splice, syntax_note, text_to_lines, Doc};
 use super::symbols::{lang_for, syntax_errors, Lang};
-use super::util::{command, rel_of, resolve, run_capture};
+use super::util::{command, rel_of, resolve_existing, resolve_new_file, run_capture, with_note};
 
 pub(crate) fn finish_edit(
     full: &Path,
@@ -52,7 +52,7 @@ pub(crate) fn finish_edit(
                 .or_else(|| after.first());
             if let Some((row, m)) = pick {
                 let row = (*row).min(doc.lines.len().saturating_sub(1));
-                msg.push_str(&format!("\n⚠ new syntax error at {}: {m}", doc.anchor(row)));
+                msg.push_str(&format!("\n{}", syntax_note(doc, row, m, "new syntax error")));
             }
         }
     }
@@ -71,7 +71,6 @@ fn split_range(start: &str, end: Option<&str>) -> (String, Option<String>) {
     }
 }
 
-/// Replace / insert / delete lines identified by `N#hh` anchors.
 pub fn hashline_edit(
     ws: &Path,
     path: &str,
@@ -79,10 +78,23 @@ pub fn hashline_edit(
     start: &str,
     end: Option<&str>,
     new_text: &str,
+    cwd: Option<&Path>,
+) -> Result<String, String> {
+    let (full, rel, doc, note) = read_doc_smart(ws, path, cwd)?;
+    hashline_edit_doc(full, rel, doc, op, start, end, new_text).map(|out| with_note(note, out))
+}
+
+fn hashline_edit_doc(
+    full: PathBuf,
+    rel: String,
+    mut doc: Doc,
+    op: &str,
+    start: &str,
+    end: Option<&str>,
+    new_text: &str,
 ) -> Result<String, String> {
     let (start, end) = split_range(start, end);
     let (start, end) = (start.as_str(), end.as_deref());
-    let (full, rel, mut doc) = read_doc(ws, path)?;
     let lang = lang_for(&rel);
     let before = syntax_errors(lang, &doc.to_text());
     let s = parse_anchor_in_doc(&doc, &rel, start)?;
@@ -152,8 +164,8 @@ pub fn hashline_edit(
     }
 }
 
-pub fn create(ws: &Path, path: &str, content: &str, force: bool) -> Result<String, String> {
-    let full = resolve(ws, path)?;
+pub fn create(ws: &Path, path: &str, content: &str, force: bool, cwd: Option<&Path>) -> Result<String, String> {
+    let (full, note) = resolve_new_file(ws, cwd, path)?;
     let rel = rel_of(ws, &full);
     if full.exists() && !force {
         return Err(format!("{rel} already exists (use edit, or force to overwrite)"));
@@ -166,11 +178,10 @@ pub fn create(ws: &Path, path: &str, content: &str, force: bool) -> Result<Strin
     let mut msg = format!("Created {rel} ({} bytes).", content.len());
     if let Some(errs) = syntax_errors(lang_for(&rel), content) {
         if let Some((row, m)) = errs.first() {
-            let line = content.lines().nth(*row).unwrap_or("");
-            msg.push_str(&format!("\n⚠ syntax error at {}#{}: {m}", row + 1, line_hash(line)));
+            msg.push_str(&format!("\n{}", syntax_note(&Doc::parse(content), *row, m, "syntax error")));
         }
     }
-    Ok(msg)
+    Ok(with_note(note, msg))
 }
 
 // --------------------------------- ast-grep ---------------------------------------------------
@@ -182,14 +193,26 @@ pub fn ast(
     path: Option<&str>,
     rewrite: Option<&str>,
     dry_run: bool,
+    cwd: Option<&Path>,
+) -> Result<String, String> {
+    let (target, note) = match path.filter(|p| !p.trim().is_empty()) {
+        Some(p) => resolve_existing(ws, cwd, p, true, true)?,
+        None => (ws.to_path_buf(), None),
+    };
+    ast_at(ws, pattern, lang, target, rewrite, dry_run).map(|out| with_note(note, out))
+}
+
+fn ast_at(
+    ws: &Path,
+    pattern: &str,
+    lang: Option<&str>,
+    target: PathBuf,
+    rewrite: Option<&str>,
+    dry_run: bool,
 ) -> Result<String, String> {
     if pattern.trim().is_empty() {
         return Err("empty pattern".into());
     }
-    let target = match path.filter(|p| !p.trim().is_empty()) {
-        Some(p) => resolve(ws, p)?,
-        None => ws.to_path_buf(),
-    };
     let Some(langs) = super::astgrep::builtin_langs(lang) else {
         // Not one of the built-in grammars: defer to an installed ast-grep CLI.
         return ast_cli(ws, &rel_of(ws, &target), pattern, lang, rewrite, dry_run);
@@ -366,6 +389,15 @@ pub fn edit_batch(ws: &Path, path: &str, edits: &[serde_json::Value], cwd: Optio
                 patch.push('\n');
             }
         };
+        // `start: "top" | "bottom" | "imports"` inserts there whatever the op says (except delete).
+        if super::patch_parse::parse_edge(start).is_some() {
+            if text.is_empty() || get(&["op"]) == Some("delete") {
+                return Err(format!("edits[{n}]: `{start}` inserts lines; pass new_text (delete needs anchors)"));
+            }
+            patch.push_str(&format!("@@ {}\n", start.trim()));
+            body(&mut patch);
+            continue;
+        }
         match get(&["op"]).unwrap_or("replace") {
             "replace" => {
                 if text.is_empty() {

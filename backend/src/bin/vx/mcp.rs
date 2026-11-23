@@ -59,7 +59,7 @@ pub fn mcp_tools(read_only: bool) -> Value {
         tools.extend([
             json!({
                 "name": "apply",
-                "description": "Apply a multi-file/multi-hunk V4A patch atomically (`*** Update File:` / `*** Add File:` / `*** Delete File:`, optionally wrapped in `*** Begin Patch` / `*** End Patch`). Supports hashline-anchored hunks (`@@ 12#ab..15#cd`, `@@ after 12#ab`, `@@ before 12#ab`, `@@ delete 12#ab..15#cd` with `+` lines) and classic `@@` context hunks (` `, `-`, `+`). All anchors refer to pre-patch lines.",
+                "description": "Apply a multi-file/multi-hunk V4A patch atomically (`*** Update File:` / `*** Add File:` / `*** Delete File:`, optionally wrapped in `*** Begin Patch` / `*** End Patch`). Supports hashline-anchored hunks (`@@ 12#ab..15#cd`, `@@ after 12#ab`, `@@ before 12#ab`, `@@ delete 12#ab..15#cd` with `+` lines), anchor-free `@@ top` / `@@ bottom` / `@@ after imports` (inserts after the file's import block and skips imports already present; no view needed), and classic `@@` context hunks (` `, `-`, `+`). All anchors refer to pre-patch lines. Paths auto-resolve unique suffixes (`components/X.tsx` -> `frontend/src/components/X.tsx`); new files go next to an existing matching folder.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -92,12 +92,12 @@ pub fn mcp_tools(read_only: bool) -> Value {
             }),
             json!({
                 "name": "edit",
-                "description": "Edit lines by N#hash anchor (no old text needed). For several edits to one file, pass them together in `edits: [{start, end?, op?, new_text}]` so every anchor resolves against the current file at once. Returns fresh anchors around the edit and syntax errors.",
+                "description": "Edit lines by N#hash anchor (no old text needed). For several edits to one file, pass them together in `edits: [{start, end?, op?, new_text}]` so every anchor resolves against the current file at once. Accepts the same paths as view (unique suffixes auto-resolve). Returns fresh anchors around the edit and syntax errors with the offending lines.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "start": { "type": "string", "description": "Anchor `12#ab`, or a whole range `12#ab..15#cd` (as printed by view/outline)" },
+                        "start": { "type": "string", "description": "Anchor `12#ab`, a whole range `12#ab..15#cd` (as printed by view/outline), or `top` / `bottom` / `imports` to insert new_text there without viewing first (`imports` skips lines already present)" },
                         "end": { "type": "string", "description": "Optional end anchor when `start` is a single anchor" },
                         "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"], "description": "Default replace (needs new_text); use delete to remove lines" },
                         "new_text": { "type": "string", "description": "Replacement / inserted text" },
@@ -129,7 +129,8 @@ pub fn mcp_tools(read_only: bool) -> Value {
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "cmd": { "type": "string", "description": "Optional command, e.g. `cargo test -p vireo`" },
+                        "cmd": { "type": "string", "description": "Optional command, e.g. `cargo test -p vireo`. In a monorepo, npm/cargo/go/... commands run in the one top-level folder holding their manifest when the root has none" },
+                        "dir": { "type": "string", "description": "Folder to run in (auto-detected checks or `cmd`); unique names like `frontend` auto-resolve" },
                         "raw": { "type": "boolean" },
                         "warnings": { "type": "boolean" },
                         "timeout": { "type": "integer" }

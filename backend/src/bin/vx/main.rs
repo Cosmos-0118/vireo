@@ -280,7 +280,7 @@ fn main() {
         "symbol" => &["--text", "--file", "--replace", "--insert-after", "--delete"],
         "create" => &["--text", "--file", "--force"],
         "ast" => &["-r", "--rewrite", "-l", "--lang", "--dry-run"],
-        "check" => &["--cmd", "--timeout", "--raw", "--warnings"],
+        "check" => &["--cmd", "--timeout", "--raw", "--warnings", "--dir"],
         "mcp" => &["--workspace", "--read-only"],
         _ => &[],
     };
@@ -501,6 +501,8 @@ fn main() {
                 "check",
                 json!({
                     "cmd": cmd_str,
+                    "dir": flag_val(&["--dir"]),
+                    "cwd": cwd_s,
                     "timeout": flag_val(&["--timeout"]).and_then(|t| t.parse::<u64>().ok()),
                     "raw": has("--raw"),
                     "warnings": has("--warnings"),

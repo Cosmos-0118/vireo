@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::doc::hl;
-use super::util::{ignored_dir, run_capture, shell_command};
+use super::util::{ignored_dir, norm_slashes, rel_of, resolve_existing, run_capture, shell_command};
 
 pub(crate) struct Diag {
     file: String,
@@ -427,10 +427,72 @@ fn raw_view(raw: &str) -> String {
     s.chars().take(20_000).collect()
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 pub struct CheckOpts {
     pub raw: bool,
     pub warnings: bool,
+    /// Folder to run in (workspace-relative; unique suffixes like `frontend` auto-resolve).
+    pub dir: Option<String>,
+    /// The caller's working directory (CLI): a custom command runs there when no `dir` is given.
+    pub cwd: Option<PathBuf>,
+}
+
+/// Manifest(s) that mark the project root a command's program works from.
+fn manifests_for(cmd: &str) -> &'static [&'static str] {
+    let prog = cmd
+        .split_whitespace()
+        .find(|t| !t.contains('='))
+        .unwrap_or("")
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let prog = prog.trim_end_matches(".exe").trim_end_matches(".cmd");
+    match prog {
+        "npm" | "npx" | "pnpm" | "pnpx" | "yarn" | "bun" | "bunx" | "node" | "tsc" | "vite" | "vitest" | "jest"
+        | "eslint" | "prettier" | "next" | "deno" => &["package.json"],
+        "cargo" => &["Cargo.toml"],
+        "go" => &["go.mod"],
+        "python" | "python3" | "py" | "pytest" | "uv" | "poetry" | "ruff" | "mypy" => {
+            &["pyproject.toml", "setup.py", "requirements.txt"]
+        }
+        "mvn" => &["pom.xml"],
+        "gradle" | "gradlew" => &["build.gradle", "build.gradle.kts"],
+        "make" => &["Makefile"],
+        _ => &[],
+    }
+}
+
+/// A custom command with no `dir`: when its project manifest isn't at the workspace root but sits
+/// in exactly one top-level folder (monorepo), run it there. Commands that pick their own folder
+/// (`--prefix`, `--manifest-path`, `-C`, `cd ...`) are left alone.
+pub(crate) fn infer_dir(ws: &Path, cmd: &str) -> Option<String> {
+    let picks_own = [" --prefix", " --manifest-path", " -C ", " --cwd", " --dir ", "cd "]
+        .iter()
+        .any(|f| format!(" {cmd}").contains(f));
+    let manifests = manifests_for(cmd);
+    if picks_own || manifests.is_empty() || manifests.iter().any(|m| ws.join(m).is_file()) {
+        return None;
+    }
+    let mut hits: Vec<String> = std::fs::read_dir(ws)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| !n.starts_with('.') && !ignored_dir(n))
+        .filter(|n| manifests.iter().any(|m| ws.join(n).join(m).is_file()))
+        .collect();
+    hits.sort();
+    (hits.len() == 1).then(|| format!("{}/", hits[0]))
+}
+
+/// Workspace-relative folder prefix (`""` for the root, else `sub/dir/`) for a check run.
+fn dir_prefix(ws: &Path, full: &Path) -> String {
+    match rel_of(ws, full).as_str() {
+        "." | "" => String::new(),
+        r => format!("{}/", r.trim_end_matches('/')),
+    }
 }
 
 /// True when a `check` report contains a failure (used for the `vx` exit code).
@@ -450,14 +512,53 @@ fn short_label(cmd: &str) -> String {
 }
 
 pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64, opts: CheckOpts) -> Result<String, String> {
-    let jobs: Vec<(String, String, String)> = match cmd.map(str::trim).filter(|c| !c.is_empty()) {
-        Some(c) => vec![(String::new(), c.to_string(), short_label(c))],
-        None => detect_checks(ws),
+    let cmd = cmd.map(str::trim).filter(|c| !c.is_empty());
+    // Folder: explicit `dir` > caller's cwd (custom command) > inferred from the command's manifest.
+    let explicit = match opts.dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => {
+            let (full, note) = resolve_existing(ws, opts.cwd.as_deref(), d, false, true)?;
+            Some((dir_prefix(ws, &full), note))
+        }
+        None => None,
+    };
+    let mut report = String::new();
+    let jobs: Vec<(String, String, String)> = match (cmd, explicit) {
+        (Some(c), Some((prefix, note))) => {
+            if let Some(n) = note {
+                report.push_str(&format!("{n}\n"));
+            }
+            vec![(prefix, c.to_string(), short_label(c))]
+        }
+        (Some(c), None) => {
+            let from_cwd = opts
+                .cwd
+                .as_deref()
+                .filter(|d| d.is_dir() && rel_of(ws, d) != norm_slashes(d))
+                .map(|d| dir_prefix(ws, d))
+                .filter(|p| !p.is_empty());
+            let prefix = from_cwd.or_else(|| infer_dir(ws, c)).unwrap_or_default();
+            vec![(prefix, c.to_string(), short_label(c))]
+        }
+        (None, Some((prefix, note))) => {
+            if let Some(n) = note {
+                report.push_str(&format!("{n}\n"));
+            }
+            let base = if prefix.is_empty() { ws.to_path_buf() } else { ws.join(prefix.trim_end_matches('/')) };
+            detect_checks(&base).into_iter().map(|(p, c, l)| (format!("{prefix}{p}"), c, l)).collect()
+        }
+        (None, None) => detect_checks(ws),
     };
     if jobs.is_empty() {
-        return Err("no project detected (Cargo.toml / tsconfig.json / go.mod / *.sln / *.csproj); pass a command, e.g. vx check npm test".into());
+        return Err("no project detected (Cargo.toml / tsconfig.json / go.mod / *.sln / *.csproj); pass a command, e.g. vx check npm test (and `dir` to pick a folder)".into());
     }
-    let mut report = String::new();
+    let multi = jobs.len() > 1 || jobs.iter().any(|(p, ..)| !p.is_empty());
+    let jobs: Vec<(String, String, String)> = jobs
+        .into_iter()
+        .map(|(p, c, l)| {
+            let l = if multi && !p.is_empty() { format!("{l} [{}]", p.trim_end_matches('/')) } else { l };
+            (p, c, l)
+        })
+        .collect();
     for (prefix, command_line, label) in jobs {
         let mut c = shell_command(&command_line);
         c.current_dir(if prefix.is_empty() { ws.to_path_buf() } else { ws.join(prefix.trim_end_matches('/')) });

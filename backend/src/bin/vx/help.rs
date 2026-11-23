@@ -7,11 +7,11 @@ pub const USAGE: &str = "vx <map|outline|view|search|apply|replace|edit|symbol|c
   vx search <regex> [path] [-g G]... [-p P] [-C N] [-F] [-i] [-l] [--limit N]\n\
   vx apply [--file F] [--dry-run]                                                    (V4A / anchored patch on stdin or --file)\n\
   vx replace <old> <new> [path] [-g G]... [-r] [--dry-run] [--expected N] [--all-files]\n\
-  vx edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]\n\
+  vx edit <file> A#h[..B#h]|top|bottom|imports [--insert-after|--insert-before|--delete] [--text T|--file F]\n\
   vx symbol <file> <name> [--replace|--insert-after|--delete] [--text T|--file F]\n\
   vx create <file> [--force] [--text T|--file F]\n\
   vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
-  vx check [--raw] [--warnings] [--timeout S] [--cmd C | cmd args...]\n\
+  vx check [--raw] [--warnings] [--timeout S] [--dir D] [--cmd C | cmd args...]\n\
   vx mcp [--workspace DIR] [--read-only]";
 
 pub const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, atomic patches & replace, smart search, symbol ops, repo map, build check, MCP server\n\
@@ -27,18 +27,21 @@ pub const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, ato
   vx replace <old> <new> [path] [-g G]... [-r] [--dry-run] [--expected N] [--all-files]\n\
                                   atomic literal (default) or regex (`-r`) replace across 1 or many files with syntax checks & CRLF preservation\n\
   vx edit <file> A#h[..B#h]       replace those lines with new code from stdin, --file F, or --text\n\
+  vx edit <file> top|bottom|imports   insert there with no anchors (`imports`: after the import block, skips duplicates)\n\
          [--insert-after|--insert-before|--delete]   (aliases --after/--before/--remove work; unknown flags are rejected)\n\
   vx symbol <file> <name>         print a whole function/class; add --replace|--insert-after|--delete to change it\n\
   vx create <file> [--force]      new file from stdin, --file F, or --text (--force overwrites)\n\
   vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
                                   ast-grep structural search; -r rewrites files IN PLACE, --dry-run only lists\n\
-  vx check [--raw] [--warnings] [--timeout S] [cmd ...]\n\
+  vx check [--raw] [--warnings] [--timeout S] [--dir D] [cmd ...]\n\
                                   run cargo/tsc/go or any command (e.g. `vx check cargo test -p x`); deduplicated anchored errors, rustc notes/labels, failing test blocks; exits 1 on failure\n\
   vx mcp [--workspace DIR] [--read-only]\n\
                                   stdio MCP JSON-RPC 2.0 server exposing vx tools with zero shell quoting\n\
 \n\
 Workflow: map or search -> outline / view (copy N#hh anchors) -> apply / replace / edit / symbol -> check.\n\
 Prefer `vx apply` or `vx replace` over Python/sed scripts for multi-file changes. On Windows, prefer `vx mcp` or `--file F` over piping multi-line code.\n\
+Every command accepts the same paths: exact (cwd or workspace root) first, else a unique suffix/basename match (noted in the output).\n\
+A custom `check` command runs in --dir, else the current folder, else the one top-level folder holding its manifest (package.json, Cargo.toml, ...).\n\
 Edits report new anchors and flag new syntax errors immediately; no need to re-read after editing.";
 
 pub const HELP_APPLY: &str = "vx apply [--file F] [--dry-run]  (reads patch from --file F or stdin)\n\
@@ -53,6 +56,10 @@ Uses the V4A patch envelope with hashline-anchored hunks (preferred) or classic 
   @@ after 40#ef                   # insert `+` lines after line 40 (also: `before 40#ef`)\n\
   +log(\"ok\");\n\
   @@ delete 50#aa..52#bb           # remove lines 50..52\n\
+  @@ after imports                 # add `+` lines after the import block (already-present lines are skipped)\n\
+  +use std::fmt;\n\
+  @@ top                           # also `@@ bottom`; `top` stays below a shebang / `//!` / 'use client'\n\
+  +// header\n\
   @@ fn helper() {                 # classic V4A context hunk: ' ' context, '-' remove, '+' add\n\
    let a = 1;\n\
   -let b = 2;\n\

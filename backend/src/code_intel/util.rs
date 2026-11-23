@@ -346,6 +346,72 @@ pub(crate) fn find_path_candidates(
     out.dedup();
     out
 }
+/// Prefix an op's output with a `(resolved ...)` path note, when there is one.
+pub(crate) fn with_note(note: Option<String>, out: String) -> String {
+    match note {
+        Some(n) => format!("{n}\n{out}"),
+        None => out,
+    }
+}
+
+
+/// Resolve an existing file (or dir) for any operation, read or write: the exact path (cwd, then
+/// workspace root) wins; otherwise a single unambiguous suffix/basename match in the workspace is
+/// used and a one-line `(resolved ...)` note is returned. Ambiguous or unknown paths are errors that
+/// list the candidates, so a write never lands on a guess.
+pub(crate) fn resolve_existing(
+    ws: &Path,
+    cwd: Option<&Path>,
+    p: &str,
+    want_files: bool,
+    want_dirs: bool,
+) -> Result<(PathBuf, Option<String>), String> {
+    let full = resolve_with_cwd(ws, cwd, p)?;
+    let kind_ok = |f: &Path| (want_files && f.is_file()) || (want_dirs && f.is_dir());
+    if kind_ok(&full) {
+        return Ok((full, None));
+    }
+    let typed = rel_of(ws, &full);
+    if full.is_dir() && !want_dirs {
+        return Err(format!("{typed} is a directory (list it with: vx map --dir {typed})"));
+    }
+    let cands = find_path_candidates(ws, &typed, want_files, want_dirs);
+    if cands.len() == 1 {
+        let hit = resolve(ws, &cands[0])?;
+        return Ok((hit, Some(format!("(resolved `{typed}` -> `{}`)", cands[0]))));
+    }
+    Err(missing_path_err(ws, &typed, want_files, want_dirs))
+}
+
+/// Where a new file should go. Prefers a location whose parent folder already exists (cwd, then
+/// workspace root, then a unique suffix match of the parent folder, e.g. `components/ui/X.tsx` ->
+/// `frontend/src/components/ui/X.tsx`), so a monorepo-relative path doesn't silently create a
+/// parallel tree at the root. Falls back to the workspace-relative path (parents are created).
+pub(crate) fn resolve_new_file(ws: &Path, cwd: Option<&Path>, p: &str) -> Result<(PathBuf, Option<String>), String> {
+    let cleaned = p.trim().trim_matches('"').trim_matches('\'').replace('\\', "/");
+    let from_ws = resolve(ws, &cleaned)?;
+    if Path::new(&cleaned).is_absolute() {
+        return Ok((from_ws, None));
+    }
+    if let Some(c) = cwd {
+        if let Ok(from_cwd) = resolve(ws, &c.join(&cleaned).to_string_lossy()) {
+            if from_cwd.exists() || from_cwd.parent().is_some_and(Path::is_dir) {
+                return Ok((from_cwd, None));
+            }
+        }
+    }
+    if from_ws.exists() || from_ws.parent().is_some_and(Path::is_dir) {
+        return Ok((from_ws, None));
+    }
+    if let Some((parent, name)) = cleaned.trim_end_matches('/').rsplit_once('/') {
+        let cands = find_path_candidates(ws, parent, false, true);
+        if cands.len() == 1 {
+            let rel = format!("{}/{name}", cands[0]);
+            return Ok((resolve(ws, &rel)?, Some(format!("(resolved `{cleaned}` -> `{rel}`)"))));
+        }
+    }
+    Ok((from_ws, None))
+}
 
 /// Format an actionable "not found" error with candidate matches or top-level workspace dirs.
 pub(crate) fn missing_path_err(ws: &Path, display: &str, want_files: bool, want_dirs: bool) -> String {

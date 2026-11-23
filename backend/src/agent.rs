@@ -158,7 +158,7 @@ fn openai_tools_schema() -> Value {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Edit by line anchors: start/end are `N#hash` from read_file/outline/search/verify output; the lines start..end are replaced by new_text (no old text needed; stale line numbers are re-located automatically). op: replace (default), insert_after, insert_before, delete. Fallback: old_text+new_text exact substring replace.",
+                "description": "Edit by line anchors: start/end are `N#hash` from read_file/outline/search/verify output; the lines start..end are replaced by new_text (no old text needed; stale line numbers are re-located automatically). op: replace (default), insert_after, insert_before, delete. start may also be `top`, `bottom` or `imports` (insert new_text after the import block; duplicates skipped) with no anchor. Fallback: old_text+new_text exact substring replace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
