@@ -60,7 +60,7 @@ import {
   FloatingContextMenu,
   type ContextMenuItem,
 } from './CommitContextMenu';
-import { CommitGraphSvg, GraphRails, graphColumnWidth } from './CommitGraphSvg';
+import { CommitGraphSvg, GraphRails, graphWidth } from './CommitGraphSvg';
 import { useCommitHover } from './CommitHoverCard';
 import { BranchBar } from './BranchBar';
 import { isPushRejected, pullThenPush } from '../utils/gitSync';
@@ -421,7 +421,6 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       }),
     [commits, totalChanged, graphFiltered, gitStatus?.branch]
   );
-  const graphColW = graphColumnWidth(graphLayout.maxLanes, GRAPH_LANE_W, GRAPH_MAX_LANES);
   const upstreamName = useMemo(() => {
     const up = commits.find((c) => c.hash === graphLayout.upstreamHash);
     const branch = gitStatus?.branch;
@@ -1701,6 +1700,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                               laneWidth={GRAPH_LANE_W}
                               rowHeight={GRAPH_ROW_H}
                               maxVisibleLanes={GRAPH_MAX_LANES}
+                              fitRow
                             />
                             <span className="pl-0.5 text-[12.5px] italic text-[var(--modified-fg)] truncate">
                               Uncommitted Changes
@@ -1742,6 +1742,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                               laneWidth={GRAPH_LANE_W}
                               rowHeight={GRAPH_ROW_H}
                               maxVisibleLanes={GRAPH_MAX_LANES}
+                              fitRow
                             />
 
                             <div className="min-w-0 flex-1 flex items-center gap-1.5 pl-0.5 pr-2">
@@ -1757,7 +1758,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                               >
                                 {c.message}
                               </span>
-                              <span className="hidden @[300px]:inline truncate min-w-0 shrink-[4] text-[11.5px] text-[var(--text-dim)]">
+                              <span className="hidden @[440px]:inline truncate min-w-0 shrink-[4] text-[11.5px] text-[var(--text-dim)]">
                                 {c.author}
                               </span>
                               {c.refs.length > 0 && (
@@ -1806,7 +1807,14 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                           {isExpanded && (
                             <div
                               className="relative bg-[var(--bg-hover)]/25"
-                              style={{ paddingLeft: graphColW }}
+                              style={{
+                                paddingLeft: graphWidth(
+                                  row.output.length,
+                                  graphLayout.maxLanes,
+                                  GRAPH_LANE_W,
+                                  GRAPH_MAX_LANES
+                                ),
+                              }}
                             >
                               <GraphRails
                                 lanes={row.output}

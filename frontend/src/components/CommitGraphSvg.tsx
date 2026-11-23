@@ -14,10 +14,34 @@ export function graphLaneSpacing(maxLanes: number, laneWidth: number, maxVisible
   return Math.max(MIN_LANE_W, Math.min(laneWidth, (laneWidth * maxVisibleLanes) / maxLanes));
 }
 
-export function graphColumnWidth(maxLanes: number, laneWidth: number, maxVisibleLanes: number) {
+/**
+ * Inset of the first lane from the left edge (and of the trailing gap after the last lane).
+ * Never narrower than a HEAD node, so compressed graphs don't clip it.
+ */
+const lanePad = (spacing: number) => Math.max(spacing, 8);
+
+/** Centre x of lane `i` for a given lane spacing. */
+export const graphLaneX = (i: number, spacing: number) => lanePad(spacing) + spacing * i;
+
+/** Width of a graph strip holding `lanes` lanes, spaced for a graph `maxLanes` wide. */
+export function graphWidth(
+  lanes: number,
+  maxLanes: number,
+  laneWidth: number,
+  maxVisibleLanes: number
+) {
   const w = graphLaneSpacing(maxLanes, laneWidth, maxVisibleLanes);
-  return w * (Math.max(1, maxLanes) + 1);
+  return lanePad(w) * 2 + w * (Math.max(1, lanes) - 1);
 }
+
+/** Width of the full graph column (every row reserves the widest row's lanes). */
+export function graphColumnWidth(maxLanes: number, laneWidth: number, maxVisibleLanes: number) {
+  return graphWidth(maxLanes, maxLanes, laneWidth, maxVisibleLanes);
+}
+
+/** Lanes a single row occupies (VS Code sizes each history row to this). */
+export const graphRowLanes = (row: GraphRowLayout) =>
+  Math.max(row.input.length, row.output.length, row.circleIndex + 1);
 
 interface CommitGraphSvgProps {
   row: GraphRowLayout;
@@ -53,12 +77,11 @@ export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
   background = 'var(--graph-row-bg, var(--bg-sidebar))',
   fitRow = false,
 }) => {
-  const rowLanes = Math.max(row.input.length, row.output.length, row.circleIndex + 1);
   const W = graphLaneSpacing(maxLanes, laneW, maxVisibleLanes);
-  const width = W * (Math.max(1, fitRow ? rowLanes : maxLanes) + 1);
+  const width = graphWidth(fitRow ? graphRowLanes(row) : maxLanes, maxLanes, laneW, maxVisibleLanes);
   const mid = H / 2;
   const R = Math.min(CURVE, mid - 1, W / 2);
-  const x = (i: number) => W * (i + 1);
+  const x = (i: number) => graphLaneX(i, W);
   const { commit, input, output, circleIndex } = row;
 
   const paths: Array<{ d: string; color: string; dashed?: boolean }> = [];
@@ -199,7 +222,7 @@ export const GraphRails: React.FC<{
           key={i}
           className="absolute inset-y-0"
           style={{
-            left: W * (i + 1) - STROKE / 2,
+            left: graphLaneX(i, W) - STROKE / 2,
             width: STROKE,
             background: lane.dashed
               ? `repeating-linear-gradient(to bottom, ${lane.color} 0 2.5px, transparent 2.5px 5px)`
