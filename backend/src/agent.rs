@@ -1,3 +1,6 @@
+use crate::agent_session::steer::{
+    emit_steer_applied, emit_steer_cancelled, ActiveTurnEntry, SteerDelivery, SteerItem, SteerMode,
+};
 use crate::checkpoint::TurnTracker;
 use crate::state::{background_command, is_ignored_dir_name, resolve_safe_path, AppState};
 use axum::{
@@ -673,6 +676,16 @@ pub async fn chat(
             return;
         }
 
+        let thread_id = req
+            .thread_id
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("oneoff-{}", uuid::Uuid::new_v4()));
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let active_turn = state.active_turns.register(&thread_id, &turn_id);
+        send_sse(&tx, "turn", json!({ "turn_id": turn_id })).await;
+
         match provider.as_str() {
             "anthropic" => {
                 run_anthropic_loop(
@@ -681,6 +694,8 @@ pub async fn chat(
                     &req,
                     &api_key,
                     &mut turn,
+                    auto_cp,
+                    active_turn.entry(),
                     &tx,
                 )
                 .await;
@@ -692,6 +707,8 @@ pub async fn chat(
                     &req,
                     &api_key,
                     &mut turn,
+                    auto_cp,
+                    active_turn.entry(),
                     &tx,
                 )
                 .await;
@@ -704,6 +721,8 @@ pub async fn chat(
                     &req,
                     &api_key,
                     &mut turn,
+                    auto_cp,
+                    active_turn.entry(),
                     &tx,
                 )
                 .await;
@@ -717,12 +736,106 @@ pub async fn chat(
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
+async fn await_now_steer(active_turn: &ActiveTurnEntry) {
+    loop {
+        if active_turn.has_now_pending() {
+            return;
+        }
+        active_turn.notified().await;
+    }
+}
+
+enum HttpOutcome {
+    Response(Result<reqwest::Response, reqwest::Error>),
+    Preempted,
+    Closed,
+}
+
+async fn send_cancellable(
+    builder: reqwest::RequestBuilder,
+    active_turn: &ActiveTurnEntry,
+    tx: &mpsc::Sender<Result<Event, Infallible>>,
+) -> HttpOutcome {
+    tokio::select! {
+        _ = tx.closed() => HttpOutcome::Closed,
+        _ = await_now_steer(active_turn) => HttpOutcome::Preempted,
+        res = builder.send() => HttpOutcome::Response(res),
+    }
+}
+
+async fn emit_steers(tx: &mpsc::Sender<Result<Event, Infallible>>, steers: &[SteerItem], base_delivery: SteerDelivery) {
+    for item in steers {
+        let delivery = if item.mode == SteerMode::Now {
+            SteerDelivery::Preempted
+        } else {
+            base_delivery
+        };
+        emit_steer_applied(tx, item, delivery).await;
+    }
+}
+
+async fn cancel_api_steers(tx: &mpsc::Sender<Result<Event, Infallible>>, active_turn: &ActiveTurnEntry, reason: &str) {
+    for item in active_turn.force_close_and_drain() {
+        emit_steer_cancelled(tx, &item.steer_id, reason).await;
+    }
+}
+
+fn join_steers(steers: &[SteerItem]) -> String {
+    steers
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// Appends a user text message to an Anthropic messages array while preserving strict
+/// user/assistant role alternation.
+fn push_anthropic_user_text(messages: &mut Vec<Value>, text: &str) {
+    if let Some(last) = messages.last_mut() {
+        if last["role"].as_str() == Some("user") {
+            match &mut last["content"] {
+                Value::Array(arr) => {
+                    arr.push(json!({ "type": "text", "text": text }));
+                    return;
+                }
+                Value::String(s) => {
+                    let prev = std::mem::take(s);
+                    last["content"] = json!([
+                        { "type": "text", "text": prev },
+                        { "type": "text", "text": text },
+                    ]);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    }
+    messages.push(json!({ "role": "user", "content": text }));
+}
+
+/// Appends a user text part to a Gemini contents array while preserving strict
+/// user/model role alternation.
+fn push_gemini_user_text(contents: &mut Vec<Value>, text: &str) {
+    if let Some(last) = contents.last_mut() {
+        if last["role"].as_str() == Some("user") {
+            if let Some(parts) = last["parts"].as_array_mut() {
+                parts.push(json!({ "text": text }));
+                return;
+            }
+        }
+    }
+    contents.push(json!({ "role": "user", "parts": [{ "text": text }] }));
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_openai_loop(
     state: &AppState,
     ws: &Path,
     req: &AgentChatReq,
     api_key: &str,
     turn: &mut TurnTracker,
+    auto_cp: bool,
+    active_turn: &ActiveTurnEntry,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) {
     let default_base = if req.provider == "ollama" {
@@ -733,6 +846,7 @@ async fn run_openai_loop(
     let base = match secure_base(req.base_url.as_deref(), default_base, !api_key.trim().is_empty()) {
         Ok(b) => b,
         Err(message) => {
+            cancel_api_steers(tx, active_turn, "turn_failed").await;
             send_sse(tx, "error", json!({ "message": message })).await;
             return;
         }
@@ -744,7 +858,12 @@ async fn run_openai_loop(
         messages.push(json!({"role": m.role, "content": m.content}));
     }
 
-    for _round in 0..12 {
+    let mut round = 0usize;
+    let mut total_rounds = 0usize;
+    while round < 12 && total_rounds < 48 {
+        round += 1;
+        total_rounds += 1;
+
         let mut builder = state.http_client.post(&url).json(&json!({
             "model": req.model,
             "messages": messages,
@@ -755,9 +874,23 @@ async fn run_openai_loop(
             builder = builder.bearer_auth(api_key.trim());
         }
 
-        let resp = match builder.send().await {
-            Ok(r) => r,
-            Err(e) => {
+        let resp = match send_cancellable(builder, active_turn, tx).await {
+            HttpOutcome::Closed => {
+                let _ = active_turn.force_close_and_drain();
+                return;
+            }
+            HttpOutcome::Preempted => {
+                let steers = active_turn.try_pop_all();
+                if !steers.is_empty() {
+                    emit_steers(tx, &steers, SteerDelivery::Preempted).await;
+                    messages.push(json!({ "role": "user", "content": join_steers(&steers) }));
+                    round = 0;
+                }
+                continue;
+            }
+            HttpOutcome::Response(Ok(r)) => r,
+            HttpOutcome::Response(Err(e)) => {
+                cancel_api_steers(tx, active_turn, "turn_failed").await;
                 send_sse(tx, "error", json!({ "message": format!("Request failed: {}", e) })).await;
                 return;
             }
@@ -767,6 +900,7 @@ async fn run_openai_loop(
         let body: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
+                cancel_api_steers(tx, active_turn, "turn_failed").await;
                 send_sse(tx, "error", json!({ "message": format!("Invalid JSON ({}): {}", status, e) })).await;
                 return;
             }
@@ -777,6 +911,7 @@ async fn run_openai_loop(
                 .as_str()
                 .unwrap_or("API error")
                 .to_string();
+            cancel_api_steers(tx, active_turn, "turn_failed").await;
             send_sse(tx, "error", json!({ "message": format!("{}: {}", status, msg) })).await;
             return;
         }
@@ -790,6 +925,15 @@ async fn run_openai_loop(
 
         let tool_calls = msg["tool_calls"].as_array();
         if tool_calls.map(|a| a.is_empty()).unwrap_or(true) {
+            if let Some(steers) = active_turn.try_close_drain_all() {
+                turn.finish(state, Some(tx)).await;
+                *turn = TurnTracker::new(auto_cp);
+                messages.push(msg.clone());
+                messages.push(json!({ "role": "user", "content": join_steers(&steers) }));
+                emit_steers(tx, &steers, SteerDelivery::Continuation).await;
+                round = 0;
+                continue;
+            }
             return;
         }
 
@@ -815,20 +959,31 @@ async fn run_openai_loop(
                 "content": result
             }));
         }
+
+        let steers = active_turn.try_pop_all();
+        if !steers.is_empty() {
+            emit_steers(tx, &steers, SteerDelivery::MidTurn).await;
+            messages.push(json!({ "role": "user", "content": join_steers(&steers) }));
+        }
     }
+    cancel_api_steers(tx, active_turn, "turn_failed").await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_anthropic_loop(
     state: &AppState,
     ws: &Path,
     req: &AgentChatReq,
     api_key: &str,
     turn: &mut TurnTracker,
+    auto_cp: bool,
+    active_turn: &ActiveTurnEntry,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) {
     let base = match secure_base(req.base_url.as_deref(), "https://api.anthropic.com", true) {
         Ok(b) => b,
         Err(message) => {
+            cancel_api_steers(tx, active_turn, "turn_failed").await;
             send_sse(tx, "error", json!({ "message": message })).await;
             return;
         }
@@ -841,8 +996,13 @@ async fn run_anthropic_loop(
         .map(|m| json!({"role": m.role, "content": m.content}))
         .collect();
 
-    for _round in 0..12 {
-        let resp = match state
+    let mut round = 0usize;
+    let mut total_rounds = 0usize;
+    while round < 12 && total_rounds < 48 {
+        round += 1;
+        total_rounds += 1;
+
+        let builder = state
             .http_client
             .post(&url)
             .header("x-api-key", api_key.trim())
@@ -853,12 +1013,25 @@ async fn run_anthropic_loop(
                 "system": SYSTEM_PROMPT,
                 "tools": anthropic_tools_schema(),
                 "messages": messages
-            }))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+            }));
+
+        let resp = match send_cancellable(builder, active_turn, tx).await {
+            HttpOutcome::Closed => {
+                let _ = active_turn.force_close_and_drain();
+                return;
+            }
+            HttpOutcome::Preempted => {
+                let steers = active_turn.try_pop_all();
+                if !steers.is_empty() {
+                    emit_steers(tx, &steers, SteerDelivery::Preempted).await;
+                    push_anthropic_user_text(&mut messages, &join_steers(&steers));
+                    round = 0;
+                }
+                continue;
+            }
+            HttpOutcome::Response(Ok(r)) => r,
+            HttpOutcome::Response(Err(e)) => {
+                cancel_api_steers(tx, active_turn, "turn_failed").await;
                 send_sse(tx, "error", json!({ "message": format!("Request failed: {}", e) })).await;
                 return;
             }
@@ -868,12 +1041,14 @@ async fn run_anthropic_loop(
         let body: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
+                cancel_api_steers(tx, active_turn, "turn_failed").await;
                 send_sse(tx, "error", json!({ "message": format!("Invalid JSON: {}", e) })).await;
                 return;
             }
         };
         if !status.is_success() {
             let msg = body["error"]["message"].as_str().unwrap_or("Anthropic API error");
+            cancel_api_steers(tx, active_turn, "turn_failed").await;
             send_sse(tx, "error", json!({ "message": format!("{}: {}", status, msg) })).await;
             return;
         }
@@ -911,19 +1086,40 @@ async fn run_anthropic_loop(
         }
 
         if tool_results.is_empty() {
+            if let Some(steers) = active_turn.try_close_drain_all() {
+                turn.finish(state, Some(tx)).await;
+                *turn = TurnTracker::new(auto_cp);
+                messages.push(json!({ "role": "assistant", "content": content_blocks }));
+                messages.push(json!({ "role": "user", "content": join_steers(&steers) }));
+                emit_steers(tx, &steers, SteerDelivery::Continuation).await;
+                round = 0;
+                continue;
+            }
             return;
+        }
+
+        let steers = active_turn.try_pop_all();
+        if !steers.is_empty() {
+            emit_steers(tx, &steers, SteerDelivery::MidTurn).await;
+            // Anthropic forbids consecutive `role: "user"` messages: append steered text
+            // directly to the same `tool_results` user message content array.
+            tool_results.push(json!({ "type": "text", "text": join_steers(&steers) }));
         }
         messages.push(json!({ "role": "assistant", "content": content_blocks }));
         messages.push(json!({ "role": "user", "content": tool_results }));
     }
+    cancel_api_steers(tx, active_turn, "turn_failed").await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_gemini_loop(
     state: &AppState,
     ws: &Path,
     req: &AgentChatReq,
     api_key: &str,
     turn: &mut TurnTracker,
+    auto_cp: bool,
+    active_turn: &ActiveTurnEntry,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) {
     let url = format!(
@@ -940,8 +1136,13 @@ async fn run_gemini_loop(
         })
         .collect();
 
-    for _round in 0..12 {
-        let resp = match state
+    let mut round = 0usize;
+    let mut total_rounds = 0usize;
+    while round < 12 && total_rounds < 48 {
+        round += 1;
+        total_rounds += 1;
+
+        let builder = state
             .http_client
             .post(&url)
             .header("x-goog-api-key", api_key.trim())
@@ -949,12 +1150,25 @@ async fn run_gemini_loop(
                 "system_instruction": { "parts": [{ "text": SYSTEM_PROMPT }] },
                 "contents": contents,
                 "tools": gemini_tools_schema()
-            }))
-            .send()
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+            }));
+
+        let resp = match send_cancellable(builder, active_turn, tx).await {
+            HttpOutcome::Closed => {
+                let _ = active_turn.force_close_and_drain();
+                return;
+            }
+            HttpOutcome::Preempted => {
+                let steers = active_turn.try_pop_all();
+                if !steers.is_empty() {
+                    emit_steers(tx, &steers, SteerDelivery::Preempted).await;
+                    push_gemini_user_text(&mut contents, &join_steers(&steers));
+                    round = 0;
+                }
+                continue;
+            }
+            HttpOutcome::Response(Ok(r)) => r,
+            HttpOutcome::Response(Err(e)) => {
+                cancel_api_steers(tx, active_turn, "turn_failed").await;
                 send_sse(tx, "error", json!({ "message": format!("Request failed: {}", e) })).await;
                 return;
             }
@@ -964,12 +1178,14 @@ async fn run_gemini_loop(
         let body: Value = match resp.json().await {
             Ok(v) => v,
             Err(e) => {
+                cancel_api_steers(tx, active_turn, "turn_failed").await;
                 send_sse(tx, "error", json!({ "message": format!("Invalid JSON: {}", e) })).await;
                 return;
             }
         };
         if !status.is_success() {
             let msg = body["error"]["message"].as_str().unwrap_or("Gemini API error");
+            cancel_api_steers(tx, active_turn, "turn_failed").await;
             send_sse(tx, "error", json!({ "message": format!("{}: {}", status, msg) })).await;
             return;
         }
@@ -1006,9 +1222,54 @@ async fn run_gemini_loop(
         }
 
         if response_parts.is_empty() {
+            if let Some(steers) = active_turn.try_close_drain_all() {
+                turn.finish(state, Some(tx)).await;
+                *turn = TurnTracker::new(auto_cp);
+                contents.push(json!({ "role": "model", "parts": parts }));
+                contents.push(json!({ "role": "user", "parts": [{ "text": join_steers(&steers) }] }));
+                emit_steers(tx, &steers, SteerDelivery::Continuation).await;
+                round = 0;
+                continue;
+            }
             return;
+        }
+
+        let steers = active_turn.try_pop_all();
+        if !steers.is_empty() {
+            emit_steers(tx, &steers, SteerDelivery::MidTurn).await;
+            // Gemini expects user text appended inside the same user `parts` array after functionResponse.
+            response_parts.push(json!({ "text": join_steers(&steers) }));
         }
         contents.push(json!({ "role": "model", "parts": parts }));
         contents.push(json!({ "role": "user", "parts": response_parts }));
+    }
+    cancel_api_steers(tx, active_turn, "turn_failed").await;
+}
+
+#[cfg(test)]
+mod steer_tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_user_text_merges_consecutive_user_turns() {
+        let mut msgs = vec![json!({ "role": "user", "content": "original" })];
+        push_anthropic_user_text(&mut msgs, "steered");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["content"][0]["text"], "original");
+        assert_eq!(msgs[0]["content"][1]["text"], "steered");
+
+        msgs.push(json!({ "role": "assistant", "content": [{ "type": "text", "text": "ok" }] }));
+        push_anthropic_user_text(&mut msgs, "next");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[2], json!({ "role": "user", "content": "next" }));
+    }
+
+    #[test]
+    fn gemini_user_text_merges_consecutive_user_parts() {
+        let mut contents = vec![json!({ "role": "user", "parts": [{ "text": "original" }] })];
+        push_gemini_user_text(&mut contents, "steered");
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["parts"][0]["text"], "original");
+        assert_eq!(contents[0]["parts"][1]["text"], "steered");
     }
 }

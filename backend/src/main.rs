@@ -353,6 +353,8 @@ fn build_router(
         )
         .route("/api/agent/permission", post(cli_agent::answer_permission))
         .route("/api/agent/question", post(agent_session::answer_question))
+        .route("/api/agent/steer", post(agent_session::steer_turn))
+        .route("/api/agent/steer/cancel", post(agent_session::cancel_steer))
         .route("/api/agent/session/prepare", post(agent_session::prepare_session))
         .route("/api/agent/session/close", post(agent_session::close_session))
         .route("/api/agent/cli-tools", get(pty::list_cli_tools))

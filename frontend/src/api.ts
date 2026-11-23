@@ -9,6 +9,10 @@ import type {
   QuestionRequest,
   SessionPrepareRes,
   SlashCommand,
+  SteerAppliedEvent,
+  SteerCancelledEvent,
+  SteerMode,
+  SteerRes,
   CommandRes,
   CommitDetailRes,
   CommitFileChange,
@@ -297,6 +301,46 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ turn_id: turnId, request_id: requestId, answers, cancelled }),
     }),
+  /** Injects or queues a mid-turn steering prompt for the thread's active turn. */
+  steerAgent: async (
+    threadId: string,
+    turnId: string | null,
+    text: string,
+    mode: SteerMode = 'steer'
+  ): Promise<SteerRes> => {
+    const res = await fetch('/api/agent/steer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        thread_id: threadId,
+        turn_id: turnId || undefined,
+        text,
+        mode,
+      }),
+    });
+    if (res.status === 409) {
+      try {
+        return (await res.json()) as SteerRes;
+      } catch {
+        return { accepted: false, reason: 'turn_ended' };
+      }
+    }
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error(txt || `HTTP ${res.status}`);
+    }
+    return (await res.json()) as SteerRes;
+  },
+  /** Withdraws a queued steering prompt before the agent consumes it. */
+  cancelSteer: (threadId: string, turnId: string | null, steerId: string) =>
+    jsonFetch<{ cancelled: boolean }>('/api/agent/steer/cancel', {
+      method: 'POST',
+      body: JSON.stringify({
+        thread_id: threadId,
+        turn_id: turnId || undefined,
+        steer_id: steerId,
+      }),
+    }),
   /** Starts (or resumes) the thread's agent session and returns its slash commands. */
   prepareSession: (req: {
     threadId: string;
@@ -374,6 +418,12 @@ export async function streamAgentChat(
     onPermissionRequest?: (req: PermissionRequest) => void;
     onPermissionCancel?: (requestId: string) => void;
     onUserQuestion?: (req: QuestionRequest) => void;
+    /** Active turn id emitted at turn start so mid-turn steering can target it. */
+    onTurn?: (turnId: string) => void;
+    /** A mid-turn steer prompt was absorbed by the agent at this point in the timeline. */
+    onSteerApplied?: (ev: SteerAppliedEvent) => void;
+    /** A queued steer prompt was cancelled before being consumed. */
+    onSteerCancelled?: (ev: SteerCancelledEvent) => void;
     /** The agent's own conversation id, to resume this thread after a restart. */
     onSession?: (s: { resume_id: string; resumed?: boolean }) => void;
     onCommands?: (commands: SlashCommand[]) => void;
@@ -412,6 +462,13 @@ export async function streamAgentChat(
   const decoder = new TextDecoder();
   let buffer = '';
   const currentEvent = 'message';
+  let doneCalled = false;
+  const emitDone = () => {
+    if (!doneCalled) {
+      doneCalled = true;
+      handlers.onDone();
+    }
+  };
 
   while (true) {
     const { done, value } = await reader.read();
@@ -442,16 +499,19 @@ export async function streamAgentChat(
         else if (evName === 'permission_request') handlers.onPermissionRequest?.(data);
         else if (evName === 'permission_cancel') handlers.onPermissionCancel?.(data.request_id);
         else if (evName === 'user_question') handlers.onUserQuestion?.(data);
+        else if (evName === 'turn' && data.turn_id) handlers.onTurn?.(data.turn_id);
+        else if (evName === 'steer_applied') handlers.onSteerApplied?.(data);
+        else if (evName === 'steer_cancelled') handlers.onSteerCancelled?.(data);
         else if (evName === 'session' && data.resume_id) handlers.onSession?.(data);
         else if (evName === 'commands') handlers.onCommands?.(data.commands ?? []);
         else if (evName === 'error') handlers.onError(data.message || 'Unknown error');
-        else if (evName === 'done') handlers.onDone();
+        else if (evName === 'done') emitDone();
       } catch {
         // ignore malformed chunk
       }
     }
   }
-  handlers.onDone();
+  emitDone();
 }
 
 export function wsUrl(path: string): string {

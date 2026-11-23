@@ -58,6 +58,8 @@ pub struct AppState {
     pub pending_questions: Arc<std::sync::Mutex<HashMap<(String, String), oneshot::Sender<QuestionAnswer>>>>,
     /// Long-lived agent CLI processes, one per chat thread.
     pub sessions: Arc<crate::agent_session::SessionManager>,
+    /// Currently running chat turns (CLI sessions and direct API loops), keyed by `thread_id`.
+    pub active_turns: Arc<crate::agent_session::ActiveTurnRegistry>,
 }
 
 /// The user's answers to an in-chat question card, keyed by question id.
@@ -91,6 +93,7 @@ impl AppState {
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_questions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sessions: Arc::new(crate::agent_session::SessionManager::default()),
+            active_turns: Arc::new(crate::agent_session::ActiveTurnRegistry::default()),
         }
     }
 

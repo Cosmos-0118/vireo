@@ -7,18 +7,19 @@
 use super::broker::{self, PermissionPrompt, SharedRules};
 use super::commands;
 use super::process::{self, failure_text};
+use super::steer::{emit_steer_applied, emit_steer_cancelled, ActiveTurnEntry, SteerDelivery, SteerItem, SteerMode};
 use super::types::{wants_model, SlashCommand, SseTx, TurnEnd, TurnInput};
 use crate::agent::send_sse;
 use crate::checkpoint::TurnTracker;
 use crate::cli_agent::{
-    claude_session_args, control_error, control_request, control_response, emit, user_message_line, Normalizer, Out,
-    PendingGuard, PermMode,
+    claude_session_args, control_error, control_request, control_response, emit, steer_user_message_line,
+    user_message_line, Normalizer, Out, PendingGuard, PermMode,
 };
 use crate::state::AppState;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -31,10 +32,28 @@ const INTERRUPT_GRACE: Duration = Duration::from_secs(8);
 
 type ControlWaiters = Mutex<HashMap<String, oneshot::Sender<Value>>>;
 
+#[derive(Debug, Clone)]
+struct TurnResultMeta {
+    queued_turn_count: usize,
+    user_message_uuids: Vec<String>,
+    has_user_message_uuids: bool,
+    is_error: bool,
+}
+
+#[derive(Debug, Clone)]
+struct InFlightSteer {
+    item: SteerItem,
+    applied: bool,
+    sent_at_epoch: u64,
+    saw_tool_result: bool,
+}
+
 enum Msg {
     Out(Out),
-    /// Claude's `result` event: the turn is over.
-    Finished,
+    /// A top-level assistant message started streaming (`stream_event` -> `message_start`).
+    MessageStart,
+    /// Claude's `result` event: the turn (or sub-turn) is over.
+    Finished(TurnResultMeta),
     Closed(Option<i32>),
 }
 
@@ -65,7 +84,7 @@ pub struct ClaudeSession {
     kill: Mutex<Option<oneshot::Sender<()>>>,
     busy: tokio::sync::Mutex<()>,
     rules: SharedRules,
-    next_control: std::sync::atomic::AtomicU64,
+    next_control: Arc<AtomicU64>,
 }
 
 impl ClaudeSession {
@@ -140,7 +159,7 @@ impl ClaudeSession {
             kill: Mutex::new(Some(kill_tx)),
             busy: tokio::sync::Mutex::new(()),
             rules: Arc::new(Mutex::new(rules)),
-            next_control: std::sync::atomic::AtomicU64::new(1),
+            next_control: Arc::new(AtomicU64::new(1)),
         };
         match session.control("initialize", json!({}), INIT_TIMEOUT).await {
             Ok(init) => {
@@ -251,6 +270,61 @@ impl ClaudeSession {
         self.sync_settings(input).await;
         let turn_id = uuid::Uuid::new_v4().to_string();
         let _pending = PendingGuard { state: state.clone(), turn_id: turn_id.clone() };
+        let active_turn = state.active_turns.register(&input.thread_id, &turn_id);
+        send_sse(tx, "turn", json!({ "turn_id": turn_id })).await;
+
+        let in_flight: Arc<Mutex<VecDeque<InFlightSteer>>> = Arc::new(Mutex::new(VecDeque::new()));
+        let (cancel_tx, mut cancel_rx) = mpsc::unbounded_channel::<(String, oneshot::Sender<bool>)>();
+        active_turn.entry().set_cancel_hook(cancel_tx);
+
+        // Background task handling `cancel_async_message` for already-dispatched mid-turn steers.
+        let cancel_stdin = self.stdin.clone();
+        let cancel_shared = self.shared.clone();
+        let cancel_in_flight = in_flight.clone();
+        let cancel_seq = self.next_control.clone();
+        let cancel_task = tokio::spawn(async move {
+            while let Some((steer_id, reply)) = cancel_rx.recv().await {
+                let cancellable = cancel_in_flight
+                    .lock()
+                    .ok()
+                    .is_some_and(|q| q.iter().any(|s| s.item.steer_id == steer_id && !s.applied));
+                if !cancellable {
+                    let _ = reply.send(false);
+                    continue;
+                }
+                let id = format!("vireo-{}", cancel_seq.fetch_add(1, Ordering::Relaxed));
+                let (wtx, wrx) = oneshot::channel();
+                if let Ok(mut w) = cancel_shared.waiters.lock() {
+                    w.insert(id.clone(), wtx);
+                }
+                if cancel_stdin
+                    .send(control_request(&id, "cancel_async_message", json!({ "message_uuid": steer_id })))
+                    .is_err()
+                {
+                    if let Ok(mut w) = cancel_shared.waiters.lock() {
+                        w.remove(&id);
+                    }
+                    let _ = reply.send(false);
+                    continue;
+                }
+                let outcome = tokio::time::timeout(Duration::from_secs(5), wrx).await;
+                if let Ok(mut w) = cancel_shared.waiters.lock() {
+                    w.remove(&id);
+                }
+                let cancelled = matches!(
+                    outcome,
+                    Ok(Ok(resp)) if resp["subtype"].as_str() != Some("error")
+                        && resp["response"]["cancelled"].as_bool() == Some(true)
+                );
+                if cancelled {
+                    if let Ok(mut q) = cancel_in_flight.lock() {
+                        q.retain(|s| s.item.steer_id != steer_id);
+                    }
+                }
+                let _ = reply.send(cancelled);
+            }
+        });
+
         if let Ok(mut n) = self.shared.norm.lock() {
             n.begin_turn();
         }
@@ -258,7 +332,11 @@ impl ClaudeSession {
         turn.begin(state).await;
         let _ = self.stdin.send(user_message_line(&input.prompt));
 
-        let end = self.pump(state, tx, turn, &mut events, &turn_id, input.mode).await;
+        let end = self
+            .pump(state, tx, turn, &mut events, &turn_id, input, active_turn.entry(), &in_flight)
+            .await;
+        active_turn.entry().clear_cancel_hook();
+        cancel_task.abort();
         self.shared.active.store(false, Ordering::SeqCst);
         turn.finish(state, Some(tx)).await;
         if end == TurnEnd::Broken {
@@ -271,6 +349,7 @@ impl ClaudeSession {
         self.shared.norm.lock().map(|n| n.finished).unwrap_or(true)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn pump(
         &self,
         state: &AppState,
@@ -278,30 +357,219 @@ impl ClaudeSession {
         turn: &mut TurnTracker,
         events: &mut mpsc::UnboundedReceiver<Msg>,
         turn_id: &str,
-        mode: PermMode,
+        input: &TurnInput,
+        active_turn: &Arc<ActiveTurnEntry>,
+        in_flight: &Arc<Mutex<VecDeque<InFlightSteer>>>,
     ) -> TurnEnd {
+        let mut msg_epoch: u64 = 0;
+
         loop {
+            // Drain any pending steers into Claude's stdin immediately.
+            for item in active_turn.try_pop_all() {
+                let priority = match item.mode {
+                    SteerMode::Steer => "next",
+                    SteerMode::Now => "now",
+                };
+                let _ = self.stdin.send(steer_user_message_line(&item.text, &item.steer_id, priority));
+                let applied = item.mode == SteerMode::Now;
+                if let Ok(mut q) = in_flight.lock() {
+                    q.push_back(InFlightSteer {
+                        item: item.clone(),
+                        applied,
+                        sent_at_epoch: msg_epoch,
+                        saw_tool_result: false,
+                    });
+                }
+                if applied {
+                    emit_steer_applied(tx, &item, SteerDelivery::Preempted).await;
+                }
+            }
+
             tokio::select! {
-                _ = tx.closed() => return self.interrupt(turn, events).await,
+                _ = tx.closed() => {
+                    let _ = active_turn.force_close_and_drain();
+                    return self.interrupt(turn, events).await;
+                }
+                _ = active_turn.notified() => {
+                    // Loop iteration will drain and forward queued steers.
+                }
                 msg = events.recv() => match msg {
-                    Some(Msg::Out(ev)) => self.handle(state, tx, turn, turn_id, mode, ev).await,
-                    Some(Msg::Finished) => return TurnEnd::Done,
+                    Some(Msg::MessageStart) => {
+                        msg_epoch += 1;
+                        let to_apply: Vec<SteerItem> = in_flight
+                            .lock()
+                            .map(|mut q| {
+                                q.iter_mut()
+                                    .filter(|s| !s.applied && ((s.sent_at_epoch >= 1 && msg_epoch > s.sent_at_epoch) || s.saw_tool_result))
+                                    .map(|s| {
+                                        s.applied = true;
+                                        s.item.clone()
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        for item in to_apply {
+                            emit_steer_applied(tx, &item, SteerDelivery::MidTurn).await;
+                        }
+                    }
+                    Some(Msg::Out(ev)) => {
+                        if matches!(&ev, Out::ToolResult { .. }) {
+                            if let Ok(mut q) = in_flight.lock() {
+                                for s in q.iter_mut() {
+                                    if !s.applied {
+                                        s.saw_tool_result = true;
+                                    }
+                                }
+                            }
+                        } else if matches!(&ev, Out::Text(_) | Out::ToolCall { .. }) {
+                            // Fallback for non-streaming turns without `stream_event` `message_start`.
+                            let to_apply: Vec<SteerItem> = in_flight
+                                .lock()
+                                .map(|mut q| {
+                                    q.iter_mut()
+                                        .filter(|s| !s.applied && s.saw_tool_result)
+                                        .map(|s| {
+                                            s.applied = true;
+                                            s.item.clone()
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            for item in to_apply {
+                                emit_steer_applied(tx, &item, SteerDelivery::MidTurn).await;
+                            }
+                        }
+                        self.handle(state, tx, turn, turn_id, input.mode, ev).await;
+                    }
+                    Some(Msg::Finished(meta)) => {
+                        if meta.is_error {
+                            self.cancel_remaining_steers(tx, active_turn, in_flight, "turn_failed").await;
+                            return TurnEnd::Done;
+                        }
+
+                        // Reconcile steers consumed during the finished sub-turn.
+                        let consumed_unapplied: Vec<SteerItem> = in_flight
+                            .lock()
+                            .map(|mut q| {
+                                let mut out = Vec::new();
+                                if meta.has_user_message_uuids {
+                                    q.retain(|s| {
+                                        if meta.user_message_uuids.iter().any(|u| u == &s.item.steer_id) {
+                                            if !s.applied {
+                                                out.push(s.item.clone());
+                                            }
+                                            false
+                                        } else {
+                                            true
+                                        }
+                                    });
+                                } else if meta.queued_turn_count == 0 {
+                                    for s in q.drain(..) {
+                                        if !s.applied {
+                                            out.push(s.item);
+                                        }
+                                    }
+                                }
+                                out
+                            })
+                            .unwrap_or_default();
+                        for item in consumed_unapplied {
+                            emit_steer_applied(tx, &item, SteerDelivery::MidTurn).await;
+                        }
+
+                        let has_in_flight = in_flight.lock().map(|q| !q.is_empty()).unwrap_or(false);
+                        if meta.queued_turn_count > 0 || has_in_flight {
+                            // Claude is automatically starting a chained turn from its internal queue.
+                            turn.finish(state, Some(tx)).await;
+                            *turn = TurnTracker::new(input.auto_cp);
+                            turn.begin(state).await;
+                            let chained: Vec<SteerItem> = in_flight
+                                .lock()
+                                .map(|mut q| {
+                                    q.iter_mut()
+                                        .filter(|s| !s.applied)
+                                        .map(|s| {
+                                            s.applied = true;
+                                            s.item.clone()
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            for item in chained {
+                                emit_steer_applied(tx, &item, SteerDelivery::Continuation).await;
+                            }
+                            msg_epoch = 0;
+                            continue;
+                        }
+
+                        // Atomic turn-end handshake: check if a steer arrived right before closing.
+                        if let Some(item) = active_turn.try_close_if_empty() {
+                            turn.finish(state, Some(tx)).await;
+                            *turn = TurnTracker::new(input.auto_cp);
+                            turn.begin(state).await;
+                            let priority = match item.mode {
+                                SteerMode::Steer => "next",
+                                SteerMode::Now => "now",
+                            };
+                            let _ = self.stdin.send(steer_user_message_line(&item.text, &item.steer_id, priority));
+                            if let Ok(mut q) = in_flight.lock() {
+                                q.push_back(InFlightSteer {
+                                    item: item.clone(),
+                                    applied: true,
+                                    sent_at_epoch: 0,
+                                    saw_tool_result: false,
+                                });
+                            }
+                            let delivery = if item.mode == SteerMode::Now {
+                                SteerDelivery::Preempted
+                            } else {
+                                SteerDelivery::Continuation
+                            };
+                            emit_steer_applied(tx, &item, delivery).await;
+                            msg_epoch = 0;
+                            continue;
+                        }
+                        return TurnEnd::Done;
+                    }
                     Some(Msg::Closed(code)) => {
+                        self.cancel_remaining_steers(tx, active_turn, in_flight, "turn_failed").await;
                         if !self.finished() {
                             let text = failure_text("Claude Code", code, &self.shared.stderr);
                             send_sse(tx, "error", json!({ "message": text })).await;
                         }
                         return TurnEnd::Broken;
                     }
-                    None => return TurnEnd::Broken,
+                    None => {
+                        self.cancel_remaining_steers(tx, active_turn, in_flight, "turn_failed").await;
+                        return TurnEnd::Broken;
+                    }
                 },
             }
         }
     }
 
-    /// Stop was pressed: ask Claude to stop and let it finish the turn so the session stays usable.
+    async fn cancel_remaining_steers(
+        &self,
+        tx: &SseTx,
+        active_turn: &Arc<ActiveTurnEntry>,
+        in_flight: &Arc<Mutex<VecDeque<InFlightSteer>>>,
+        reason: &str,
+    ) {
+        let mut ids: Vec<String> = in_flight
+            .lock()
+            .map(|mut q| q.drain(..).filter(|s| !s.applied).map(|s| s.item.steer_id).collect())
+            .unwrap_or_default();
+        for item in active_turn.force_close_and_drain() {
+            ids.push(item.steer_id);
+        }
+        for id in ids {
+            emit_steer_cancelled(tx, &id, reason).await;
+        }
+    }
+
+    /// Stop was pressed: ask Claude to stop (and discard queued steers) so the session stays usable.
     async fn interrupt(&self, turn: &mut TurnTracker, events: &mut mpsc::UnboundedReceiver<Msg>) -> TurnEnd {
-        let _ = self.stdin.send(control_request("vireo-interrupt", "interrupt", json!({})));
+        let _ = self.stdin.send(control_request("vireo-interrupt", "interrupt", json!({ "cancel_queued": true })));
         let deadline = tokio::time::sleep(INTERRUPT_GRACE);
         tokio::pin!(deadline);
         loop {
@@ -309,8 +577,8 @@ impl ClaudeSession {
                 _ = &mut deadline => return TurnEnd::Broken,
                 msg = events.recv() => match msg {
                     Some(Msg::Out(Out::ToolCall { name, args, .. })) => turn.note_tool(&name, &args),
-                    Some(Msg::Out(_)) => {}
-                    Some(Msg::Finished) => return TurnEnd::Stopped,
+                    Some(Msg::Out(_)) | Some(Msg::MessageStart) => {}
+                    Some(Msg::Finished(_)) => return TurnEnd::Stopped,
                     _ => return TurnEnd::Broken,
                 },
             }
@@ -379,6 +647,12 @@ fn route_line(shared: &Shared, stdin: &mpsc::UnboundedSender<String>, evt_tx: &m
     }
     let outs = shared.norm.lock().map(|mut n| n.feed(v)).unwrap_or_default();
     let active = shared.active.load(Ordering::SeqCst);
+    let is_message_start = v["type"].as_str() == Some("stream_event")
+        && v["parent_tool_use_id"].is_null()
+        && v["event"]["type"].as_str() == Some("message_start");
+    if is_message_start && active {
+        let _ = evt_tx.send(Msg::MessageStart);
+    }
     let finished = v["type"].as_str() == Some("result");
     for out in outs {
         if active {
@@ -403,7 +677,18 @@ fn route_line(shared: &Shared, stdin: &mpsc::UnboundedSender<String>, evt_tx: &m
         }
     }
     if finished && active {
-        let _ = evt_tx.send(Msg::Finished);
+        let meta = TurnResultMeta {
+            queued_turn_count: v["queued_turn_count"].as_u64().unwrap_or(0) as usize,
+            has_user_message_uuids: v.get("user_message_uuids").and_then(Value::as_array).is_some(),
+            user_message_uuids: v["user_message_uuids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .collect(),
+            is_error: v["is_error"].as_bool() == Some(true),
+        };
+        let _ = evt_tx.send(Msg::Finished(meta));
     }
 }
 

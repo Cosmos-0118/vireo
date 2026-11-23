@@ -8,12 +8,14 @@ use super::acp_events::{auto_allows, permission_outcome, AcpEvents};
 use super::broker::{self, PermissionPrompt, SharedRules};
 use super::jsonrpc::{Incoming, RpcClient};
 use super::process::{self, failure_text};
+use super::steer::{emit_steer_applied, emit_steer_cancelled, ActiveTurnEntry, SteerDelivery};
 use super::types::{wants_model, SlashCommand, SseTx, TurnEnd, TurnInput};
 use crate::agent::send_sse;
 use crate::checkpoint::TurnTracker;
 use crate::cli_agent::{emit, CliKind, Out, PendingGuard, PermMode};
 use crate::state::AppState;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -233,6 +235,8 @@ impl AcpSession {
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let _pending = PendingGuard { state: state.clone(), turn_id: turn_id.clone() };
+        let active_turn = state.active_turns.register(&input.thread_id, &turn_id);
+        send_sse(tx, "turn", json!({ "turn_id": turn_id })).await;
         turn.begin(state).await;
 
         let mut text = input.prompt.clone();
@@ -241,9 +245,11 @@ impl AcpSession {
         }
         let rpc = self.rpc.clone();
         let params = json!({ "sessionId": self.session_id, "prompt": [{ "type": "text", "text": text }] });
-        let mut prompt = tokio::spawn(async move { rpc.request("session/prompt", params).await });
+        let prompt = tokio::spawn(async move { rpc.request("session/prompt", params).await });
 
-        let end = self.pump(state, tx, turn, &mut incoming, &turn_id, input.mode, &mut prompt).await;
+        let end = self
+            .pump(state, tx, turn, &mut incoming, &turn_id, input, active_turn.entry(), prompt)
+            .await;
         turn.finish(state, Some(tx)).await;
         if end == TurnEnd::Broken {
             self.shutdown();
@@ -259,35 +265,115 @@ impl AcpSession {
         turn: &mut TurnTracker,
         incoming: &mut mpsc::UnboundedReceiver<Incoming>,
         turn_id: &str,
-        mode: PermMode,
-        prompt: &mut tokio::task::JoinHandle<Result<Value, super::jsonrpc::RpcError>>,
+        input: &TurnInput,
+        active_turn: &Arc<ActiveTurnEntry>,
+        mut prompt: tokio::task::JoinHandle<Result<Value, super::jsonrpc::RpcError>>,
     ) -> TurnEnd {
+        let mut preempting = false;
+        let open_perms: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+
         loop {
+            if !preempting && active_turn.has_now_pending() {
+                preempting = true;
+                self.cancel_open_perms(state, tx, turn_id, &open_perms).await;
+                self.rpc.notify("session/cancel", json!({ "sessionId": self.session_id }));
+            }
+
             tokio::select! {
-                _ = tx.closed() => return self.cancel(prompt, turn, incoming).await,
-                res = &mut *prompt => {
+                _ = tx.closed() => {
+                    let _ = active_turn.force_close_and_drain();
+                    return self.cancel(&mut prompt, turn, incoming).await;
+                }
+                _ = active_turn.notified(), if !preempting => {
+                    // Top of loop checks `has_now_pending()` to trigger immediate preemption;
+                    // regular `SteerMode::Steer` items stay safely queued until `session/prompt` finishes.
+                }
+                res = &mut prompt => {
                     // Everything the agent sent before its answer is already queued.
                     while let Ok(msg) = incoming.try_recv() {
-                        self.handle(state, tx, turn, turn_id, mode, msg).await;
+                        self.handle(state, tx, turn, turn_id, input.mode, msg, &open_perms, preempting).await;
                     }
-                    return match res {
-                        Ok(Ok(r)) => self.finish_reason(tx, r["stopReason"].as_str().unwrap_or("end_turn")).await,
-                        Ok(Err(e)) => {
-                            send_sse(tx, "error", json!({ "message": format!("{} failed: {e}", self.kind.label()) })).await;
-                            TurnEnd::Done
+                    match res {
+                        Ok(Ok(r)) => {
+                            let reason = r["stopReason"].as_str().unwrap_or("end_turn");
+                            let can_chain = preempting || reason == "end_turn";
+                            if can_chain {
+                                let next = if preempting {
+                                    active_turn.try_pop_now_or_front().or_else(|| active_turn.try_close_if_empty())
+                                } else {
+                                    active_turn.try_close_if_empty()
+                                };
+                                if let Some(item) = next {
+                                    turn.finish(state, Some(tx)).await;
+                                    *turn = TurnTracker::new(input.auto_cp);
+                                    turn.begin(state).await;
+                                    let delivery = if preempting {
+                                        SteerDelivery::Preempted
+                                    } else {
+                                        SteerDelivery::Continuation
+                                    };
+                                    emit_steer_applied(tx, &item, delivery).await;
+                                    let rpc = self.rpc.clone();
+                                    let params = json!({
+                                        "sessionId": self.session_id,
+                                        "prompt": [{ "type": "text", "text": item.text }],
+                                    });
+                                    prompt = tokio::spawn(async move { rpc.request("session/prompt", params).await });
+                                    preempting = false;
+                                    continue;
+                                }
+                            } else {
+                                let cancel_reason = if reason == "cancelled" { "stopped" } else { "turn_failed" };
+                                for item in active_turn.force_close_and_drain() {
+                                    emit_steer_cancelled(tx, &item.steer_id, cancel_reason).await;
+                                }
+                            }
+                            return self.finish_reason(tx, reason).await;
                         }
-                        Err(_) => TurnEnd::Broken,
-                    };
+                        Ok(Err(e)) => {
+                            for item in active_turn.force_close_and_drain() {
+                                emit_steer_cancelled(tx, &item.steer_id, "turn_failed").await;
+                            }
+                            send_sse(tx, "error", json!({ "message": format!("{} failed: {e}", self.kind.label()) })).await;
+                            return TurnEnd::Done;
+                        }
+                        Err(_) => {
+                            for item in active_turn.force_close_and_drain() {
+                                emit_steer_cancelled(tx, &item.steer_id, "turn_failed").await;
+                            }
+                            return TurnEnd::Broken;
+                        }
+                    }
                 }
                 msg = incoming.recv() => match msg {
                     Some(Incoming::Closed) | None => {
+                        for item in active_turn.force_close_and_drain() {
+                            emit_steer_cancelled(tx, &item.steer_id, "turn_failed").await;
+                        }
                         let text = failure_text(self.kind.label(), None, &self.stderr);
                         send_sse(tx, "error", json!({ "message": text })).await;
                         return TurnEnd::Broken;
                     }
-                    Some(msg) => self.handle(state, tx, turn, turn_id, mode, msg).await,
+                    Some(msg) => self.handle(state, tx, turn, turn_id, input.mode, msg, &open_perms, preempting).await,
                 },
             }
+        }
+    }
+
+    async fn cancel_open_perms(
+        &self,
+        state: &AppState,
+        tx: &SseTx,
+        turn_id: &str,
+        open_perms: &Arc<Mutex<HashMap<String, Value>>>,
+    ) {
+        let items: Vec<(String, Value)> = open_perms
+            .lock()
+            .map(|mut m| m.drain().collect())
+            .unwrap_or_default();
+        for (req_id, rpc_id) in items {
+            broker::cancel_permission(state, tx, turn_id, &req_id).await;
+            self.rpc.respond(&rpc_id, json!({ "outcome": { "outcome": "cancelled" } }));
         }
     }
 
@@ -343,7 +429,18 @@ impl AcpSession {
         }
     }
 
-    async fn handle(&self, state: &AppState, tx: &SseTx, turn: &mut TurnTracker, turn_id: &str, mode: PermMode, msg: Incoming) {
+    #[allow(clippy::too_many_arguments)]
+    async fn handle(
+        &self,
+        state: &AppState,
+        tx: &SseTx,
+        turn: &mut TurnTracker,
+        turn_id: &str,
+        mode: PermMode,
+        msg: Incoming,
+        open_perms: &Arc<Mutex<HashMap<String, Value>>>,
+        preempting: bool,
+    ) {
         match msg {
             Incoming::Notification { method, params } if method == "session/update" => {
                 let outs = self.events.lock().map(|mut e| e.feed(&params["update"])).unwrap_or_default();
@@ -356,6 +453,10 @@ impl AcpSession {
             }
             Incoming::Request { id, method, params } if method == "session/request_permission" => {
                 let rpc = self.rpc.clone();
+                if preempting {
+                    rpc.respond(&id, json!({ "outcome": { "outcome": "cancelled" } }));
+                    return;
+                }
                 let options = params["options"].clone();
                 if auto_allows(mode, params["toolCall"]["kind"].as_str()) {
                     rpc.respond(&id, json!({ "outcome": permission_outcome(&options, true, false) }));
@@ -363,8 +464,16 @@ impl AcpSession {
                 }
                 let (tool, input) = self.events.lock().map(|e| e.permission_card(&params)).unwrap_or_default();
                 let request_id = params["toolCall"]["toolCallId"].as_str().map(str::to_string).unwrap_or_else(|| id.to_string());
+                let rid_key = request_id.clone();
+                if let Ok(mut m) = open_perms.lock() {
+                    m.insert(rid_key.clone(), id.clone());
+                }
+                let open = open_perms.clone();
                 let prompt = PermissionPrompt { request_id, tool, input };
                 broker::ask_permission(state, tx, turn_id, &self.rules, prompt, move |d| {
+                    if let Ok(mut m) = open.lock() {
+                        m.remove(&rid_key);
+                    }
                     rpc.respond(&id, json!({ "outcome": permission_outcome(&options, d.allow, d.remember) }));
                 })
                 .await;

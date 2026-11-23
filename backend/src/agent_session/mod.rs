@@ -16,11 +16,13 @@ mod jsonrpc;
 mod manager;
 mod process;
 mod routes;
+pub(crate) mod steer;
 mod types;
 
 pub use broker::answer_question;
 pub use manager::SessionManager;
 pub use routes::{close_session, prepare_session};
+pub use steer::{cancel_steer, steer_turn, ActiveTurnRegistry};
 
 use crate::agent::{send_sse, AgentChatReq};
 use crate::checkpoint::TurnTracker;
@@ -62,7 +64,13 @@ pub async fn run_turn(state: &AppState, ws: &Path, req: &AgentChatReq, kind: Cli
     } else {
         req.messages.last().map(|m| m.content.clone()).unwrap_or_default()
     };
-    let input = TurnInput { prompt, model: req.model.clone(), mode };
+    let input = TurnInput {
+        thread_id: thread_id.clone(),
+        prompt,
+        model: req.model.clone(),
+        mode,
+        auto_cp,
+    };
     let mut turn = TurnTracker::new(auto_cp);
     let end = session.run_turn(state, tx, &mut turn, &input).await;
     match end {

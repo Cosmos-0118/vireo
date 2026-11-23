@@ -25,9 +25,11 @@ pub struct SlashCommand {
 /// What a driver needs to run one turn.
 #[derive(Debug, Clone)]
 pub struct TurnInput {
+    pub thread_id: String,
     pub prompt: String,
     pub model: String,
     pub mode: PermMode,
+    pub auto_cp: bool,
 }
 
 /// How a turn ended, as far as the session's health is concerned.

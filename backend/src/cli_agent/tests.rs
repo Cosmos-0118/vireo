@@ -208,3 +208,44 @@ fn claude_session_args_keep_the_session_alive_and_resumable() {
     assert!(resumed.windows(2).any(|w| w == ["--permission-mode", "acceptEdits"]));
     assert!(resumed.windows(2).any(|w| w == ["--model", "opus"]));
 }
+
+#[test]
+fn claude_normalizer_resets_between_auto_chained_turns() {
+    let mut n = Normalizer::new(Path::new("C:/w"));
+    let feed = |n: &mut Normalizer, s: &str| n.feed(&serde_json::from_str::<Value>(s).unwrap());
+
+    assert_eq!(
+        feed(&mut n, r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m1"}},"parent_tool_use_id":null}"#),
+        vec![]
+    );
+    assert_eq!(
+        feed(&mut n, r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"First"}},"parent_tool_use_id":null}"#),
+        vec![Out::TextDelta("First".into())]
+    );
+    assert_eq!(
+        feed(&mut n, r#"{"type":"result","subtype":"success","is_error":false,"result":"First","queued_turn_count":1}"#),
+        vec![]
+    );
+    assert!(n.finished);
+
+    // Chained Turn 2 arrives on stdout before pump() calls begin_turn():
+    // must NOT prepend "\n\n" and must clear `finished`.
+    assert_eq!(
+        feed(&mut n, r#"{"type":"stream_event","event":{"type":"message_start","message":{"id":"m2"}},"parent_tool_use_id":null}"#),
+        vec![]
+    );
+    assert!(!n.finished);
+    assert_eq!(
+        feed(&mut n, r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Second"}},"parent_tool_use_id":null}"#),
+        vec![Out::TextDelta("Second".into())]
+    );
+}
+
+#[test]
+fn steer_user_message_includes_uuid_and_priority() {
+    let v: Value = serde_json::from_str(&steer_user_message_line("pivot", "u-123", "next")).unwrap();
+    assert_eq!(v["type"], "user");
+    assert_eq!(v["uuid"], "u-123");
+    assert_eq!(v["priority"], "next");
+    assert_eq!(v["message"]["content"][0]["text"], "pivot");
+}

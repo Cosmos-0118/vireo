@@ -45,6 +45,7 @@ import type {
   QuestionRequest,
   RollbackRes,
   SlashCommand,
+  SteerMode,
   ToastAction,
   UiChatMessage,
 } from '../types';
@@ -133,6 +134,20 @@ interface PastedImage {
   url: string;
   path?: string;
   status: 'uploading' | 'ready' | 'error';
+}
+
+interface DraftPrompt {
+  shownText: string;
+  promptText: string;
+  ctxFiles: string[];
+  ctxChanges?: number;
+  ctxImages?: number;
+}
+
+interface QueuedSteer extends DraftPrompt {
+  steerId: string;
+  turnId: string;
+  mode: SteerMode;
 }
 
 function slimMessages(ms: UiChatMessage[]): UiChatMessage[] {
@@ -341,6 +356,28 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   }));
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
+  const runningRef = useRef(false);
+  runningRef.current = running;
+  const messagesRef = useRef<UiChatMessage[]>(messages);
+  messagesRef.current = messages;
+  const activeTurnIdRef = useRef<string | null>(null);
+  const activeAssistantIdRef = useRef<string | null>(null);
+  const pendingFollowupRef = useRef<DraftPrompt | null>(null);
+  const runSeqRef = useRef(0);
+  const [queuedSteers, setQueuedSteers] = useState<QueuedSteer[]>([]);
+  const queuedSteersRef = useRef<QueuedSteer[]>([]);
+  const [sendingSteer, setSendingSteer] = useState(false);
+  const updateQueuedSteers = (updater: (prev: QueuedSteer[]) => QueuedSteer[]) => {
+    const next = updater(queuedSteersRef.current);
+    queuedSteersRef.current = next;
+    setQueuedSteers(next);
+  };
+  const clearActiveTurnState = () => {
+    activeTurnIdRef.current = null;
+    activeAssistantIdRef.current = null;
+    pendingFollowupRef.current = null;
+    updateQueuedSteers(() => []);
+  };
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
   // Activity groups the user opened/closed by hand, keyed `${messageId}:${partIndex}` (collapsed by default).
   const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>({});
@@ -429,6 +466,11 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showModelMenu]);
 
+  // Close engine switcher when a turn starts running.
+  useEffect(() => {
+    if (running) setShowModelMenu(false);
+  }, [running]);
+
   const cliToolId = CLI_PROVIDER_TOOL[config.provider];
   const cliInstalled = cliToolId ? cliTools.find((t) => t.id === cliToolId)?.installed : undefined;
   const configured = cliToolId
@@ -477,8 +519,11 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
   useEffect(() => {
     if (workspacePath === threadStore.ws) return;
+    runSeqRef.current += 1;
     abortRef.current?.abort();
+    runningRef.current = false;
     setRunning(false);
+    clearActiveTurnState();
     setMessages([]);
     setExpandedTools({});
     setGroupOpen({});
@@ -595,9 +640,9 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const patchAssistant = (id: string, fn: (m: UiChatMessage) => UiChatMessage) =>
     setMessages((prev) => prev.map((m) => (m.id === id ? fn(m) : m)));
 
-  const sendPrompt = async () => {
+  const takeDraftFromComposer = (): DraftPrompt | null => {
     const trimmed = input.trim();
-    if ((!trimmed && readyImages.length === 0) || running || imagesBusy) return;
+    if ((!trimmed && readyImages.length === 0) || imagesBusy) return null;
 
     const imagePaths = readyImages.map((i) => i.path as string);
     const imageNote = imagePaths.length
@@ -606,15 +651,30 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         }: ${imagePaths.join(', ')}]\n\n`
       : '';
     const shownText = trimmed || (imagePaths.length > 1 ? 'See attached images.' : 'See attached image.');
+    const ctxFiles = [...(activeChip ? [activeChip] : []), ...extraFiles];
+    const ctxChanges = includeChanges && changedFileCount > 0 ? changedFileCount : undefined;
+    const ctxImages = imagePaths.length || undefined;
+    const promptText = buildContextPrefix() + imageNote + shownText;
+
+    setInput('');
+    images.forEach((i) => URL.revokeObjectURL(i.url));
+    setImages([]);
+    setAtRange(null);
+
+    return { shownText, promptText, ctxFiles, ctxChanges, ctxImages };
+  };
+
+  const sendPromptWithDraft = async (draft: DraftPrompt) => {
+    if (runningRef.current) return;
 
     const now = Date.now();
     const userMsg: UiChatMessage = {
       id: `u-${now}`,
       role: 'user',
-      content: shownText,
-      ctxFiles: [...(activeChip ? [activeChip] : []), ...extraFiles],
-      ctxChanges: includeChanges && changedFileCount > 0 ? changedFileCount : undefined,
-      ctxImages: imagePaths.length || undefined,
+      content: draft.shownText,
+      ctxFiles: draft.ctxFiles,
+      ctxChanges: draft.ctxChanges,
+      ctxImages: draft.ctxImages,
     };
     const assistantId = `a-${now + 1}`;
     const assistantMsg: UiChatMessage = {
@@ -628,15 +688,18 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     };
 
     const historyPayload = [
-      ...messages.map((m) => ({ role: m.role, content: m.content })),
-      { role: 'user', content: buildContextPrefix() + imageNote + shownText },
+      ...messagesRef.current.map((m) => ({ role: m.role, content: m.content })),
+      { role: 'user', content: draft.promptText },
     ];
 
+    const runId = ++runSeqRef.current;
+    activeTurnIdRef.current = null;
+    activeAssistantIdRef.current = assistantId;
+    pendingFollowupRef.current = null;
+    updateQueuedSteers(() => []);
+
     setMessages((prev) => [...prev, userMsg, assistantMsg]);
-    setInput('');
-    images.forEach((i) => URL.revokeObjectURL(i.url));
-    setImages([]);
-    setAtRange(null);
+    runningRef.current = true;
     setRunning(true);
     stickRef.current = true;
     setAtBottom(true);
@@ -644,23 +707,89 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
+    const patchCurrent = (fn: (m: UiChatMessage) => UiChatMessage) => {
+      const id = activeAssistantIdRef.current;
+      if (id) patchAssistant(id, fn);
+    };
+
     try {
       await streamAgentChat(
         config,
         historyPayload,
         {
+          onTurn: (tid) => {
+            if (runSeqRef.current !== runId) return;
+            activeTurnIdRef.current = tid;
+          },
+          onSteerApplied: (ev) => {
+            if (runSeqRef.current !== runId) return;
+            const meta = queuedSteersRef.current.find((s) => s.steerId === ev.steer_id);
+            updateQueuedSteers((prev) => prev.filter((s) => s.steerId !== ev.steer_id));
+
+            const ts = Date.now();
+            const prevId = activeAssistantIdRef.current;
+            const nextAssistantId = `a-${ts}-${Math.random().toString(36).slice(2, 6)}`;
+            activeAssistantIdRef.current = nextAssistantId;
+
+            const steerUserMsg: UiChatMessage = {
+              id: `u-${ts}-${Math.random().toString(36).slice(2, 6)}`,
+              role: 'user',
+              content: meta?.shownText ?? ev.text,
+              ctxFiles: meta?.ctxFiles?.length ? meta.ctxFiles : undefined,
+              ctxChanges: meta?.ctxChanges,
+              ctxImages: meta?.ctxImages,
+            };
+            const nextAssistantMsg: UiChatMessage = {
+              id: nextAssistantId,
+              role: 'assistant',
+              content: '',
+              tools: [],
+              streaming: true,
+              startedAt: ts,
+              engine: engineShort,
+            };
+
+            setMessages((prev) => {
+              const out: UiChatMessage[] = [];
+              for (const m of prev) {
+                if (m.id === prevId) {
+                  const hasOutput =
+                    !!m.content || (m.tools && m.tools.length > 0) || !!m.error || !!m.checkpoint;
+                  if (hasOutput) {
+                    out.push({ ...m, streaming: false, endedAt: ts });
+                  }
+                } else {
+                  out.push(m);
+                }
+              }
+              return [...out, steerUserMsg, nextAssistantMsg];
+            });
+            stickRef.current = true;
+            setAtBottom(true);
+          },
+          onSteerCancelled: (ev) => {
+            if (runSeqRef.current !== runId) return;
+            const meta = queuedSteersRef.current.find((s) => s.steerId === ev.steer_id);
+            updateQueuedSteers((prev) => prev.filter((s) => s.steerId !== ev.steer_id));
+            if (meta && ev.reason === 'turn_failed') {
+              setInput((cur) => (cur.trim() ? cur : meta.shownText));
+            }
+          },
           // The backend emits one `text` event per model turn (not token deltas), so
           // consecutive events are separate paragraphs.
-          onText: (text) =>
-            patchAssistant(assistantId, (m) => ({
+          onText: (text) => {
+            if (runSeqRef.current !== runId) return;
+            patchCurrent((m) => ({
               ...m,
               content: m.content ? `${m.content}\n\n${text}` : text,
               parts: [...(m.parts ?? []), { kind: 'text', text }],
               firstOutputAt: m.firstOutputAt ?? Date.now(),
-            })),
+            }));
+          },
           // Token-level streaming: fragments extend the current paragraph.
-          onTextDelta: (delta) =>
-            patchAssistant(assistantId, (m) => {
+          onTextDelta: (delta) => {
+            if (runSeqRef.current !== runId) return;
+            patchCurrent((m) => {
               const parts = [...(m.parts ?? [])];
               const last = parts[parts.length - 1];
               if (last?.kind === 'text') parts[parts.length - 1] = { kind: 'text', text: last.text + delta };
@@ -671,13 +800,19 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 parts,
                 firstOutputAt: m.firstOutputAt ?? Date.now(),
               };
-            }),
+            });
+          },
           onSession: (sess) => {
+            if (runSeqRef.current !== runId) return;
             resumeIdsRef.current[sessionKey(threadId, config.provider)] = sess.resume_id;
           },
-          onCommands: setCommands,
-          onToolCall: (call) =>
-            patchAssistant(assistantId, (m) => {
+          onCommands: (cmds) => {
+            if (runSeqRef.current !== runId) return;
+            setCommands(cmds);
+          },
+          onToolCall: (call) => {
+            if (runSeqRef.current !== runId) return;
+            patchCurrent((m) => {
               const parts = [...(m.parts ?? [])];
               const last = parts[parts.length - 1];
               if (last?.kind === 'tools') parts[parts.length - 1] = { kind: 'tools', ids: [...last.ids, call.id] };
@@ -688,51 +823,177 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 parts,
                 firstOutputAt: m.firstOutputAt ?? Date.now(),
               };
-            }),
+            });
+          },
           onToolResult: (res) => {
-            patchAssistant(assistantId, (m) => ({
-              ...m,
-              tools: (m.tools || []).map((t) =>
-                t.id === res.id ? { ...t, result: res.result, endedAt: Date.now() } : t
-              ),
-            }));
+            if (runSeqRef.current !== runId) return;
+            // Match across all messages so a tool started before a mid-turn split still updates cleanly.
+            setMessages((prev) =>
+              prev.map((m) =>
+                m.tools?.some((t) => t.id === res.id)
+                  ? {
+                      ...m,
+                      tools: m.tools.map((t) =>
+                        t.id === res.id ? { ...t, result: res.result, endedAt: Date.now() } : t
+                      ),
+                    }
+                  : m
+              )
+            );
             if (['write_file', 'edit_file', 'symbol_edit', 'ast'].includes(res.name)) {
               onRefreshGit();
             }
           },
           onCheckpoint: (cp) => {
-            patchAssistant(assistantId, (m) => ({ ...m, checkpoint: cp }));
+            if (runSeqRef.current !== runId) return;
+            patchCurrent((m) => ({ ...m, checkpoint: cp }));
             onRefreshGit();
           },
-          onPermissionRequest: (req) =>
+          onPermissionRequest: (req) => {
+            if (runSeqRef.current !== runId) return;
             setPermRequests((prev) =>
               prev.some((r) => r.request_id === req.request_id) ? prev : [...prev, req]
-            ),
-          onPermissionCancel: (id) => setPermRequests((prev) => prev.filter((r) => r.request_id !== id)),
-          onUserQuestion: (req) =>
-            setQuestions((prev) => (prev.some((q) => q.request_id === req.request_id) ? prev : [...prev, req])),
-          onError: (msg) => patchAssistant(assistantId, (m) => ({ ...m, error: msg })),
+            );
+          },
+          onPermissionCancel: (id) => {
+            if (runSeqRef.current !== runId) return;
+            setPermRequests((prev) => prev.filter((r) => r.request_id !== id));
+          },
+          onUserQuestion: (req) => {
+            if (runSeqRef.current !== runId) return;
+            setQuestions((prev) => (prev.some((q) => q.request_id === req.request_id) ? prev : [...prev, req]));
+          },
+          onError: (msg) => {
+            if (runSeqRef.current !== runId) return;
+            patchCurrent((m) => ({ ...m, error: msg }));
+          },
           onDone: () => {
-            patchAssistant(assistantId, (m) => ({ ...m, streaming: false, endedAt: Date.now() }));
+            if (runSeqRef.current !== runId) return;
+            patchCurrent((m) => ({ ...m, streaming: false, endedAt: Date.now() }));
+            runningRef.current = false;
             setRunning(false);
             setPermRequests([]);
             setQuestions([]);
+            activeTurnIdRef.current = null;
+            activeAssistantIdRef.current = null;
+            updateQueuedSteers(() => []);
             onRefreshGit();
+
+            const followup = pendingFollowupRef.current;
+            if (followup) {
+              pendingFollowupRef.current = null;
+              queueMicrotask(() => {
+                void sendPromptWithDraft(followup);
+              });
+            }
           },
         },
         ctrl.signal,
         threadRulesRef.current[threadId],
-        supportsSessions(config.provider)
-          ? { threadId, resumeId: resumeIdsRef.current[sessionKey(threadId, config.provider)] }
-          : undefined
+        {
+          threadId,
+          resumeId: supportsSessions(config.provider)
+            ? resumeIdsRef.current[sessionKey(threadId, config.provider)]
+            : undefined,
+        }
       );
     } catch (e: unknown) {
+      if (runSeqRef.current !== runId) return;
       if ((e as Error).name !== 'AbortError') {
-        patchAssistant(assistantId, (m) => ({ ...m, error: String(e), streaming: false, endedAt: Date.now() }));
+        patchCurrent((m) => ({ ...m, error: String(e), streaming: false, endedAt: Date.now() }));
       }
+      runningRef.current = false;
       setRunning(false);
       setPermRequests([]);
       setQuestions([]);
+      clearActiveTurnState();
+    }
+  };
+
+  const sendPrompt = async () => {
+    if (runningRef.current) {
+      await steerPrompt('steer');
+      return;
+    }
+    const draft = takeDraftFromComposer();
+    if (!draft) return;
+    await sendPromptWithDraft(draft);
+  };
+
+  const steerPrompt = async (mode: SteerMode = 'steer') => {
+    if (!runningRef.current) {
+      await sendPrompt();
+      return;
+    }
+    if (sendingSteer || imagesBusy) return;
+    const draft = takeDraftFromComposer();
+    if (!draft) return;
+
+    setSendingSteer(true);
+    try {
+      const res = await api.steerAgent(threadId, activeTurnIdRef.current, draft.promptText, mode);
+      if (res.accepted && res.steer_id) {
+        updateQueuedSteers((prev) => [
+          ...prev,
+          {
+            ...draft,
+            steerId: res.steer_id!,
+            turnId: res.turn_id ?? activeTurnIdRef.current ?? '',
+            mode,
+          },
+        ]);
+      } else if (runningRef.current) {
+        // Turn ended right as steer arrived: promote automatically when onDone fires.
+        pendingFollowupRef.current = draft;
+      } else {
+        void sendPromptWithDraft(draft);
+      }
+    } catch (e: unknown) {
+      setInput((prev) => (prev.trim() ? `${draft.shownText}\n${prev}` : draft.shownText));
+      onToast(e instanceof Error ? e.message : 'Failed to steer agent', true);
+    } finally {
+      setSendingSteer(false);
+    }
+  };
+
+  const cancelQueuedSteer = async (item: QueuedSteer) => {
+    try {
+      const res = await api.cancelSteer(threadId, item.turnId, item.steerId);
+      if (res.cancelled) {
+        updateQueuedSteers((prev) => prev.filter((s) => s.steerId !== item.steerId));
+        setInput((prev) => (prev.trim() ? `${item.shownText}\n${prev}` : item.shownText));
+        requestAnimationFrame(() => textareaRef.current?.focus());
+      } else if (!runningRef.current) {
+        updateQueuedSteers((prev) => prev.filter((s) => s.steerId !== item.steerId));
+      }
+    } catch {
+      // ignore — steer may have already been applied
+    }
+  };
+
+  const promoteQueuedSteer = async (item: QueuedSteer) => {
+    try {
+      const cancelled = await api.cancelSteer(threadId, item.turnId, item.steerId);
+      if (!cancelled.cancelled) return;
+      updateQueuedSteers((prev) => prev.filter((s) => s.steerId !== item.steerId));
+      const res = await api.steerAgent(threadId, activeTurnIdRef.current, item.promptText, 'now');
+      if (res.accepted && res.steer_id) {
+        updateQueuedSteers((prev) => [
+          ...prev,
+          {
+            ...item,
+            steerId: res.steer_id!,
+            turnId: res.turn_id ?? activeTurnIdRef.current ?? '',
+            mode: 'now',
+          },
+        ]);
+      } else if (runningRef.current) {
+        pendingFollowupRef.current = item;
+      } else {
+        void sendPromptWithDraft(item);
+      }
+    } catch (e: unknown) {
+      onToast(e instanceof Error ? e.message : 'Failed to send immediately', true);
     }
   };
 
@@ -760,20 +1021,26 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   };
 
   const stopGeneration = () => {
+    runSeqRef.current += 1;
     abortRef.current?.abort();
+    runningRef.current = false;
     setRunning(false);
     setPermRequests([]);
     setQuestions([]);
+    clearActiveTurnState();
     setMessages((prev) =>
       prev.map((m) => (m.streaming ? { ...m, streaming: false, endedAt: Date.now() } : m))
     );
   };
 
   const newThread = () => {
+    runSeqRef.current += 1;
     abortRef.current?.abort();
+    runningRef.current = false;
     setRunning(false);
     setPermRequests([]);
     setQuestions([]);
+    clearActiveTurnState();
     setMessages([]);
     setExpandedTools({});
     setGroupOpen({});
@@ -784,10 +1051,13 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   };
 
   const openThread = (t: AgentThread) => {
+    runSeqRef.current += 1;
     abortRef.current?.abort();
+    runningRef.current = false;
     setRunning(false);
     setPermRequests([]);
     setQuestions([]);
+    clearActiveTurnState();
     Object.assign(resumeIdsRef.current, t.resumeIds ?? {});
     setMessages(t.messages);
     setExpandedTools({});
@@ -802,8 +1072,11 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     setThreadStore((prev) => ({ ws: prev.ws, list: prev.list.filter((t) => t.id !== id) }));
     api.closeSession(id).catch(() => {});
     if (id === threadId) {
+      runSeqRef.current += 1;
       abortRef.current?.abort();
+      runningRef.current = false;
       setRunning(false);
+      clearActiveTurnState();
       setMessages([]);
       setThreadId(newThreadId());
     }
@@ -1279,6 +1552,49 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
       {/* Zone 4: composer + quiet mode footer */}
       <div className="px-3 pb-3 pt-2 shrink-0">
+        {queuedSteers.length > 0 && (
+          <div className="mb-1.5 space-y-1">
+            {queuedSteers.map((item) => {
+              const waitingApproval = permRequests.length > 0 || questions.length > 0;
+              const statusLabel = waitingApproval
+                ? 'Waiting on confirmation above'
+                : item.mode === 'now'
+                  ? 'Sending now…'
+                  : 'Queued to steer…';
+              return (
+                <div
+                  key={item.steerId}
+                  className="flex items-center gap-2 h-7 pl-2.5 pr-1.5 rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[11.5px]"
+                >
+                  <span className="shrink-0 text-[10.5px] font-medium text-[var(--accent)]">
+                    {statusLabel}
+                  </span>
+                  <span className="truncate flex-1 min-w-0 text-[var(--text-primary)]" title={item.shownText}>
+                    {item.shownText}
+                  </span>
+                  {item.mode !== 'now' && (
+                    <button
+                      type="button"
+                      onClick={() => void promoteQueuedSteer(item)}
+                      className="shrink-0 h-5 px-1.5 rounded text-[11px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
+                      title="Interrupt the current step and apply this immediately"
+                    >
+                      Send now
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void cancelQueuedSteer(item)}
+                    className="shrink-0 w-5 h-5 flex items-center justify-center rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
+                    title="Cancel queued message and return it to the composer"
+                  >
+                    <X size={11} />
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        )}
         <div className="relative rounded-lg border border-[var(--border)] bg-[var(--bg-input)] focus-within:border-[var(--accent)] transition-colors">
           {/* Pasted image thumbnails */}
           {images.length > 0 && (
@@ -1464,7 +1780,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               }
               if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
-                sendPrompt();
+                if (running) void steerPrompt('steer');
+                else void sendPrompt();
               } else if (e.key === 'Escape' && running) {
                 stopGeneration();
               }
@@ -1477,7 +1794,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             }}
             rows={1}
             style={{ minHeight: 44 }}
-            placeholder="Chat with Agent"
+            placeholder={running ? 'Steer agent mid-turn…' : 'Chat with Agent'}
             className={`block w-full px-2.5 ${hasContext || images.length > 0 ? 'pt-1.5' : 'pt-2.5'} pb-1.5 text-[12.5px] leading-[1.45] bg-transparent text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none`}
           />
 
@@ -1499,9 +1816,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               <div className="relative min-w-0">
                 <button
                   data-pop="engine"
+                  disabled={running}
                   onClick={() => setShowModelMenu((v) => !v)}
-                  className="flex items-center gap-1.5 max-w-full h-6 px-1.5 rounded-md text-[11.5px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
-                  title={`${engineName} · ${config.model} — ${engineStatus.text}`}
+                  className="flex items-center gap-1.5 max-w-full h-6 px-1.5 rounded-md text-[11.5px] text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 disabled:cursor-not-allowed cursor-pointer transition-colors"
+                  title={running ? 'Finish or stop the current turn to switch engines' : `${engineName} · ${config.model} — ${engineStatus.text}`}
                 >
                   {!engineStatus.ok && (
                     <span className="w-1.5 h-1.5 rounded-full shrink-0" style={{ background: WARN_DOT }} />
@@ -1645,16 +1963,28 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
             <div className="flex items-center gap-1 shrink-0">
               {running ? (
-                <button
-                  onClick={stopGeneration}
-                  className="w-6 h-6 flex items-center justify-center rounded-md bg-[var(--danger)] text-white cursor-pointer"
-                  title="Stop (Esc)"
-                >
-                  <Square size={11} />
-                </button>
+                <>
+                  {(input.trim().length > 0 || readyImages.length > 0) && (
+                    <button
+                      onClick={() => void steerPrompt('steer')}
+                      disabled={imagesBusy || sendingSteer}
+                      className="w-6 h-6 flex items-center justify-center rounded-md bg-[var(--accent)] text-white disabled:opacity-40 cursor-pointer hover:opacity-95 transition-opacity"
+                      title="Steer agent (Enter)"
+                    >
+                      <ArrowUp size={13} />
+                    </button>
+                  )}
+                  <button
+                    onClick={stopGeneration}
+                    className="w-6 h-6 flex items-center justify-center rounded-md bg-[var(--danger)] text-white cursor-pointer"
+                    title="Stop (Esc)"
+                  >
+                    <Square size={11} />
+                  </button>
+                </>
               ) : (
                 <button
-                  onClick={sendPrompt}
+                  onClick={() => void sendPrompt()}
                   disabled={(!input.trim() && readyImages.length === 0) || imagesBusy}
                   className="w-6 h-6 flex items-center justify-center rounded-md bg-[var(--accent)] text-white disabled:opacity-40 cursor-pointer hover:opacity-95 transition-opacity"
                   title="Send (Enter)"

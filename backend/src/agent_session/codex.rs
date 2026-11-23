@@ -9,13 +9,14 @@ use super::codex_events::{self, Approval, CodexEvents};
 use super::commands;
 use super::jsonrpc::{Incoming, RpcClient, RpcError};
 use super::process::{self, failure_text};
+use super::steer::{emit_steer_applied, emit_steer_cancelled, ActiveTurnEntry, SteerDelivery, SteerItem, SteerMode};
 use super::types::{wants_model, SlashCommand, SseTx, TurnEnd, TurnInput};
 use crate::agent::send_sse;
 use crate::checkpoint::TurnTracker;
 use crate::cli_agent::{codex_app_server_args, emit, Out, PendingGuard, PermMode};
 use crate::state::{AppState, PermissionDecision};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -294,15 +295,21 @@ impl CodexSession {
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let _pending = PendingGuard { state: state.clone(), turn_id: turn_id.clone() };
+        let active_turn = state.active_turns.register(&input.thread_id, &turn_id);
+        send_sse(tx, "turn", json!({ "turn_id": turn_id })).await;
+
         if let Ok(mut e) = self.events.lock() {
             e.begin_turn();
         }
         turn.begin(state).await;
 
         let (method, params) = self.start_request(input);
+        let steerable = method == "turn/start";
         let rpc = self.rpc.clone();
-        let mut start = tokio::spawn(async move { rpc.request(method, params).await });
-        let end = self.pump(state, tx, turn, &mut incoming, &turn_id, &mut start).await;
+        let start = tokio::spawn(async move { rpc.request(method, params).await });
+        let end = self
+            .pump(state, tx, turn, &mut incoming, &turn_id, input, active_turn.entry(), start, steerable)
+            .await;
         turn.finish(state, Some(tx)).await;
         if end == TurnEnd::Broken {
             self.shutdown();
@@ -322,35 +329,114 @@ impl CodexSession {
         turn: &mut TurnTracker,
         incoming: &mut mpsc::UnboundedReceiver<Incoming>,
         turn_id: &str,
-        start: &mut tokio::task::JoinHandle<Result<Value, RpcError>>,
+        input: &TurnInput,
+        active_turn: &Arc<ActiveTurnEntry>,
+        mut start: tokio::task::JoinHandle<Result<Value, RpcError>>,
+        mut turn_steerable: bool,
     ) -> TurnEnd {
         let mut codex_turn: Option<String> = None;
         let mut start_done = false;
+        let mut steer_rpc: Option<(SteerItem, tokio::task::JoinHandle<Result<Value, RpcError>>)> = None;
+        let mut pending_followup: VecDeque<(SteerItem, bool)> = VecDeque::new();
+        let mut preempting = false;
+        let mut last_turn_failed = false;
+        let open_approvals: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+
         loop {
+            // Dispatch any queued steers once we have the active Codex turn id.
+            if let Some(ref active_codex_turn) = codex_turn {
+                if !preempting && steer_rpc.is_none() {
+                    if active_turn.has_now_pending() {
+                        if let Some(item) = active_turn.try_pop_now_or_front() {
+                            preempting = true;
+                            pending_followup.push_front((item, true));
+                            self.cancel_open_approvals(state, tx, turn_id, &open_approvals).await;
+                            let rpc = self.rpc.clone();
+                            let tid = self.thread_id.clone();
+                            let cturn = active_codex_turn.clone();
+                            tokio::spawn(async move {
+                                let _ = rpc
+                                    .request("turn/interrupt", json!({ "threadId": tid, "turnId": cturn }))
+                                    .await;
+                            });
+                        }
+                    } else if turn_steerable {
+                        if let Some(item) = active_turn.try_pop() {
+                            let rpc = self.rpc.clone();
+                            let params = json!({
+                                "threadId": self.thread_id,
+                                "expectedTurnId": active_codex_turn,
+                                "input": [{ "type": "text", "text": item.text }],
+                            });
+                            let handle = tokio::spawn(async move { rpc.request("turn/steer", params).await });
+                            steer_rpc = Some((item, handle));
+                        }
+                    }
+                }
+            }
+
+            let can_dispatch = codex_turn.is_some() && !preempting && steer_rpc.is_none();
+
             tokio::select! {
                 _ = tx.closed() => {
+                    let _ = active_turn.force_close_and_drain();
                     if codex_turn.is_none() && !start_done {
-                        if let Ok(Ok(Ok(r))) = tokio::time::timeout(Duration::from_secs(5), &mut *start).await {
+                        if let Ok(Ok(Ok(r))) = tokio::time::timeout(Duration::from_secs(5), &mut start).await {
                             codex_turn = r["turn"]["id"].as_str().map(str::to_string);
                         }
                     }
                     return self.interrupt(codex_turn, turn, incoming).await;
                 }
-                res = &mut *start, if !start_done => {
+                _ = active_turn.notified(), if can_dispatch => {
+                    // Loop iteration will pop and dispatch the newly enqueued steer.
+                }
+                res = &mut start, if !start_done => {
                     start_done = true;
                     match res {
-                        Ok(Ok(r)) => codex_turn = r["turn"]["id"].as_str().map(str::to_string),
+                        Ok(Ok(r)) => {
+                            if codex_turn.is_none() {
+                                codex_turn = r["turn"]["id"].as_str().map(str::to_string);
+                            }
+                        }
                         Ok(Err(e)) => {
+                            self.cancel_remaining_steers(tx, active_turn, &mut pending_followup, "turn_failed").await;
                             send_sse(tx, "error", json!({ "message": format!("Codex rejected the request: {e}") })).await;
                             return TurnEnd::Done;
                         }
-                        Err(_) => return TurnEnd::Broken,
+                        Err(_) => {
+                            self.cancel_remaining_steers(tx, active_turn, &mut pending_followup, "turn_failed").await;
+                            return TurnEnd::Broken;
+                        }
+                    }
+                }
+                res = async { (&mut steer_rpc.as_mut().unwrap().1).await }, if steer_rpc.is_some() => {
+                    let (item, _) = steer_rpc.take().unwrap();
+                    match res {
+                        Ok(Ok(_)) => {
+                            emit_steer_applied(tx, &item, SteerDelivery::MidTurn).await;
+                        }
+                        Ok(Err(e)) => {
+                            let lower = e.message.to_lowercase();
+                            if lower.contains("notsteerable") || lower.contains("not steerable") {
+                                turn_steerable = false;
+                                active_turn.requeue_front(item);
+                            } else {
+                                // NoActiveTurn / ExpectedTurnMismatch: chain after turn/completed.
+                                pending_followup.push_back((item, false));
+                            }
+                        }
+                        Err(_) => {
+                            pending_followup.push_back((item, false));
+                        }
                     }
                 }
                 msg = incoming.recv() => match msg {
                     Some(Incoming::Notification { method, params }) => {
                         if method == "turn/started" && codex_turn.is_none() {
                             codex_turn = params["turn"]["id"].as_str().map(str::to_string);
+                        }
+                        if method == "turn/completed" {
+                            last_turn_failed = params["turn"]["status"].as_str() == Some("failed");
                         }
                         let outs = self.events.lock().map(|mut e| e.feed(&method, &params)).unwrap_or_default();
                         for ev in outs {
@@ -360,13 +446,71 @@ impl CodexSession {
                             emit(state, tx, ev).await;
                         }
                         if self.finished() {
+                            // Resolve any in-flight `turn/steer` RPC before deciding whether to chain.
+                            if let Some((item, handle)) = steer_rpc.take() {
+                                match tokio::time::timeout(Duration::from_secs(2), handle).await {
+                                    Ok(Ok(Ok(_))) => {
+                                        emit_steer_applied(tx, &item, SteerDelivery::MidTurn).await;
+                                    }
+                                    _ => {
+                                        pending_followup.push_front((item, false));
+                                    }
+                                }
+                            }
+
+                            if last_turn_failed && !preempting {
+                                self.cancel_remaining_steers(tx, active_turn, &mut pending_followup, "turn_failed").await;
+                                return TurnEnd::Done;
+                            }
+
+                            let next = pending_followup.pop_front().or_else(|| {
+                                active_turn
+                                    .try_close_if_empty()
+                                    .map(|i| (i.clone(), i.mode == SteerMode::Now))
+                            });
+                            if let Some((item, was_preempt)) = next {
+                                turn.finish(state, Some(tx)).await;
+                                *turn = TurnTracker::new(input.auto_cp);
+                                turn.begin(state).await;
+                                if let Ok(mut e) = self.events.lock() {
+                                    e.begin_turn();
+                                }
+                                let delivery = if was_preempt || preempting {
+                                    SteerDelivery::Preempted
+                                } else {
+                                    SteerDelivery::Continuation
+                                };
+                                emit_steer_applied(tx, &item, delivery).await;
+
+                                let next_input = TurnInput {
+                                    thread_id: input.thread_id.clone(),
+                                    prompt: item.text,
+                                    model: input.model.clone(),
+                                    mode: input.mode,
+                                    auto_cp: input.auto_cp,
+                                };
+                                let (next_method, next_params) = self.start_request(&next_input);
+                                turn_steerable = next_method == "turn/start";
+                                let rpc = self.rpc.clone();
+                                start = tokio::spawn(async move { rpc.request(next_method, next_params).await });
+                                start_done = false;
+                                codex_turn = None;
+                                preempting = false;
+                                last_turn_failed = false;
+                                continue;
+                            }
                             return TurnEnd::Done;
                         }
                     }
                     Some(Incoming::Request { id, method, params }) => {
-                        self.on_request(state, tx, turn_id, id, &method, &params).await;
+                        if preempting {
+                            self.rpc.respond_error(&id, -32000, "Preempted by a newer instruction.");
+                        } else {
+                            self.on_request(state, tx, turn_id, id, &method, &params, &open_approvals).await;
+                        }
                     }
                     Some(Incoming::Closed) | None => {
+                        self.cancel_remaining_steers(tx, active_turn, &mut pending_followup, "turn_failed").await;
                         if !self.finished() {
                             let text = failure_text("Codex", None, &self.stderr);
                             send_sse(tx, "error", json!({ "message": text })).await;
@@ -375,6 +519,38 @@ impl CodexSession {
                     }
                 },
             }
+        }
+    }
+
+    async fn cancel_open_approvals(
+        &self,
+        state: &AppState,
+        tx: &SseTx,
+        turn_id: &str,
+        open_approvals: &Arc<Mutex<HashMap<String, Value>>>,
+    ) {
+        let items: Vec<(String, Value)> = open_approvals
+            .lock()
+            .map(|mut m| m.drain().collect())
+            .unwrap_or_default();
+        for (req_id, rpc_id) in items {
+            broker::cancel_permission(state, tx, turn_id, &req_id).await;
+            self.rpc.respond_error(&rpc_id, -32000, "Preempted by a newer instruction.");
+        }
+    }
+
+    async fn cancel_remaining_steers(
+        &self,
+        tx: &SseTx,
+        active_turn: &Arc<ActiveTurnEntry>,
+        pending_followup: &mut VecDeque<(SteerItem, bool)>,
+        reason: &str,
+    ) {
+        for (item, _) in pending_followup.drain(..) {
+            emit_steer_cancelled(tx, &item.steer_id, reason).await;
+        }
+        for item in active_turn.force_close_and_drain() {
+            emit_steer_cancelled(tx, &item.steer_id, reason).await;
         }
     }
 
@@ -425,6 +601,7 @@ impl CodexSession {
         id: Value,
         method: &str,
         params: &Value,
+        open_approvals: &Arc<Mutex<HashMap<String, Value>>>,
     ) {
         let rpc = self.rpc.clone();
         let request_id = id.to_string();
@@ -447,8 +624,16 @@ impl CodexSession {
                 let available = params["availableDecisions"].clone();
                 let granted = params["permissions"].clone();
                 let kind = method.to_string();
+                let rid_key = request_id.clone();
+                if let Ok(mut m) = open_approvals.lock() {
+                    m.insert(rid_key.clone(), id.clone());
+                }
+                let open = open_approvals.clone();
                 let prompt = PermissionPrompt { request_id, tool, input };
                 broker::ask_permission(state, tx, turn_id, &self.rules, prompt, move |d| {
+                    if let Ok(mut m) = open.lock() {
+                        m.remove(&rid_key);
+                    }
                     let body = if kind == "item/permissions/requestApproval" {
                         permissions_response(d, &granted)
                     } else {
@@ -460,9 +645,19 @@ impl CodexSession {
             }
             "item/tool/requestUserInput" => {
                 let questions = codex_events::parse_questions(params);
-                broker::ask_questions(state, tx, turn_id, &request_id, &questions, move |answers| match answers {
-                    Some(a) => rpc.respond(&id, codex_events::question_response(&a)),
-                    None => rpc.respond(&id, json!({ "answers": {} })),
+                let rid_key = request_id.clone();
+                if let Ok(mut m) = open_approvals.lock() {
+                    m.insert(rid_key.clone(), id.clone());
+                }
+                let open = open_approvals.clone();
+                broker::ask_questions(state, tx, turn_id, &request_id, &questions, move |answers| {
+                    if let Ok(mut m) = open.lock() {
+                        m.remove(&rid_key);
+                    }
+                    match answers {
+                        Some(a) => rpc.respond(&id, codex_events::question_response(&a)),
+                        None => rpc.respond(&id, json!({ "answers": {} })),
+                    }
                 })
                 .await;
             }
@@ -474,12 +669,20 @@ impl CodexSession {
                     rpc.respond(&id, json!({ "action": "decline" }));
                     return;
                 }
+                let rid_key = request_id.clone();
+                if let Ok(mut m) = open_approvals.lock() {
+                    m.insert(rid_key.clone(), id.clone());
+                }
+                let open = open_approvals.clone();
                 let prompt = PermissionPrompt {
                     request_id,
                     tool: format!("mcp:{server}"),
                     input: json!({ "message": message }),
                 };
                 broker::ask_permission(state, tx, turn_id, &self.rules, prompt, move |d| {
+                    if let Ok(mut m) = open.lock() {
+                        m.remove(&rid_key);
+                    }
                     let body = if d.allow { json!({ "action": "accept", "content": {} }) } else { json!({ "action": "decline" }) };
                     rpc.respond(&id, body);
                 })

@@ -10,6 +10,16 @@ pub(crate) fn user_message_line(prompt: &str) -> String {
     .to_string()
 }
 
+pub(crate) fn steer_user_message_line(prompt: &str, uuid: &str, priority: &str) -> String {
+    json!({
+        "type": "user",
+        "uuid": uuid,
+        "priority": priority,
+        "message": { "role": "user", "content": [{ "type": "text", "text": prompt }] }
+    })
+    .to_string()
+}
+
 pub(crate) fn control_response(request_id: &str, allow: bool, input: &Value) -> String {
     let body = if allow {
         json!({ "behavior": "allow", "updatedInput": input })

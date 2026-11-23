@@ -385,3 +385,24 @@ export interface CliToolStatus {
   path?: string | null;
   install_hint: string;
 }
+
+export type SteerMode = 'steer' | 'now';
+export type SteerDelivery = 'mid_turn' | 'continuation' | 'preempted';
+
+export interface SteerAppliedEvent {
+  steer_id: string;
+  text: string;
+  delivery: SteerDelivery;
+}
+
+export interface SteerCancelledEvent {
+  steer_id: string;
+  reason: 'user_cancelled' | 'turn_failed' | 'stopped' | string;
+}
+
+export interface SteerRes {
+  accepted: boolean;
+  steer_id?: string;
+  turn_id?: string;
+  reason?: string;
+}

@@ -111,6 +111,9 @@ impl Normalizer {
             // Token-level streaming (`--include-partial-messages`). Sub-agent output is skipped
             // here; it still arrives whole through the `assistant` event.
             Some("stream_event") => {
+                if self.finished {
+                    self.finished = false;
+                }
                 if !v["parent_tool_use_id"].is_null() {
                     return out;
                 }
@@ -139,6 +142,9 @@ impl Normalizer {
                 }
             }
             Some("assistant") => {
+                if self.finished {
+                    self.finished = false;
+                }
                 let msg = &v["message"];
                 // Claude Code fabricates "synthetic" assistant messages for errors such as
                 // "Not logged in"; the matching `result` event reports them, so skip the echo.
@@ -170,6 +176,9 @@ impl Normalizer {
                 }
             }
             Some("user") => {
+                if self.finished {
+                    self.finished = false;
+                }
                 // Output of a local slash command (`/context`, `/cost`, …) is echoed as a user
                 // message wrapped in `<local-command-stdout>`.
                 if let Some(text) = local_command_output(&v["message"]["content"]) {
@@ -209,6 +218,12 @@ impl Normalizer {
                         .unwrap_or_else(|| format!("{label} reported an error."));
                     out.push(Out::Error(msg));
                 }
+                // Reset per-turn streaming state immediately so an auto-chained turn arriving
+                // on stdout before pump() reacts does not inherit stale paragraph/dedup flags.
+                self.turn_text = false;
+                self.pending_break = false;
+                self.cur_msg = None;
+                self.streamed_msgs.clear();
             }
             _ => {}
         }

@@ -83,4 +83,4 @@ pub use permissions::answer_permission;
 pub(crate) use permissions::{permission_rule, permission_summary, rule_allows, PendingGuard};
 pub(crate) use prompt::build_prompt;
 pub(crate) use tools::{map_vx, map_vx_mcp_tool, rel_path, simplify_command, tail_chars};
-pub(crate) use wire::{control_error, control_request, control_response, user_message_line};
+pub(crate) use wire::{control_error, control_request, control_response, steer_user_message_line, user_message_line};
