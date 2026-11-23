@@ -61,6 +61,7 @@ import {
 import { CommitGraphSvg, GraphRails, graphColumnWidth } from './CommitGraphSvg';
 import { useCommitHover } from './CommitHoverCard';
 import { BranchBar } from './BranchBar';
+import { isPushRejected, pullThenPush } from '../utils/gitSync';
 import { fileStatusColor, RefBadges, SyncMark } from './GitBadges';
 
 function plural(n: number, word: string) {
@@ -501,6 +502,16 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
           if (pushRes.stderr.includes('has no upstream')) {
             const retry = await api.gitPush(true);
             if (!retry.ok) throw new Error(retry.stderr || 'Push failed');
+          } else if (isPushRejected(pushRes.stderr || pushRes.stdout)) {
+            onToast('Committed, but push rejected: the remote has commits you don’t have.', true, {
+              label: 'Pull (rebase) & push',
+              run: () =>
+                void runAction(async () => {
+                  await pullThenPush('rebase');
+                  onToast('Rebased onto remote and pushed');
+                }),
+            });
+            return;
           } else {
             throw new Error(pushRes.stderr || 'Push failed');
           }

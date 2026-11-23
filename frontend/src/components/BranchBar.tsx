@@ -21,8 +21,9 @@ import {
   Trash2,
 } from 'lucide-react';
 import { api } from '../api';
-import type { BranchesRes, BranchInfo, GitStatusRes } from '../types';
+import type { BranchesRes, BranchInfo, GitStatusRes, ToastAction } from '../types';
 import { SyncCounts } from './GitBadges';
+import { isPushRejected, pullThenPush } from '../utils/gitSync';
 
 /* ------------------------------------------------------------------------- */
 /* Helpers                                                                   */
@@ -109,7 +110,7 @@ interface BranchBarProps {
   busy: boolean;
   uncommittedCount: number;
   runAction: (fn: () => Promise<void>) => Promise<void>;
-  onToast: (msg: string, isError?: boolean) => void;
+  onToast: (msg: string, isError?: boolean, action?: ToastAction) => void;
   onRefreshBranches: () => void;
   /** Opens the "publish to GitHub / add remote" dialog. */
   onOpenPublish: (mode: 'github' | 'remote') => void;
@@ -190,8 +191,12 @@ export const BranchBar: React.FC<BranchBarProps> = ({
       const res = await api.gitPush(false);
       if (!res.ok) {
         const msg = res.stderr || res.stdout || 'Push failed';
-        if (/rejected|fetch first|non-fast-forward/i.test(msg)) {
-          throw new Error('Push rejected: the remote has commits you don’t have. Pull first, then push.');
+        if (isPushRejected(msg)) {
+          onToast('Push rejected: the remote has commits you don’t have.', true, {
+            label: 'Pull (rebase) & push',
+            run: () => void doSync('rebase'),
+          });
+          return;
         }
         throw new Error(msg);
       }
@@ -207,10 +212,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
 
   const doSync = (mode: 'merge' | 'rebase') =>
     act('Syncing', async () => {
-      const pull = await api.gitPull(mode);
-      if (!pull.ok) throw new Error(pull.stderr || pull.stdout || 'Pull failed');
-      const push = await api.gitPush(false);
-      if (!push.ok) throw new Error(push.stderr || push.stdout || 'Push failed');
+      await pullThenPush(mode);
       onToast(mode === 'rebase' ? 'Rebased onto remote and pushed' : 'Merged remote changes and pushed');
     });
 
