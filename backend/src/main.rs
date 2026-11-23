@@ -305,6 +305,7 @@ fn build_router(
         .route("/api/files/tree", get(files::get_tree))
         .route("/api/files/list", get(files::list_files))
         .route("/api/files/read", get(files::read_file))
+        .route("/api/files/raw", get(files::read_raw))
         .route("/api/files/write", post(files::write_file))
         .route("/api/files/search", post(files::search_files))
         .route("/api/files/replace", post(files::replace_in_files))

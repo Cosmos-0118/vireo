@@ -342,6 +342,36 @@ pub async fn read_file(
     }))
 }
 
+/// Streams a workspace image (used by the Markdown preview for relative `![](img.png)` links).
+/// Only `image/*` files up to 20 MB are served; everything else is refused.
+pub async fn read_raw(
+    State(state): State<AppState>,
+    Query(q): Query<ReadFileQuery>,
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let full = resolve_safe_path(&ws, &q.path).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let mime = mime_guess::from_path(&full).first_or_octet_stream();
+    if mime.type_() != mime_guess::mime::IMAGE {
+        return Err((StatusCode::UNSUPPORTED_MEDIA_TYPE, "Only images are served".into()));
+    }
+    let meta = tokio::fs::metadata(&full)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    if meta.len() > 20 * 1024 * 1024 {
+        return Err((StatusCode::PAYLOAD_TOO_LARGE, "Image too large".into()));
+    }
+    let bytes = tokio::fs::read(&full)
+        .await
+        .map_err(|e| (StatusCode::NOT_FOUND, e.to_string()))?;
+    Ok(axum::response::Response::builder()
+        .header("Content-Type", mime.as_ref())
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Content-Security-Policy", "sandbox")
+        .header("Cache-Control", "no-cache")
+        .body(axum::body::Body::from(bytes))
+        .unwrap())
+}
+
 pub async fn write_file(
     State(state): State<AppState>,
     Json(req): Json<WriteFileReq>,
