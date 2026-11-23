@@ -54,13 +54,18 @@ fn resolve_target(
 }
 
 pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> Result<String, String> {
+    // `a.rs:Foo` / `a.rs:10..30` given as the path alone (MCP callers) behaves like the CLI spec.
+    let target = target.map(str::trim).filter(|t| !t.is_empty());
+    let (path, target) = match target {
+        Some(t) => (path, Some(t)),
+        None => split_view_spec(path),
+    };
     let (_, rel, doc, note) = read_doc_smart(ws, path, cwd)?;
     let prefix = note.map(|n| format!("{n}\n")).unwrap_or_default();
     let n = doc.lines.len();
     if n == 0 {
         return Ok(format!("{prefix}# {rel} (empty)\n"));
     }
-    let target = target.map(str::trim).filter(|t| !t.is_empty());
     let parts: Vec<&str> = match target {
         Some(t) if t.contains(',') => t.split(',').map(str::trim).filter(|p| !p.is_empty()).collect(),
         Some(t) => vec![t],

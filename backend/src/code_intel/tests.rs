@@ -187,7 +187,8 @@ fn search_recovers_monorepo_globs_paths_context_literal_and_files() {
         &SearchOpts { literal: true, path: Some("frontend".into()), ..Default::default() },
     )
     .unwrap();
-    assert!(lit.contains("BranchBar.tsx:2#"), "{lit}");
+    // Narrow searches include anchored context, grouped under a `# file` header.
+    assert!(lit.contains("BranchBar.tsx") && lit.contains("2#") && lit.contains("|const badge"), "{lit}");
 
     // Context (`-C 1`) returns anchored surrounding lines.
     let ctx = search(
@@ -505,7 +506,12 @@ fn familiar_parameter_names_and_range_strings_work_first_try() {
     assert!(r.contains("Replaced 1"), "{r}");
     // search with `pattern`, edit with `new_string`.
     let s = run_op(&ws, "search", &json!({"pattern": "three"})).unwrap();
-    assert!(s.contains("a.txt:3#"), "{s}");
+    assert!(s.contains("# a.txt") && s.contains("|three") && s.contains("4#"), "{s}");
+    // `path:symbol-or-range` and Read-style offset/limit both work over the MCP-style `view`.
+    let v = run_op(&ws, "view", &json!({"path": "a.txt:3..4"})).unwrap();
+    assert!(v.contains("|three") && v.contains("|four") && !v.contains("|one"), "{v}");
+    let v = run_op(&ws, "view", &json!({"file_path": "a.txt", "offset": 2, "limit": 2})).unwrap();
+    assert!(v.contains("|TWO") && v.contains("|three") && !v.contains("|four"), "{v}");
     // A whole `N#hh..M#hh` range in `start`, as printed by view/outline.
     let range = format!("2#{}..3#{}", line_hash("TWO"), line_hash("three"));
     let e = run_op(&ws, "edit", &json!({"path": "a.txt", "start": range, "new_string": "mid"})).unwrap();

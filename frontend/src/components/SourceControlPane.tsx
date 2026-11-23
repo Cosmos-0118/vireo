@@ -1501,9 +1501,11 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                 style={graphOpen ? { flex: `0 0 ${Math.round(cleanRatio * 100)}%` } : { flex: '1 1 auto' }}
                 className="flex flex-col items-center justify-center gap-2.5 min-h-0 overflow-hidden px-4 text-center"
               >
-                <span className="flex items-center justify-center w-10 h-10 rounded-xl border border-[var(--added-fg)]/25 bg-gradient-to-b from-[var(--added-fg)]/15 to-[var(--added-fg)]/5 text-[var(--added-fg)] shadow-[0_0_18px_color-mix(in_srgb,var(--added-fg)_14%,transparent)]">
-                  <GitCommitHorizontal size={18} strokeWidth={1.75} />
-                </span>
+                <svg width="44" height="44" viewBox="0 0 44 44" fill="none" aria-hidden="true" className="text-[var(--added-fg)]">
+                  <circle cx="22" cy="22" r="21" stroke="currentColor" strokeOpacity="0.12" />
+                  <circle cx="22" cy="22" r="15.5" fill="currentColor" fillOpacity="0.1" stroke="currentColor" strokeOpacity="0.35" />
+                  <path d="M15.5 22.5l4.5 4.5 8.5-9.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
                 <span className="flex flex-col items-center gap-0.5 leading-none">
                   <span className="text-[12.5px] font-medium text-[var(--text-primary)]">No changes</span>
                   <span className="text-[11px] text-[var(--text-dim)]">Working tree clean</span>

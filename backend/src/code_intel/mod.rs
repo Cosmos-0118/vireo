@@ -113,7 +113,18 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
                     .collect();
                 view_many(ws, &list, cwd.as_deref())
             } else {
-                view(ws, need("path")?, s(a, "target"), cwd.as_deref())
+                // Native `Read`-style `offset`/`limit` become a line range.
+                let range = match (s(a, "target"), a["offset"].as_u64()) {
+                    (None, Some(off)) => {
+                        let start = off.max(1);
+                        Some(match a["limit"].as_u64().filter(|l| *l > 0) {
+                            Some(l) => format!("{start}..{}", start + l - 1),
+                            None => format!("{start}.."),
+                        })
+                    }
+                    _ => None,
+                };
+                view(ws, need("path")?, range.as_deref().or_else(|| s(a, "target")), cwd.as_deref())
             }
         }
         "map" => repo_map(ws, s(a, "query"), s(a, "dir")),

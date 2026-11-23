@@ -558,8 +558,11 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
         return Ok(res);
     }
 
-    if opts.context > 0 {
-        let ctx = opts.context.min(10);
+    // Narrow searches get ±2 anchored lines by default so the agent can edit straight from the
+    // result without a separate `view`.
+    let context = if opts.context == 0 && hits.len() <= 12 { 2 } else { opts.context };
+    if context > 0 {
+        let ctx = context.min(10);
         // Group hit line numbers per file, preserving discovery order.
         let mut by_file: Vec<(String, Vec<usize>)> = Vec::new();
         for (file, line, _) in &hits {

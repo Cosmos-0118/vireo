@@ -92,7 +92,7 @@ pub fn mcp_tools(read_only: bool) -> Value {
             }),
             json!({
                 "name": "edit",
-                "description": "Edit lines by N#hash anchor (no old text needed). Reports new anchors and syntax errors.",
+                "description": "Edit lines by N#hash anchor (no old text needed). For several edits to one file, pass them together in `edits: [{start, end?, op?, new_text}]` so every anchor resolves against the current file at once. Returns fresh anchors around the edit and syntax errors.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

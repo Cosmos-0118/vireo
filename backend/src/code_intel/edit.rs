@@ -28,6 +28,22 @@ pub(crate) fn finish_edit(
         } else {
             format!(" New anchors: {}..{}.", doc.anchor(a), doc.anchor(b))
         });
+        // Fresh anchors for the edited block and its neighbours, so a follow-up edit needs no re-view.
+        let last = doc.lines.len().saturating_sub(1);
+        let (from, to) = (a.saturating_sub(2), (b + 2).min(last));
+        if !doc.lines.is_empty() && from <= to {
+            let (inner_a, inner_b) = (a.max(from), b.min(to));
+            if inner_b.saturating_sub(inner_a) < 12 {
+                msg.push_str(&format!("\n{}", doc.hashlines(from, to).trim_end()));
+            } else {
+                msg.push_str(&format!(
+                    "\n{}\n…[{} lines]…\n{}",
+                    doc.hashlines(from, inner_a + 5).trim_end(),
+                    inner_b - inner_a - 11,
+                    doc.hashlines(inner_b - 5, to).trim_end()
+                ));
+            }
+        }
     }
     if let (Some(before), Some(after)) = (before, syntax_errors(lang, &text)) {
         if after.len() > before.len() {

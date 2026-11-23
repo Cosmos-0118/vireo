@@ -228,6 +228,14 @@ pub(crate) fn locate(
             return Ok(pairs[0]);
         }
     }
+    // Far-away shifts (a big earlier edit): accept a pair that is unique across the whole file.
+    if cands.is_empty() {
+        let wide: Vec<isize> = (0..n as isize).filter(|&c| ok(c)).collect();
+        if wide.len() == 1 {
+            let c = wide[0] as usize;
+            return Ok((c, c + span));
+        }
+    }
     let why = if cands.is_empty() { "no longer match" } else { "match several places" };
     let s_ok = s.0 >= 1 && s.0 <= n && line_hash(&doc.lines[s.0 - 1]) == s.1;
     let e_ok = e.0 >= 1 && e.0 <= n && line_hash(&doc.lines[e.0 - 1]) == e.1;
