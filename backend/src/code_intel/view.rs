@@ -56,10 +56,8 @@ fn resolve_target(
 pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> Result<String, String> {
     // `a.rs:Foo` / `a.rs:10..30` given as the path alone (MCP callers) behaves like the CLI spec.
     let target = target.map(str::trim).filter(|t| !t.is_empty());
-    let (path, target) = match target {
-        Some(t) => (path, Some(t)),
-        None => split_view_spec(path),
-    };
+    let (path, inline) = split_view_spec(path);
+    let target = target.or(inline);
     let (_, rel, doc, note) = read_doc_smart(ws, path, cwd)?;
     let prefix = note.map(|n| format!("{n}\n")).unwrap_or_default();
     let n = doc.lines.len();
@@ -119,12 +117,11 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> 
         for i in *from..=*to {
             let line = show_line(&doc, i);
             if shown >= MAX_VIEW_LINES || (shown > 0 && out.len() + line.len() > MAX_VIEW_BYTES) {
-                out.push_str(&format!(
-                    "…[budget reached; continue with {}:{}..{}]\n",
-                    rel,
-                    i + 1,
-                    to + 1
-                ));
+                let mut spec = format!("{}..{}", i + 1, to + 1);
+                for (f, t, _) in &sections[si + 1..] {
+                    spec.push_str(&format!(",{}..{}", f + 1, t + 1));
+                }
+                out.push_str(&format!("…[budget reached; continue with {rel}:{spec}]\n"));
                 return Ok(out);
             }
             out.push_str(&line);

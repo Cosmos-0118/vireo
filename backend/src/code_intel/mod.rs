@@ -154,6 +154,20 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
                 };
                 return symbol_op(ws, need("path")?, sym, mode, s(a, "new_text").unwrap_or(""), cwd.as_deref());
             }
+            // Native `Edit`-style call (`old_string` + `new_string`, no anchor): exact single replace.
+            if s(a, "start").is_none() {
+                if let Some(old) = ["old_string", "oldString", "old_text", "old"].iter().find_map(|k| s(a, k)) {
+                    let opts = ReplaceOpts {
+                        path: Some(need("path")?.to_string()),
+                        cwd: cwd.clone(),
+                        regex: false,
+                        dry_run: false,
+                        expected: if a["replace_all"].as_bool().unwrap_or(false) { None } else { Some(1) },
+                        ..Default::default()
+                    };
+                    return replace_text(ws, old, s(a, "new_text").unwrap_or(""), &opts);
+                }
+            }
             // `top` / `bottom` / `imports` need no anchor: same path as a one-entry batch.
             if s(a, "start").and_then(parse_edge).is_some() {
                 return edit_batch(ws, need("path")?, std::slice::from_ref(a), cwd.as_deref());

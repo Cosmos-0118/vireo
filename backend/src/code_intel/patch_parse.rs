@@ -67,7 +67,7 @@ pub(crate) enum FileOp {
 }
 
 fn strip_hashline_prefix(l: &str) -> &str {
-    let re = lazy_re!(r"^\d+#[0-9a-fA-F]{2}\|");
+    let re = lazy_re!(r"^(?:>\s*)?\d+#[0-9a-fA-F]{2}[|\-]");
     match re.find(l) {
         Some(m) => &l[m.end()..],
         None => l,

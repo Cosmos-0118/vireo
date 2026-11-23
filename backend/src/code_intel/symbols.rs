@@ -3,11 +3,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::{Language, Node, Parser};
-use walkdir::WalkDir;
 
 use super::doc::{hl, line_hash, read_doc_smart, splice, text_to_lines, Doc};
 use super::edit::finish_edit;
-use super::util::{find_path_candidates, ignored_dir, missing_path_err, rel_of, resolve, with_note};
+use super::util::{command, find_path_candidates, ignored_dir, missing_path_err, rel_of, resolve, run_capture, with_note};
 use super::view::MAX_VIEW_LINES;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -837,6 +836,72 @@ fn symbol_op_doc(
 
 // --------------------------------- repo map ---------------------------------------------------
 
+/// Unique top-level symbol names of a file: `impl Foo` next to `struct Foo` and bare `mod foo;`
+/// declarations add nothing to a map line (and would double-count rank).
+fn top_names(syms: &[Sym]) -> Vec<&str> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut out = Vec::new();
+    for s in syms.iter().filter(|s| s.depth == 0) {
+        let sig = s.sig.trim();
+        let bare_mod = sig.ends_with(';') && (sig.starts_with("mod ") || sig.contains(" mod "));
+        if !bare_mod && seen.insert(s.name.as_str()) {
+            out.push(s.name.as_str());
+        }
+    }
+    out
+}
+
+fn is_test_path(rel: &str) -> bool {
+    let l = rel.to_lowercase();
+    let name = l.rsplit('/').next().unwrap_or(&l);
+    name == "tests.rs"
+        || name.starts_with("test_")
+        || name.contains(".test.")
+        || name.contains(".spec.")
+        || name.contains("_test.")
+        || l.contains("/__tests__/")
+        || l.contains("/tests/")
+}
+
+/// Workspace-relative files with uncommitted changes (modified, staged or untracked). Cached on the
+/// git index mtime plus a short TTL so repeated `map` calls in a long-lived `vx mcp` stay free.
+fn dirty_files(ws: &Path) -> HashSet<String> {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant, SystemTime};
+    type Cache = Option<(PathBuf, Option<SystemTime>, Instant, HashSet<String>)>;
+    static CACHE: Mutex<Cache> = Mutex::new(None);
+    let git_dir = ws.join(".git");
+    if !git_dir.exists() {
+        return HashSet::new();
+    }
+    let stamp = std::fs::metadata(git_dir.join("index")).and_then(|m| m.modified()).ok();
+    if let Ok(g) = CACHE.lock() {
+        if let Some((p, st, at, set)) = g.as_ref() {
+            if p == ws && *st == stamp && at.elapsed() < Duration::from_secs(3) {
+                return set.clone();
+            }
+        }
+    }
+    let mut cmd = command("git");
+    cmd.current_dir(ws).args(["-c", "core.quotepath=off", "status", "--porcelain=v1", "-uall"]);
+    let set: HashSet<String> = match run_capture(cmd, Duration::from_secs(5)) {
+        Ok(o) if o.code == 0 => o
+            .stdout
+            .lines()
+            .filter(|l| l.len() > 3)
+            .map(|l| {
+                let p = &l[3..];
+                p.rsplit_once(" -> ").map_or(p, |(_, new)| new).trim_matches('"').to_string()
+            })
+            .collect(),
+        _ => HashSet::new(),
+    };
+    if let Ok(mut g) = CACHE.lock() {
+        *g = Some((ws.to_path_buf(), stamp, Instant::now(), set.clone()));
+    }
+    set
+}
+
 pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<String, String> {
     let mut dir_note: Option<String> = None;
     let root = match dir.filter(|d| !d.trim().is_empty()) {
@@ -872,12 +937,18 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
     }
     let mut entries: Vec<Entry> = Vec::new();
     let ident = lazy_re!(r"[A-Za-z_][A-Za-z0-9_]{2,}");
-    for e in WalkDir::new(&root)
-        .into_iter()
-        .filter_entry(|e| e.depth() == 0 || !(e.file_type().is_dir() && ignored_dir(&e.file_name().to_string_lossy())))
-        .flatten()
-    {
-        if !e.file_type().is_file() {
+    let walk = ignore::WalkBuilder::new(&root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_exclude(true)
+        .require_git(false)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .filter_entry(|e| {
+            e.depth() == 0 || !(e.file_type().is_some_and(|t| t.is_dir()) && ignored_dir(&e.file_name().to_string_lossy()))
+        })
+        .build();
+    for e in walk.flatten() {
+        if !e.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
         let rel = rel_of(ws, e.path());
@@ -896,29 +967,45 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
     if entries.is_empty() {
         return Ok("No supported source files found (rs, ts, tsx, js, py, go, cs, java, c/cpp, rb, php, kt, sh).".into());
     }
-    // Cheap "PageRank": a file matters if other files mention its top-level symbols.
-    let mut mentions: HashMap<u64, usize> = HashMap::new();
-    for e in &entries {
-        for id in &e.idents {
-            *mentions.entry(*id).or_default() += 1;
-        }
-    }
-    let rank: Vec<usize> = entries
-        .iter()
-        .map(|e| {
-            e.syms
-                .iter()
-                .filter(|s| s.depth == 0)
-                .map(|s| mentions.get(&hash_ident(&s.name)).copied().unwrap_or(1).saturating_sub(1).min(10))
-                .sum()
-        })
-        .collect();
     let tokens: Vec<String> = query
         .unwrap_or("")
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .filter(|t| t.len() >= 2)
         .map(|t| t.to_lowercase())
         .collect();
+    let demote_tests = !tokens.iter().any(|t| t.contains("test") || t.contains("spec"));
+    // Cheap "PageRank": a file matters if other files mention its top-level symbols. Identifiers
+    // found in most files (`new`, `read`, ...) carry no signal, and the sum is damped so a file with
+    // dozens of symbols doesn't drown one with a single exported component.
+    let mut mentions: HashMap<u64, usize> = HashMap::new();
+    for e in &entries {
+        for id in &e.idents {
+            *mentions.entry(*id).or_default() += 1;
+        }
+    }
+    let common_cap = (entries.len() * 2 / 5).max(8);
+    let rank: Vec<i64> = entries
+        .iter()
+        .map(|e| {
+            let mut scores: Vec<usize> = top_names(&e.syms)
+                .iter()
+                .filter(|n| n.len() >= 4)
+                .map(|n| {
+                    let m = mentions.get(&hash_ident(n)).copied().unwrap_or(1);
+                    if m > common_cap { 0 } else { m.saturating_sub(1).min(10) }
+                })
+                .collect();
+            scores.sort_unstable_by(|a, b| b.cmp(a));
+            let top: usize = scores.iter().take(3).sum();
+            let rest: usize = scores.iter().skip(3).sum();
+            let mut f = top as f64 + rest as f64 / (scores.len().max(1) as f64).sqrt();
+            if demote_tests && is_test_path(&e.rel) {
+                f *= 0.25;
+            }
+            (f * 4.0) as i64
+        })
+        .collect();
+    let dirty = dirty_files(ws);
     let mut order: Vec<(usize, i64)> = Vec::new();
     for (i, e) in entries.iter().enumerate() {
         let mut score = 0i64;
@@ -941,33 +1028,82 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
                 continue;
             }
         }
-        order.push((i, score * 100 + rank[i] as i64));
+        let boost = if dirty.contains(&e.rel) { 60 } else { 0 };
+        order.push((i, score * 10_000 + rank[i] + boost));
     }
     order.sort_by(|a, b| b.1.cmp(&a.1).then(entries[a.0].rel.cmp(&entries[b.0].rel)));
+    // Bare map over a multi-project repo: interleave the big top-level dirs so one language's
+    // symbol density can't blank out another subproject.
+    if tokens.is_empty() && dir.map_or(true, |d| d.trim().is_empty()) {
+        let top = |i: usize| entries[i].rel.split_once('/').map_or(".", |(d, _)| d).to_string();
+        let mut groups: Vec<(String, Vec<(usize, i64)>)> = Vec::new();
+        for o in order.drain(..) {
+            let t = top(o.0);
+            match groups.iter_mut().find(|g| g.0 == t) {
+                Some(g) => g.1.push(o),
+                None => groups.push((t, vec![o])),
+            }
+        }
+        let min_big = (entries.len() * 15 / 100).max(1);
+        let (big, small): (Vec<_>, Vec<_>) = groups.into_iter().partition(|g| g.1.len() >= min_big);
+        let mut merged: Vec<(usize, i64)> = Vec::new();
+        let mut round = 0usize;
+        while big.iter().any(|g| round < g.1.len()) {
+            for g in &big {
+                if let Some(o) = g.1.get(round) {
+                    merged.push(*o);
+                }
+            }
+            round += 1;
+        }
+        let mut rest: Vec<(usize, i64)> = small.into_iter().flat_map(|g| g.1).collect();
+        rest.sort_by(|a, b| b.1.cmp(&a.1).then(entries[a.0].rel.cmp(&entries[b.0].rel)));
+        order = merged;
+        order.extend(rest);
+    }
     // A bare `map` is an orientation overview, so keep it short; a query or dir earns more room.
     let narrowed = dir.map_or(false, |d| !d.trim().is_empty());
     let budget = if !tokens.is_empty() { 7000 } else if narrowed { 8000 } else { 4500 };
     let mut out = dir_note.unwrap_or_default();
     if tokens.is_empty() {
         // Directory histogram first: cheap orientation that lets the caller pick a `dir`.
+        let pfx = {
+            let r = rel_of(ws, &root);
+            let r = r.trim_matches('/');
+            if r == "." { String::new() } else { r.to_string() }
+        };
         let mut by_dir: HashMap<&str, usize> = HashMap::new();
         for e in &entries {
-            let top = e.rel.split_once('/').map_or(".", |(d, _)| d);
+            let inner = if pfx.is_empty() { e.rel.as_str() } else { e.rel.strip_prefix(pfx.as_str()).map_or(e.rel.as_str(), |r| r.trim_start_matches('/')) };
+            let top = inner.split_once('/').map_or(".", |(d, _)| d);
             *by_dir.entry(top).or_default() += 1;
         }
         let mut dirs: Vec<(&str, usize)> = by_dir.into_iter().collect();
         dirs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         let listed: Vec<String> = dirs.iter().take(8).map(|(d, n)| format!("{d} {n}")).collect();
-        out.push_str(&format!("# {} source files ({}); top-ranked below\n", entries.len(), listed.join(", ")));
+        let changed: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).filter(|r| dirty.contains(*r)).collect();
+        let changed_note = if changed.is_empty() {
+            String::new()
+        } else {
+            let more = changed.len().saturating_sub(5);
+            format!(
+                "; {} uncommitted [M]: {}{}",
+                changed.len(),
+                changed.iter().take(5).copied().collect::<Vec<_>>().join(", "),
+                if more > 0 { format!(" +{more}") } else { String::new() }
+            )
+        };
+        out.push_str(&format!("# {} source files ({}){changed_note}; top-ranked below\n", entries.len(), listed.join(", ")));
     }
     let mut shown = 0usize;
     for (i, _) in &order {
         let e = &entries[*i];
-        let mut block = format!("{} ({})\n", e.rel, e.nlines);
+        let mark = if dirty.contains(&e.rel) { " [M]" } else { "" };
+        let mut block = format!("{} ({}){mark}\n", e.rel, e.nlines);
         if tokens.is_empty() {
-            let names: Vec<String> = e.syms.iter().filter(|s| s.depth == 0).map(|s| s.name.clone()).collect();
+            let names = top_names(&e.syms);
             let extra = names.len().saturating_sub(10);
-            block = format!("{} ({}): {}{}\n", e.rel, e.nlines, names.iter().take(10).cloned().collect::<Vec<_>>().join(", "), if extra > 0 { format!(" +{extra}") } else { String::new() });
+            block = format!("{} ({}){mark}: {}{}\n", e.rel, e.nlines, names.iter().take(10).copied().collect::<Vec<_>>().join(", "), if extra > 0 { format!(" +{extra}") } else { String::new() });
         } else {
             // Source lines are only needed for the few files actually shown: re-read them now.
             let text = std::fs::read_to_string(ws.join(&e.rel)).unwrap_or_default();

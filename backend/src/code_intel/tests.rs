@@ -939,3 +939,46 @@ fn bare_repo_map_has_directory_overview() {
     assert!(m.starts_with("# 2 source files (") && m.contains("src 1"), "{m}");
     assert!(!repo_map(&ws, Some("baz"), None).unwrap().starts_with("# "));
 }
+
+#[test]
+fn anchors_copied_from_any_tool_parse() {
+    use super::doc::parse_anchor;
+    for s in ["12#a4", "12#a4|let x = 1;", "> 12#a4|", "[12#a4", "12#a4]", "src/a.rs:12#a4"] {
+        assert_eq!(parse_anchor(s).unwrap(), (12, "a4".to_string()), "{s}");
+    }
+    assert_eq!(parse_anchor("110#5E-    code").unwrap(), (110, "5e".to_string()));
+    assert!(parse_anchor("12#abc").is_err());
+    assert!(parse_anchor("0#a4").is_err());
+    assert_eq!(super::doc::text_to_lines("110#5e-    x\n> 12#a4|y"), vec!["    x".to_string(), "y".to_string()]);
+}
+
+#[test]
+fn edit_accepts_old_string_without_anchor() {
+    let ws = tmp("edit-old");
+    std::fs::write(ws.join("a.rs"), RS).unwrap();
+    let a = json!({"path": "a.rs", "old_string": "x + 1", "new_string": "x + 9"});
+    run_op(&ws, "edit", &a).unwrap();
+    assert!(std::fs::read_to_string(ws.join("a.rs")).unwrap().contains("x + 9"));
+}
+
+#[test]
+fn view_splits_inline_range_even_with_target() {
+    let ws = tmp("view-inline");
+    std::fs::write(ws.join("a.rs"), RS).unwrap();
+    let v = view(&ws, "a.rs:5..7", Some("5..7"), None).unwrap();
+    assert!(v.contains("lines 5..7"), "{v}");
+}
+
+#[test]
+fn search_demotes_lockfiles_and_prose_below_source() {
+    let ws = tmp("search-tier");
+    std::fs::write(ws.join("a.rs"), "fn needle() {}\n").unwrap();
+    std::fs::write(ws.join("Cargo.lock"), "needle\nneedle\n").unwrap();
+    std::fs::write(ws.join("notes.txt"), "needle\n").unwrap();
+    let out = search(&ws, "needle", &SearchOpts { limit: 80, ..Default::default() }).unwrap();
+    let a = out.find("a.rs").unwrap();
+    let t = out.find("notes.txt").unwrap();
+    assert!(a < t, "{out}");
+    assert!(out.contains("+2 hits in lockfiles/generated files: Cargo.lock"), "{out}");
+    assert!(out.contains("#") && out.contains("fn needle"), "auto-context kept for source hits: {out}");
+}

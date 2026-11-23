@@ -217,6 +217,8 @@ fn rg_search(
         "!target",
         "--glob",
         "!dist",
+        "--max-filesize",
+        "2M",
     ]);
     if opts.ignore_case {
         cmd.arg("-i");
@@ -394,7 +396,9 @@ pub(crate) fn builtin_search(
         .case_insensitive(smart)
         .build()
         .map_err(|e| format!("search failed: invalid regex: {e}"))?;
-    let files = collect_files(ws, targets, globs)?;
+    let mut files = collect_files(ws, targets, globs)?;
+    // Visit real source before lockfiles/prose so `max_total` never starves it.
+    files.sort_by_key(|(_, rel)| signal_tier(rel));
     let max_per_file = if opts.files_only { 1000 } else if opts.limit > 80 { 50 } else { 20 };
     let max_total = (opts.limit * 5).max(400);
     let mut hits: Vec<Hit> = Vec::new();
@@ -482,18 +486,35 @@ pub fn search(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Strin
     }
 }
 
-/// Lockfiles and minified/generated bundles: huge, repetitive, and almost never what a code
-/// search is after, so their hits are listed last instead of crowding out real source.
-fn is_low_signal(rel: &str) -> bool {
-    let name = rel.rsplit('/').next().unwrap_or(rel).to_lowercase();
-    name.ends_with(".lock")
+/// How likely a file is to be what a code search is after: 0 source, 1 tests/config data,
+/// 2 prose/reports, 3 lockfiles/generated bundles. Lower tiers are listed first.
+fn signal_tier(rel: &str) -> u8 {
+    let lower = rel.to_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    if name.ends_with(".lock")
         || name.ends_with(".lockb")
         || name.ends_with("-lock.json")
         || name.ends_with("-lock.yaml")
         || name == "go.sum"
         || name.ends_with(".min.js")
         || name.ends_with(".min.css")
-        || name.ends_with(".map")
+        || matches!(ext, "map" | "tsbuildinfo" | "snap" | "svg")
+    {
+        return 3;
+    }
+    if matches!(ext, "md" | "markdown" | "txt" | "rst" | "adoc" | "log" | "csv") {
+        return 2;
+    }
+    let is_test = name == "tests.rs"
+        || name.contains(".test.")
+        || name.contains(".spec.")
+        || name.contains("_test.")
+        || lower.contains("/__tests__/");
+    if is_test || matches!(ext, "json" | "yaml" | "yml") {
+        return 1;
+    }
+    0
 }
 fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, String> {
     if query.trim().is_empty() {
@@ -541,14 +562,15 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
             }
         }
     };
-    // Asking for a lockfile/bundle by name or glob opts out of the demotion. Stable sort keeps the
-    // original order within each group.
-    let asked_for_noise = scope.targets.iter().chain(scope.globs.iter()).any(|t| {
-        let t = t.to_lowercase();
-        t.contains("lock") || t.contains(".min.") || t.contains(".map") || t.contains("go.sum")
-    });
+    // Asking for a lockfile/bundle/doc by name or glob opts out of the demotion. Stable sort keeps
+    // the original order within each tier. Negated globs (`!*.lock`) never count as asking.
+    let asked_for_noise = scope
+        .targets
+        .iter()
+        .chain(scope.globs.iter())
+        .any(|t| !t.starts_with('!') && signal_tier(t.trim_end_matches('/')) >= 2);
     if !asked_for_noise {
-        hits.sort_by_key(|h| is_low_signal(&h.0));
+        hits.sort_by_key(|h| signal_tier(&h.0));
     }
 
     let mut res = String::new();
@@ -570,7 +592,7 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
         }
         let mut pairs: Vec<(&str, usize)> = counts.into_iter().collect();
         pairs.sort_by(|a, b| {
-            let noise = |f: &str| !asked_for_noise && is_low_signal(f);
+            let noise = |f: &str| if asked_for_noise { 0 } else { signal_tier(f) };
             noise(a.0).cmp(&noise(b.0)).then_with(|| b.1.cmp(&a.1)).then_with(|| a.0.cmp(b.0))
         });
         for (i, (f, n)) in pairs.iter().enumerate() {
@@ -583,14 +605,36 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
         return Ok(res);
     }
 
+    // With real source hits, lockfile/generated hits collapse into one trailing summary line.
+    let mut noise_note = String::new();
+    if !asked_for_noise && hits.iter().any(|h| signal_tier(&h.0) < 3) {
+        let (keep, noise): (Vec<Hit>, Vec<Hit>) = hits.into_iter().partition(|h| signal_tier(&h.0) < 3);
+        hits = keep;
+        if !noise.is_empty() {
+            let mut names: Vec<&str> = noise.iter().map(|h| h.0.as_str()).collect();
+            names.dedup();
+            names.truncate(4);
+            noise_note = format!("[+{} hits in lockfiles/generated files: {}]\n", noise.len(), names.join(", "));
+        }
+    }
     // Narrow searches get ±2 anchored lines by default so the agent can edit straight from the
-    // result without a separate `view`.
-    let context = if opts.context == 0 && hits.len() <= 12 { 2 } else { opts.context };
+    // result without a separate `view`. Only source/test hits count and get context; prose hits
+    // follow as plain lines.
+    let primary = hits.iter().take_while(|h| signal_tier(&h.0) <= 1).count();
+    let narrow = if primary > 0 { primary } else { hits.len() };
+    let context = if opts.context == 0 && narrow <= 12 { 2 } else { opts.context };
+    let split = if context == 0 {
+        0
+    } else if primary > 0 {
+        primary
+    } else {
+        hits.len()
+    };
     if context > 0 {
         let ctx = context.min(10);
         // Group hit line numbers per file, preserving discovery order.
         let mut by_file: Vec<(String, Vec<usize>)> = Vec::new();
-        for (file, line, _) in &hits {
+        for (file, line, _) in &hits[..split] {
             if let Some(entry) = by_file.iter_mut().find(|(f, _)| f == file) {
                 entry.1.push(*line);
             } else {
@@ -639,19 +683,23 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
                 }
             }
         }
-        return Ok(res);
+        if split == hits.len() {
+            res.push_str(&noise_note);
+            return Ok(res);
+        }
     }
 
-    for (count, (file, line, raw)) in hits.iter().enumerate() {
+    for (count, (file, line, raw)) in hits[split..].iter().enumerate() {
         if count >= limit || res.len() > 12_000 {
             res.push_str(&format!(
                 "…[{} more matches; narrow the query, path, --glob, or raise --limit]\n",
-                hits.len() - count
+                hits.len() - split - count
             ));
             break;
         }
         let text: String = raw.chars().take(200).collect();
         res.push_str(&format!("{file}:{line}#{}| {}\n", line_hash(raw), text.trim()));
     }
+    res.push_str(&noise_note);
     Ok(res)
 }

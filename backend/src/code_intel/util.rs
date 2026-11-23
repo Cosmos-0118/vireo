@@ -153,6 +153,7 @@ pub(crate) fn run_capture(mut cmd: Command, timeout: Duration) -> Result<RunOut,
     let t1 = child.stdout.take().map(|s| pump(s, out_buf.clone()));
     let t2 = child.stderr.take().map(|s| pump(s, err_buf.clone()));
     let mut timed_out = false;
+    let mut wait_ms = 1u64;
     let code = loop {
         match child.try_wait() {
             Ok(Some(st)) => break st.code().unwrap_or(-1),
@@ -163,7 +164,9 @@ pub(crate) fn run_capture(mut cmd: Command, timeout: Duration) -> Result<RunOut,
                     let _ = child.wait();
                     break -1;
                 }
-                std::thread::sleep(Duration::from_millis(40));
+                // Short jobs (rg, git) finish in a few ms: back off from 1ms up to 40ms.
+                std::thread::sleep(Duration::from_millis(wait_ms));
+                wait_ms = (wait_ms * 2).min(40);
             }
             Err(e) => return Err(e.to_string()),
         }

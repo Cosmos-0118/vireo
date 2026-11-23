@@ -152,15 +152,16 @@ pub(crate) fn read_doc_smart(
 }
 
 pub(crate) fn parse_anchor(s: &str) -> Result<(usize, String), String> {
-    let t = s.trim().trim_end_matches('|');
     let bad = || format!("bad anchor `{s}` (expected like 189#a4, copied from view/search output)");
-    let (n, h) = t.split_once('#').ok_or_else(bad)?;
-    let n: usize = n.trim().parse().map_err(|_| bad())?;
-    let h = h.trim().to_lowercase();
-    if n == 0 || h.len() != 2 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+    // Accept anchors as printed by any vx tool: `12#a4`, `12#a4|code`, `110#5e-code` (search context),
+    // `> 12#a4|` (diagnostics), `[12#a4` / `12#a4]` (outline), `path/file.rs:12#a4` (search).
+    let re = lazy_re!(r"^[>\[\s]*(?:[^\s:#]+:)?(\d+)#([0-9a-fA-F]{2})(?:$|[|\-\]\s.])");
+    let c = re.captures(s.trim()).ok_or_else(bad)?;
+    let n: usize = c[1].parse().map_err(|_| bad())?;
+    if n == 0 {
         return Err(bad());
     }
-    Ok((n, h))
+    Ok((n, c[2].to_lowercase()))
 }
 
 /// Parse an anchor, attaching live anchored lines near the typed line number if malformed so the
@@ -237,6 +238,19 @@ pub(crate) fn locate(
         }
         if pairs.len() == 1 {
             return Ok(pairs[0]);
+        }
+        // Several closing lines share the hash (`}` `}`): the true end sits at the start line's indent.
+        let indent = |r: usize| doc.lines[r].len() - doc.lines[r].trim_start().len();
+        let same: Vec<&(usize, usize)> = pairs.iter().filter(|(st, en)| indent(*st) == indent(*en)).collect();
+        let starts: std::collections::HashSet<usize> = same.iter().map(|p| p.0).collect();
+        if starts.len() == 1 {
+            // Prefer the candidate closest to the expected span.
+            if let Some(p) = same.iter().min_by_key(|p| (p.1 - p.0).abs_diff(span)) {
+                let best = (p.1 - p.0).abs_diff(span);
+                if same.iter().filter(|q| (q.1 - q.0).abs_diff(span) == best).count() == 1 {
+                    return Ok(**p);
+                }
+            }
         }
     }
     // Far-away shifts (a big earlier edit): accept a pair that is unique across the whole file.
@@ -324,7 +338,7 @@ pub(crate) fn text_to_lines(new_text: &str) -> Vec<String> {
     let t = t.strip_suffix('\n').unwrap_or(&t);
     let mut lines: Vec<String> = t.split('\n').map(str::to_string).collect();
     // Models sometimes echo the `N#hh|` prefixes back; a real code line never starts like that.
-    let re = lazy_re!(r"^\d+#[0-9a-fA-F]{2}\|");
+    let re = lazy_re!(r"^(?:>\s*)?\d+#[0-9a-fA-F]{2}[|\-]");
     for l in lines.iter_mut() {
         if let Some(m) = re.find(l) {
             *l = l[m.end()..].to_string();
