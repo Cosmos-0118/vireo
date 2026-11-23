@@ -41,7 +41,9 @@ import type {
   MessagePart,
   PermissionMode,
   PermissionRequest,
+  QuestionRequest,
   RollbackRes,
+  SlashCommand,
   ToastAction,
   UiChatMessage,
 } from '../types';
@@ -56,15 +58,11 @@ import {
   normPath,
   type ChangeLookup,
 } from './AgentActivity';
-
-/** Human-readable scope of a saved "always allow" rule (mirrors `permission_rule` in the backend). */
-function describeRule(rule: string): string {
-  const [tool, kind, ...rest] = rule.split(':');
-  const value = rest.join(':');
-  if (kind === 'cmd') return `${tool} commands starting with "${value}" (no pipes or chaining)`;
-  if (kind === 'dir') return `${tool} on any file under ${value}/`;
-  return `Every ${rule} request`;
-}
+import { PermissionCard } from './agent/PermissionCard';
+import { QuestionCard } from './agent/QuestionCard';
+import { SlashCommandMenu } from './agent/SlashCommandMenu';
+import { sessionKey, supportsSessions } from './agent/sessions';
+import { useSlashMenu } from './agent/useSlashMenu';
 
 const OK_DOT = '#10b981';
 const WARN_DOT = '#f59e0b';
@@ -111,6 +109,8 @@ interface AgentThread {
   title: string;
   updatedAt: number;
   messages: UiChatMessage[];
+  /** The agent CLI's own conversation id per engine, so the thread resumes after a restart. */
+  resumeIds?: Record<string, string>;
 }
 
 const MAX_THREADS = 20;
@@ -137,6 +137,10 @@ function slimMessages(ms: UiChatMessage[]): UiChatMessage[] {
     })),
   }));
 }
+
+/** The resume ids belonging to one thread (keys are `thread:engine`). */
+const threadResumeIds = (all: Record<string, string>, threadId: string): Record<string, string> =>
+  Object.fromEntries(Object.entries(all).filter(([k]) => k.startsWith(`${threadId}:`)));
 
 const threadTitle = (ms: UiChatMessage[]) => {
   const first = ms.find((m) => m.role === 'user');
@@ -302,6 +306,13 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const [showPermMenu, setShowPermMenu] = useState(false);
   // "Always allow in this thread" rules; the CLI runs statelessly, so Vireo re-sends them each turn.
   const threadRulesRef = useRef<Record<string, string[]>>({});
+  // Multiple-choice questions from the running agent turn. Never persisted with the thread.
+  const [questions, setQuestions] = useState<QuestionRequest[]>([]);
+  // The agent session's slash commands for the current thread + engine (fetched lazily).
+  const [commands, setCommands] = useState<SlashCommand[]>([]);
+  const [commandsLoading, setCommandsLoading] = useState(false);
+  // Agent conversation ids per `thread:engine`, sent back so a restarted backend can resume them.
+  const resumeIdsRef = useRef<Record<string, string>>({});
 
   const {
     config,
@@ -337,6 +348,35 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const [extraFiles, setExtraFiles] = useState<string[]>([]);
   const abortRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const sessionEngine = supportsSessions(config.provider);
+  const loadCommands = React.useCallback(() => {
+    if (!sessionEngine || commands.length > 0 || commandsLoading) return;
+    setCommandsLoading(true);
+    api
+      .prepareSession({
+        threadId,
+        provider: config.provider,
+        model: config.model,
+        permissionMode: config.permissionMode ?? 'auto_edit',
+        resumeId: resumeIdsRef.current[sessionKey(threadId, config.provider)],
+        allowedRules: threadRulesRef.current[threadId],
+      })
+      .then((res) => {
+        if (res.resume_id) resumeIdsRef.current[sessionKey(threadId, config.provider)] = res.resume_id;
+        setCommands(res.commands);
+      })
+      .catch(() => {})
+      .finally(() => setCommandsLoading(false));
+  }, [sessionEngine, commands.length, commandsLoading, threadId, config.provider, config.model, config.permissionMode]);
+  const slash = useSlashMenu(sessionEngine ? commands : [], loadCommands);
+
+  // Commands belong to one agent session: forget them when the thread or engine changes.
+  useEffect(() => {
+    setCommands([]);
+    slash.close();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [threadId, config.provider]);
 
   const modelRef = usePopoverClose(showModelMenu, () => setShowModelMenu(false), 'engine');
   const threadsRef = usePopoverClose(showThreads, () => setShowThreads(false), 'threads');
@@ -412,6 +452,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     stickRef.current = true;
     setAtBottom(true);
     setThreadId(newThreadId());
+    setQuestions([]);
+    resumeIdsRef.current = {};
     setThreadStore({ ws: workspacePath, list: loadThreads(workspacePath) });
   }, [workspacePath, threadStore.ws]);
 
@@ -420,7 +462,13 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     setThreadStore((prev) => ({
       ws: prev.ws,
       list: [
-        { id: threadId, title: threadTitle(messages), updatedAt: Date.now(), messages: slimMessages(messages) },
+        {
+          id: threadId,
+          title: threadTitle(messages),
+          updatedAt: Date.now(),
+          messages: slimMessages(messages),
+          resumeIds: threadResumeIds(resumeIdsRef.current, threadId),
+        },
         ...prev.list.filter((t) => t.id !== threadId),
       ].slice(0, MAX_THREADS),
     }));
@@ -565,6 +613,24 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               parts: [...(m.parts ?? []), { kind: 'text', text }],
               firstOutputAt: m.firstOutputAt ?? Date.now(),
             })),
+          // Token-level streaming: fragments extend the current paragraph.
+          onTextDelta: (delta) =>
+            patchAssistant(assistantId, (m) => {
+              const parts = [...(m.parts ?? [])];
+              const last = parts[parts.length - 1];
+              if (last?.kind === 'text') parts[parts.length - 1] = { kind: 'text', text: last.text + delta };
+              else parts.push({ kind: 'text', text: delta.replace(/^\n+/, '') });
+              return {
+                ...m,
+                content: m.content + (m.content ? delta : delta.replace(/^\n+/, '')),
+                parts,
+                firstOutputAt: m.firstOutputAt ?? Date.now(),
+              };
+            }),
+          onSession: (sess) => {
+            resumeIdsRef.current[sessionKey(threadId, config.provider)] = sess.resume_id;
+          },
+          onCommands: setCommands,
           onToolCall: (call) =>
             patchAssistant(assistantId, (m) => {
               const parts = [...(m.parts ?? [])];
@@ -598,16 +664,22 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               prev.some((r) => r.request_id === req.request_id) ? prev : [...prev, req]
             ),
           onPermissionCancel: (id) => setPermRequests((prev) => prev.filter((r) => r.request_id !== id)),
+          onUserQuestion: (req) =>
+            setQuestions((prev) => (prev.some((q) => q.request_id === req.request_id) ? prev : [...prev, req])),
           onError: (msg) => patchAssistant(assistantId, (m) => ({ ...m, error: msg })),
           onDone: () => {
             patchAssistant(assistantId, (m) => ({ ...m, streaming: false, endedAt: Date.now() }));
             setRunning(false);
             setPermRequests([]);
+            setQuestions([]);
             onRefreshGit();
           },
         },
         ctrl.signal,
-        threadRulesRef.current[threadId]
+        threadRulesRef.current[threadId],
+        supportsSessions(config.provider)
+          ? { threadId, resumeId: resumeIdsRef.current[sessionKey(threadId, config.provider)] }
+          : undefined
       );
     } catch (e: unknown) {
       if ((e as Error).name !== 'AbortError') {
@@ -615,6 +687,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       }
       setRunning(false);
       setPermRequests([]);
+      setQuestions([]);
     }
   };
 
@@ -627,10 +700,21 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     api.answerPermission(p.turn_id, p.request_id, allow, remember).catch(() => {});
   };
 
+  const answerQuestion = (q: QuestionRequest, answers: Record<string, string[]>) => {
+    setQuestions((prev) => prev.filter((r) => r.request_id !== q.request_id));
+    api.answerQuestion(q.turn_id, q.request_id, answers).catch(() => {});
+  };
+
+  const dismissQuestion = (q: QuestionRequest) => {
+    setQuestions((prev) => prev.filter((r) => r.request_id !== q.request_id));
+    api.answerQuestion(q.turn_id, q.request_id, {}, true).catch(() => {});
+  };
+
   const stopGeneration = () => {
     abortRef.current?.abort();
     setRunning(false);
     setPermRequests([]);
+    setQuestions([]);
     setMessages((prev) =>
       prev.map((m) => (m.streaming ? { ...m, streaming: false, endedAt: Date.now() } : m))
     );
@@ -640,6 +724,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     abortRef.current?.abort();
     setRunning(false);
     setPermRequests([]);
+    setQuestions([]);
     setMessages([]);
     setExpandedTools({});
     setGroupOpen({});
@@ -653,6 +738,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     abortRef.current?.abort();
     setRunning(false);
     setPermRequests([]);
+    setQuestions([]);
+    Object.assign(resumeIdsRef.current, t.resumeIds ?? {});
     setMessages(t.messages);
     setExpandedTools({});
     setGroupOpen({});
@@ -664,12 +751,19 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
 
   const removeThread = (id: string) => {
     setThreadStore((prev) => ({ ws: prev.ws, list: prev.list.filter((t) => t.id !== id) }));
+    api.closeSession(id).catch(() => {});
     if (id === threadId) {
       abortRef.current?.abort();
       setRunning(false);
       setMessages([]);
       setThreadId(newThreadId());
     }
+  };
+
+  const pickSlash = (command: SlashCommand) => {
+    setInput((prev) => slash.complete(prev, command));
+    slash.close();
+    requestAnimationFrame(() => textareaRef.current?.focus());
   };
 
   const prefill = (text: string) => {
@@ -1031,39 +1125,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               );
             })}
             {permRequests.map((p) => (
-              <div
-                key={p.request_id}
-                className="rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2 space-y-1.5"
-              >
-                <div className="flex items-center gap-1.5 text-[11px] text-[var(--text-muted)]">
-                  <Lock size={11} className="shrink-0" />
-                  Permission requested · {p.tool}
-                </div>
-                <div className="text-[12px] font-mono text-[var(--text-primary)] break-all max-h-24 overflow-y-auto">
-                  {p.summary}
-                </div>
-                <div className="flex flex-wrap gap-1.5 pt-0.5">
-                  <button
-                    onClick={() => answerPermission(p, true)}
-                    className="h-6 px-2 rounded-md text-[11px] bg-[var(--accent)] text-white cursor-pointer hover:opacity-95"
-                  >
-                    Allow
-                  </button>
-                  <button
-                    onClick={() => answerPermission(p, true, true)}
-                    className="h-6 px-2 rounded-md text-[11px] border border-[var(--border)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
-                    title={`For the rest of this thread, allow: ${describeRule(p.rule)}`}
-                  >
-                    Always allow in thread
-                  </button>
-                  <button
-                    onClick={() => answerPermission(p, false)}
-                    className="h-6 px-2 rounded-md text-[11px] text-[var(--text-muted)] hover:bg-[var(--bg-hover)] cursor-pointer"
-                  >
-                    Deny
-                  </button>
-                </div>
-              </div>
+              <PermissionCard key={p.request_id} request={p} onAnswer={answerPermission} />
+            ))}
+            {questions.map((q) => (
+              <QuestionCard key={q.request_id} request={q} onSubmit={answerQuestion} onDismiss={dismissQuestion} />
             ))}
           </div>
         )}
@@ -1211,6 +1276,15 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             </div>
           )}
 
+          {slash.open && sessionEngine && (
+            <SlashCommandMenu
+              items={slash.items}
+              selected={slash.index}
+              loading={commandsLoading}
+              onPick={pickSlash}
+            />
+          )}
+
           {/* Row 2: textarea */}
           <textarea
             ref={textareaRef}
@@ -1222,8 +1296,25 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               const m = v.slice(0, caret).match(/(?:^|\s)@([^\s@]*)$/);
               setAtRange(m ? { start: caret - m[1].length - 1, end: caret, query: m[1] } : null);
               if (m) setShowFilePicker(false);
+              if (sessionEngine) slash.update(v, caret);
             }}
             onKeyDown={(e) => {
+              if (slash.open && sessionEngine) {
+                if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+                  e.preventDefault();
+                  slash.move(e.key === 'ArrowDown' ? 1 : -1);
+                  return;
+                }
+                if (((e.key === 'Enter' && !e.shiftKey) || e.key === 'Tab') && slash.items.length > 0) {
+                  e.preventDefault();
+                  pickSlash(slash.items[slash.index]);
+                  return;
+                }
+                if (e.key === 'Escape') {
+                  slash.close();
+                  return;
+                }
+              }
               if (atRange && filteredFiles.length > 0) {
                 if (e.key === 'ArrowDown') {
                   e.preventDefault();
@@ -1254,7 +1345,11 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             }}
             rows={1}
             style={{ minHeight: 44 }}
-            placeholder="Ask anything, edit files, or explain diffs… (@ to add a file)"
+            placeholder={
+              sessionEngine
+                ? 'Ask anything, edit files, or explain diffs… (@ for files, / for commands)'
+                : 'Ask anything, edit files, or explain diffs… (@ to add a file)'
+            }
             className="block w-full px-2.5 py-1.5 text-[13px] leading-[1.5] bg-transparent text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none"
           />
 

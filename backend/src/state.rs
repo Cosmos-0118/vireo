@@ -54,6 +54,18 @@ pub struct AppState {
     /// Tool-permission prompts from a running agent CLI awaiting the user's answer,
     /// keyed by `(turn_id, request_id)`.
     pub pending_permissions: Arc<std::sync::Mutex<HashMap<(String, String), oneshot::Sender<PermissionDecision>>>>,
+    /// Multiple-choice questions from a running agent awaiting the user's answer, same keying.
+    pub pending_questions: Arc<std::sync::Mutex<HashMap<(String, String), oneshot::Sender<QuestionAnswer>>>>,
+    /// Long-lived agent CLI processes, one per chat thread.
+    pub sessions: Arc<crate::agent_session::SessionManager>,
+}
+
+/// The user's answers to an in-chat question card, keyed by question id.
+#[derive(Debug, Clone, Default)]
+pub struct QuestionAnswer {
+    pub answers: HashMap<String, Vec<String>>,
+    /// The user dismissed the card instead of answering.
+    pub cancelled: bool,
 }
 
 /// The user's answer to an in-chat permission card.
@@ -77,6 +89,8 @@ impl AppState {
             http_client: reqwest::Client::new(),
             main_window: Arc::new(OnceLock::new()),
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            pending_questions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sessions: Arc::new(crate::agent_session::SessionManager::default()),
         }
     }
 

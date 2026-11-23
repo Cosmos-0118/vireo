@@ -19,26 +19,18 @@ export const PROVIDER_PRESETS: Record<Provider, { model: string; baseUrl: string
   anthropic: { model: 'claude-sonnet-5-5', baseUrl: 'https://api.anthropic.com' },
   gemini: { model: '', baseUrl: '' },
   ollama: { model: '', baseUrl: 'http://127.0.0.1:11434/v1' },
-  'antigravity-cli': { model: 'default', baseUrl: '' },
   'claude-cli': { model: 'default', baseUrl: '' },
   'codex-cli': { model: 'default', baseUrl: '' },
-  'gemini-cli': { model: 'default', baseUrl: '' },
-  'opencode-cli': { model: 'default', baseUrl: '' },
-  'cursor-cli': { model: 'default', baseUrl: '' },
   'copilot-cli': { model: 'default', baseUrl: '' },
-  'amp-cli': { model: 'default', baseUrl: '' },
-  'qwen-cli': { model: 'default', baseUrl: '' },
 };
 
 /**
  * Static options only where the CLI itself defines them (Claude Code aliases track the latest
- * model; Cursor and Amp have fixed modes). Everything else is discovered at runtime from the CLI
- * (Codex, Antigravity), Ollama, or the provider API; otherwise just "default" + a custom id.
+ * model). Everything else is discovered at runtime from the CLI (Codex), Ollama, or the provider
+ * API; otherwise just "default" + a custom id.
  */
 const STATIC_MODELS: Partial<Record<Provider, string[]>> = {
   'claude-cli': ['default', 'sonnet', 'opus', 'haiku'],
-  'cursor-cli': ['default', 'auto'],
-  'amp-cli': ['default', 'smart', 'rush', 'deep'],
 };
 
 export const PROVIDER_LABEL: Record<Provider, string> = {
@@ -46,15 +38,9 @@ export const PROVIDER_LABEL: Record<Provider, string> = {
   anthropic: 'Anthropic',
   gemini: 'Gemini',
   ollama: 'Ollama',
-  'antigravity-cli': 'Antigravity',
   'claude-cli': 'Claude Code',
   'codex-cli': 'Codex',
-  'gemini-cli': 'Gemini',
-  'opencode-cli': 'OpenCode',
-  'cursor-cli': 'Cursor',
   'copilot-cli': 'GitHub Copilot',
-  'amp-cli': 'Amp',
-  'qwen-cli': 'Qwen Code',
 };
 
 /** Provider ids whose API keys are kept in the OS credential store. */
@@ -62,28 +48,12 @@ export const SECRET_NAMES = Object.keys(PROVIDER_LABEL);
 
 /** Providers that run an installed CLI with its own login instead of an API key. */
 export const CLI_PROVIDER_TOOL: Partial<Record<Provider, string>> = {
-  'antigravity-cli': 'antigravity',
   'claude-cli': 'claude',
   'codex-cli': 'codex',
-  'gemini-cli': 'gemini',
-  'opencode-cli': 'opencode',
-  'cursor-cli': 'cursor',
   'copilot-cli': 'copilot',
-  'amp-cli': 'amp',
-  'qwen-cli': 'qwen',
 };
 
-export const CLI_PROVIDERS: Provider[] = [
-  'antigravity-cli',
-  'claude-cli',
-  'codex-cli',
-  'gemini-cli',
-  'opencode-cli',
-  'cursor-cli',
-  'copilot-cli',
-  'amp-cli',
-  'qwen-cli',
-];
+export const CLI_PROVIDERS: Provider[] = ['claude-cli', 'codex-cli', 'copilot-cli'];
 export const API_PROVIDERS: Provider[] = ['anthropic', 'openai', 'gemini'];
 
 export const PERM_MODES: Record<
@@ -94,14 +64,14 @@ export const PERM_MODES: Record<
     label: 'Ask',
     icon: Lock,
     claudeNote: 'Asks before every edit and shell command.',
-    codexNote: 'Read-only sandbox. Codex cannot ask in chat, so it cannot edit.',
-    cliNote: 'Read-only / plan mode where supported; no automatic edits.',
+    codexNote: 'Asks before every edit and command; the workspace sandbox stays on.',
+    cliNote: 'Asks before edits and commands where the CLI can prompt; otherwise read-only.',
   },
   auto_edit: {
     label: 'Auto-edit',
     icon: ShieldCheck,
     claudeNote: 'Edits in the workspace are automatic; anything else asks.',
-    codexNote: 'Edits and commands stay inside the workspace sandbox.',
+    codexNote: 'Edits and commands run in the workspace sandbox; Codex asks when it needs more.',
     cliNote: 'Workspace edits are auto-accepted using the CLI’s safety mode.',
   },
   full_access: {
@@ -152,7 +122,11 @@ export const AgentSettingsProvider: React.FC<{
   const [config, setConfig] = useState<AgentConfig>(() => {
     try {
       const saved = localStorage.getItem(CONFIG_KEY);
-      if (saved) return { ...DEFAULT_CONFIG, ...JSON.parse(saved) };
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        // A provider that was removed in an update falls back to the default engine.
+        if (parsed.provider in PROVIDER_PRESETS) return { ...DEFAULT_CONFIG, ...parsed };
+      }
     } catch {
       // ignore
     }
@@ -240,7 +214,6 @@ export const AgentSettingsProvider: React.FC<{
     let list: string[];
     if (p === 'ollama') list = ollamaModels;
     else if (p === 'codex-cli') list = ['default', ...(localModels?.codex ?? [])];
-    else if (p === 'antigravity-cli') list = ['default', ...(localModels?.antigravity ?? [])];
     else if (isApi) list = apiModelsCurrent?.list ?? [];
     else list = STATIC_MODELS[p] ?? ['default'];
     // Always keep the active model selectable, even when it is a custom id.

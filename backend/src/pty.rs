@@ -471,11 +471,6 @@ fn extension_dirs(profile: Option<&Path>, prefix: &str, sub: &[&str]) -> Vec<Pat
     out
 }
 
-/// Resolve an agent CLI to a full executable path, using PATH plus app-bundled locations.
-pub fn resolve_cli_tool(cmd: &str) -> Option<PathBuf> {
-    find_command_in_path(cmd, &augmented_path_env())
-}
-
 /// Resolve the first matching binary from a list of candidate command names.
 pub fn resolve_cli_tool_any(cmds: &[&str]) -> Option<PathBuf> {
     let path_env = augmented_path_env();

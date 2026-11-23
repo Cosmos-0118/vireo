@@ -249,15 +249,9 @@ export interface AgentConfig {
     | 'anthropic'
     | 'gemini'
     | 'ollama'
-    | 'antigravity-cli'
     | 'claude-cli'
     | 'codex-cli'
-    | 'gemini-cli'
-    | 'opencode-cli'
-    | 'cursor-cli'
-    | 'copilot-cli'
-    | 'amp-cli'
-    | 'qwen-cli';
+    | 'copilot-cli';
   baseUrl: string;
   apiKey: string;
   model: string;
@@ -277,6 +271,47 @@ export interface PermissionRequest {
   input: Record<string, unknown>;
   /** Rule saved when the user picks "always allow in this thread". */
   rule: string;
+}
+
+/** An entry of the composer's `/` palette, discovered from the running agent session. */
+export interface SlashCommand {
+  /** Without the leading slash. */
+  name: string;
+  description: string;
+  /** Argument hint such as `<file>`. */
+  hint?: string;
+  source: 'builtin' | 'skill' | 'project' | 'user' | string;
+}
+
+export interface QuestionOption {
+  label: string;
+  description: string;
+}
+
+export interface AgentQuestion {
+  /** Key of the answer sent back to the agent. */
+  id: string;
+  header: string;
+  question: string;
+  options: QuestionOption[];
+  multi_select: boolean;
+  /** The user may type a free-form answer instead of picking an option. */
+  allow_other: boolean;
+  secret: boolean;
+}
+
+/** Multiple-choice questions from a running agent turn, shown inline until answered. */
+export interface QuestionRequest {
+  turn_id: string;
+  request_id: string;
+  questions: AgentQuestion[];
+}
+
+/** Result of warming a thread's agent session. */
+export interface SessionPrepareRes {
+  resume_id: string | null;
+  resumed?: boolean;
+  commands: SlashCommand[];
 }
 
 export interface ToolCallTrace {
@@ -315,8 +350,6 @@ export interface LocalModelsInfo {
   ollama: { running: boolean; models: string[] };
   /** Model slugs listed in the user's Codex install. */
   codex: string[];
-  /** Model slugs reported by `agy models` when Antigravity CLI is installed. */
-  antigravity?: string[];
 }
 
 export interface CliToolStatus {

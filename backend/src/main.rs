@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod agent;
+mod agent_session;
 mod checkpoint;
 mod cli_agent;
 mod code_intel;
@@ -341,6 +342,9 @@ fn build_router(
         .route("/api/git/redo", post(checkpoint::redo_checkpoint))
         .route("/api/agent/chat", post(agent::chat))
         .route("/api/agent/permission", post(cli_agent::answer_permission))
+        .route("/api/agent/question", post(agent_session::answer_question))
+        .route("/api/agent/session/prepare", post(agent_session::prepare_session))
+        .route("/api/agent/session/close", post(agent_session::close_session))
         .route("/api/agent/cli-tools", get(pty::list_cli_tools))
         .route("/api/agent/models", get(agent::list_models))
         .route("/api/agent/api-models", post(agent::list_api_models))
@@ -382,6 +386,7 @@ async fn require_workspace(
         || path.starts_with("/api/git")
         || path == "/api/tasks"
         || path == "/api/agent/chat"
+        || path == "/api/agent/session/prepare"
         || path == "/ws/pty";
     if needs_ws && state.workspace_path().await.as_os_str().is_empty() {
         return (StatusCode::CONFLICT, "No folder is open").into_response();

@@ -170,6 +170,8 @@ pub async fn set_workspace(
         *ws = cleaned_path.clone();
     }
     state.checkpoints.write().await.clear();
+    // Agent processes keep their working directory open; end them so the old folder is released.
+    state.sessions.close_all().await;
     let _ = state.watcher_retarget_tx.send(cleaned_path.clone()).await;
     let _ = state.events_tx.send(WorkspaceEvent::WorkspaceSwitched {
         path: cleaned_str.clone(),

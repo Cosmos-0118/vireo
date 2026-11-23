@@ -6,6 +6,9 @@ import type {
   CliToolStatus,
   LocalModelsInfo,
   PermissionRequest,
+  QuestionRequest,
+  SessionPrepareRes,
+  SlashCommand,
   CommandRes,
   CommitDetailRes,
   CommitFileChange,
@@ -272,6 +275,37 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ turn_id: turnId, request_id: requestId, allow, remember }),
     }),
+  answerQuestion: (turnId: string, requestId: string, answers: Record<string, string[]>, cancelled = false) =>
+    jsonFetch<{ ok: boolean }>('/api/agent/question', {
+      method: 'POST',
+      body: JSON.stringify({ turn_id: turnId, request_id: requestId, answers, cancelled }),
+    }),
+  /** Starts (or resumes) the thread's agent session and returns its slash commands. */
+  prepareSession: (req: {
+    threadId: string;
+    provider: string;
+    model: string;
+    permissionMode?: string;
+    resumeId?: string;
+    allowedRules?: string[];
+  }) =>
+    jsonFetch<SessionPrepareRes>('/api/agent/session/prepare', {
+      method: 'POST',
+      body: JSON.stringify({
+        thread_id: req.threadId,
+        provider: req.provider,
+        model: req.model,
+        permission_mode: req.permissionMode,
+        resume_id: req.resumeId,
+        allowed_rules: req.allowedRules,
+      }),
+    }),
+  /** Ends the thread's agent process (the thread was deleted). */
+  closeSession: (threadId: string) =>
+    jsonFetch<{ ok: boolean }>('/api/agent/session/close', {
+      method: 'POST',
+      body: JSON.stringify({ thread_id: threadId }),
+    }),
   cliTools: () => jsonFetch<CliToolStatus[]>('/api/agent/cli-tools'),
   /** API keys live in the OS credential store (via the backend), never in browser storage. */
   getSecrets: (names: string[]) =>
@@ -305,16 +339,23 @@ export async function streamAgentChat(
   messages: Array<{ role: string; content: string }>,
   handlers: {
     onText: (text: string) => void;
+    /** A streamed fragment of the reply; consecutive fragments continue the same paragraph. */
+    onTextDelta?: (text: string) => void;
     onToolCall: (call: { id: string; name: string; args: Record<string, unknown> }) => void;
     onToolResult: (res: { id: string; name: string; result: string }) => void;
     onCheckpoint: (cp: Checkpoint) => void;
     onPermissionRequest?: (req: PermissionRequest) => void;
     onPermissionCancel?: (requestId: string) => void;
+    onUserQuestion?: (req: QuestionRequest) => void;
+    /** The agent's own conversation id, to resume this thread after a restart. */
+    onSession?: (s: { resume_id: string; resumed?: boolean }) => void;
+    onCommands?: (commands: SlashCommand[]) => void;
     onError: (msg: string) => void;
     onDone: () => void;
   },
   signal?: AbortSignal,
-  allowedRules?: string[]
+  allowedRules?: string[],
+  session?: { threadId: string; resumeId?: string }
 ) {
   const res = await fetch('/api/agent/chat', {
     method: 'POST',
@@ -329,6 +370,8 @@ export async function streamAgentChat(
       auto_checkpoint: config.autoCheckpoint,
       permission_mode: config.permissionMode ?? 'auto_edit',
       allowed_rules: allowedRules?.length ? allowedRules : undefined,
+      thread_id: session?.threadId,
+      resume_id: session?.resumeId,
     }),
   });
 
@@ -365,11 +408,15 @@ export async function streamAgentChat(
       try {
         const data = JSON.parse(dataStr);
         if (evName === 'text' && data.text) handlers.onText(data.text);
+        else if (evName === 'text_delta' && data.text) (handlers.onTextDelta ?? handlers.onText)(data.text);
         else if (evName === 'tool_call') handlers.onToolCall(data);
         else if (evName === 'tool_result') handlers.onToolResult(data);
         else if (evName === 'checkpoint') handlers.onCheckpoint(data);
         else if (evName === 'permission_request') handlers.onPermissionRequest?.(data);
         else if (evName === 'permission_cancel') handlers.onPermissionCancel?.(data.request_id);
+        else if (evName === 'user_question') handlers.onUserQuestion?.(data);
+        else if (evName === 'session' && data.resume_id) handlers.onSession?.(data);
+        else if (evName === 'commands') handlers.onCommands?.(data.commands ?? []);
         else if (evName === 'error') handlers.onError(data.message || 'Unknown error');
         else if (evName === 'done') handlers.onDone();
       } catch {
