@@ -170,7 +170,10 @@ pub(crate) fn parse_anchor_in_doc(doc: &Doc, rel: &str, raw: &str) -> Result<(us
     match parse_anchor(raw) {
         Ok(a) => Ok(a),
         Err(msg) => {
-            let digits: String = raw.trim().chars().take_while(|c| c.is_ascii_digit()).collect();
+            let digits: String = lazy_re!(r"^[>\[\s]*(?:[^\s:#]+:)?(\d+)")
+                .captures(raw.trim())
+                .map(|c| c[1].to_string())
+                .unwrap_or_default();
             if let Ok(line_no) = digits.parse::<usize>() {
                 if line_no >= 1 && !doc.lines.is_empty() {
                     return Err(format!(
@@ -205,7 +208,18 @@ pub(crate) fn locate(
             && line_hash(&doc.lines[start0 as usize + span]) == e.1
     };
     let base = s.0 as isize - 1;
-    if ok(base) {
+    let indent = |r: usize| doc.lines[r].len() - doc.lines[r].trim_start().len();
+    // `}` hashes the same at every depth (the hash ignores indentation), so an exact match whose end
+    // line is a deeper closer, with a same-indent twin nearby, is a shifted inner block, not the target.
+    let inner_end = |b: usize| -> bool {
+        let end = b + span;
+        span > 0
+            && doc.lines[end].trim_start().starts_with(['}', ')', ']'])
+            && indent(end) > indent(b)
+            && (end.saturating_sub(5)..=(end + 5).min(n - 1))
+                .any(|r| r > b && r != end && indent(r) == indent(b) && line_hash(&doc.lines[r]) == e.1)
+    };
+    if ok(base) && !inner_end(base as usize) {
         return Ok((base as usize, base as usize + span));
     }
     let mut cands = Vec::new();
@@ -240,7 +254,6 @@ pub(crate) fn locate(
             return Ok(pairs[0]);
         }
         // Several closing lines share the hash (`}` `}`): the true end sits at the start line's indent.
-        let indent = |r: usize| doc.lines[r].len() - doc.lines[r].trim_start().len();
         let same: Vec<&(usize, usize)> = pairs.iter().filter(|(st, en)| indent(*st) == indent(*en)).collect();
         let starts: std::collections::HashSet<usize> = same.iter().map(|p| p.0).collect();
         if starts.len() == 1 {

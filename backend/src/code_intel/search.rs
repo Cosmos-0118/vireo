@@ -506,11 +506,7 @@ fn signal_tier(rel: &str) -> u8 {
     if matches!(ext, "md" | "markdown" | "txt" | "rst" | "adoc" | "log" | "csv") {
         return 2;
     }
-    let is_test = name == "tests.rs"
-        || name.contains(".test.")
-        || name.contains(".spec.")
-        || name.contains("_test.")
-        || lower.contains("/__tests__/");
+    let is_test = super::symbols::is_test_path(&lower);
     if is_test || matches!(ext, "json" | "yaml" | "yml") {
         return 1;
     }
@@ -611,8 +607,12 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
         let (keep, noise): (Vec<Hit>, Vec<Hit>) = hits.into_iter().partition(|h| signal_tier(&h.0) < 3);
         hits = keep;
         if !noise.is_empty() {
-            let mut names: Vec<&str> = noise.iter().map(|h| h.0.as_str()).collect();
-            names.dedup();
+            let mut names: Vec<&str> = Vec::new();
+            for h in &noise {
+                if !names.contains(&h.0.as_str()) {
+                    names.push(h.0.as_str());
+                }
+            }
             names.truncate(4);
             noise_note = format!("[+{} hits in lockfiles/generated files: {}]\n", noise.len(), names.join(", "));
         }
@@ -673,6 +673,7 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
                 for ln in *a..=*b {
                     if shown_lines >= max_lines || res.len() > 16_000 {
                         res.push_str("…[more matches; narrow query, path, or --glob]\n");
+                        res.push_str(&noise_note);
                         return Ok(res);
                     }
                     let raw = flines[ln - 1];
@@ -698,7 +699,7 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
             break;
         }
         let text: String = raw.chars().take(200).collect();
-        res.push_str(&format!("{file}:{line}#{}| {}\n", line_hash(raw), text.trim()));
+        res.push_str(&format!("{file}:{line}#{}| {}\n", line_hash(raw), text.trim_end()));
     }
     res.push_str(&noise_note);
     Ok(res)

@@ -88,7 +88,7 @@ fn is_file_header(l: &str) -> bool {
 
 fn parse_anchored_header(h: &str) -> Option<(AnchorKind, (usize, String), (usize, String))> {
     let re = lazy_re!(
-        r"^(?i:(after|before|replace|delete)\s+)?(\d+#[0-9A-Fa-f]{2})(?:\s*(?:\.\.|-)\s*(\d+#[0-9A-Fa-f]{2}))?$"
+        r"^(?i:(after|before|replace|delete)\s+)?\[?(\d+#[0-9A-Fa-f]{2})(?:\s*(?:\.\.|-)\s*(\d+#[0-9A-Fa-f]{2}))?\]?$"
     );
     let c = re.captures(h.trim())?;
     let kind = match c.get(1).map(|m| m.as_str().to_ascii_lowercase()).as_deref() {

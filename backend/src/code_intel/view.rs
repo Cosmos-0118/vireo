@@ -6,11 +6,11 @@ use super::doc::{hl, read_doc_smart, Doc};
 use super::symbols::{find_symbol, lang_for, qualified, symbols};
 
 pub(crate) const MAX_VIEW_LINES: usize = 400;
-const MAX_VIEW_BYTES: usize = 30_000;
+pub(crate) const MAX_VIEW_BYTES: usize = 30_000;
 /// One minified/generated line must not eat the whole budget (the hash stays that of the full line).
 const MAX_LINE_CHARS: usize = 2_000;
 
-fn show_line(doc: &Doc, i: usize) -> String {
+pub(crate) fn show_line(doc: &Doc, i: usize) -> String {
     let line = hl(i + 1, &doc.lines[i]);
     let extra = line.chars().count().saturating_sub(MAX_LINE_CHARS);
     if extra == 0 {

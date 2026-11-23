@@ -4,10 +4,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tree_sitter::{Language, Node, Parser};
 
-use super::doc::{hl, line_hash, read_doc_smart, splice, text_to_lines, Doc};
+use super::doc::{line_hash, read_doc_smart, splice, text_to_lines, Doc};
 use super::edit::finish_edit;
 use super::util::{command, find_path_candidates, ignored_dir, missing_path_err, rel_of, resolve, run_capture, with_note};
-use super::view::MAX_VIEW_LINES;
+use super::view::{show_line, MAX_VIEW_BYTES, MAX_VIEW_LINES};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lang {
@@ -795,7 +795,12 @@ fn symbol_op_doc(
     if matches!(mode, "" | "read") {
         let mut out = format!("# {rel} {} lines {}..{}\n", qualified(&s), r0 + 1, r1 + 1);
         for i in r0..=r1.min(r0 + MAX_VIEW_LINES - 1) {
-            out.push_str(&hl(i + 1, &doc.lines[i]));
+            let line = show_line(&doc, i);
+            if i > r0 && out.len() + line.len() > MAX_VIEW_BYTES {
+                out.push_str(&format!("…[{} more lines; continue with {rel}:{}..{}]\n", r1 + 1 - i, i + 1, r1 + 1));
+                return Ok(out);
+            }
+            out.push_str(&line);
             out.push('\n');
         }
         if r1 + 1 > r0 + MAX_VIEW_LINES {
@@ -851,7 +856,7 @@ fn top_names(syms: &[Sym]) -> Vec<&str> {
     out
 }
 
-fn is_test_path(rel: &str) -> bool {
+pub(crate) fn is_test_path(rel: &str) -> bool {
     let l = rel.to_lowercase();
     let name = l.rsplit('/').next().unwrap_or(&l);
     name == "tests.rs"
@@ -938,7 +943,7 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
     let mut entries: Vec<Entry> = Vec::new();
     let ident = lazy_re!(r"[A-Za-z_][A-Za-z0-9_]{2,}");
     let walk = ignore::WalkBuilder::new(&root)
-        .hidden(false)
+        .hidden(true)
         .git_ignore(true)
         .git_exclude(true)
         .require_git(false)
@@ -1028,7 +1033,7 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
                 continue;
             }
         }
-        let boost = if dirty.contains(&e.rel) { 60 } else { 0 };
+        let boost = if dirty.contains(&e.rel) { 200 } else { 0 };
         order.push((i, score * 10_000 + rank[i] + boost));
     }
     order.sort_by(|a, b| b.1.cmp(&a.1).then(entries[a.0].rel.cmp(&entries[b.0].rel)));
@@ -1081,7 +1086,7 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
         let mut dirs: Vec<(&str, usize)> = by_dir.into_iter().collect();
         dirs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
         let listed: Vec<String> = dirs.iter().take(8).map(|(d, n)| format!("{d} {n}")).collect();
-        let changed: Vec<&str> = entries.iter().map(|e| e.rel.as_str()).filter(|r| dirty.contains(*r)).collect();
+        let changed: Vec<&str> = order.iter().map(|(i, _)| entries[*i].rel.as_str()).filter(|r| dirty.contains(*r)).collect();
         let changed_note = if changed.is_empty() {
             String::new()
         } else {

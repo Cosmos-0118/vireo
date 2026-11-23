@@ -982,3 +982,36 @@ fn search_demotes_lockfiles_and_prose_below_source() {
     assert!(out.contains("+2 hits in lockfiles/generated files: Cargo.lock"), "{out}");
     assert!(out.contains("#") && out.contains("fn needle"), "auto-context kept for source hits: {out}");
 }
+
+#[test]
+fn locate_rejects_shifted_inner_closer_with_same_hash() {
+    use super::doc::{locate, Doc};
+    // An earlier edit grew the `if` block, so the stale end line (6) is now the inner `    }`.
+    let doc = Doc::parse("fn foo() {\n    if a {\n        one();\n        two();\n        three();\n    }\n    bar();\n}\n");
+    let s = (1, line_hash("fn foo() {"));
+    let e = (6, line_hash("}"));
+    assert_eq!(locate(&doc, "a.rs", &s, &e).unwrap(), (0, 7));
+    // Unshifted: the exact match is still taken.
+    let doc = Doc::parse("fn foo() {\n    if a {\n        one();\n    }\n    bar();\n}\n");
+    assert_eq!(locate(&doc, "a.rs", &(1, line_hash("fn foo() {")), &(6, line_hash("}"))).unwrap(), (0, 5));
+}
+
+#[test]
+fn malformed_prefixed_anchor_still_shows_live_lines() {
+    use super::doc::{parse_anchor_in_doc, Doc};
+    let doc = Doc::parse("a\nb\nc\n");
+    for raw in ["src/a.rs:2#zz", "[2#zz", "> 2#zz", "2#zz"] {
+        let err = parse_anchor_in_doc(&doc, "a.rs", raw).unwrap_err();
+        assert!(err.contains("Current lines near 2"), "{raw}: {err}");
+    }
+}
+
+#[test]
+fn repo_map_skips_hidden_dirs() {
+    let ws = tmp("map-hidden");
+    std::fs::create_dir_all(ws.join(".github")).unwrap();
+    std::fs::write(ws.join(".github/w.rs"), "fn hidden_one() {}\n").unwrap();
+    std::fs::write(ws.join("a.rs"), "fn shown_one() {}\n").unwrap();
+    let m = repo_map(&ws, None, None).unwrap();
+    assert!(m.contains("shown_one") && !m.contains("hidden_one"), "{m}");
+}

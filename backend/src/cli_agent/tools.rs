@@ -106,20 +106,10 @@ pub(crate) fn map_vx_mcp_tool(tool: &str, input: &Value, ws: &Path) -> (String, 
         "map" => ("repo_map".into(), json!({ "query": input["query"].as_str().unwrap_or("") })),
         "view" if input["outline"].as_bool() == Some(true) => ("outline".into(), json!({ "path": p() })),
         "view" => {
-            let mut a = json!({ "path": p() });
-            if let Some(t) = input["target"].as_str().filter(|s| !s.is_empty()) {
-                if let Some((s, e)) = t.split_once("..") {
-                    if let Ok(s) = s.parse::<u64>() {
-                        a["start_line"] = json!(s);
-                    }
-                    if let Ok(e) = e.parse::<u64>() {
-                        a["end_line"] = json!(e);
-                    }
-                } else {
-                    a["symbol"] = json!(t);
-                }
-            }
-            ("read_file".into(), a)
+            let full = p();
+            let (raw_p, inline_t) = crate::code_intel::split_view_spec(&full);
+            let t = input["target"].as_str().filter(|s| !s.is_empty()).or(inline_t);
+            ("read_file".into(), view_args(raw_p, t))
         }
         "search" => ("search_code".into(), json!({ "query": input["query"].as_str().unwrap_or("") })),
         "edit" => ("edit_file".into(), json!({ "path": p() })),
@@ -140,6 +130,22 @@ pub(crate) fn map_vx_mcp_tool(tool: &str, input: &Value, ws: &Path) -> (String, 
     }
 }
 
+fn view_args(path: &str, target: Option<&str>) -> Value {
+    let mut a = json!({ "path": path });
+    if let Some(t) = target {
+        if let Some((s, e)) = t.split_once("..") {
+            if let Ok(s) = s.parse::<u64>() {
+                a["start_line"] = json!(s);
+            }
+            if let Ok(e) = e.parse::<u64>() {
+                a["end_line"] = json!(e);
+            }
+        } else {
+            a["symbol"] = json!(t);
+        }
+    }
+    a
+}
 /// Recognise a `vx ...` shell call and present it with the chat UI's tool vocabulary.
 pub(crate) fn map_vx(command: &str, ws: &Path) -> Option<(String, Value)> {
     static VX_CALL: std::sync::OnceLock<Option<regex::Regex>> = std::sync::OnceLock::new();
@@ -163,20 +169,10 @@ pub(crate) fn map_vx(command: &str, ws: &Path) -> Option<(String, Value)> {
         "map" => ("repo_map".into(), json!({ "query": pos.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ") })),
         "outline" => ("outline".into(), json!({ "path": path(0) })),
         "view" => {
-            let mut a = json!({ "path": path(0) });
-            if let Some(t) = pos.get(1) {
-                if let Some((s, e)) = t.split_once("..") {
-                    if let Ok(s) = s.parse::<u64>() {
-                        a["start_line"] = json!(s);
-                    }
-                    if let Ok(e) = e.parse::<u64>() {
-                        a["end_line"] = json!(e);
-                    }
-                } else {
-                    a["symbol"] = json!(t);
-                }
-            }
-            ("read_file".into(), a)
+            let first = path(0);
+            let (raw_p, inline_t) = crate::code_intel::split_view_spec(&first);
+            let t = pos.get(1).map(|s| s.as_str()).or(inline_t);
+            ("read_file".into(), view_args(raw_p, t))
         }
         "edit" => ("edit_file".into(), json!({ "path": path(0) })),
         "apply" | "replace" => ("edit_file".into(), json!({ "path": "" })),
@@ -194,7 +190,21 @@ pub(crate) fn map_vx(command: &str, ws: &Path) -> Option<(String, Value)> {
             }
             ("ast".into(), a)
         }
-        "check" => ("verify".into(), json!({ "command": pos.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ") })),
+        "check" => {
+            // Drop vx's own leading flags (`--raw`, `--timeout N`, ...) but keep the wrapped command's.
+            let mut it = toks.iter().peekable();
+            while let Some(t) = it.peek() {
+                if !t.starts_with('-') {
+                    break;
+                }
+                let takes_value = matches!(t.as_str(), "--timeout" | "--dir");
+                it.next();
+                if takes_value {
+                    it.next();
+                }
+            }
+            ("verify".into(), json!({ "command": it.map(|s| s.as_str()).collect::<Vec<_>>().join(" ") }))
+        }
         _ => return None,
     })
 }

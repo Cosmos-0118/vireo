@@ -134,7 +134,11 @@ x
     let (n, a) = map_vx("vx apply --file patch.txt", ws).unwrap();
     assert_eq!((n.as_str(), a["path"].as_str()), ("edit_file", Some("")));
     let (n, a) = map_vx("vx check cargo test -p vireo", ws).unwrap();
-    assert_eq!((n.as_str(), a["command"].as_str()), ("verify", Some("cargo test vireo")));
+    assert_eq!((n.as_str(), a["command"].as_str()), ("verify", Some("cargo test -p vireo")));
+    let (_, a) = map_vx("vx check --raw --timeout 60 cargo test -p vireo", ws).unwrap();
+    assert_eq!(a["command"].as_str(), Some("cargo test -p vireo"));
+    let (_, a) = map_vx_mcp_tool("view", &json!({"path": "big.txt:401..500"}), ws);
+    assert_eq!((a["path"].as_str(), a["start_line"].as_u64(), a["end_line"].as_u64()), (Some("big.txt"), Some(401), Some(500)));
     assert!(map_vx("cargo build", ws).is_none());
 
     // MCP tool calls from Claude Code map onto the same UI vocabulary.
