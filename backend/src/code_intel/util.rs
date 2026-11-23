@@ -210,7 +210,7 @@ pub(crate) fn ignored_dir(name: &str) -> bool {
     matches!(
         name,
         ".git" | "node_modules" | "target" | "dist" | "build" | ".next" | ".nuxt" | "__pycache__"
-            | ".venv" | "venv" | ".turbo" | ".cache" | "coverage"
+            | ".venv" | "venv" | ".turbo" | ".cache" | "coverage" | "obj" | ".gradle" | ".vs" | ".idea"
     )
 }
 

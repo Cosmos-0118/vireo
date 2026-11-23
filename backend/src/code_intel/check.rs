@@ -59,6 +59,17 @@ fn detect_checks(ws: &Path) -> Vec<(String, String, String)> {
             out.push((p.clone(), "go vet ./...".to_string(), "go vet".to_string()));
         }
     }
+    if out.is_empty() {
+        // A solution or project file: `dotnet build` also type-checks, which is what a check is for.
+        let has_dotnet = |d: &Path| {
+            std::fs::read_dir(d)
+                .map(|rd| rd.flatten().any(|e| matches!(e.path().extension().and_then(|x| x.to_str()), Some("sln" | "slnx" | "csproj"))))
+                .unwrap_or(false)
+        };
+        if let Some((p, _)) = dirs.iter().find(|(_, d)| has_dotnet(d)) {
+            out.push((p.clone(), "dotnet build --nologo -v q".to_string(), "dotnet build".to_string()));
+        }
+    }
     out
 }
 
@@ -444,7 +455,7 @@ pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64, opts: CheckOpts) -
         None => detect_checks(ws),
     };
     if jobs.is_empty() {
-        return Err("no project detected (Cargo.toml / tsconfig.json / go.mod); pass a command, e.g. vx check npm test".into());
+        return Err("no project detected (Cargo.toml / tsconfig.json / go.mod / *.sln / *.csproj); pass a command, e.g. vx check npm test".into());
     }
     let mut report = String::new();
     for (prefix, command_line, label) in jobs {
