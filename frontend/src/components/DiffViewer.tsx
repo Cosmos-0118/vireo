@@ -1,3 +1,5 @@
+import { Binary, Equals, GitDiff } from '@phosphor-icons/react';
+import { EmptyState, EmptyStateButton } from './ui/EmptyState';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { diffLines, diffWordsWithSpace } from 'diff';
 import {
@@ -1188,9 +1190,13 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
 
   if (!diff) {
     return (
-      <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-muted)]">
-        Select a modified file or commit change to inspect its diff.
-      </div>
+      <EmptyState
+        size="lg"
+        icon={GitDiff}
+        title="No diff selected"
+        description="Pick a changed file or a commit to inspect its changes."
+        className="flex-1"
+      />
     );
   }
 
@@ -1608,24 +1614,22 @@ ${hunk.excerpt.slice(0, 3500)}
 
       {/* Diff Body + VS Code Overview Ruler */}
       {diff.binary ? (
-        <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-muted)]">
-          Binary file changed. No text preview available.
-        </div>
+        <EmptyState
+          size="lg"
+          icon={Binary}
+          title="Binary file changed"
+          description="There's no text preview for this file type."
+          className="flex-1"
+        />
       ) : computed.adds === 0 && computed.dels === 0 ? (
-        <div className="flex-1 flex flex-col items-center justify-center gap-2 text-xs text-[var(--text-muted)]">
-          <Check size={24} className="text-[var(--added-fg)]" />
-          <span>
-            {ignoreWhitespace
-              ? `No non-whitespace differences in ${diff.path}`
-              : `No differences in ${diff.path}`}
-          </span>
-          <button
-            onClick={onSwitchToCode}
-            className="text-xs underline text-[var(--accent)] cursor-pointer"
-          >
-            Open file content
-          </button>
-        </div>
+        <EmptyState
+          size="lg"
+          icon={Equals}
+          title={ignoreWhitespace ? 'Only whitespace changed' : 'No differences'}
+          description={<span className="font-mono text-[11.5px]">{diff.path}</span>}
+          action={<EmptyStateButton onClick={onSwitchToCode}>Open file</EmptyStateButton>}
+          className="flex-1"
+        />
       ) : (
         <div className="flex-1 flex min-h-0 relative overflow-hidden">
           <div

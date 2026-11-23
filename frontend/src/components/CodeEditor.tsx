@@ -1,3 +1,5 @@
+import { Binary } from '@phosphor-icons/react';
+import { EmptyState } from './ui/EmptyState';
 import React, { useEffect, useRef, useState } from 'react';
 import {
   Annotation,
@@ -915,9 +917,13 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
   if (binary) {
     return (
-      <div className="flex-1 flex items-center justify-center p-6 text-center text-[var(--text-muted)]">
-        Binary file cannot be displayed in the text editor.
-      </div>
+      <EmptyState
+        size="lg"
+        icon={Binary}
+        title="Binary file"
+        description="This file can't be displayed in the text editor."
+        className="flex-1"
+      />
     );
   }
 

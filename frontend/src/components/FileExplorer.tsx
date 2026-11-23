@@ -1,3 +1,5 @@
+import { FolderDashed, MagnifyingGlass } from '@phosphor-icons/react';
+import { EmptyState } from './ui/EmptyState';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { setPathDrag } from '../utils/dnd';
 import {
@@ -597,9 +599,16 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
       <div ref={scrollRef} className="flex-1 overflow-y-auto py-1.5">
         {filterOpen && filterQuery.trim() ? (
           filterMatches.length === 0 ? (
-            <div className="p-3 text-xs text-[var(--text-dim)]">
-              {allFiles ? 'No matching files.' : 'Loading…'}
-            </div>
+            allFiles ? (
+              <EmptyState
+                size="sm"
+                icon={MagnifyingGlass}
+                title="No matching files"
+                description={<>Nothing matches <span className="text-[var(--text-muted)]">“{filterQuery.trim()}”</span>.</>}
+              />
+            ) : (
+              <div className="p-3 text-xs text-[var(--text-dim)]">Loading…</div>
+            )
           ) : (
             filterMatches.map((f) => {
               const st = statusByPath.get(f);
@@ -640,7 +649,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
             })
           )
         ) : rows.length === 0 ? (
-          <div className="p-3 text-xs text-[var(--text-dim)]">No files.</div>
+          <EmptyState size="sm" icon={FolderDashed} title="This folder is empty" description="Files you create here will show up in the explorer." />
         ) : (
           rows.map(renderRow)
         )}

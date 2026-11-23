@@ -34,6 +34,7 @@ import {
 import { diffLines } from 'diff';
 import { AgentSettingsProvider } from './agentSettings';
 import { api, wsUrl } from './api';
+import { gitWriteActive } from './utils/gitWrites';
 import {
   applyTheme,
   BUILTIN_THEMES,
@@ -812,6 +813,8 @@ export function App() {
 
   // Watcher batch -> "what did the agent just change?" (works for any agent, CLI or built-in).
   fsChangedRef.current = (paths: string[], dirtyBefore: Set<string>) => {
+    // Pull/checkout/stash/reset rewrite files too; that is git, not the agent.
+    const fromGit = gitWriteActive();
     const lock =
       /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|bun\.lockb?|composer\.lock|poetry\.lock|Gemfile\.lock)$/;
     let files = paths
@@ -961,7 +964,10 @@ export function App() {
 
       const sup = selfWriteRef.current;
       const now = Date.now();
-      const ui = results.filter((r) => !(sup.all > now || (sup.paths.get(r.path) ?? 0) > now));
+      const ui =
+        fromGit || gitWriteActive()
+          ? []
+          : results.filter((r) => !(sup.all > now || (sup.paths.get(r.path) ?? 0) > now));
       if (!ui.length) return;
       for (const r of ui) {
         lastEditRef.current.delete(r.path);

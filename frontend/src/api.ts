@@ -1,3 +1,4 @@
+import { trackGitWrite } from './utils/gitWrites';
 import type {
   AgentConfig,
   BranchesRes,
@@ -405,6 +406,25 @@ export const api = {
       `/api/agent/models${ollamaBase ? `?ollama_base=${encodeURIComponent(ollamaBase)}` : ''}`
     ),
 };
+
+// Git ops that rewrite working-tree files: their watcher events are ours, not the agent's.
+const GIT_WRITE_OPS = [
+  'gitDiscard',
+  'gitDiscardAll',
+  'gitPull',
+  'gitCheckout',
+  'gitCherryPick',
+  'gitRevert',
+  'gitReset',
+  'gitMerge',
+  'gitStash',
+  'gitOperation',
+  'gitApplyPatch',
+] as const satisfies ReadonlyArray<keyof typeof api>;
+for (const name of GIT_WRITE_OPS) {
+  const op = api[name] as (...args: unknown[]) => Promise<unknown>;
+  (api as Record<string, unknown>)[name] = (...args: unknown[]) => trackGitWrite(() => op(...args));
+}
 
 export async function streamAgentChat(
   config: AgentConfig,

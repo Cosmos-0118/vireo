@@ -1,3 +1,5 @@
+import { CheckCircle, Equals, FileDashed, GitCommit } from '@phosphor-icons/react';
+import { EmptyRow, EmptyState } from './ui/EmptyState';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
@@ -1497,20 +1499,14 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
 
             {/* Clean tree: a quiet placeholder keeps the graph docked at the bottom and resizable */}
             {totalChanged === 0 && (
-              <div
+              <EmptyState
+                icon={CheckCircle}
+                tone="success"
+                title="Working tree clean"
+                description="New edits will appear here as they happen."
                 style={graphOpen ? { flex: `0 0 ${Math.round(cleanRatio * 100)}%` } : { flex: '1 1 auto' }}
-                className="flex flex-col items-center justify-center gap-2.5 min-h-0 overflow-hidden px-4 text-center"
-              >
-                <svg width="44" height="44" viewBox="0 0 44 44" fill="none" aria-hidden="true" className="text-[var(--added-fg)]">
-                  <circle cx="22" cy="22" r="21" stroke="currentColor" strokeOpacity="0.12" />
-                  <circle cx="22" cy="22" r="15.5" fill="currentColor" fillOpacity="0.1" stroke="currentColor" strokeOpacity="0.35" />
-                  <path d="M15.5 22.5l4.5 4.5 8.5-9.5" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                </svg>
-                <span className="flex flex-col items-center gap-0.5 leading-none">
-                  <span className="text-[12.5px] font-medium text-[var(--text-primary)]">No changes</span>
-                  <span className="text-[11px] text-[var(--text-dim)]">Working tree clean</span>
-                </span>
-              </div>
+                className="!py-4"
+              />
             )}
 
             {/* Draggable Splitter between Changes/placeholder & Graph */}
@@ -1644,9 +1640,9 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                       </div>
                       <div className="overflow-y-auto py-0.5">
                         {compareDrawer.files.length === 0 ? (
-                          <div className="px-2.5 py-2 text-[11px] text-[var(--text-dim)]">
-                            No differences from working tree.
-                          </div>
+                          <EmptyRow icon={Equals} className="!px-2.5 !text-[11.5px]">
+                            Identical to the working tree
+                          </EmptyRow>
                         ) : (
                           compareDrawer.files.map((f) => (
                             <div
@@ -1878,9 +1874,9 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                                 )}
 
                                 {detail && detail.files.length === 0 && (
-                                  <div className="text-[11px] text-[var(--text-dim)] py-0.5">
-                                    No file changes.
-                                  </div>
+                                  <EmptyRow icon={FileDashed} className="!px-0 !py-0.5 !text-[11.5px]">
+                                    No file changes in this commit
+                                  </EmptyRow>
                                 )}
 
                                 {detail && detail.files.length > 0 && (
@@ -1950,9 +1946,12 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                     })}
 
                     {commits.length === 0 && !graphLoading && (
-                      <div className="px-3 py-4 text-center text-xs text-[var(--text-dim)]">
-                        {graphSearch ? 'No matching commits.' : 'No commits yet.'}
-                      </div>
+                      <EmptyState
+                        size="sm"
+                        icon={GitCommit}
+                        title={graphSearch ? 'No matching commits' : 'No commits yet'}
+                        description={graphSearch ? 'Try a different message, author or hash.' : 'Your first commit will show up here.'}
+                      />
                     )}
 
                     {hasMore && (

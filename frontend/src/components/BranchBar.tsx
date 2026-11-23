@@ -1,3 +1,5 @@
+import { GitBranch as PhGitBranch } from '@phosphor-icons/react';
+import { EmptyRow } from './ui/EmptyState';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { visibleInterval } from '../utils/visibleInterval';
 import {
@@ -881,7 +883,7 @@ const BranchPicker: React.FC<BranchPickerProps> = ({
         <>
           <div ref={listRef} role="listbox" className="max-h-[320px] overflow-y-auto py-1">
             {items.length === 0 && !q && (
-              <div className="px-3 py-3 text-[12px] text-[var(--text-dim)]">No branches yet.</div>
+              <EmptyRow icon={PhGitBranch} className="!py-3">No branches yet</EmptyRow>
             )}
 
             {items[0]?.type === 'create' &&
