@@ -284,6 +284,16 @@ export const api = {
     });
     if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
   },
+  /** Live model list from an API provider (needs the key for Anthropic / Gemini). */
+  apiModels: async (provider: string, baseUrl: string, apiKey: string): Promise<string[]> => {
+    const res = await fetch('/api/agent/api-models', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, base_url: baseUrl, api_key: apiKey }),
+    });
+    if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
+    return ((await res.json()) as { models: string[] }).models;
+  },
   agentModels: (ollamaBase?: string) =>
     jsonFetch<LocalModelsInfo>(
       `/api/agent/models${ollamaBase ? `?ollama_base=${encodeURIComponent(ollamaBase)}` : ''}`

@@ -18,21 +18,26 @@ import {
   RotateCcw,
   Undo2,
   Settings,
-  ShieldAlert,
-  ShieldCheck,
   Square,
   Terminal as TerminalIcon,
   X,
   Zap,
 } from 'lucide-react';
 import { api, streamAgentChat } from '../api';
+import {
+  CLI_PROVIDERS,
+  CLI_PROVIDER_TOOL,
+  API_PROVIDERS,
+  PERM_MODES,
+  PROVIDER_LABEL,
+  PROVIDER_PRESETS,
+  useAgentSettings,
+  type Provider,
+} from '../agentSettings';
 import type { LiteTheme } from '../themes';
 import type {
-  AgentConfig,
-  CliToolStatus,
   Checkpoint,
   GitFileStatus,
-  LocalModelsInfo,
   MessagePart,
   PermissionMode,
   PermissionRequest,
@@ -52,14 +57,6 @@ import {
   type ChangeLookup,
 } from './AgentActivity';
 
-const DEFAULT_CONFIG: AgentConfig = {
-  provider: 'claude-cli',
-  baseUrl: '',
-  apiKey: '',
-  model: 'default',
-  autoCheckpoint: true,
-};
-
 /** Human-readable scope of a saved "always allow" rule (mirrors `permission_rule` in the backend). */
 function describeRule(rule: string): string {
   const [tool, kind, ...rest] = rule.split(':');
@@ -68,120 +65,6 @@ function describeRule(rule: string): string {
   if (kind === 'dir') return `${tool} on any file under ${value}/`;
   return `Every ${rule} request`;
 }
-
-const PERM_MODES: Record<
-  PermissionMode,
-  { label: string; icon: typeof Lock; claudeNote: string; codexNote: string; cliNote: string }
-> = {
-  ask: {
-    label: 'Ask',
-    icon: Lock,
-    claudeNote: 'Asks before every edit and shell command.',
-    codexNote: 'Read-only sandbox. Codex cannot ask in chat, so it cannot edit.',
-    cliNote: 'Read-only / plan mode where supported; no automatic edits.',
-  },
-  auto_edit: {
-    label: 'Auto-edit',
-    icon: ShieldCheck,
-    claudeNote: 'Edits in the workspace are automatic; anything else asks.',
-    codexNote: 'Edits and commands stay inside the workspace sandbox.',
-    cliNote: 'Workspace edits are auto-accepted using the CLI’s safety mode.',
-  },
-  full_access: {
-    label: 'Full access',
-    icon: ShieldAlert,
-    claudeNote: 'Never asks. Can change any file and run any command.',
-    codexNote: 'No sandbox, no approvals. Full access to this machine.',
-    cliNote: 'Auto-approves tools and commands without prompts.',
-  },
-};
-
-const PROVIDER_PRESETS: Record<AgentConfig['provider'], { model: string; baseUrl: string }> = {
-  openai: { model: 'gpt-4.1', baseUrl: 'https://api.openai.com/v1' },
-  anthropic: { model: 'claude-sonnet-4-20250514', baseUrl: 'https://api.anthropic.com' },
-  gemini: { model: 'gemini-2.5-pro', baseUrl: '' },
-  ollama: { model: 'qwen2.5-coder:14b', baseUrl: 'http://127.0.0.1:11434/v1' },
-  'antigravity-cli': { model: 'default', baseUrl: '' },
-  'claude-cli': { model: 'default', baseUrl: '' },
-  'codex-cli': { model: 'default', baseUrl: '' },
-  'gemini-cli': { model: 'default', baseUrl: '' },
-  'opencode-cli': { model: 'default', baseUrl: '' },
-  'cursor-cli': { model: 'default', baseUrl: '' },
-  'copilot-cli': { model: 'default', baseUrl: '' },
-  'amp-cli': { model: 'default', baseUrl: '' },
-  'qwen-cli': { model: 'default', baseUrl: '' },
-};
-
-// Fallbacks only: Ollama, Codex, and Antigravity lists are replaced by what is actually installed.
-const MODEL_PRESETS: Record<AgentConfig['provider'], string[]> = {
-  openai: ['gpt-4.1', 'gpt-4.1-mini', 'o4-mini'],
-  anthropic: ['claude-sonnet-4-20250514', 'claude-opus-4-20250514'],
-  gemini: ['gemini-2.5-pro', 'gemini-2.5-flash'],
-  ollama: ['qwen2.5-coder:14b', 'llama3.1', 'deepseek-r1'],
-  'antigravity-cli': [
-    'default',
-    'gemini-4-neon-high',
-    'gemini-4-neon-xhigh',
-    'gemini-3.8-flash-high',
-    'claude-opus-5-5-high',
-    'claude-sonnet-5-5-high',
-  ],
-  'claude-cli': ['default', 'sonnet', 'opus', 'haiku'],
-  'codex-cli': ['default'],
-  'gemini-cli': ['default', 'gemini-2.5-pro', 'gemini-2.5-flash'],
-  'opencode-cli': ['default'],
-  'cursor-cli': ['default', 'auto'],
-  'copilot-cli': ['default'],
-  'amp-cli': ['default', 'smart', 'rush', 'deep'],
-  'qwen-cli': ['default'],
-};
-
-const LEGACY_KEYS_STORE = 'vireo-agent-keys';
-const PROVIDER_LABEL: Record<AgentConfig['provider'], string> = {
-  openai: 'OpenAI',
-  anthropic: 'Anthropic',
-  gemini: 'Gemini',
-  ollama: 'Ollama',
-  'antigravity-cli': 'Antigravity',
-  'claude-cli': 'Claude Code',
-  'codex-cli': 'Codex',
-  'gemini-cli': 'Gemini',
-  'opencode-cli': 'OpenCode',
-  'cursor-cli': 'Cursor',
-  'copilot-cli': 'GitHub Copilot',
-  'amp-cli': 'Amp',
-  'qwen-cli': 'Qwen Code',
-};
-
-/** Provider ids whose API keys are kept in the OS credential store. */
-const SECRET_NAMES = Object.keys(PROVIDER_LABEL);
-
-/** Providers that run an installed CLI with its own login instead of an API key. */
-const CLI_PROVIDER_TOOL: Partial<Record<AgentConfig['provider'], string>> = {
-  'antigravity-cli': 'antigravity',
-  'claude-cli': 'claude',
-  'codex-cli': 'codex',
-  'gemini-cli': 'gemini',
-  'opencode-cli': 'opencode',
-  'cursor-cli': 'cursor',
-  'copilot-cli': 'copilot',
-  'amp-cli': 'amp',
-  'qwen-cli': 'qwen',
-};
-
-type Provider = AgentConfig['provider'];
-const CLI_PROVIDERS: Provider[] = [
-  'antigravity-cli',
-  'claude-cli',
-  'codex-cli',
-  'gemini-cli',
-  'opencode-cli',
-  'cursor-cli',
-  'copilot-cli',
-  'amp-cli',
-  'qwen-cli',
-];
-const API_PROVIDERS: Provider[] = ['anthropic', 'openai', 'gemini'];
 
 const OK_DOT = '#10b981';
 const WARN_DOT = '#f59e0b';
@@ -382,6 +265,8 @@ interface AgentPanelProps {
   onOpenDiff: (path: string) => void;
   onRefreshGit: () => Promise<void>;
   onToast: (msg: string, isError?: boolean, action?: ToastAction) => void;
+  /** Open the Settings tab (engine, models, API keys, preferences). */
+  onOpenSettings: () => void;
 }
 
 interface AtRange {
@@ -403,8 +288,8 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   onOpenDiff,
   onRefreshGit,
   onToast,
+  onOpenSettings,
 }) => {
-  const [showSettings, setShowSettings] = useState(false);
   const [showModelMenu, setShowModelMenu] = useState(false);
   const [showThreads, setShowThreads] = useState(false);
   const [showFilePicker, setShowFilePicker] = useState(false);
@@ -418,26 +303,18 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   // "Always allow in this thread" rules; the CLI runs statelessly, so Vireo re-sends them each turn.
   const threadRulesRef = useRef<Record<string, string[]>>({});
 
-  const [config, setConfig] = useState<AgentConfig>(() => {
-    try {
-      const saved = localStorage.getItem('vireo-agent-config');
-      if (saved) return { ...DEFAULT_CONFIG, ...JSON.parse(saved) };
-    } catch {
-      // ignore
-    }
-    return DEFAULT_CONFIG;
-  });
-  // Keys are remembered per provider so switching engines never leaks one provider's key to another.
-  const [secretsReady, setSecretsReady] = useState(false);
-  const savedSecretsRef = useRef<Record<string, string>>({});
-  const [apiKeys, setApiKeys] = useState<Record<string, string>>(() => {
-    try {
-      // Legacy clear-text store; migrated to the OS credential store on mount, then removed.
-      return JSON.parse(localStorage.getItem(LEGACY_KEYS_STORE) || '{}');
-    } catch {
-      return {};
-    }
-  });
+  const {
+    config,
+    setConfig,
+    apiKeys,
+    setProvider,
+    cliTools,
+    localModels,
+    ollamaModels,
+    modelOptions,
+    refresh: refreshEngines,
+    showQuickActions,
+  } = useAgentSettings();
 
   const [messages, setMessages] = useState<UiChatMessage[]>([]);
   const [threadId, setThreadId] = useState(newThreadId);
@@ -461,7 +338,6 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const abortRef = useRef<AbortController | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  const settingsRef = usePopoverClose(showSettings, () => setShowSettings(false), 'settings');
   const modelRef = usePopoverClose(showModelMenu, () => setShowModelMenu(false), 'engine');
   const threadsRef = usePopoverClose(showThreads, () => setShowThreads(false), 'threads');
   const permMenuRef = usePopoverClose(showPermMenu, () => setShowPermMenu(false), 'perm');
@@ -475,40 +351,17 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     'picker'
   );
 
-  const [cliTools, setCliTools] = useState<CliToolStatus[]>([]);
-  const [localModels, setLocalModels] = useState<LocalModelsInfo | null>(null);
-
-  // Refresh what is installed locally (CLIs, Ollama models) at mount and whenever a menu opens.
+  // Re-detect installed CLIs / models whenever the engine menu opens.
   useEffect(() => {
-    let cancelled = false;
-    api
-      .cliTools()
-      .then((t) => !cancelled && setCliTools(t))
-      .catch(() => {});
-    api
-      .agentModels(config.provider === 'ollama' ? config.baseUrl : undefined)
-      .then((m) => !cancelled && setLocalModels(m))
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
+    if (showModelMenu) refreshEngines();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showSettings, showModelMenu, config.provider]);
+  }, [showModelMenu]);
 
   const cliToolId = CLI_PROVIDER_TOOL[config.provider];
   const cliInstalled = cliToolId ? cliTools.find((t) => t.id === cliToolId)?.installed : undefined;
   const configured = cliToolId
     ? cliInstalled !== false
     : config.provider === 'ollama' || !!config.apiKey.trim();
-  const ollamaModels = localModels?.ollama.running ? localModels.ollama.models : [];
-  const modelOptions: string[] =
-    config.provider === 'ollama' && ollamaModels.length
-      ? ollamaModels
-      : config.provider === 'codex-cli' && localModels?.codex.length
-        ? ['default', ...localModels.codex]
-        : config.provider === 'antigravity-cli' && localModels?.antigravity?.length
-          ? ['default', ...localModels.antigravity]
-          : MODEL_PRESETS[config.provider];
   const orderedCliProviders = useMemo(() => {
     return [...CLI_PROVIDERS].sort((a, b) => {
       const aInst = cliTools.find((t) => t.id === CLI_PROVIDER_TOOL[a])?.installed ? 1 : 0;
@@ -539,83 +392,6 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         ? { ok: true, text: 'Key set' }
         : { ok: false, text: 'No API key' };
   const engineShort = `${PROVIDER_LABEL[config.provider]}${shortModel(config.model) ? ` · ${shortModel(config.model)}` : ''}`;
-
-  // Persist everything except the API key, which goes to the OS credential store instead.
-  useEffect(() => {
-    try {
-      localStorage.setItem('vireo-agent-config', JSON.stringify({ ...config, apiKey: '' }));
-    } catch {
-      // ignore
-    }
-  }, [config]);
-
-  useEffect(() => {
-    setApiKeys((prev) =>
-      prev[config.provider] === config.apiKey ? prev : { ...prev, [config.provider]: config.apiKey }
-    );
-  }, [config.provider, config.apiKey]);
-
-  // Load keys from the OS credential store; keys a previous version left in localStorage are
-  // moved there once and then erased from the browser.
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      let stored: Record<string, string> = {};
-      try {
-        stored = await api.getSecrets(SECRET_NAMES);
-      } catch {
-        // credential store unavailable: fall back to whatever is in memory
-      }
-      if (cancelled) return;
-      const merged: Record<string, string> = { ...stored };
-      for (const [k, v] of Object.entries(apiKeys)) if (v.trim()) merged[k] = v;
-      const saved = { ...stored };
-      let migrated = true;
-      for (const name of SECRET_NAMES) {
-        if ((merged[name] ?? '') === (stored[name] ?? '')) continue;
-        try {
-          await api.putSecret(name, merged[name]);
-          saved[name] = merged[name];
-        } catch {
-          migrated = false;
-        }
-      }
-      if (cancelled) return;
-      if (migrated) {
-        try {
-          localStorage.removeItem(LEGACY_KEYS_STORE);
-        } catch {
-          // ignore
-        }
-      }
-      savedSecretsRef.current = saved;
-      setApiKeys(merged);
-      setConfig((c) => (c.apiKey ? c : { ...c, apiKey: merged[c.provider] ?? '' }));
-      setSecretsReady(true);
-    })();
-    return () => {
-      cancelled = true;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Write changed keys back to the credential store (debounced while typing).
-  useEffect(() => {
-    if (!secretsReady) return;
-    const timer = setTimeout(() => {
-      for (const name of SECRET_NAMES) {
-        const value = apiKeys[name] ?? '';
-        if (value === (savedSecretsRef.current[name] ?? '')) continue;
-        api
-          .putSecret(name, value)
-          .then(() => {
-            savedSecretsRef.current[name] = value;
-          })
-          .catch(() => onToast('Could not save API key to the OS credential store', true));
-      }
-    }, 600);
-    return () => clearTimeout(timer);
-  }, [apiKeys, secretsReady, onToast]);
 
   // Persist threads per workspace; a workspace switch swaps the list and starts a fresh thread.
   useEffect(() => {
@@ -723,16 +499,6 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     () => [...messages].reverse().find((m) => m.checkpoint)?.checkpoint,
     [messages]
   );
-
-  const setProvider = (p: Provider) =>
-    setConfig((prev) => ({
-      ...prev,
-      provider: p,
-      model:
-        p === 'ollama' && ollamaModels.length ? ollamaModels[0] : PROVIDER_PRESETS[p].model,
-      baseUrl: PROVIDER_PRESETS[p].baseUrl,
-      apiKey: apiKeys[p] ?? '',
-    }));
 
   const buildContextPrefix = (): string => {
     const files = [...(activeChip ? [activeChip] : []), ...extraFiles];
@@ -1018,7 +784,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const chooseApi = (p: Provider) => {
     setProvider(p);
     setShowModelMenu(false);
-    if (!(apiKeys[p] ?? '').trim()) setShowSettings(true);
+    if (!(apiKeys[p] ?? '').trim()) onOpenSettings();
   };
 
   const chooseOllamaModel = (m: string) => {
@@ -1075,10 +841,9 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             <History size={14} />
           </button>
           <button
-            data-pop="settings"
-            onClick={() => setShowSettings((v) => !v)}
-            className={`${iconBtn} ${showSettings ? '!text-[var(--accent)]' : ''}`}
-            title="Engine & API settings"
+            onClick={onOpenSettings}
+            className={iconBtn}
+            title="Settings"
           >
             <Settings size={14} />
           </button>
@@ -1125,103 +890,6 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         </div>
       )}
 
-      {/* Settings popover (overlay, never shifts the chat) */}
-      {showSettings && (
-        <div
-          ref={settingsRef}
-          className="absolute right-2 top-10 z-40 w-[320px] max-w-[calc(100%-16px)] p-3 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl space-y-2.5 text-xs"
-        >
-          <div className="flex items-center justify-between font-semibold text-[var(--text-primary)]">
-            <span>Engine & API</span>
-            <button
-              onClick={() => setShowSettings(false)}
-              className="text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
-            >
-              <X size={13} />
-            </button>
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <div>
-              <label className="block text-[11px] text-[var(--text-muted)] mb-0.5">Provider</label>
-              <select
-                value={config.provider}
-                onChange={(e) => setProvider(e.target.value as Provider)}
-                className={inputCls}
-              >
-                <optgroup label="Installed CLI agents">
-                  {CLI_PROVIDERS.map((p) => (
-                    <option key={p} value={p}>
-                      {PROVIDER_LABEL[p]} CLI
-                    </option>
-                  ))}
-                </optgroup>
-                <optgroup label="API &amp; Local">
-                  <option value="openai">OpenAI / Compatible</option>
-                  <option value="anthropic">Anthropic Claude</option>
-                  <option value="gemini">Google Gemini</option>
-                  <option value="ollama">Ollama (Local)</option>
-                </optgroup>
-              </select>
-            </div>
-            <div>
-              <label className="block text-[11px] text-[var(--text-muted)] mb-0.5">Model</label>
-              <input
-                value={config.model}
-                onChange={(e) => setConfig((prev) => ({ ...prev, model: e.target.value }))}
-                className={inputCls}
-              />
-            </div>
-          </div>
-          {cliToolId && (
-            <div className="text-[11px] leading-snug text-[var(--text-muted)]">
-              {cliInstalled === false
-                ? `${PROVIDER_LABEL[config.provider]} CLI not found. Install it, then reopen this menu.`
-                : `Runs your installed ${PROVIDER_LABEL[config.provider]} CLI with its own login — no API key. File edits are auto-accepted; use "default" to keep the CLI's configured model.`}
-            </div>
-          )}
-          {config.provider === 'ollama' && localModels && !localModels.ollama.running && (
-            <div className="text-[11px] leading-snug text-[var(--text-muted)]">
-              Ollama isn&apos;t running at this address, so the model list is a placeholder.
-            </div>
-          )}
-          {config.provider !== 'gemini' && !cliToolId && (
-            <div>
-              <label className="block text-[11px] text-[var(--text-muted)] mb-0.5">
-                Base URL (optional — OpenRouter, DeepSeek, LM Studio)
-              </label>
-              <input
-                value={config.baseUrl}
-                onChange={(e) => setConfig((prev) => ({ ...prev, baseUrl: e.target.value }))}
-                placeholder="https://api.openai.com/v1"
-                className={inputCls}
-              />
-            </div>
-          )}
-          {config.provider !== 'ollama' && !cliToolId && (
-            <div>
-              <label className="block text-[11px] text-[var(--text-muted)] mb-0.5">
-                API key (stored only in this browser)
-              </label>
-              <input
-                type="password"
-                value={config.apiKey}
-                onChange={(e) => setConfig((prev) => ({ ...prev, apiKey: e.target.value }))}
-                placeholder="sk-..."
-                className={inputCls}
-              />
-            </div>
-          )}
-          <label className="flex items-center gap-2 text-[11px] text-[var(--text-muted)] cursor-pointer">
-            <input
-              type="checkbox"
-              checked={config.autoCheckpoint}
-              onChange={(e) => setConfig((prev) => ({ ...prev, autoCheckpoint: e.target.checked }))}
-            />
-            Auto-create Git checkpoint before agent edits
-          </label>
-        </div>
-      )}
-
       {/* Zone 2: timeline */}
       <div className="relative flex-1 min-h-0 flex flex-col">
         <div
@@ -1232,35 +900,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         {messages.length === 0 ? (
           // Zone 2A: ready state, anchored to the composer instead of floating mid-panel.
           <div className="mt-auto space-y-3">
-            <button
-              onClick={() => (engineStatus.ok ? undefined : setShowModelMenu(true))}
-              data-pop="engine"
-              className={`block w-full text-left px-3 py-2 rounded-md border border-[var(--border)] bg-[var(--bg-elevated)]/60 ${
-                engineStatus.ok ? 'cursor-default' : 'cursor-pointer hover:bg-[var(--bg-hover)]'
-              }`}
-            >
-              <div className="flex items-center gap-2 text-[12.5px]">
-                <span
-                  className="w-1.5 h-1.5 rounded-full shrink-0"
-                  style={{ background: engineStatus.ok ? OK_DOT : WARN_DOT }}
-                />
-                <span className="font-medium text-[var(--text-primary)] truncate">{engineName}</span>
-                <span className="flex-1" />
-                <span
-                  className="shrink-0 text-[11.5px]"
-                  style={{ color: engineStatus.ok ? OK_DOT : WARN_DOT }}
-                >
-                  {engineStatus.text}
-                  {!engineStatus.ok && ' · Choose engine →'}
-                </span>
-              </div>
-              <div className="mt-0.5 pl-3.5 text-[11.5px] text-[var(--text-muted)] truncate">
-                Workspace: {workspaceName}
-                {branch && ` · ${branch}`}
-                {changedFileCount > 0 && ` · ${changedFileCount} file${changedFileCount === 1 ? '' : 's'} changed`}
-              </div>
-            </button>
-
+            {showQuickActions && (
             <div>
               <div className="mb-1 text-[10.5px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">
                 Quick actions
@@ -1283,6 +923,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                 ))}
               </div>
             </div>
+            )}
           </div>
         ) : (
           // Zone 2B: conversation
@@ -1695,7 +1336,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                           }
                         />
                         <span className="flex-1 truncate">
-                          {PROVIDER_LABEL[p]} <span className="text-[var(--text-dim)]">· {PROVIDER_PRESETS[p].model.replace(/-\d{8}$/, '')}</span>
+                          {PROVIDER_LABEL[p]} {PROVIDER_PRESETS[p].model && <span className="text-[var(--text-dim)]">· {PROVIDER_PRESETS[p].model}</span>}
                         </span>
                         {config.provider === p && hasKey ? (
                           <Check size={12} className="text-[var(--accent)] shrink-0" />
@@ -1748,7 +1389,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                   <div
                     onClick={() => {
                       setShowModelMenu(false);
-                      setShowSettings(true);
+                      onOpenSettings();
                     }}
                     className={`${menuRow} !text-[var(--text-muted)]`}
                   >
