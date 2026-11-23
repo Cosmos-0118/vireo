@@ -514,6 +514,32 @@ pub async fn list_models(
     Json(json!({ "ollama": ollama, "codex": codex }))
 }
 
+/// Resolve an API base URL, refusing to send a credential over plain HTTP to a non-loopback host.
+fn secure_base(base: Option<&str>, default: &str, has_key: bool) -> Result<String, String> {
+    let raw = base
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or(default)
+        .trim_end_matches('/');
+    let url = reqwest::Url::parse(raw).map_err(|e| format!("Invalid base URL: {e}"))?;
+    match url.scheme() {
+        "https" => {}
+        "http" => {
+            let loopback = match url.host() {
+                Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+                Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                None => false,
+            };
+            if has_key && !loopback {
+                return Err("Refusing to send an API key over unencrypted HTTP; use an https:// base URL.".into());
+            }
+        }
+        other => return Err(format!("Unsupported base URL scheme: {other}")),
+    }
+    Ok(raw.to_string())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ApiModelsReq {
     pub provider: String,
@@ -531,25 +557,30 @@ pub async fn list_api_models(
     let bad = |m: String| (axum::http::StatusCode::BAD_GATEWAY, m);
     let key = req.api_key.as_deref().unwrap_or("").trim().to_string();
     let base = req.base_url.as_deref().map(|b| b.trim().trim_end_matches('/')).filter(|b| !b.is_empty());
+    let default_base = match req.provider.as_str() {
+        "anthropic" => "https://api.anthropic.com",
+        _ => "https://api.openai.com/v1",
+    };
+    let base_checked = secure_base(base, default_base, !key.is_empty()).map_err(bad)?;
     let client = state.http_client.clone();
     let timeout = Duration::from_secs(8);
 
     let (builder, id_field) = match req.provider.as_str() {
         "anthropic" => (
             client
-                .get(format!("{}/v1/models?limit=100", base.unwrap_or("https://api.anthropic.com")))
+                .get(format!("{base_checked}/v1/models?limit=100"))
                 .header("x-api-key", &key)
                 .header("anthropic-version", "2023-06-01"),
             "id",
         ),
         "gemini" => (
-            client.get(format!(
-                "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200&key={key}"
-            )),
+            client
+                .get("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200")
+                .header("x-goog-api-key", &key),
             "name",
         ),
         "openai" => {
-            let mut b = client.get(format!("{}/models", base.unwrap_or("https://api.openai.com/v1")));
+            let mut b = client.get(format!("{base_checked}/models"));
             if !key.is_empty() {
                 b = b.bearer_auth(&key);
             }
@@ -694,16 +725,18 @@ async fn run_openai_loop(
     turn: &mut TurnTracker,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) {
-    let base = req
-        .base_url
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or(if req.provider == "ollama" {
-            "http://127.0.0.1:11434/v1"
-        } else {
-            "https://api.openai.com/v1"
-        })
-        .trim_end_matches('/');
+    let default_base = if req.provider == "ollama" {
+        "http://127.0.0.1:11434/v1"
+    } else {
+        "https://api.openai.com/v1"
+    };
+    let base = match secure_base(req.base_url.as_deref(), default_base, !api_key.trim().is_empty()) {
+        Ok(b) => b,
+        Err(message) => {
+            send_sse(tx, "error", json!({ "message": message })).await;
+            return;
+        }
+    };
     let url = format!("{}/chat/completions", base);
 
     let mut messages: Vec<Value> = vec![json!({"role": "system", "content": SYSTEM_PROMPT})];
@@ -793,12 +826,13 @@ async fn run_anthropic_loop(
     turn: &mut TurnTracker,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) {
-    let base = req
-        .base_url
-        .as_deref()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or("https://api.anthropic.com")
-        .trim_end_matches('/');
+    let base = match secure_base(req.base_url.as_deref(), "https://api.anthropic.com", true) {
+        Ok(b) => b,
+        Err(message) => {
+            send_sse(tx, "error", json!({ "message": message })).await;
+            return;
+        }
+    };
     let url = format!("{}/v1/messages", base);
 
     let mut messages: Vec<Value> = req
@@ -893,9 +927,8 @@ async fn run_gemini_loop(
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) {
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        req.model,
-        api_key.trim()
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent",
+        req.model
     );
 
     let mut contents: Vec<Value> = req
@@ -911,6 +944,7 @@ async fn run_gemini_loop(
         let resp = match state
             .http_client
             .post(&url)
+            .header("x-goog-api-key", api_key.trim())
             .json(&json!({
                 "system_instruction": { "parts": [{ "text": SYSTEM_PROMPT }] },
                 "contents": contents,

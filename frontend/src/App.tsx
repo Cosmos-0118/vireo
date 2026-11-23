@@ -296,6 +296,13 @@ export function App() {
   const pillTimerRef = useRef<number | undefined>(undefined);
   const tabsRef = useRef<OpenTab[]>([]);
   const gitStatusRef = useRef<GitStatusRes | null>(null);
+  /**
+   * `git status` requests resolve out of order. `seq` numbers requests, `applied` is the newest one
+   * shown, and `startedAt` is when that one began (it reflects disk state from that moment on).
+   */
+  const gitFetchRef = useRef({ seq: 0, applied: 0, startedAt: 0 });
+  /** When the watcher last reported each path changed (normalized); see the prune effect below. */
+  const editedAtRef = useRef<Map<string, number>>(new Map());
   const followRef = useRef(followEdits);
 
   /** Our own writes (save, discard, revert) must not be announced as agent edits. */
@@ -328,8 +335,15 @@ export function App() {
   }, []);
 
   const refreshGit = useCallback(async () => {
+    const f = gitFetchRef.current;
+    const seq = ++f.seq;
+    const startedAt = Date.now();
     try {
       const status = await api.gitStatus();
+      // A slower, older request must not overwrite a newer answer (it can predate an agent edit).
+      if (seq < f.applied) return;
+      f.applied = seq;
+      f.startedAt = startedAt;
       setGitStatus(status);
     } catch {
       // ignore transient error
@@ -345,6 +359,9 @@ export function App() {
         setWsDraft('');
         return;
       }
+      const gf = gitFetchRef.current;
+      const gitSeq = ++gf.seq;
+      const gitStartedAt = Date.now();
       const [ws, status, files, taskList] = await Promise.all([
         Promise.resolve(current),
         api.gitStatus(),
@@ -353,7 +370,11 @@ export function App() {
       ]);
       setWorkspace(ws);
       setWsDraft(ws.path);
-      setGitStatus(status);
+      if (gitSeq >= gf.applied) {
+        gf.applied = gitSeq;
+        gf.startedAt = gitStartedAt;
+        setGitStatus(status);
+      }
       setAllFiles(files);
       setTasks(taskList);
 
@@ -779,7 +800,16 @@ export function App() {
     // Paths arrive oldest-first; keep the most recent ones (the last is the one to follow).
     files = files.slice(-24);
     if (!files.length) return;
-    files.forEach((p) => inflightRef.current.add(p));
+    // Stamped before the follow-up `git status` starts, so a status that began earlier (and may
+    // not list this file yet) can never prune its review state.
+    const editedAt = Date.now();
+    files.forEach((p) => {
+      inflightRef.current.add(p);
+      editedAtRef.current.set(p, editedAt);
+    });
+    while (editedAtRef.current.size > 500) {
+      editedAtRef.current.delete(editedAtRef.current.keys().next().value as string);
+    }
 
     const run = async () => {
       const results: Array<{
@@ -1081,7 +1111,11 @@ export function App() {
     const dirty = gitStatus.files.map((f) => f.path.replace(/\\/g, '/'));
     const exact = new Set(dirty);
     const dirs = dirty.filter((d) => d.endsWith('/'));
-    const stillChanged = (p: string) => exact.has(p) || dirs.some((d) => p.startsWith(d));
+    // Only trust "clean" when this status was requested after the file's last reported change;
+    // otherwise it may simply predate the edit.
+    const startedAt = gitFetchRef.current.startedAt;
+    const stillChanged = (p: string) =>
+      exact.has(p) || dirs.some((d) => p.startsWith(d)) || (editedAtRef.current.get(p) ?? 0) >= startedAt;
     setLiveEdits((prev) => {
       const next = prev.filter((e) => stillChanged(e.path));
       return next.length === prev.length ? prev : next;
