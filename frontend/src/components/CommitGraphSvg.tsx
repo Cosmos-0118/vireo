@@ -36,7 +36,7 @@ interface CommitGraphSvgProps {
 }
 
 const STROKE = 1.5;
-const CURVE = 5;
+const CURVE = 6;
 const DASH = '2.5 2.5';
 
 /**
@@ -67,13 +67,13 @@ export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
   input.forEach((lane, index) => {
     if (lane.id === commit.hash) {
       if (index !== circleIndex) {
-        // ╯ converge into the node from the right
+        // ╯ another rail waiting for this commit converges into the node from the right
         paths.push({
-          d: `M ${x(index)} 0 A ${W} ${mid} 0 0 1 ${x(index) - W} ${mid} H ${x(circleIndex)}`,
+          d: `M ${x(index)} 0 V ${mid - R} A ${R} ${R} 0 0 1 ${x(index) - R} ${mid} H ${x(circleIndex)}`,
           color: lane.color,
           dashed: lane.dashed,
         });
-      } else {
+      } else if (row.slotFilled) {
         outIdx++;
       }
       return;
@@ -86,7 +86,7 @@ export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
           dashed: lane.dashed,
         });
       } else {
-        // lane shifts left after a lane to its left ended
+        // rail shifts left after a rail to its left ended
         paths.push({
           d:
             `M ${x(index)} 0 V ${mid - R} A ${R} ${R} 0 0 1 ${x(index) - R} ${mid} ` +
@@ -99,21 +99,16 @@ export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
     }
   });
 
-  // ╮ fork out to extra parents (merge commits)
-  for (let i = 1; i < commit.parents.length; i++) {
-    let p = -1;
-    for (let k = output.length - 1; k >= 0; k--) {
-      if (output[k].id === commit.parents[i]) {
-        p = k;
-        break;
-      }
-    }
-    if (p === -1) continue;
-    paths.push({
-      d: `M ${x(p) - W} ${mid} A ${W} ${mid} 0 0 1 ${x(p)} ${H} M ${x(p) - W} ${mid} H ${x(circleIndex)}`,
-      color: output[p].color,
-      dashed: output[p].dashed,
-    });
+  // Links from the node down to each parent rail: straight, forking right (╮),
+  // or joining an existing rail on either side (╰ / ╯).
+  for (const link of row.parentLinks) {
+    const px = x(link.index);
+    let d: string;
+    if (link.index === circleIndex) d = `M ${x(circleIndex)} ${mid} V ${H}`;
+    else if (link.index > circleIndex)
+      d = `M ${x(circleIndex)} ${mid} H ${px - R} A ${R} ${R} 0 0 1 ${px} ${mid + R} V ${H}`;
+    else d = `M ${x(circleIndex)} ${mid} H ${px + R} A ${R} ${R} 0 0 0 ${px} ${mid + R} V ${H}`;
+    paths.push({ d, color: link.color, dashed: link.dashed });
   }
 
   const inputIndex = input.findIndex((l) => l.id === commit.hash);
@@ -122,13 +117,6 @@ export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
       d: `M ${x(circleIndex)} 0 V ${mid}`,
       color: input[inputIndex].color,
       dashed: input[inputIndex].dashed,
-    });
-  }
-  if (commit.parents.length > 0 && output[circleIndex]) {
-    paths.push({
-      d: `M ${x(circleIndex)} ${mid} V ${H}`,
-      color: row.circleColor,
-      dashed: output[circleIndex].dashed,
     });
   }
 

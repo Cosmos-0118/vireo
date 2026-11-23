@@ -1742,7 +1742,6 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                               laneWidth={GRAPH_LANE_W}
                               rowHeight={GRAPH_ROW_H}
                               maxVisibleLanes={GRAPH_MAX_LANES}
-                              fitRow
                             />
 
                             <div className="min-w-0 flex-1 flex items-center gap-1.5 pl-0.5 pr-2">

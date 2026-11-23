@@ -30,6 +30,13 @@ export interface Swimlane {
   dashed?: boolean;
 }
 
+export interface ParentLink {
+  /** Index into the row's output lanes */
+  index: number;
+  color: string;
+  dashed?: boolean;
+}
+
 export type SyncState = 'outgoing' | 'incoming' | null;
 
 export interface GraphRowLayout {
@@ -40,6 +47,10 @@ export interface GraphRowLayout {
   /** Column of this row's node */
   circleIndex: number;
   circleColor: string;
+  /** The commit's own lane continues straight down (first parent opened a new rail in its slot) */
+  slotFilled: boolean;
+  /** One link per distinct parent: the output lane the node connects to */
+  parentLinks: ParentLink[];
   isMerge: boolean;
   isHead: boolean;
   /** Not pushed to (outgoing) / not pulled from (incoming) the upstream */
@@ -156,6 +167,8 @@ export function computeGitGraphLayout(
         output: [],
         circleIndex: 0,
         circleColor: color,
+        slotFilled: false,
+        parentLinks: [],
         isMerge: commit.parents.length > 1,
         isHead: commit.is_head,
         sync: sync.get(commit.hash) ?? null,
@@ -176,43 +189,59 @@ export function computeGitGraphLayout(
     const input = prevOutput.map((l) => ({ ...l }));
     const output: Swimlane[] = [];
     const isWT = kind === 'working-tree';
+    const dashed = isWT || undefined;
     const label = isWT ? GRAPH_REF_COLOR : labelColor(commit, branch);
     const parents = commit.parents;
 
-    let firstParentAdded = false;
+    // Ids already tracked by lanes that pass straight through this row. A parent that is
+    // already awaited joins that lane instead of opening a duplicate rail (this keeps
+    // fan-outs such as many bot branches off one commit down to a single shared rail).
+    const tracked = new Set<string>();
+    for (const l of input) if (l.id !== commit.hash) tracked.add(l.id);
+
+    const inputIndex = input.findIndex((l) => l.id === commit.hash);
+    const circleIndex = inputIndex !== -1 ? inputIndex : input.length;
+    const laneColor = inputIndex !== -1 ? input[inputIndex].color : (label ?? nextColor());
+    const circleColor = label ?? laneColor;
+
+    let slotSeen = false;
+    let slotFilled = false;
     for (const lane of input) {
       if (lane.id === commit.hash) {
-        if (!firstParentAdded && parents.length > 0) {
-          output.push({ id: parents[0], color: label ?? lane.color, dashed: isWT || undefined });
-          firstParentAdded = true;
+        if (!slotSeen) {
+          slotSeen = true;
+          if (parents.length > 0 && !tracked.has(parents[0])) {
+            output.push({ id: parents[0], color: circleColor, dashed });
+            tracked.add(parents[0]);
+            slotFilled = true;
+          }
         }
         continue;
       }
       output.push({ ...lane });
     }
 
-    for (let i = firstParentAdded ? 1 : 0; i < parents.length; i++) {
+    for (let i = slotSeen ? 1 : 0; i < parents.length; i++) {
+      const p = parents[i];
+      if (tracked.has(p)) continue;
       let color: string | undefined;
-      if (i === 0) color = label;
+      if (i === 0) color = circleColor;
       else {
-        const parent = byHashForColor.get(parents[i]);
+        const parent = byHashForColor.get(p);
         color = parent ? labelColor(parent, branch) : undefined;
       }
-      output.push({ id: parents[i], color: color ?? nextColor(), dashed: isWT || undefined });
+      output.push({ id: p, color: color ?? nextColor(), dashed });
+      tracked.add(p);
     }
 
-    const inputIndex = input.findIndex((l) => l.id === commit.hash);
-    const circleIndex = inputIndex !== -1 ? inputIndex : input.length;
-    // Root commits keep their incoming lane colour (the slot in `output` now
-    // belongs to whichever neighbouring lane shifted left into it).
-    const circleColor =
-      parents.length === 0 && inputIndex !== -1
-        ? (label ?? input[inputIndex].color)
-        : circleIndex < output.length
-          ? output[circleIndex].color
-          : circleIndex < input.length
-            ? input[circleIndex].color
-            : (label ?? GRAPH_REF_COLOR);
+    const parentLinks: ParentLink[] = [];
+    const linked = new Set<number>();
+    parents.forEach((p, i) => {
+      const index = output.findIndex((l) => l.id === p);
+      if (index === -1 || linked.has(index)) return;
+      linked.add(index);
+      parentLinks.push({ index, color: i === 0 ? circleColor : output[index].color, dashed });
+    });
 
     maxLanes = Math.max(maxLanes, input.length, output.length, circleIndex + 1);
     rows.push({
@@ -222,6 +251,8 @@ export function computeGitGraphLayout(
       output,
       circleIndex,
       circleColor,
+      slotFilled,
+      parentLinks,
       isMerge: parents.length > 1,
       isHead: commit.is_head,
       sync: sync.get(commit.hash) ?? null,
