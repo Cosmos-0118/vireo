@@ -1,3 +1,5 @@
+import { FileDashed, GitCommit } from '@phosphor-icons/react';
+import { EmptyState } from './ui/EmptyState';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Check,
@@ -648,7 +650,7 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
           </div>
           <div className="p-1.5">
             {!compareMode && !d ? null : activeFiles.length === 0 ? (
-              <div className="p-4 text-xs text-[var(--text-dim)] text-center">No file changes.</div>
+              <EmptyState size="sm" icon={FileDashed} title="No file changes" description="This commit doesn't touch any files." />
             ) : treeView ? (
               renderTreeNodes(fileTree, 0)
             ) : (
@@ -978,9 +980,21 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
         })}
 
         {commits.length === 0 && !loading && (
-          <div className="p-8 text-center text-xs text-[var(--text-dim)]">
-            {search ? `No commits match "${search}".` : 'No commits found in this repository.'}
-          </div>
+          <EmptyState
+            size="lg"
+            icon={GitCommit}
+            title={search ? 'No matching commits' : 'No commits yet'}
+            description={
+              search ? (
+                <>
+                  Nothing matches <span className="text-[var(--text-muted)]">“{search}”</span>. Try a message, author or hash.
+                </>
+              ) : (
+                'Commits will appear here once you make your first one.'
+              )
+            }
+            className="py-16"
+          />
         )}
 
         {hasMore && (

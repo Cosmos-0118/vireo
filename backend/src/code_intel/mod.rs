@@ -34,6 +34,7 @@ mod view;
 #[cfg(test)]
 mod tests;
 
+use patch_parse::parse_edge;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -151,7 +152,11 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
                     "replace" | "insert_after" | "delete" => s(a, "op").unwrap_or("replace"),
                     other => return Err(format!("op `{other}` isn't supported with `symbol` (replace, insert_after, delete)")),
                 };
-                return symbol_op(ws, need("path")?, sym, mode, s(a, "new_text").unwrap_or(""));
+                return symbol_op(ws, need("path")?, sym, mode, s(a, "new_text").unwrap_or(""), cwd.as_deref());
+            }
+            // `top` / `bottom` / `imports` need no anchor: same path as a one-entry batch.
+            if s(a, "start").and_then(parse_edge).is_some() {
+                return edit_batch(ws, need("path")?, std::slice::from_ref(a), cwd.as_deref());
             }
             hashline_edit(
                 ws,
@@ -160,6 +165,7 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
                 need("start")?,
                 s(a, "end"),
                 s(a, "new_text").unwrap_or(""),
+                cwd.as_deref(),
             )
         }
         "replace" => {
@@ -180,12 +186,14 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
             need("symbol")?,
             s(a, "mode").unwrap_or("read"),
             s(a, "new_code").unwrap_or(""),
+            cwd.as_deref(),
         ),
         "create" => create(
             ws,
             need("path")?,
             s(a, "content").unwrap_or(""),
             a["force"].as_bool().unwrap_or(false),
+            cwd.as_deref(),
         ),
         "ast" => ast(
             ws,
@@ -194,6 +202,7 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
             s(a, "path"),
             s(a, "rewrite"),
             a["dry_run"].as_bool().unwrap_or(false),
+            cwd.as_deref(),
         ),
         "apply" => apply_patch(ws, need("patch")?, cwd.as_deref(), a["dry_run"].as_bool().unwrap_or(false)),
         "check" => check(
@@ -203,6 +212,8 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
             CheckOpts {
                 raw: a["raw"].as_bool().unwrap_or(false),
                 warnings: a["warnings"].as_bool().unwrap_or(false),
+                dir: s(a, "dir").map(str::to_string),
+                cwd: cwd.clone(),
             },
         ),
         other => Err(format!("unknown op `{other}`")),

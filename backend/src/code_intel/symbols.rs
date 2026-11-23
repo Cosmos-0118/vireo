@@ -1,13 +1,13 @@
 //! Tree-sitter language support, symbol extraction, outline, repo map, and symbol ops.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tree_sitter::{Language, Node, Parser};
 use walkdir::WalkDir;
 
-use super::doc::{hl, line_hash, read_doc, read_doc_smart, splice, text_to_lines, Doc};
+use super::doc::{hl, line_hash, read_doc_smart, splice, text_to_lines, Doc};
 use super::edit::finish_edit;
-use super::util::{find_path_candidates, ignored_dir, missing_path_err, rel_of, resolve};
+use super::util::{find_path_candidates, ignored_dir, missing_path_err, rel_of, resolve, with_note};
 use super::view::MAX_VIEW_LINES;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -137,6 +137,38 @@ pub(crate) fn syntax_errors(lang: Option<Lang>, src: &str) -> Option<Vec<(usize,
     let mut out = Vec::new();
     collect_errors(tree.root_node(), src.as_bytes(), &mut out);
     Some(out)
+}
+
+/// 0-based row of the last line of the top-level import block (`use`, `import`, `#include`,
+/// `using`, ...), or of the package/namespace header when a file has no imports yet. `None` when
+/// the language has no parser or the file has neither.
+pub(crate) fn import_end_row(lang: Option<Lang>, src: &str) -> Option<usize> {
+    let lang = lang?;
+    let tree = parse_tree(lang, src)?;
+    let root = tree.root_node();
+    let (imports, headers): (&[&str], &[&str]) = match lang {
+        Lang::Rust => (&["use_declaration", "extern_crate_declaration"], &[]),
+        Lang::Ts | Lang::Tsx | Lang::Js => (&["import_statement"], &[]),
+        Lang::Py => (&["import_statement", "import_from_statement", "future_import_statement"], &[]),
+        Lang::Go => (&["import_declaration"], &["package_clause"]),
+        Lang::Java => (&["import_declaration"], &["package_declaration"]),
+        Lang::Kotlin => (&["import_list", "import_header", "import"], &["package_header"]),
+        Lang::CSharp => (&["using_directive"], &[]),
+        Lang::C | Lang::Cpp => (&["preproc_include"], &[]),
+        Lang::Php => (&["namespace_use_declaration"], &["namespace_definition", "php_tag"]),
+        Lang::Ruby | Lang::Bash | Lang::Json => (&[], &[]),
+    };
+    let (mut last_import, mut last_header) = (None, None);
+    let mut c = root.walk();
+    for ch in root.children(&mut c) {
+        let k = ch.kind();
+        if imports.contains(&k) {
+            last_import = Some(rows(ch).1);
+        } else if headers.contains(&k) && ch.named_child_count() <= 1 {
+            last_header = Some(rows(ch).1);
+        }
+    }
+    last_import.or(last_header)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -736,8 +768,26 @@ pub fn outline(ws: &Path, path: &str, cwd: Option<&Path>) -> Result<String, Stri
 }
 
 /// Read or change a whole symbol (function, struct, class, ...) by name.
-pub fn symbol_op(ws: &Path, path: &str, symbol: &str, mode: &str, new_code: &str) -> Result<String, String> {
-    let (full, rel, mut doc) = read_doc(ws, path)?;
+pub fn symbol_op(
+    ws: &Path,
+    path: &str,
+    symbol: &str,
+    mode: &str,
+    new_code: &str,
+    cwd: Option<&Path>,
+) -> Result<String, String> {
+    let (full, rel, doc, note) = read_doc_smart(ws, path, cwd)?;
+    symbol_op_doc(full, rel, doc, symbol, mode, new_code).map(|out| with_note(note, out))
+}
+
+fn symbol_op_doc(
+    full: PathBuf,
+    rel: String,
+    mut doc: Doc,
+    symbol: &str,
+    mode: &str,
+    new_code: &str,
+) -> Result<String, String> {
     let lang = lang_for(&rel).filter(|l| *l != Lang::Json).ok_or_else(|| format!("no symbol support for {rel}"))?;
     let text = doc.to_text();
     let syms = symbols(lang, &text);

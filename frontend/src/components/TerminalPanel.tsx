@@ -1,3 +1,5 @@
+import { TerminalWindow } from '@phosphor-icons/react';
+import { EmptyState } from './ui/EmptyState';
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   Check,
@@ -564,9 +566,13 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       {/* Terminal viewport */}
       <div className="flex-1 min-h-0 relative">
         {!workspacePath && (
-          <div className="absolute inset-0 flex items-center justify-center text-xs text-[var(--text-dim)]">
-            Open a folder to start a terminal.
-          </div>
+          <EmptyState
+            size="sm"
+            icon={TerminalWindow}
+            title="No folder open"
+            description="Open a folder to start a terminal session."
+            className="absolute inset-0"
+          />
         )}
         {workspacePath && tabs.map((tab) => (
           <SingleTerminal

@@ -205,7 +205,7 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
                     .or_else(|| after.first())
                 {
                     let row = (*row).min(new_doc.lines.len().saturating_sub(1));
-                    syntax_note = Some(format!("⚠ {rel}: new syntax error at {}: {m}", new_doc.anchor(row)));
+                    syntax_note = Some(super::doc::syntax_note(&new_doc, row, m, &format!("{rel}: new syntax error")));
                 }
             }
         }

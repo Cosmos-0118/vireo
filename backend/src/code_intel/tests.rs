@@ -37,11 +37,11 @@ fn hashline_edit_replace_drift_and_syntax_warning() {
     let mut shifted = String::from("// a\n// b\n// c\n");
     shifted.push_str(RS);
     std::fs::write(ws.join("a.rs"), &shifted).unwrap();
-    let r = hashline_edit(&ws, "a.rs", "replace", &l5, Some(&l7), "fn foo(x: i32) -> i32 {\n    x + 2\n}").unwrap();
+    let r = hashline_edit(&ws, "a.rs", "replace", &l5, Some(&l7), "fn foo(x: i32) -> i32 {\n    x + 2\n}", None).unwrap();
     assert!(r.contains("lines 8..10"), "{r}");
     assert!(std::fs::read_to_string(ws.join("a.rs")).unwrap().contains("x + 2"));
     let anchor = format!("8#{}", line_hash("fn foo(x: i32) -> i32 {"));
-    let r = hashline_edit(&ws, "a.rs", "replace", &anchor, None, "fn foo(x: i32) -> i32 {{{").unwrap();
+    let r = hashline_edit(&ws, "a.rs", "replace", &anchor, None, "fn foo(x: i32) -> i32 {{{", None).unwrap();
     assert!(r.contains("syntax error"), "{r}");
 }
 
@@ -51,14 +51,14 @@ fn stale_and_malformed_anchors_show_live_snippets() {
     let lines: String = (1..=30).map(|i| format!("let v{i} = {i};\n")).collect();
     std::fs::write(ws.join("a.rs"), &lines).unwrap();
     // Stale single anchor
-    let err = hashline_edit(&ws, "a.rs", "replace", "5#ff", None, "x").unwrap_err();
+    let err = hashline_edit(&ws, "a.rs", "replace", "5#ff", None, "x", None).unwrap_err();
     assert!(err.contains("no longer match") && err.contains("let v5 = 5;"), "{err}");
     // Malformed hex anchor shows real lines around line 12
-    let err = hashline_edit(&ws, "a.rs", "replace", "12#zz", None, "x").unwrap_err();
+    let err = hashline_edit(&ws, "a.rs", "replace", "12#zz", None, "x", None).unwrap_err();
     assert!(err.contains("bad anchor") && err.contains("let v12 = 12;"), "{err}");
     // Distant end anchor typo shows lines near line 25 (not clipped to start!)
     let s1 = format!("1#{}", line_hash("let v1 = 1;"));
-    let err = hashline_edit(&ws, "a.rs", "replace", &s1, Some("25#00"), "x").unwrap_err();
+    let err = hashline_edit(&ws, "a.rs", "replace", &s1, Some("25#00"), "x", None).unwrap_err();
     assert!(err.contains("end anchor") && err.contains("let v25 = 25;"), "{err}");
     assert_eq!(std::fs::read_to_string(ws.join("a.rs")).unwrap(), lines);
 }
@@ -68,14 +68,7 @@ fn crlf_is_preserved_and_prefixes_stripped() {
     let ws = tmp("crlf");
     std::fs::write(ws.join("a.ts"), "const a = 1;\r\nconst b = 2;\r\n").unwrap();
     let anchor = format!("1#{}", line_hash("const a = 1;"));
-    hashline_edit(
-        &ws,
-        "a.ts",
-        "replace",
-        &anchor,
-        None,
-        &format!("1#{}|const a = 9;\nconst c = 3;", line_hash("x")),
-    )
+    hashline_edit(&ws, "a.ts", "replace", &anchor, None, &format!("1#{}|const a = 9;\nconst c = 3;", line_hash("x")), None)
     .unwrap();
     assert_eq!(
         std::fs::read_to_string(ws.join("a.ts")).unwrap(),
@@ -87,7 +80,7 @@ fn crlf_is_preserved_and_prefixes_stripped() {
 fn symbol_replace_and_ts_outline() {
     let ws = tmp("sym");
     std::fs::write(ws.join("a.rs"), RS).unwrap();
-    let r = symbol_op(&ws, "a.rs", "Bar::baz", "replace", "    fn baz(&self) -> bool {\n        false\n    }").unwrap();
+    let r = symbol_op(&ws, "a.rs", "Bar::baz", "replace", "    fn baz(&self) -> bool {\n        false\n    }", None).unwrap();
     assert!(r.contains("Replaced Bar::baz"), "{r}");
     assert!(std::fs::read_to_string(ws.join("a.rs")).unwrap().contains("false"));
     let ts = "export interface A { x: number }\n/** doc */\nexport const f = (a: number) => a;\nexport class K {\n  m() { return 1; }\n}\n";
@@ -420,27 +413,27 @@ fn ast_builtin_search_rewrite_and_ignore() {
 
     // Metavariables work in languages that need the expando placeholder (Rust, Python) and in
     // ones that do not (TypeScript); .gitignore'd files are skipped.
-    let all = edit::ast(&ws, "foo($A, $B)", None, None, None, false).unwrap();
+    let all = edit::ast(&ws, "foo($A, $B)", None, None, None, false, None).unwrap();
     assert!(all.starts_with("4 match(es)"), "{all}");
     assert!(all.contains("src/a.rs:2#") && all.contains("src/a.rs:3#"), "{all}");
     assert!(all.contains("src/c.py:2#") && all.contains("src/d.ts:1#"), "{all}");
     assert!(!all.contains("gen/b.rs"), "{all}");
 
-    let py = edit::ast(&ws, "foo($$$ARGS)", Some("python"), None, None, false).unwrap();
+    let py = edit::ast(&ws, "foo($$$ARGS)", Some("python"), None, None, false, None).unwrap();
     assert!(py.starts_with("1 match(es)") && py.contains("src/c.py"), "{py}");
 
-    let dry = edit::ast(&ws, "foo($A, $B)", Some("rust"), Some("src"), Some("baz($B, $A)"), true).unwrap();
+    let dry = edit::ast(&ws, "foo($A, $B)", Some("rust"), Some("src"), Some("baz($B, $A)"), true, None).unwrap();
     assert!(dry.contains("dry run"), "{dry}");
     assert!(std::fs::read_to_string(ws.join("src/a.rs")).unwrap().contains("foo(1, 2)"));
 
-    let done = edit::ast(&ws, "foo($A, $B)", Some("rs"), None, Some("baz($B, $A)"), false).unwrap();
+    let done = edit::ast(&ws, "foo($A, $B)", Some("rs"), None, Some("baz($B, $A)"), false, None).unwrap();
     assert!(done.starts_with("Rewrote 2 match(es) in 1 file(s)"), "{done}");
     assert_eq!(
         std::fs::read_to_string(ws.join("src/a.rs")).unwrap(),
         "fn f() {\n    let v = baz(2, 1);\n    baz(bar(4), 3);\n}\n"
     );
     assert_eq!(std::fs::read_to_string(ws.join("gen/b.rs")).unwrap(), "fn g() { foo(9, 9); }\n");
-    assert_eq!(edit::ast(&ws, "nothing_here($A)", Some("go"), None, None, false).unwrap(), "No matches.");
+    assert_eq!(edit::ast(&ws, "nothing_here($A)", Some("go"), None, None, false, None).unwrap(), "No matches.");
 }
 
 #[test]
@@ -488,11 +481,11 @@ fn compress_collapses_repeated_build_noise_and_keeps_root_cause() {
 fn check_reports_silent_passes_and_environment_causes() {
     let ws = tmp("check-quiet");
     let opts = check::CheckOpts::default();
-    let ok = check::check(&ws, Some("exit 0"), 30, opts).unwrap();
+    let ok = check::check(&ws, Some("exit 0"), 30, opts.clone()).unwrap();
     assert!(ok.contains("ok (") && ok.contains("exit 0, no output"), "{ok}");
-    let chatty = check::check(&ws, Some("echo hello"), 30, opts).unwrap();
+    let chatty = check::check(&ws, Some("echo hello"), 30, opts.clone()).unwrap();
     assert!(chatty.contains("1 output line(s), last: hello"), "{chatty}");
-    let env = check::check(&ws, Some("echo cl.exe not found && exit 1"), 30, opts).unwrap();
+    let env = check::check(&ws, Some("echo cl.exe not found && exit 1"), 30, opts.clone()).unwrap();
     assert!(env.contains("✖") && env.contains("hint: MSVC build tools"), "{env}");
     assert!(check::check_failed(&env));
 }
@@ -593,7 +586,7 @@ fn symbol_can_be_pinned_by_line_and_anchor_range_survives_length_drift() {
     std::fs::write(ws.join("a.txt"), "head\nstart\nx\ny\nz\nend\ntail\n").unwrap();
     let s = format!("2#{}", line_hash("start"));
     let e = format!("7#{}", line_hash("end")); // really line 6
-    let out = hashline_edit(&ws, "a.txt", "replace", &s, Some(&e), "S\nE").unwrap();
+    let out = hashline_edit(&ws, "a.txt", "replace", &s, Some(&e), "S\nE", None).unwrap();
     assert!(out.contains("Edited"), "{out}");
     assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "head\nS\nE\ntail\n");
 }
@@ -631,7 +624,7 @@ fn search_falls_back_to_literal_and_ast_and_add_file_keep_crlf() {
     // `ast -r` keeps CRLF files CRLF.
     let ws = tmp("ast-crlf");
     std::fs::write(ws.join("a.rs"), "fn a() {\r\n    old(1);\r\n}\r\n").unwrap();
-    let out = ast(&ws, "old($X)", Some("rust"), None, Some("new($X);\nnew2($X)"), false).unwrap();
+    let out = ast(&ws, "old($X)", Some("rust"), None, Some("new($X);\nnew2($X)"), false, None).unwrap();
     assert!(out.contains("a.rs"), "{out}");
     let s = std::fs::read(ws.join("a.rs")).unwrap();
     assert!(!s.windows(2).any(|w| w[1] == b'\n' && w[0] != b'\r'), "{:?}", String::from_utf8_lossy(&s));
@@ -734,10 +727,10 @@ fn csharp_outline_includes_namespaces_members_and_attributes() {
 fn csharp_symbol_replace_keeps_the_file_valid() {
     let ws = tmp("cs-replace");
     std::fs::write(ws.join("A.cs"), "class A\n{\n    int F() { return 1; }\n}\n").unwrap();
-    let r = symbol_op(&ws, "A.cs", "A.F", "replace", "    int F() { return 2; }").unwrap();
+    let r = symbol_op(&ws, "A.cs", "A.F", "replace", "    int F() { return 2; }", None).unwrap();
     assert!(r.contains("Replaced"), "{r}");
     assert!(std::fs::read_to_string(ws.join("A.cs")).unwrap().contains("return 2;"));
-    let broken = symbol_op(&ws, "A.cs", "A.F", "replace", "    int F() { return 3;").unwrap();
+    let broken = symbol_op(&ws, "A.cs", "A.F", "replace", "    int F() { return 3;", None).unwrap();
     assert!(broken.to_lowercase().contains("syntax"), "syntax check must run for C#: {broken}");
 }
 
@@ -801,6 +794,110 @@ fn repo_map_lists_new_languages() {
 fn structural_search_works_in_csharp_and_java() {
     let ws = tmp("ast-cs");
     std::fs::write(ws.join("A.cs"), "class A { void F() { Console.WriteLine(1); } }\n").unwrap();
-    let r = edit::ast(&ws, "Console.WriteLine($A)", Some("csharp"), None, None, false).unwrap();
+    let r = edit::ast(&ws, "Console.WriteLine($A)", Some("csharp"), None, None, false, None).unwrap();
     assert!(r.contains("A.cs"), "{r}");
+}
+
+#[test]
+fn writes_auto_resolve_unique_paths_like_view() {
+    let ws = tmp("resolve-writes");
+    let dir = ws.join("frontend/src/components");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("Pane.tsx"), "const a = 1;\nconst b = 2;\n").unwrap();
+    let a1 = format!("1#{}", line_hash("const a = 1;"));
+    // Monorepo-relative path (as typed from `frontend/src`) resolves for edit, with a note.
+    let r = hashline_edit(&ws, "components/Pane.tsx", "replace", &a1, None, "const a = 9;", None).unwrap();
+    assert!(r.contains("resolved `components/Pane.tsx` -> `frontend/src/components/Pane.tsx`"), "{r}");
+    // ... and for apply, edit batches and symbol reads.
+    let p = "*** Begin Patch\n*** Update File: src/components/Pane.tsx\n@@ bottom\n+const c = 3;\n*** End Patch\n";
+    let r = apply_patch(&ws, p, None, false).unwrap();
+    assert!(r.contains("resolved"), "{r}");
+    assert_eq!(std::fs::read_to_string(dir.join("Pane.tsx")).unwrap(), "const a = 9;\nconst b = 2;\nconst c = 3;\n");
+    // Ambiguity is an error that lists the candidates, never a guess.
+    std::fs::create_dir_all(ws.join("other")).unwrap();
+    std::fs::write(ws.join("other/Pane.tsx"), "x\n").unwrap();
+    let e = hashline_edit(&ws, "Pane.tsx", "replace", &a1, None, "y", None).unwrap_err();
+    assert!(e.contains("Did you mean") && e.contains("other/Pane.tsx"), "{e}");
+    // A patch naming one file twice via different spellings is rejected.
+    let p2 = "*** Begin Patch\n*** Update File: frontend/src/components/Pane.tsx\n@@ top\n+// x\n*** Update File: src/components/Pane.tsx\n@@ bottom\n+// y\n*** End Patch\n";
+    assert!(apply_patch(&ws, p2, None, false).unwrap_err().contains("appears twice"));
+}
+
+#[test]
+fn new_files_land_next_to_existing_monorepo_folders() {
+    let ws = tmp("resolve-new");
+    std::fs::create_dir_all(ws.join("frontend/src/components/ui")).unwrap();
+    let r = create(&ws, "components/ui/Empty.tsx", "export const E = 1;\n", false, None).unwrap();
+    assert!(ws.join("frontend/src/components/ui/Empty.tsx").is_file(), "{r}");
+    assert!(!ws.join("components").exists());
+    let p = "*** Begin Patch\n*** Add File: src/components/ui/Row.tsx\n+export const R = 1;\n*** End Patch\n";
+    apply_patch(&ws, p, None, false).unwrap();
+    assert!(ws.join("frontend/src/components/ui/Row.tsx").is_file());
+    // A genuinely new folder is still created where it was asked for.
+    create(&ws, "newpkg/lib.rs", "fn a() {}\n", false, None).unwrap();
+    assert!(ws.join("newpkg/lib.rs").is_file());
+}
+
+#[test]
+fn edge_hunks_top_bottom_and_imports() {
+    let ws = tmp("edges");
+    std::fs::write(
+        ws.join("a.ts"),
+        "'use client';\nimport { a } from './a';\nimport {\n  b,\n} from './b';\n\nexport const x = a + b;\n",
+    )
+    .unwrap();
+    std::fs::write(ws.join("b.rs"), "#!/usr/bin/env rust\n//! crate doc\nfn main() {}\n").unwrap();
+    std::fs::write(ws.join("c.py"), "\"\"\"doc\"\"\"\nimport os\nfrom x import y\n\nprint(os)\n").unwrap();
+    let p = "*** Begin Patch\n\
+*** Update File: a.ts\n@@ after imports\n+import { c } from './c';\n+import { a } from './a';\n\
+*** Update File: b.rs\n@@ top\n+use std::fmt;\n@@ bottom\n+fn tail() {}\n\
+*** Update File: c.py\n@@ imports\n+import sys\n\
+*** End Patch\n";
+    let r = apply_patch(&ws, p, None, false).unwrap();
+    assert!(r.contains("skipped 1 line(s) already present"), "{r}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.ts")).unwrap(),
+        "'use client';\nimport { a } from './a';\nimport {\n  b,\n} from './b';\nimport { c } from './c';\n\nexport const x = a + b;\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("b.rs")).unwrap(),
+        "#!/usr/bin/env rust\n//! crate doc\nuse std::fmt;\nfn main() {}\nfn tail() {}\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ws.join("c.py")).unwrap(),
+        "\"\"\"doc\"\"\"\nimport os\nfrom x import y\nimport sys\n\nprint(os)\n"
+    );
+    // Re-adding only existing imports is a no-op; `edit` takes the same keywords.
+    let again = "*** Begin Patch\n*** Update File: c.py\n@@ after imports\n+import sys\n*** End Patch\n";
+    assert!(apply_patch(&ws, again, None, false).unwrap().contains("already present"));
+    let r = run_op(&ws, "edit", &serde_json::json!({ "path": "c.py", "start": "bottom", "new_text": "print(1)" })).unwrap();
+    assert!(r.contains("M c.py"), "{r}");
+    assert!(std::fs::read_to_string(ws.join("c.py")).unwrap().ends_with("print(os)\nprint(1)\n"));
+}
+
+#[test]
+fn syntax_warnings_show_the_offending_lines() {
+    let ws = tmp("syntax-ctx");
+    std::fs::write(ws.join("a.rs"), "fn a() {\n    let x = 1;\n}\n").unwrap();
+    let a2 = format!("2#{}", line_hash("    let x = 1;"));
+    let r = hashline_edit(&ws, "a.rs", "replace", &a2, None, "    let x = (1;", None).unwrap();
+    assert!(r.contains("⚠ new syntax error at"), "{r}");
+    assert!(r.lines().any(|l| l.starts_with("> ")), "offending line marked: {r}");
+}
+
+#[test]
+fn check_runs_custom_commands_in_the_right_folder() {
+    let ws = tmp("check-dir");
+    std::fs::create_dir_all(ws.join("web")).unwrap();
+    std::fs::write(ws.join("web/package.json"), "{}").unwrap();
+    std::fs::write(ws.join("web/marker.txt"), "WEBMARK").unwrap();
+    let list = if cfg!(windows) { "type marker.txt" } else { "cat marker.txt" };
+    // Explicit `dir`, auto-resolved by name.
+    let opts = check::CheckOpts { dir: Some("web".into()), ..Default::default() };
+    let r = check::check(&ws, Some(list), 30, opts).unwrap();
+    assert!(r.contains("WEBMARK") && r.contains("[web]"), "{r}");
+    // Inferred: `npm ...` with package.json only in `web/`.
+    assert_eq!(check::infer_dir(&ws, "npm test").as_deref(), Some("web/"));
+    assert_eq!(check::infer_dir(&ws, "npm --prefix web test"), None);
+    assert_eq!(check::infer_dir(&ws, "echo hi"), None);
 }

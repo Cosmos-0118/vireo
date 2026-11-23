@@ -11,6 +11,27 @@ pub(crate) enum AnchorKind {
     Before,
 }
 
+/// File positions that need no anchor: `@@ top`, `@@ bottom`, `@@ after imports`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum Edge {
+    /// Line 1 (after a `#!` shebang).
+    Top,
+    /// After the last line.
+    Bottom,
+    /// After the last top-level import/use/include (falls back to `Top`); lines already present
+    /// in the file are skipped, so re-adding an import is a no-op.
+    Imports,
+}
+
+pub(crate) fn parse_edge(h: &str) -> Option<Edge> {
+    match h.trim().to_ascii_lowercase().as_str() {
+        "top" | "bof" | "top of file" => Some(Edge::Top),
+        "bottom" | "eof" | "end of file" => Some(Edge::Bottom),
+        "imports" | "after imports" => Some(Edge::Imports),
+        _ => None,
+    }
+}
+
 pub(crate) enum Hunk {
     Anchored {
         kind: AnchorKind,
@@ -23,6 +44,12 @@ pub(crate) enum Hunk {
     /// Deferred to `plan_update` so we can print real lines from the file near that line number.
     BadAnchor {
         raw: String,
+        header: String,
+    },
+    /// `@@ top` / `@@ bottom` / `@@ after imports`: insert the `+` lines there.
+    Edge {
+        at: Edge,
+        new: Vec<String>,
         header: String,
     },
     Context {
@@ -173,7 +200,9 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                 if let Some(h) = b.strip_prefix("@@") {
                     pending_blanks = 0;
                     let h = h.trim().trim_end_matches("@@").trim();
-                    if let Some((kind, start, end)) = parse_anchored_header(h) {
+                    if let Some(at) = parse_edge(h) {
+                        hunks.push(Hunk::Edge { at, new: Vec::new(), header: format!("@@ {h}") });
+                    } else if let Some((kind, start, end)) = parse_anchored_header(h) {
                         hunks.push(Hunk::Anchored {
                             kind,
                             start,
@@ -214,6 +243,20 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                 let Some(cur) = hunks.last_mut() else { continue };
                 match cur {
                     Hunk::BadAnchor { .. } => {}
+                    Hunk::Edge { new, header, .. } => {
+                        if let Some(rest) = b.strip_prefix('+') {
+                            new.extend(std::iter::repeat(String::new()).take(pending_blanks));
+                            pending_blanks = 0;
+                            new.push(strip_hashline_prefix(rest).to_string());
+                        } else if b.trim().is_empty() {
+                            pending_blanks += 1;
+                        } else {
+                            return Err(format!(
+                                "patch line {line_no}: `{header}` takes only `+` lines (the lines to insert); got `{}`",
+                                clip(b, 60)
+                            ));
+                        }
+                    }
                     Hunk::Anchored { new, header, kind, .. } => {
                         if let Some(rest) = b.strip_prefix('+') {
                             new.extend(std::iter::repeat(String::new()).take(pending_blanks));

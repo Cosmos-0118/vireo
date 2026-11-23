@@ -21,10 +21,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use super::doc::{line_hash, locate, parse_anchor_in_doc, read_doc, splice, Doc};
-use super::patch_parse::{parse_patch, AnchorKind, FileOp, Hunk};
-use super::symbols::{lang_for, syntax_errors};
-use super::util::{missing_path_err, rel_of, resolve};
+use super::doc::{locate, parse_anchor_in_doc, read_doc, splice, syntax_note, Doc};
+use super::patch_parse::{parse_patch, AnchorKind, Edge, FileOp, Hunk};
+use super::symbols::{import_end_row, lang_for, syntax_errors};
+use super::util::{rel_of, resolve_existing, resolve_new_file};
 
 /// Fold typographic punctuation to ASCII (what models often type instead of the file's text).
 fn fold_punct(s: &str) -> String {
@@ -199,30 +199,12 @@ struct PlannedFile {
     notes: Vec<String>,
 }
 
-fn patch_path(ws: &Path, cwd: Option<&Path>, p: &str, must_exist: bool) -> Result<PathBuf, String> {
-    let p = p.trim();
-    if p.is_empty() {
+/// Which file an `Update`/`Delete` names: exact path first, else a unique workspace match (noted).
+fn existing_path(ws: &Path, cwd: Option<&Path>, p: &str) -> Result<(PathBuf, Option<String>), String> {
+    if p.trim().is_empty() {
         return Err("empty file path".into());
     }
-    let from_ws = resolve(ws, p);
-    let from_cwd = cwd.and_then(|c| {
-        if Path::new(p).is_absolute() {
-            None
-        } else {
-            resolve(ws, &c.join(p).to_string_lossy()).ok()
-        }
-    });
-    if must_exist {
-        if let Some(c) = from_cwd.filter(|f| f.exists()) {
-            return Ok(c);
-        }
-        return from_ws;
-    }
-    match (from_ws, from_cwd) {
-        (Ok(w), _) => Ok(w),
-        (Err(_), Some(c)) => Ok(c),
-        (Err(e), None) => Err(e),
-    }
+    resolve_existing(ws, cwd, p.trim(), true, false)
 }
 
 fn plan_update(
@@ -233,7 +215,7 @@ fn plan_update(
     hunks: &[Hunk],
     errors: &mut Vec<String>,
 ) -> Option<PlannedFile> {
-    let full = match patch_path(ws, cwd, path, true) {
+    let (full, resolved) = match existing_path(ws, cwd, path) {
         Ok(f) => f,
         Err(e) => {
             errors.push(format!("{path}: {e}"));
@@ -250,7 +232,7 @@ fn plan_update(
     let lang = lang_for(&rel);
     let before_errs = syntax_errors(lang, &doc.to_text());
     let mut edits: Vec<(usize, usize, Vec<String>, usize)> = Vec::new();
-    let mut notes = Vec::new();
+    let mut notes: Vec<String> = resolved.into_iter().collect();
     let mut cursor = 0usize;
     let mut failed = false;
     for (hi, h) in hunks.iter().enumerate() {
@@ -281,6 +263,36 @@ fn plan_update(
                     errors.push(format!("{}: {}", tag(header), piece_errs.join("\n")));
                 }
                 failed = true;
+            }
+            Hunk::Edge { at, new, header } => {
+                if new.iter().all(|l| l.trim().is_empty()) {
+                    errors.push(format!("{}: nothing to insert (no `+` lines)", tag(header)));
+                    failed = true;
+                    continue;
+                }
+                let mut lines = new.clone();
+                let row = match at {
+                    Edge::Top => top_row(&doc.lines),
+                    Edge::Bottom => doc.lines.len(),
+                    Edge::Imports => {
+                        // Re-adding an import that is already there is a no-op, not a duplicate.
+                        let have: HashSet<&str> = doc.lines.iter().map(|l| l.trim()).collect();
+                        let before = lines.len();
+                        lines.retain(|l| l.trim().is_empty() || !have.contains(l.trim()));
+                        if lines.iter().all(|l| l.trim().is_empty()) {
+                            notes.push(format!("{}: already present, nothing inserted", tag(header)));
+                            continue;
+                        }
+                        if lines.len() < before {
+                            notes.push(format!("{}: skipped {} line(s) already present", tag(header), before - lines.len()));
+                        }
+                        match import_end_row(lang, &doc.to_text()) {
+                            Some(r) => r + 1,
+                            None => top_row(&doc.lines),
+                        }
+                    }
+                };
+                edits.push((row, 0, lines, hi));
             }
             Hunk::Anchored { kind, start, end, new, header } => {
                 let (r0, r1) = match locate(&doc, &rel, start, end) {
@@ -474,7 +486,7 @@ fn plan_update(
     let mut target_rel = rel.clone();
     let mut remove_after = None;
     if let Some(m) = move_to {
-        match patch_path(ws, cwd, m, false) {
+        match resolve_new_file(ws, cwd, m).map(|(t, _)| t) {
             Ok(t) if t.exists() => {
                 errors.push(format!("{rel}: cannot move to {m}: it already exists"));
                 return None;
@@ -498,13 +510,15 @@ fn plan_update(
                 .or_else(|| after.first())
             {
                 let row = (*row).min(new_doc.lines.len().saturating_sub(1));
-                notes.push(format!("⚠ {target_rel}: new syntax error at {}: {m}", new_doc.anchor(row)));
+                notes.push(syntax_note(&new_doc, row, m, &format!("{target_rel}: new syntax error")));
             }
         }
     }
     let moved = if remove_after.is_some() { format!(" -> {target_rel}") } else { String::new() };
     let now = if ranges.is_empty() { String::new() } else { format!("  new anchors: {}", ranges.join(", ")) };
-    let summary = if edits.is_empty() {
+    let summary = if edits.is_empty() && moved.is_empty() {
+        format!("= {rel}  (no change)")
+    } else if edits.is_empty() {
         format!("R {rel}{moved}")
     } else {
         format!("M {rel}{moved}  {} hunk(s) +{plus} -{minus}{now}", edits.len())
@@ -547,26 +561,21 @@ pub fn apply_patch(
             continue;
         }
         match op {
-            FileOp::Add { path, lines } => match patch_path(ws, cwd, path, false) {
-                Ok(full) if full.exists() => errors.push(format!(
+            FileOp::Add { path, lines } => match resolve_new_file(ws, cwd, path) {
+                Ok((full, _)) if full.exists() => errors.push(format!(
                     "{path}: already exists; use `*** Update File:` (or delete it first)"
                 )),
-                Ok(full) => {
+                Ok((full, resolved)) => {
                     let rel = rel_of(ws, &full);
                     let eol = sibling_eol(&full);
                     let mut text = lines.join(eol);
                     if !text.is_empty() {
                         text.push_str(eol);
                     }
-                    let mut notes = Vec::new();
+                    let mut notes: Vec<String> = resolved.into_iter().collect();
                     if let Some(errs) = syntax_errors(lang_for(&rel), &text) {
                         if let Some((row, m)) = errs.first() {
-                            let line = text.lines().nth(*row).unwrap_or("");
-                            notes.push(format!(
-                                "⚠ {rel}: syntax error at {}#{}: {m}",
-                                row + 1,
-                                line_hash(line)
-                            ));
+                            notes.push(syntax_note(&Doc::parse(&text), *row, m, &format!("{rel}: syntax error")));
                         }
                     }
                     plans.push(PlannedFile {
@@ -581,8 +590,8 @@ pub fn apply_patch(
                 }
                 Err(e) => errors.push(format!("{path}: {e}")),
             },
-            FileOp::Delete { path } => match patch_path(ws, cwd, path, true) {
-                Ok(full) if full.is_file() => {
+            FileOp::Delete { path } => match existing_path(ws, cwd, path) {
+                Ok((full, resolved)) => {
                     let rel = rel_of(ws, &full);
                     plans.push(PlannedFile {
                         original: std::fs::read(&full).ok(),
@@ -591,10 +600,9 @@ pub fn apply_patch(
                         rel,
                         new_text: None,
                         remove_after: None,
-                        notes: Vec::new(),
+                        notes: resolved.into_iter().collect(),
                     });
                 }
-                Ok(full) => errors.push(missing_path_err(ws, &rel_of(ws, &full), true, false)),
                 Err(e) => errors.push(format!("{path}: {e}")),
             },
             FileOp::Update { path, move_to, hunks } => {
@@ -602,6 +610,12 @@ pub fn apply_patch(
                     plans.push(p);
                 }
             }
+        }
+    }
+    // Two spellings (e.g. a full path and a short suffix) can name the same file.
+    for (i, p) in plans.iter().enumerate() {
+        if plans[..i].iter().any(|q| q.full == p.full) {
+            errors.push(format!("{}: appears twice in the patch; put all its hunks under one `*** Update File:`", p.rel));
         }
     }
     if !errors.is_empty() {
@@ -685,4 +699,24 @@ fn sibling_eol(full: &Path) -> &'static str {
         }
     }
     "\n"
+}
+
+/// Row for `@@ top`: line 1, but after a `#!` shebang and leading file-level directives that must
+/// stay first (`//!` / `#![...]` in Rust, `'use client'` / `"use strict"` in JS).
+fn top_row(lines: &[String]) -> usize {
+    let mut row = 0;
+    if lines.first().is_some_and(|l| l.starts_with("#!") && !l.starts_with("#![")) {
+        row = 1;
+    }
+    while let Some(l) = lines.get(row) {
+        let t = l.trim_start();
+        let directive = t.starts_with("//!")
+            || t.starts_with("#![")
+            || ((t.starts_with("'use ") || t.starts_with("\"use ")) && t.trim_end().trim_end_matches(';').len() < 40);
+        if !directive {
+            break;
+        }
+        row += 1;
+    }
+    row
 }

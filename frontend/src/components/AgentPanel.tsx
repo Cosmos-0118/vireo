@@ -1,3 +1,5 @@
+import { ChatsCircle, Cube, MagnifyingGlass } from '@phosphor-icons/react';
+import { EmptyRow } from './ui/EmptyState';
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowRight,
@@ -1289,7 +1291,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         >
           <div className={menuHead}>Recent threads</div>
           {threadStore.list.length === 0 ? (
-            <div className="px-3 py-2 text-[var(--text-dim)]">No saved threads in this workspace yet.</div>
+            <EmptyRow icon={ChatsCircle}>No saved threads in this workspace yet</EmptyRow>
           ) : (
             <div className="max-h-64 overflow-y-auto">
               {threadStore.list.map((t) => (
@@ -1712,7 +1714,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
               )}
               <div className="max-h-52 overflow-y-auto py-1">
                 {filteredFiles.length === 0 ? (
-                  <div className="px-3 py-2 text-[12px] text-[var(--text-dim)]">No matching files</div>
+                  <EmptyRow icon={MagnifyingGlass}>No matching files</EmptyRow>
                 ) : (
                   filteredFiles.map((f, i) => (
                     <div
@@ -1879,9 +1881,9 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                       Local models · Ollama {localModels ? (localModels.ollama.running ? '(running)' : '(not running)') : ''}
                     </div>
                     {ollamaModels.length === 0 ? (
-                      <div className="px-3 py-1 text-[11.5px] text-[var(--text-dim)]">
-                        {localModels?.ollama.running ? 'No models pulled yet.' : 'Start Ollama to list local models.'}
-                      </div>
+                      <EmptyRow icon={Cube} className="!py-1 !text-[11.5px]">
+                        {localModels?.ollama.running ? 'No models pulled yet' : 'Start Ollama to list local models'}
+                      </EmptyRow>
                     ) : (
                       ollamaModels.map((m) => (
                         <div key={m} onClick={() => chooseOllamaModel(m)} className={menuRow}>

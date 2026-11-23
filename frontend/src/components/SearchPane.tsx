@@ -1,3 +1,5 @@
+import { MagnifyingGlass, ListMagnifyingGlass } from '@phosphor-icons/react';
+import { EmptyState, EmptyStateButton } from './ui/EmptyState';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AtSign,
@@ -1058,10 +1060,15 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
         className="flex-1 overflow-y-auto py-1 outline-none"
       >
         {!hasQuery ? (
-          <div className="px-4 py-6 text-center text-[12px] text-[var(--text-dim)] space-y-2">
-            <div>Search across the workspace</div>
+          <div className="text-center text-[12px] text-[var(--text-dim)]">
+            <EmptyState
+              icon={MagnifyingGlass}
+              title="Search the workspace"
+              description="Find text across every file. Use the filters to narrow by path or file type."
+              className={recent.length > 0 ? '!pb-3' : ''}
+            />
             {recent.length > 0 && (
-              <div className="pt-2 space-y-1.5">
+              <div className="px-4 pb-4 space-y-1.5">
                 <div className="flex items-center justify-center gap-2 text-[10.5px] uppercase tracking-wider">
                   Recent
                   <button
@@ -1094,21 +1101,29 @@ export const SearchPane: React.FC<SearchPaneProps> = ({
         ) : searching && !results ? (
           <div className="px-4 py-4 text-[12px] text-[var(--text-muted)]">Searching…</div>
         ) : results && groups.length === 0 ? (
-          <div className="px-4 py-6 text-center text-[12px] text-[var(--text-muted)] space-y-2">
-            <div>
-              No results for <span className="font-semibold text-[var(--text-primary)]">“{query}”</span>
-              {scope === 'changed' ? ` in ${totalChanged} changed file${totalChanged === 1 ? '' : 's'}` : ''}
-              {results.matches.length > 0 ? ' (all dismissed)' : ''}
-            </div>
-            {anyFilter && (
-              <button
-                onClick={resetFilters}
-                className="px-2 h-6 rounded-md border border-[var(--border)] hover:bg-[var(--bg-hover)] text-[11.5px] text-[var(--text-primary)] cursor-pointer"
-              >
-                {scope === 'changed' ? 'Search all files instead' : 'Reset filters'}
-              </button>
-            )}
-          </div>
+          <EmptyState
+            icon={ListMagnifyingGlass}
+            title={results.matches.length > 0 ? 'All results dismissed' : 'No results'}
+            description={
+              results.matches.length > 0 ? (
+                <>
+                  Every match for <span className="text-[var(--text-muted)] break-all">“{query}”</span> was dismissed.
+                </>
+              ) : (
+                <>
+                  Nothing matches <span className="text-[var(--text-muted)] break-all">“{query}”</span>
+                  {scope === 'changed' ? ` in ${totalChanged} changed file${totalChanged === 1 ? '' : 's'}` : ''}.
+                </>
+              )
+            }
+            action={
+              anyFilter && (
+                <EmptyStateButton onClick={resetFilters}>
+                  {scope === 'changed' ? 'Search all files' : 'Reset filters'}
+                </EmptyStateButton>
+              )
+            }
+          />
         ) : (
           rows.map((r) => (r.kind === 'file' ? renderFileRow(r.group) : renderMatchRow(r.group, r.match)))
         )}

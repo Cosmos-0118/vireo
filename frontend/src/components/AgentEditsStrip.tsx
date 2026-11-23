@@ -1,3 +1,5 @@
+import { MagnifyingGlass } from '@phosphor-icons/react';
+import { EmptyRow } from './ui/EmptyState';
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { ChevronDown, ChevronLeft, ChevronRight, Search } from 'lucide-react';
@@ -327,7 +329,7 @@ function EditsPopover({
         </div>
       )}
       <div ref={listRef} className="overflow-y-auto py-1" style={{ maxHeight: 'min(50vh, 360px)' }}>
-        {filtered.length === 0 && <div className="px-3 py-2 text-[var(--text-dim)]">No matching files</div>}
+        {filtered.length === 0 && <EmptyRow icon={MagnifyingGlass}>No matching files</EmptyRow>}
         {filtered.map((e, i) => {
           const current = activePath === e.path;
           const dir = dirName(e.path);

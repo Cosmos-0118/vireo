@@ -1,3 +1,5 @@
+import { MagnifyingGlass } from '@phosphor-icons/react';
+import { EmptyRow } from './ui/EmptyState';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Palette, Play, Search } from 'lucide-react';
 import { FileIcon } from './FileIcon';
@@ -123,9 +125,9 @@ export const QuickOpen: React.FC<QuickOpenProps> = ({
         </div>
         <div className="max-h-[340px] overflow-y-auto py-1">
           {items.length === 0 ? (
-            <div className="px-4 py-6 text-center text-xs text-[var(--text-dim)]">
-              No matching files or commands.
-            </div>
+            <EmptyRow icon={MagnifyingGlass} className="!px-4 !py-3">
+              No matching files or commands
+            </EmptyRow>
           ) : (
             items.map((item, i) => (
               <div

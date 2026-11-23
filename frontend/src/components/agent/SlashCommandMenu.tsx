@@ -1,3 +1,5 @@
+import { Command } from '@phosphor-icons/react';
+import { EmptyRow } from '../ui/EmptyState';
 import React, { useEffect, useRef } from 'react';
 import type { SlashCommand } from '../../types';
 
@@ -23,9 +25,11 @@ export const SlashCommandMenu: React.FC<SlashCommandMenuProps> = ({ items, selec
     <div className="absolute left-2 right-2 bottom-full mb-1 z-40 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl overflow-hidden">
       <div ref={listRef} className="max-h-64 overflow-y-auto py-1">
         {items.length === 0 ? (
-          <div className="px-3 py-2 text-[12px] text-[var(--text-dim)]">
-            {loading ? 'Loading commands…' : 'No matching commands'}
-          </div>
+          loading ? (
+            <div className="px-3 py-2 text-[12px] text-[var(--text-dim)]">Loading commands…</div>
+          ) : (
+            <EmptyRow icon={Command}>No matching commands</EmptyRow>
+          )
         ) : (
           items.map((c, i) => (
             <div
