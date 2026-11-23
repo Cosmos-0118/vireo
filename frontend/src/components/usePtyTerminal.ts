@@ -328,23 +328,27 @@ export function usePtyTerminal(
           return HANDLED;
         }
         if (key === 'v') {
-          ev.preventDefault();
-          // term.paste honours bracketed-paste mode and normalises newlines. When the clipboard
-          // holds an image (no text), CLI agents read it from the OS clipboard themselves once
-          // they get their image-paste key, so forward that instead of pasting nothing.
-          const pasteImageKey = IS_WINDOWS ? '\x1bv' : '\x16'; // Alt+V on Windows, Ctrl+V elsewhere
-          navigator.clipboard
-            ?.readText()
-            .then((text) => {
-              if (disposed) return;
-              if (text) term.paste(text);
-              else sendInput(pasteImageKey);
-            })
-            .catch(() => sendInput(pasteImageKey));
+          // Don't preventDefault: the browser then fires a native `paste` event (handled below),
+          // which carries the clipboard without the permission prompt navigator.clipboard.read*
+          // triggers.
           return HANDLED;
         }
         return !HANDLED;
       });
+
+      // term.paste honours bracketed-paste mode and normalises newlines. When the clipboard holds
+      // an image (no text), CLI agents read it from the OS clipboard themselves once they get
+      // their image-paste key, so forward that instead of pasting nothing.
+      const pasteImageKey = IS_WINDOWS ? 'v' : ''; // Alt+V on Windows, Ctrl+V elsewhere
+      const onPaste = (ev: ClipboardEvent) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        if (disposed) return;
+        const text = ev.clipboardData?.getData('text/plain');
+        if (text) term.paste(text);
+        else sendInput(pasteImageKey);
+      };
+      host.addEventListener('paste', onPaste, true);
 
       // Replayed history can contain terminal queries; the emulator would answer them into the
       // live shell, so its output is muted until the server says the replay has been written.
@@ -449,6 +453,7 @@ export function usePtyTerminal(
         document.removeEventListener('visibilitychange', onVisibility);
         ro.disconnect();
         dataSub.dispose();
+        host.removeEventListener('paste', onPaste, true);
         if (sock) sock.close();
         controlRef.current = null;
         termRef.current = null;

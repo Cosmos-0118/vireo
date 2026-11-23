@@ -1138,17 +1138,20 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                   }
                 }}
                 rows={commitMsg.includes('\n') ? 4 : 2}
-                placeholder={
-                  isDetached
-                    ? 'Message (Ctrl+Enter to commit on detached HEAD)'
-                    : `Message (Ctrl+Enter to commit on “${gitStatus.branch}”)`
-                }
+                aria-label="Commit message"
                 className={`block w-full pl-2.5 pr-8 py-1.5 text-[12.5px] bg-[var(--bg-input)] border text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none resize-none leading-relaxed ${
                   amendMode
                     ? `rounded-b-md ${headPushed ? 'border-[var(--modified-fg)]/50' : 'border-[var(--accent)]/50'} focus:border-[var(--accent)]`
                     : 'rounded-md border-[var(--border)] focus:border-[var(--accent)]'
                 }`}
               />
+              {!commitMsg && (
+                <div className="absolute left-[11px] right-8 top-[7px] truncate pointer-events-none text-[12.5px] leading-relaxed text-[var(--text-dim)]">
+                  {isDetached
+                    ? 'Message (Ctrl+Enter to commit on detached HEAD)'
+                    : `Message (Ctrl+Enter to commit on “${gitStatus.branch}”)`}
+                </div>
+              )}
               <button
                 onClick={handleGenerateMessage}
                 disabled={generating || busy || !canCommit}

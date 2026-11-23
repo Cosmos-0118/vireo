@@ -359,3 +359,8 @@ html.app-hidden *::before,
 html.app-hidden *::after {
   animation-play-state: paused !important;
 }
+
+/* Single-line fields cut long text and placeholders with an ellipsis instead of clipping. */
+input:not([type="checkbox"]):not([type="radio"]) {
+  text-overflow: ellipsis;
+}
