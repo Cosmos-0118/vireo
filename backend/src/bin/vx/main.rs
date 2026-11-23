@@ -559,6 +559,45 @@ mod vx_tests {
         assert!(!looks_like_flag("--foo.bar"));
     }
     #[test]
+    fn mcp_create_ast_outline_check_and_aliases() {
+        let ws = std::env::temp_dir().join(format!("vireo-mcp2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let call = |id: u64, name: &str, args: serde_json::Value| {
+            let r = handle_mcp_request(
+                &ws,
+                false,
+                &json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":args}}),
+            )
+            .unwrap();
+            (r["result"]["isError"].as_bool().unwrap(), r["result"]["content"][0]["text"].as_str().unwrap().to_string())
+        };
+        let list = handle_mcp_request(&ws, false, &json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).unwrap();
+        let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+        assert!(names.contains(&"create") && names.contains(&"ast") && names.contains(&"symbol"), "{names:?}");
+
+        // create, using agent-style parameter names.
+        let (err, t) = call(2, "create", json!({"file_path":"m.rs","content":"fn old_name() {\n    old(1);\n}\n"}));
+        assert!(!err, "{t}");
+        // outline through `view`.
+        let (err, t) = call(3, "view", json!({"path":"m.rs","outline":true}));
+        assert!(!err && t.contains("old_name"), "{t}");
+        // ast rewrite.
+        let (err, t) = call(4, "ast", json!({"pattern":"old($X)","lang":"rust","rewrite":"new($X)"}));
+        assert!(!err, "{t}");
+        assert!(std::fs::read_to_string(ws.join("m.rs")).unwrap().contains("new(1)"));
+        // symbol read, familiar `name` alias.
+        let (err, t) = call(5, "symbol", json!({"path":"m.rs","name":"old_name"}));
+        assert!(!err && t.contains("new(1)"), "{t}");
+        // failing custom check surfaces isError.
+        let (err, _) = call(6, "check", json!({"cmd":"exit 3"}));
+        assert!(err);
+        // unknown tool and missing params are errors, not panics.
+        assert!(call(7, "nope", json!({})).0);
+        assert!(call(8, "view", json!({"path":"missing.rs"})).0);
+    }
+
+    #[test]
     fn mcp_initialize_list_and_call() {
         let ws = std::env::temp_dir().join(format!("vireo-mcp-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&ws);

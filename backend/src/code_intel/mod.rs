@@ -44,7 +44,7 @@ pub use check::{check, check_failed, CheckOpts};
 #[allow(unused_imports)]
 pub use doc::line_hash;
 #[allow(unused_imports)]
-pub use edit::{ast, create, hashline_edit};
+pub use edit::{ast, create, edit_batch, hashline_edit};
 #[allow(unused_imports)]
 pub use patch::apply_patch;
 #[allow(unused_imports)]
@@ -68,7 +68,8 @@ Prefer `vx` over cat/rg/sed/Python patch scripts. For edits: use `vx apply` (ato
 - search <regex> [path] [-g G] [-C N] [-F] [-l]   anchored grep (smart path/glob resolution, context, literal, files-only)\n\
 - apply [--file F] [--dry-run]  atomic multi-file V4A patch (`*** Update File:` + `@@ 12#ab..15#cd`/`@@ after`/`@@ delete` with `+` lines, or classic `@@` context)\n\
 - replace <old> <new> [path] [-g G] [-r] [--dry-run] [--expected N]   atomic literal/regex replace across files\n\
-- edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]\n\
+- edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]   (MCP: `start` may be a range `12#ab..15#cd`; `edits:[{start,end?,op?,new_text}]` batches several atomically; `symbol` instead of `start` edits a whole symbol)\n\
+- Familiar names work: file_path/old_string/new_string/pattern/content/name. `search` retries as literal text when a regex finds nothing. `view a.rs:Foo` or `Foo:7` reads a symbol.\n\
 - symbol <file> <name> [--replace|--insert-after|--delete] [--text T|--file F]\n\
 - create <file> [--force] [--text T|--file F]\n\
 - ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
@@ -98,6 +99,8 @@ fn globs_from(args: &Value) -> Vec<String> {
 
 /// Single entry point shared by the built-in agent, the `vx` CLI, and the `vx mcp` server.
 pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
+    let aliased = with_aliases(op, a);
+    let a = &aliased;
     let need = |k: &str| s(a, k).ok_or_else(|| format!("missing `{k}`"));
     let cwd = s(a, "cwd").map(PathBuf::from);
     match op {
@@ -127,14 +130,27 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
             };
             search(ws, need("query")?, &opts)
         }
-        "edit" => hashline_edit(
-            ws,
-            need("path")?,
-            s(a, "op").unwrap_or("replace"),
-            need("start")?,
-            s(a, "end"),
-            s(a, "new_text").unwrap_or(""),
-        ),
+        "edit" => {
+            if let Some(list) = a.get("edits").and_then(|v| v.as_array()) {
+                return edit_batch(ws, need("path")?, list, cwd.as_deref());
+            }
+            // A symbol name instead of anchors: edit the whole symbol.
+            if let (None, Some(sym)) = (s(a, "start"), s(a, "symbol")) {
+                let mode = match s(a, "op").unwrap_or("replace") {
+                    "replace" | "insert_after" | "delete" => s(a, "op").unwrap_or("replace"),
+                    other => return Err(format!("op `{other}` isn't supported with `symbol` (replace, insert_after, delete)")),
+                };
+                return symbol_op(ws, need("path")?, sym, mode, s(a, "new_text").unwrap_or(""));
+            }
+            hashline_edit(
+                ws,
+                need("path")?,
+                s(a, "op").unwrap_or("replace"),
+                need("start")?,
+                s(a, "end"),
+                s(a, "new_text").unwrap_or(""),
+            )
+        }
         "replace" => {
             let opts = ReplaceOpts {
                 path: s(a, "path").map(str::to_string),
@@ -195,4 +211,46 @@ pub fn run_op_string(ws: &Path, op: &str, a: &Value) -> String {
 #[allow(dead_code)]
 pub fn describe() -> Value {
     json!({ "hint": AGENT_HINT })
+}
+
+/// Accepts the parameter names other agents' tools use (Claude Code, OpenCode, Cursor, ...) so a
+/// first call with a familiar name works. A canonical name always wins when both are given.
+fn with_aliases(op: &str, a: &Value) -> Value {
+    let Some(obj) = a.as_object() else { return a.clone() };
+    let table: &[(&str, &[&str])] = match op {
+        "outline" => &[("path", &["file_path", "filePath", "file"])],
+        "view" => &[("path", &["file_path", "filePath", "file"]), ("target", &["range", "lines", "symbol"])],
+        "search" => &[("query", &["pattern", "regex", "q"]), ("glob", &["include"]), ("path", &["dir", "directory"])],
+        "map" => &[("dir", &["path"])],
+        "edit" => &[
+            ("path", &["file_path", "filePath", "file"]),
+            ("new_text", &["new_string", "newString", "new_code", "content", "text", "replacement"]),
+            ("op", &["mode"]),
+        ],
+        "replace" => &[
+            ("path", &["file_path", "filePath", "file"]),
+            ("old", &["old_string", "oldString", "old_text", "search"]),
+            ("new", &["new_string", "newString", "new_text", "replacement"]),
+        ],
+        "symbol" => &[
+            ("path", &["file_path", "filePath", "file"]),
+            ("symbol", &["name"]),
+            ("mode", &["op"]),
+            ("new_code", &["new_text", "new_string", "newString", "content", "text"]),
+        ],
+        "create" => &[("path", &["file_path", "filePath", "file"]), ("content", &["new_text", "text", "file_text"])],
+        "ast" => &[("pattern", &["query"]), ("rewrite", &["replacement"]), ("lang", &["language"])],
+        "apply" => &[("patch", &["input", "diff"])],
+        "check" => &[("cmd", &["command"])],
+        _ => &[],
+    };
+    let mut out = obj.clone();
+    for (canon, alts) in table {
+        if out.get(*canon).map_or(true, Value::is_null) {
+            if let Some(v) = alts.iter().find_map(|k| obj.get(*k).filter(|v| !v.is_null())) {
+                out.insert((*canon).to_string(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
 }

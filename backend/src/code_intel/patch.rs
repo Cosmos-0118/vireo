@@ -62,7 +62,7 @@ fn fuzzy_eq(file: &str, pat: &str, wild: &mut bool) -> bool {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-enum MatchLevel {
+pub(crate) enum MatchLevel {
     Exact,
     Rstrip,
     Trim,
@@ -71,7 +71,7 @@ enum MatchLevel {
 
 /// Find `pat` in `lines` at or after `from`. Exact/rstrip take the first hit (V4A semantics);
 /// the looser passes must be unique so they can never pick the wrong place.
-fn seek_lines(
+pub(crate) fn seek_lines(
     lines: &[String],
     pat: &[String],
     from: usize,
@@ -132,13 +132,13 @@ fn leading_ws(s: &str) -> &str {
     &s[..n]
 }
 
-enum Shift {
+pub(crate) enum Shift {
     Add(String),
     Drop(String),
     Replace(String, String),
 }
 
-fn indent_shift(old_first: &str, file_first: &str) -> Option<Shift> {
+pub(crate) fn indent_shift(old_first: &str, file_first: &str) -> Option<Shift> {
     let (a, b) = (leading_ws(old_first), leading_ws(file_first));
     if a == b {
         return None;
@@ -152,7 +152,7 @@ fn indent_shift(old_first: &str, file_first: &str) -> Option<Shift> {
     }
 }
 
-fn apply_shift(l: &str, s: &Shift) -> String {
+pub(crate) fn apply_shift(l: &str, s: &Shift) -> String {
     if l.trim().is_empty() {
         return l.to_string();
     }
@@ -163,7 +163,7 @@ fn apply_shift(l: &str, s: &Shift) -> String {
     }
 }
 
-fn closest_hint(doc: &Doc, old: &[String]) -> String {
+pub(crate) fn closest_hint(doc: &Doc, old: &[String]) -> String {
     let wanted: Vec<&str> = old.iter().map(|l| l.trim()).filter(|l| l.len() >= 4).collect();
     if wanted.is_empty() || doc.lines.is_empty() {
         return String::new();
@@ -462,7 +462,8 @@ fn plan_update(
     for (start, remove, new, _) in &edits {
         let s = (*start as isize + delta) as usize;
         if !new.is_empty() {
-            ranges.push(format!("{}..{}", new_doc.anchor(s), new_doc.anchor(s + new.len() - 1)));
+            let (a, b) = (new_doc.anchor(s), new_doc.anchor(s + new.len() - 1));
+            ranges.push(if new.len() == 1 { a } else { format!("{a}..{b}") });
         }
         delta += new.len() as isize - *remove as isize;
         plus += new.len();
@@ -502,7 +503,7 @@ fn plan_update(
         }
     }
     let moved = if remove_after.is_some() { format!(" -> {target_rel}") } else { String::new() };
-    let now = if ranges.is_empty() { String::new() } else { format!("  now {}", ranges.join(", ")) };
+    let now = if ranges.is_empty() { String::new() } else { format!("  new anchors: {}", ranges.join(", ")) };
     let summary = if edits.is_empty() {
         format!("R {rel}{moved}")
     } else {
@@ -552,9 +553,10 @@ pub fn apply_patch(
                 )),
                 Ok(full) => {
                     let rel = rel_of(ws, &full);
-                    let mut text = lines.join("\n");
+                    let eol = sibling_eol(&full);
+                    let mut text = lines.join(eol);
                     if !text.is_empty() {
-                        text.push('\n');
+                        text.push_str(eol);
                     }
                     let mut notes = Vec::new();
                     if let Some(errs) = syntax_errors(lang_for(&rel), &text) {
@@ -665,4 +667,22 @@ pub fn apply_patch(
         }
     }
     Ok(out)
+}
+
+/// Line ending for a new file: follow its neighbours (the first sibling with a newline decides),
+/// defaulting to LF.
+fn sibling_eol(full: &Path) -> &'static str {
+    let Some(dir) = full.parent() else { return "\n" };
+    let Ok(rd) = std::fs::read_dir(dir) else { return "\n" };
+    for e in rd.flatten().take(40) {
+        let p = e.path();
+        if !p.is_file() || lang_for(&p.to_string_lossy()).is_none() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&p) else { continue };
+        if let Some(i) = bytes.iter().take(1 << 16).position(|&b| b == b'\n') {
+            return if i > 0 && bytes[i - 1] == b'\r' { "\r\n" } else { "\n" };
+        }
+    }
+    "\n"
 }

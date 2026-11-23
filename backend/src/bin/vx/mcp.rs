@@ -97,12 +97,14 @@ pub fn mcp_tools(read_only: bool) -> Value {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "start": { "type": "string", "description": "Start anchor N#hh" },
-                        "end": { "type": "string", "description": "Optional end anchor N#hh for a range" },
-                        "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"] },
-                        "new_text": { "type": "string" }
+                        "start": { "type": "string", "description": "Anchor `12#ab`, or a whole range `12#ab..15#cd` (as printed by view/outline)" },
+                        "end": { "type": "string", "description": "Optional end anchor when `start` is a single anchor" },
+                        "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"], "description": "Default replace (needs new_text); use delete to remove lines" },
+                        "new_text": { "type": "string", "description": "Replacement / inserted text" },
+                        "edits": { "type": "array", "description": "Several edits to this file in ONE atomic call; anchors all refer to the file as it is now. Each: {start, end?, op?, new_text?}", "items": { "type": "object" } },
+                        "symbol": { "type": "string", "description": "Instead of anchors: edit a whole symbol by name (op replace / insert_after / delete)" }
                     },
-                    "required": ["path", "start"]
+                    "required": ["path"]
                 },
                 "annotations": { "readOnlyHint": false }
             }),
@@ -132,6 +134,36 @@ pub fn mcp_tools(read_only: bool) -> Value {
                         "warnings": { "type": "boolean" },
                         "timeout": { "type": "integer" }
                     }
+                },
+                "annotations": { "readOnlyHint": false }
+            }),
+            json!({
+                "name": "create",
+                "description": "Create a new file (refuses to overwrite unless force=true). Parent folders are created.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "content": { "type": "string" },
+                        "force": { "type": "boolean", "description": "Overwrite if the file exists" }
+                    },
+                    "required": ["path", "content"]
+                },
+                "annotations": { "readOnlyHint": false }
+            }),
+            json!({
+                "name": "ast",
+                "description": "Structural (ast-grep) search, optionally rewrite with `rewrite` (use $VAR metavariables). Set dry_run to preview a rewrite.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "ast-grep pattern, e.g. `$X.unwrap()`" },
+                        "rewrite": { "type": "string", "description": "Optional rewrite template" },
+                        "lang": { "type": "string" },
+                        "path": { "type": "string" },
+                        "dry_run": { "type": "boolean" }
+                    },
+                    "required": ["pattern"]
                 },
                 "annotations": { "readOnlyHint": false }
             }),
@@ -172,7 +204,7 @@ pub fn handle_mcp_request(ws: &Path, read_only: bool, req: &Value) -> Option<Val
             }
             let (op, payload) = match name {
                 "view" if args["outline"].as_bool() == Some(true) => ("outline", args),
-                "map" | "view" | "search" | "apply" | "replace" | "edit" | "symbol" | "check" => (name, args),
+                "map" | "view" | "search" | "apply" | "replace" | "edit" | "symbol" | "check" | "create" | "ast" => (name, args),
                 other => {
                     return ok(json!({
                         "content": [{ "type": "text", "text": format!("Error: unknown tool `{other}`") }],

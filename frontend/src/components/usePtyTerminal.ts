@@ -6,6 +6,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { Unicode11Addon } from '@xterm/addon-unicode11';
 import '@xterm/xterm/css/xterm.css';
 import { wsUrl } from '../api';
+import { isUsableDrag, readDrop, shellQuote, uploadDropped } from '../utils/dnd';
 import type { LiteTheme } from '../themes';
 
 const PRIMARY_FONT = 'JetBrains Mono Variable';
@@ -354,6 +355,34 @@ export function usePtyTerminal(
       };
       host.addEventListener('paste', onPaste, true);
 
+      // Drag-and-drop: Vireo files paste their absolute path; OS files are saved to a temp
+      // folder first (browsers hide real paths) and that path is pasted. Works for plain shells
+      // and for CLI agents (they read pasted paths as file/image references).
+      const onDragOver = (ev: DragEvent) => {
+        if (!isUsableDrag(ev.dataTransfer)) return;
+        ev.preventDefault();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+      };
+      const onDrop = (ev: DragEvent) => {
+        if (!isUsableDrag(ev.dataTransfer)) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        const { paths, files } = readDrop(ev.dataTransfer);
+        const out = paths.map((p) => p.abs);
+        const paste = () => {
+          if (disposed || out.length === 0) return;
+          term.paste(out.map(shellQuote).join(' ') + ' ');
+          term.focus();
+        };
+        if (files.length === 0) return paste();
+        Promise.allSettled(files.map(uploadDropped)).then((res) => {
+          for (const r of res) if (r.status === 'fulfilled') out.push(r.value);
+          paste();
+        });
+      };
+      host.addEventListener('dragover', onDragOver);
+      host.addEventListener('drop', onDrop);
+
       // Replayed history can contain terminal queries; the emulator would answer them into the
       // live shell, so its output is muted until the server says the replay has been written.
       let replaying = true;
@@ -461,6 +490,8 @@ export function usePtyTerminal(
         ro.disconnect();
         dataSub.dispose();
         host.removeEventListener('paste', onPaste, true);
+        host.removeEventListener('dragover', onDragOver);
+        host.removeEventListener('drop', onDrop);
         if (sock) sock.close();
         controlRef.current = null;
         termRef.current = null;

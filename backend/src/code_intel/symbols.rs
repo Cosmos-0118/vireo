@@ -362,8 +362,21 @@ pub(crate) fn qualified(s: &Sym) -> String {
     }
 }
 
+/// `Foo:45` / `Foo@45` pins a symbol to the one starting at (or enclosing) line 45.
+fn split_line_pin(q: &str) -> (&str, Option<usize>) {
+    if let Some((head, tail)) = q.rsplit_once([':', '@']) {
+        if !head.is_empty() && !head.ends_with(':') && !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            if let Ok(n) = tail.parse() {
+                return (head.trim(), Some(n));
+            }
+        }
+    }
+    (q, None)
+}
+
 pub(crate) fn find_symbol<'a>(syms: &'a [Sym], query: &str) -> Result<&'a Sym, String> {
-    let mut q = query.trim();
+    let (query_name, line_pin) = split_line_pin(query.trim());
+    let mut q = query_name;
     let mut want_impl = false;
     for kw in [
         "pub(crate) ", "pub ", "async ", "export ", "default ", "fn ", "func ", "def ", "function ", "class ",
@@ -390,6 +403,19 @@ pub(crate) fn find_symbol<'a>(syms: &'a [Sym], query: &str) -> Result<&'a Sym, S
             name_ok && cont.as_ref().map(|c| s.container.as_deref() == Some(c.as_str())).unwrap_or(true)
         })
         .collect();
+    if let Some(l) = line_pin {
+        let exact: Vec<&Sym> = m.iter().copied().filter(|s| s.start + 1 == l).collect();
+        m = if !exact.is_empty() {
+            exact
+        } else {
+            let mut inner: Vec<&Sym> = m.iter().copied().filter(|s| s.start < l && l <= s.end + 1).collect();
+            inner.sort_by_key(|s| s.end - s.start);
+            inner.into_iter().take(1).collect()
+        };
+        if m.is_empty() {
+            return Err(format!("no symbol `{name}` starts at or encloses line {l} (run outline to list symbols)"));
+        }
+    }
     if m.len() > 1 {
         let filtered: Vec<&Sym> = m.iter().copied().filter(|s| (s.kind == "impl_item") == want_impl).collect();
         if !filtered.is_empty() {
@@ -413,7 +439,8 @@ pub(crate) fn find_symbol<'a>(syms: &'a [Sym], query: &str) -> Result<&'a Sym, S
             })
         }
         _ => Err(format!(
-            "symbol `{query}` is ambiguous; qualify it as Container::name. Candidates: {}",
+            "symbol `{query}` is ambiguous; pin one by start line (e.g. `{name}:{}`) or qualify it as Container::name. Candidates: {}",
+            m[0].start + 1,
             m.iter()
                 .map(|s| format!("{} {} (lines {}..{})", s.kind, qualified(s), s.start + 1, s.end + 1))
                 .collect::<Vec<_>>()

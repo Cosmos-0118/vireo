@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { setPathDrag } from '../utils/dnd';
 import {
   AtSign,
   ChevronDown,
@@ -436,6 +437,8 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
       <div
         key={entry.path}
         data-path={entry.path}
+        draggable
+        onDragStart={(e) => setPathDrag(e, { rel: entry.path, abs: absolutePath(entry.path) })}
         onClick={(e) => {
           if (entry.is_dir) toggleDir(entry);
           else if (row.deleted || (e.altKey && st)) onOpenDiff(entry.path);
@@ -606,6 +609,8 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                 <div
                   key={f}
                   data-path={f}
+                  draggable
+                  onDragStart={(e) => setPathDrag(e, { rel: f, abs: absolutePath(f) })}
                   onClick={() => onOpenFile(f)}
                   onContextMenu={(e) => {
                     e.preventDefault();

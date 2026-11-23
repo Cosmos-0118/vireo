@@ -104,10 +104,49 @@ pub(crate) fn parse_diags(raw: &str, prefix: &str) -> Vec<Diag> {
     let mut out: Vec<Diag> = Vec::new();
     let generic = lazy_re!(r"(?i)^(?P<f>[^\s:()][^:()]*?)(?:[:(](?P<l>\d+)(?:[:,](?P<c>\d+))?\)?):?\s*-?\s*(?P<sev>error|warning|fatal error)\b[:\s]*(?P<m>.*)$");
     let code_re = lazy_re!(r"^(?P<c>[A-Z]{1,4}\d{3,5})\b:?\s*(?P<m>.*)$");
+    // rustc's human format (plain `cargo build` / `cargo test`): a header line, then `--> file:l:c`,
+    // then a source snippet whose `^^^ label` line carries the explanation.
+    let rustc_head = lazy_re!(r"^(?P<lvl>error|warning)(?:\[(?P<c>[A-Za-z0-9]+)\])?: (?P<m>.+)$");
+    let rustc_arrow = lazy_re!(r"^\s*--> (?P<f>[^:\n]+):(?P<l>\d+):(?P<c>\d+)\s*$");
+    let rustc_label = lazy_re!(r"^\s*(?:\d+\s*)?\|\s*[\s^~\-]*\^[\^~\-]*\s*(?P<t>.*)$");
+    let mut pending: Option<(bool, String, String)> = None;
+    let mut want_label = false;
     // tsc / gcc print a message's details on indented lines right after it.
     let mut continuing = false;
     for l in raw.lines() {
         let l = l.trim_end();
+        if let Some(c) = rustc_head.captures(l) {
+            continuing = false;
+            want_label = false;
+            pending = Some((&c["lvl"] == "error", c.name("c").map_or(String::new(), |m| m.as_str().to_string()), c["m"].to_string()));
+            continue;
+        }
+        if let Some((error, code, msg)) = pending.take() {
+            if let Some(c) = rustc_arrow.captures(l) {
+                out.push(Diag {
+                    file: format!("{prefix}{}", c["f"].trim().replace('\\', "/").trim_start_matches("./")),
+                    line: c["l"].parse().unwrap_or(0),
+                    col: c["c"].parse().unwrap_or(0),
+                    error,
+                    code,
+                    msg,
+                    label: String::new(),
+                    notes: Vec::new(),
+                });
+                want_label = true;
+                continue;
+            }
+            // No location (e.g. `error: could not compile ...`): not a located diagnostic.
+        }
+        if want_label {
+            if let Some(c) = rustc_label.captures(l) {
+                if let Some(d) = out.last_mut() {
+                    d.label = clip(c["t"].trim(), 140);
+                }
+                want_label = false;
+                continue;
+            }
+        }
         if l.starts_with('{') {
             continuing = false;
             let Ok(v) = serde_json::from_str::<Value>(l) else { continue };
@@ -231,12 +270,27 @@ fn progress_line(t: &str) -> bool {
 /// otherwise lines that look like failures (with a little context), otherwise the tail.
 pub(crate) fn compress_plain(raw: &str) -> String {
     let mut lines: Vec<&str> = Vec::new();
+    // Long lines that repeat (per-crate build-script warnings, env dumps) are shown once with a
+    // count; crate names/versions are ignored when comparing so `warning: foo@1.0: X` and
+    // `warning: bar@2.0: X` collapse.
+    let mut reps: Vec<usize> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let prefix_re = lazy_re!(r"^(?:cargo:warning=|warning: [\w.\-]+@[\w.+\-]+: )");
     for l in raw.lines() {
         let t = l.trim_end();
         if t.trim().is_empty() || progress_line(t) || lines.last() == Some(&t) || t.contains("run with `RUST_BACKTRACE=1`") {
             continue;
         }
+        if t.trim().chars().count() >= 24 {
+            let key = prefix_re.replace(t.trim(), "").into_owned();
+            if let Some(&idx) = seen.get(&key) {
+                reps[idx] += 1;
+                continue;
+            }
+            seen.insert(key, lines.len());
+        }
         lines.push(t);
+        reps.push(1);
     }
     let fail_re = lazy_re!(r"(?i)(\bfail|\berror\b|panicked|assert|expected|received|\bleft\b|\bright\b|exception|traceback|✕|×|FAILED|test result:)");
     let mut keep = vec![false; lines.len()];
@@ -249,27 +303,72 @@ pub(crate) fn compress_plain(raw: &str) -> String {
         } else if *l == "failures:" || l.starts_with("test result:") {
             in_block = false;
         }
-        if in_block || fail_re.is_match(l) {
+        // A `warning:` header (or its snippet) merely mentioning "expected"/"error" isn't a failure.
+        let warn_header = l.starts_with("warning");
+        if in_block || (!warn_header && fail_re.is_match(l)) {
             keep[i] = true;
             any = true;
             if !in_block {
-                for k in keep.iter_mut().skip(i + 1).take(2) {
+                // A compiler error's snippet and `^^^ label` follow it; other hits need less.
+                let ctx = if l.starts_with("error") { 5 } else { 2 };
+                for k in keep.iter_mut().skip(i + 1).take(ctx) {
                     *k = true;
                 }
             }
         }
     }
-    let picked: Vec<&str> = if any {
-        lines.iter().zip(&keep).filter(|(_, k)| **k).map(|(l, _)| *l).collect()
-    } else {
-        lines.clone()
-    };
+    let fmt = |i: usize| if reps[i] > 1 { format!("{}  (×{})", lines[i], reps[i]) } else { lines[i].to_string() };
+    let picked: Vec<String> = (0..lines.len()).filter(|&i| !any || keep[i]).map(fmt).collect();
     let n = picked.len();
-    let mut out = picked.iter().skip(n.saturating_sub(60)).copied().collect::<Vec<_>>().join("\n");
-    if n > 60 {
-        out = format!("…[{} earlier lines]\n{out}", n - 60);
-    }
+    // Root causes are at the top, summaries at the bottom: keep both ends, drop the middle.
+    let out = if n > 60 {
+        format!(
+            "{}\n…[{} lines omitted]\n{}",
+            picked[..20].join("\n"),
+            n - 60,
+            picked[n - 40..].join("\n")
+        )
+    } else {
+        picked.join("\n")
+    };
     out.chars().take(6000).collect()
+}
+
+/// Environment problems that look like code failures: said first, so tail-trimming can't hide them.
+fn env_hint(raw: &str) -> Option<&'static str> {
+    let l = raw.to_ascii_lowercase();
+    if (l.contains("cl.exe") || l.contains("link.exe")) && (l.contains("not found") || l.contains("not be found")) {
+        return Some("hint: MSVC build tools are not on PATH for this shell (environment problem, not a code error). Run from a VS Developer shell or source the repo's msvc-env.ps1 (Enter-MsvcEnv), then retry.");
+    }
+    if l.contains("command not found") || l.contains("is not recognized as an internal or external command") || l.contains("program not found") {
+        return Some("hint: a required program is missing or not on PATH (environment problem, not a code error).");
+    }
+    if l.contains("os error 32") || l.contains("lnk1104") || l.contains("being used by another process") || l.contains("text file busy") {
+        return Some("hint: a file is locked by a running process, likely the app or a previous build (environment problem, not a code error). Stop that process, or use a check that doesn't relink (e.g. `cargo check`).");
+    }
+    if l.contains("eaddrinuse") || l.contains("os error 10048") || l.contains("address already in use") {
+        return Some("hint: a TCP port is already in use by another process (environment problem, not a code error).");
+    }
+    if l.contains("failed to download") || l.contains("enotfound") || l.contains("could not resolve host") || l.contains("unable to update registry") || l.contains("network is unreachable") {
+        return Some("hint: the network or package registry is unreachable (environment problem, not a code error). Retry, or run offline if dependencies are already cached.");
+    }
+    if l.contains("eperm") || l.contains("eacces") || l.contains("access is denied") || l.contains("permission denied") {
+        return Some("hint: a permission error blocked the command (environment problem, not a code error). Check file ownership and that no process holds the file.");
+    }
+    None
+}
+
+/// What a passing custom command printed, so a silent pass is stated rather than implied.
+fn quiet_note(raw: &str) -> String {
+    let out: Vec<&str> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && !t.starts_with('{') && !progress_line(t))
+        .collect();
+    match out.last() {
+        None => ", exit 0, no output".to_string(),
+        Some(last) => format!(", exit 0, {} output line(s), last: {}", out.len(), clip(last, 80)),
+    }
 }
 
 /// cargo test / libtest summaries, e.g. "45 passed, 2 ignored".
@@ -281,6 +380,12 @@ pub(crate) fn test_summary(raw: &str) -> Option<String> {
         p += c[1].parse::<u64>().unwrap_or(0);
         f += c[2].parse::<u64>().unwrap_or(0);
         ig += c[3].parse::<u64>().unwrap_or(0);
+    }
+    if any && p == 0 && f == 0 {
+        return Some("0 tests ran ⚠ (check the test name/filter)".to_string());
+    }
+    if !any && lazy_re!(r"(?i)no tests (ran|found|collected)|collected 0 items|Tests:\s+0 total").is_match(raw) {
+        return Some("0 tests ran ⚠ (check the test name/filter)".to_string());
     }
     any.then(|| format!("{p} passed, {f} failed{}", if ig > 0 { format!(", {ig} ignored") } else { String::new() }))
 }
@@ -367,8 +472,9 @@ pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64, opts: CheckOpts) -
         let warns = diags.len() - errors;
         let tests = test_summary(&raw).map(|t| format!(", tests: {t}")).unwrap_or_default();
         if out.code == 0 && errors == 0 {
+            let quiet = if cmd.is_some() && diags.is_empty() && tests.is_empty() { quiet_note(&raw) } else { String::new() };
             report.push_str(&format!(
-                "✔ {label} ok ({:.1}s{tests}){}\n",
+                "✔ {label} ok ({:.1}s{tests}{quiet}){}\n",
                 out.secs,
                 if warns > 0 { format!(", {warns} warning(s){}", if opts.warnings { ":" } else { " (list: --warnings)" }) } else { String::new() }
             ));
@@ -381,7 +487,8 @@ pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64, opts: CheckOpts) -
         } else {
             let tail = compress_plain(&raw);
             let tail = if tail.trim().is_empty() { "(no output)".to_string() } else { tail };
-            report.push_str(&format!("✖ {label} failed (exit {}, {:.1}s{tests}):\n{}\n", out.code, out.secs, tail));
+            let hint = env_hint(&raw).map(|h| format!("{h}\n")).unwrap_or_default();
+            report.push_str(&format!("✖ {label} failed (exit {}, {:.1}s{tests}):\n{hint}{}\n", out.code, out.secs, tail));
         }
     }
     let max = if opts.raw { 24_000 } else { 12_000 };

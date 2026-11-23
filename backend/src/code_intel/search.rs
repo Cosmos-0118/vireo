@@ -460,7 +460,29 @@ fn run_search_pass(
     }
 }
 
+/// Search; when a regex finds nothing (or doesn't compile) but the query holds regex
+/// metacharacters, retry once as a literal string and say so.
 pub fn search(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, String> {
+    let first = search_once(ws, query, opts);
+    let retry = !opts.literal
+        && query.chars().any(|c| "()[]{}.*+?^$|\\".contains(c))
+        && match &first {
+            Ok(t) => t.trim_end().ends_with("No matches found."),
+            Err(e) => e.contains("regex"),
+        };
+    if !retry {
+        return first;
+    }
+    let lit = SearchOpts { literal: true, ..opts.clone() };
+    match search_once(ws, query, &lit) {
+        Ok(t) if !t.trim_end().ends_with("No matches found.") => {
+            Ok(format!("(note: no regex matches; showing literal matches for `{query}`)\n{t}"))
+        }
+        _ => first,
+    }
+}
+
+fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, String> {
     if query.trim().is_empty() {
         return Err("empty query".into());
     }

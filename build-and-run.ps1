@@ -40,8 +40,12 @@ foreach ($tool in @('cargo', 'rustc')) {
     }
 }
 
-Write-Host "`n[1/5] Stopping any running vireo.exe instance..." -ForegroundColor Yellow
-Get-Process -Name "vireo", "vireo-server" -ErrorAction SilentlyContinue | Stop-Process -Force
+Write-Host "`n[1/5] Stopping running dev-build instances (installed Vireo is left alone)..." -ForegroundColor Yellow
+# Only processes started from this repo's target\release folder; an installed copy has another path.
+$ReleaseDirFull = [System.IO.Path]::GetFullPath($ReleaseDir).TrimEnd('\') + '\'
+Get-Process -Name "vireo", "vireo-server" -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and $_.Path.StartsWith($ReleaseDirFull, [System.StringComparison]::OrdinalIgnoreCase) } |
+    Stop-Process -Force
 
 Write-Host "[2/5] Cleaning previous build artifacts..." -ForegroundColor Yellow
 if (Test-Path $DistDir) {

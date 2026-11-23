@@ -441,3 +441,235 @@ fn ast_builtin_search_rewrite_and_ignore() {
     assert_eq!(std::fs::read_to_string(ws.join("gen/b.rs")).unwrap(), "fn g() { foo(9, 9); }\n");
     assert_eq!(edit::ast(&ws, "nothing_here($A)", Some("go"), None, None, false).unwrap(), "No matches.");
 }
+
+#[test]
+fn add_file_accepts_raw_content_but_rejects_mixed() {
+    let ws = tmp("add-raw");
+    std::fs::write(ws.join("a.rs"), "fn one() {}\n").unwrap();
+    let a1 = format!("1#{}", line_hash("fn one() {}"));
+    // Raw (no `+`) Add File with inner blank lines, followed by another op: both applied.
+    let patch = format!(
+        "*** Begin Patch\n*** Add File: sub/n.ts\nimport x from 'y';\n\nexport const a = 1;\n\n*** Update File: a.rs\n@@ {a1}\n+fn uno() {{}}\n*** End Patch\n"
+    );
+    let out = apply_patch(&ws, &patch, None, false).unwrap();
+    assert!(out.contains("new anchors:"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("sub/n.ts")).unwrap().trim_end(),
+        "import x from 'y';\n\nexport const a = 1;"
+    );
+    assert!(std::fs::read_to_string(ws.join("a.rs")).unwrap().contains("fn uno"));
+
+    // A single `+` among raw lines is ambiguous: reject and write nothing.
+    let mixed = "*** Begin Patch\n*** Add File: m.txt\n+one\ntwo\n*** End Patch\n";
+    let err = apply_patch(&ws, mixed, None, false).unwrap_err();
+    assert!(err.contains("must all start with `+`"), "{err}");
+    assert!(!ws.join("m.txt").exists());
+}
+
+#[test]
+fn compress_collapses_repeated_build_noise_and_keeps_root_cause() {
+    let mut raw = String::new();
+    for c in ["tree-sitter@0.27.2", "tree-sitter-json@0.24.8", "tree-sitter-python@0.25.0"] {
+        raw.push_str("  cargo:warning=Compiler family detection failed due to error: ToolNotFound: failed to find tool \"cl.exe\"\n");
+        raw.push_str(&format!("warning: {c}: Compiler family detection failed due to error: ToolNotFound: failed to find tool \"cl.exe\"\n"));
+        raw.push_str(&format!("error: failed to run custom build command for `{}`\n", c.split('@').next().unwrap()));
+        raw.push_str("  CFLAGS = None\n  CRATE_CC_NO_DEFAULTS = None\n");
+    }
+    raw.push_str("error: could not compile `vireo` due to previous error\n");
+    let c = compress_plain(&raw);
+    assert_eq!(c.matches("Compiler family detection").count(), 1, "{c}");
+    assert!(c.contains("(×6)"), "{c}");
+    assert!(c.contains("could not compile `vireo`"), "{c}");
+    assert!(c.lines().count() < 12, "{c}");
+}
+
+#[test]
+fn check_reports_silent_passes_and_environment_causes() {
+    let ws = tmp("check-quiet");
+    let opts = check::CheckOpts::default();
+    let ok = check::check(&ws, Some("exit 0"), 30, opts).unwrap();
+    assert!(ok.contains("ok (") && ok.contains("exit 0, no output"), "{ok}");
+    let chatty = check::check(&ws, Some("echo hello"), 30, opts).unwrap();
+    assert!(chatty.contains("1 output line(s), last: hello"), "{chatty}");
+    let env = check::check(&ws, Some("echo cl.exe not found && exit 1"), 30, opts).unwrap();
+    assert!(env.contains("✖") && env.contains("hint: MSVC build tools"), "{env}");
+    assert!(check::check_failed(&env));
+}
+
+#[test]
+fn familiar_parameter_names_and_range_strings_work_first_try() {
+    let ws = tmp("aliases");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    // Claude-Code style names for replace.
+    let r = run_op(&ws, "replace", &json!({"file_path": "a.txt", "old_string": "two", "new_string": "TWO"})).unwrap();
+    assert!(r.contains("Replaced 1"), "{r}");
+    // search with `pattern`, edit with `new_string`.
+    let s = run_op(&ws, "search", &json!({"pattern": "three"})).unwrap();
+    assert!(s.contains("a.txt:3#"), "{s}");
+    // A whole `N#hh..M#hh` range in `start`, as printed by view/outline.
+    let range = format!("2#{}..3#{}", line_hash("TWO"), line_hash("three"));
+    let e = run_op(&ws, "edit", &json!({"path": "a.txt", "start": range, "new_string": "mid"})).unwrap();
+    assert!(e.contains("Edited a.txt lines 2..3"), "{e}");
+    assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "one\nmid\nfour\n");
+    // Bracketed range, copied straight from `outline`.
+    let br = format!("[2#{}..2#{}]", line_hash("mid"), line_hash("mid"));
+    run_op(&ws, "edit", &json!({"path": "a.txt", "start": br, "op": "delete"})).unwrap();
+    assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "one\nfour\n");
+    // A forgotten new_text must not silently delete lines.
+    let a1 = format!("1#{}", line_hash("one"));
+    let err = run_op(&ws, "edit", &json!({"path": "a.txt", "start": a1})).unwrap_err();
+    assert!(err.contains("use op `delete`"), "{err}");
+    assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "one\nfour\n");
+}
+
+#[test]
+fn view_never_returns_zero_lines_for_a_huge_line() {
+    let ws = tmp("viewlong");
+    let huge = "x".repeat(60_000);
+    std::fs::write(ws.join("min.js"), format!("{huge}\nsecond\n")).unwrap();
+    let v = view(&ws, "min.js", None, None).unwrap();
+    assert!(v.contains("1#") && v.contains("chars on this line]"), "first line shown, clipped");
+    assert!(v.contains("second"), "{}", &v[v.len().saturating_sub(200)..]);
+    assert!(v.len() < 8_000, "{}", v.len());
+}
+
+#[test]
+fn human_rustc_output_is_parsed_with_label_and_zero_tests_flagged() {
+    let raw = "warning: unused variable: `x`\n --> src/a.rs:3:9\n  |\n3 |     let x = 1;\n  |         ^ help: prefix with underscore\n\nerror[E0308]: mismatched types\n  --> src/lib.rs:12:5\n   |\n11 | fn bar() -> usize {\n12 |     \"hello\"\n   |     ^^^^^^^ expected `usize`, found `&str`\n\nerror: could not compile `vireo` due to 1 previous error\n";
+    let d = parse_diags(raw, "");
+    assert_eq!(d.len(), 2, "one error + one warning, and `could not compile` is not a located diagnostic");
+    let ws = tmp("human-rustc");
+    let r = render_diags(&ws, &d, "cargo test", 1.0, true);
+    assert!(r.starts_with("✖ 1 error(s), 1 warning(s)"), "{r}");
+    assert!(r.contains("src/lib.rs:12") && r.contains("E0308") && r.contains("expected `usize`"), "{r}");
+    assert_eq!(
+        test_summary("test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out").as_deref(),
+        Some("0 tests ran ⚠ (check the test name/filter)")
+    );
+    // Long failing output: root error at the top and the summary at the bottom both survive.
+    let mut long = String::from("error[E0599]: no method named `frob`\n  --> src/a.rs:1:1\n");
+    for i in 0..120 {
+        long.push_str(&format!("note: filler line number {i} with enough text to be kept as distinct\n"));
+    }
+    long.push_str("error: could not compile `vireo`\n");
+    let c = compress_plain(&long);
+    assert!(c.contains("no method named `frob`") && c.contains("could not compile"), "{c}");
+}
+
+#[test]
+fn replace_tolerates_indent_drift_in_one_file_and_hints_on_a_miss() {
+    let ws = tmp("replace-fuzzy");
+    std::fs::write(ws.join("a.rs"), "fn foo() {\n    let a = 1;\n    bar(a);\n}\n").unwrap();
+    // Model forgot the 4-space indent; unique match is applied with the file's indentation.
+    let opts = ReplaceOpts { path: Some("a.rs".into()), ..Default::default() };
+    let r = replace_text(&ws, "let a = 1;\nbar(a);", "let a = 2;\nbaz(a);", &opts).unwrap();
+    assert!(r.contains("matched ignoring indentation"), "{r}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("a.rs")).unwrap(),
+        "fn foo() {\n    let a = 2;\n    baz(a);\n}\n"
+    );
+    // A real miss shows the closest anchored lines instead of a bare error.
+    let err = replace_text(&ws, "fn foo() {\n    nothing_like_this();", "x", &opts).unwrap_err();
+    assert!(err.contains("no matches found") && err.contains("Closest lines"), "{err}");
+}
+
+#[test]
+fn symbol_can_be_pinned_by_line_and_anchor_range_survives_length_drift() {
+    let src = "struct Foo;\n\nimpl Foo {\n    fn a(&self) {}\n}\n\nimpl Foo {\n    fn b(&self) {}\n}\n";
+    let syms = symbols(Lang::Rust, src);
+    let err = find_symbol(&syms, "impl Foo").unwrap_err();
+    assert!(err.contains("ambiguous") && err.contains("Foo:3"), "{err}");
+    let second = find_symbol(&syms, "impl Foo:7").unwrap();
+    assert_eq!(second.start + 1, 7);
+
+    // End anchor is two lines off after an earlier edit: still resolved.
+    let ws = tmp("locate-drift");
+    std::fs::write(ws.join("a.txt"), "head\nstart\nx\ny\nz\nend\ntail\n").unwrap();
+    let s = format!("2#{}", line_hash("start"));
+    let e = format!("7#{}", line_hash("end")); // really line 6
+    let out = hashline_edit(&ws, "a.txt", "replace", &s, Some(&e), "S\nE").unwrap();
+    assert!(out.contains("Edited"), "{out}");
+    assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "head\nS\nE\ntail\n");
+}
+
+#[test]
+fn glob_braces_work() {
+    let m = super::search::GlobMatcher::compile(&["*.{ts,tsx}".to_string()]).unwrap();
+    assert!(m.matches("src/a.tsx", "a.tsx") && m.matches("b.ts", "b.ts") && !m.matches("c.rs", "c.rs"));
+}
+
+#[test]
+fn view_spec_splits_at_first_colon_and_keeps_drive_letters() {
+    use super::split_view_spec as s;
+    assert_eq!(s("a.rs:Foo:7"), ("a.rs", Some("Foo:7")));
+    assert_eq!(s("a.rs:10..20"), ("a.rs", Some("10..20")));
+    assert_eq!(s(r"C:\x\a.rs:Foo:7"), (r"C:\x\a.rs", Some("Foo:7")));
+    assert_eq!(s("C:/x/a.rs"), ("C:/x/a.rs", None));
+    assert_eq!(s("a.rs"), ("a.rs", None));
+}
+
+#[test]
+fn search_falls_back_to_literal_and_ast_and_add_file_keep_crlf() {
+    let ws = tmp("literal-fallback");
+    std::fs::write(ws.join("a.txt"), "call foo(bar) now\nx = a.b[0]\n").unwrap();
+    // `foo(bar)` as a regex matches "foobar", not the text: falls back to literal.
+    let out = search(&ws, "foo(bar)", &SearchOpts::default()).unwrap();
+    assert!(out.contains("showing literal matches") && out.contains("foo(bar)"), "{out}");
+    // Unclosed group is an invalid regex: also literal.
+    let out = search(&ws, "a.b[0", &SearchOpts::default()).unwrap();
+    assert!(out.contains("showing literal matches"), "{out}");
+    // Real regex hits are untouched.
+    let out = search(&ws, r"foo\(bar\)",&SearchOpts::default()).unwrap();
+    assert!(!out.contains("literal matches") && out.contains("foo(bar)"), "{out}");
+
+    // `ast -r` keeps CRLF files CRLF.
+    let ws = tmp("ast-crlf");
+    std::fs::write(ws.join("a.rs"), "fn a() {\r\n    old(1);\r\n}\r\n").unwrap();
+    let out = ast(&ws, "old($X)", Some("rust"), None, Some("new($X);\nnew2($X)"), false).unwrap();
+    assert!(out.contains("a.rs"), "{out}");
+    let s = std::fs::read(ws.join("a.rs")).unwrap();
+    assert!(!s.windows(2).any(|w| w[1] == b'\n' && w[0] != b'\r'), "{:?}", String::from_utf8_lossy(&s));
+
+    // `*** Add File:` follows the neighbours' line endings.
+    let ws = tmp("add-eol");
+    std::fs::write(ws.join("old.rs"), "fn a() {}\r\nfn b() {}\r\n").unwrap();
+    apply_patch(&ws, "*** Begin Patch\n*** Add File: new.rs\n+fn c() {}\n+fn d() {}\n*** End Patch\n", None, false).unwrap();
+    assert_eq!(std::fs::read(ws.join("new.rs")).unwrap(), b"fn c() {}\r\nfn d() {}\r\n");
+}
+
+#[test]
+fn edit_batch_is_atomic_and_edit_accepts_a_symbol() {
+    let ws = tmp("edit-batch");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+    let h = |n: usize, t: &str| format!("{n}#{}", line_hash(t));
+    let edits = serde_json::json!([
+        { "start": h(1, "one"), "new_text": "ONE" },
+        { "start": format!("{}..{}", h(3, "three"), h(4, "four")), "new_text": "34a\n34b" },
+        { "op": "insert_after", "start": h(5, "five"), "new_text": "six" },
+    ]);
+    let out = edit_batch(&ws, "a.txt", edits.as_array().unwrap(), None).unwrap();
+    assert!(out.contains("a.txt"), "{out}");
+    assert_eq!(std::fs::read_to_string(ws.join("a.txt")).unwrap(), "ONE\ntwo\n34a\n34b\nfive\nsix\n");
+
+    // One bad entry: nothing is written.
+    std::fs::write(ws.join("b.txt"), "x\ny\n").unwrap();
+    let bad = serde_json::json!([
+        { "start": h(1, "x"), "new_text": "X" },
+        { "start": "2#zz", "new_text": "Y" },
+    ]);
+    assert!(edit_batch(&ws, "b.txt", bad.as_array().unwrap(), None).is_err());
+    assert_eq!(std::fs::read_to_string(ws.join("b.txt")).unwrap(), "x\ny\n");
+
+    // `edit` with `symbol` instead of anchors.
+    std::fs::write(ws.join("s.rs"), "fn a() -> i32 {\n    1\n}\n\nfn b() {}\n").unwrap();
+    let args = serde_json::json!({"path":"s.rs","symbol":"a","new_text":"fn a() -> i32 {\n    2\n}"});
+    run_op(&ws, "edit", &args).unwrap();
+    assert!(std::fs::read_to_string(ws.join("s.rs")).unwrap().contains("    2\n"));
+}
+
+#[test]
+fn warning_text_does_not_hide_the_real_failure() {
+    let raw = "warning: unused variable `expected`\n  --> src/a.rs:3:9\nwarning: field never read, error type\nerror[E0308]: mismatched types\n  --> src/a.rs:9:5\n";
+    let out = compress_plain(raw);
+    assert!(out.contains("E0308"), "{out}");
+}

@@ -5,6 +5,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use super::patch::apply_patch;
 use super::doc::{line_hash, locate, parse_anchor_in_doc, read_doc, splice, text_to_lines, Doc};
 use super::symbols::{lang_for, syntax_errors, Lang};
 use super::util::{command, rel_of, resolve, run_capture};
@@ -22,7 +23,11 @@ pub(crate) fn finish_edit(
     std::fs::write(full, text.as_bytes()).map_err(|e| format!("cannot write {rel}: {e}"))?;
     let mut msg = summary;
     if let Some((a, b)) = new_range {
-        msg.push_str(&format!(" Now {}..{}.", doc.anchor(a), doc.anchor(b)));
+        msg.push_str(&if a == b {
+            format!(" New anchor: {}.", doc.anchor(a))
+        } else {
+            format!(" New anchors: {}..{}.", doc.anchor(a), doc.anchor(b))
+        });
     }
     if let (Some(before), Some(after)) = (before, syntax_errors(lang, &text)) {
         if after.len() > before.len() {
@@ -38,6 +43,18 @@ pub(crate) fn finish_edit(
     Ok(msg)
 }
 
+/// `12#ab..15#cd` (optionally bracketed, as printed by `outline`) given as `start` alone.
+fn split_range(start: &str, end: Option<&str>) -> (String, Option<String>) {
+    let start = start.trim().trim_start_matches('[').trim_end_matches(']').trim();
+    let end = end.map(str::trim).filter(|e| !e.is_empty());
+    match (end, start.split_once("..")) {
+        (None, Some((a, b))) if !a.trim().is_empty() && !b.trim().is_empty() => {
+            (a.trim().to_string(), Some(b.trim().to_string()))
+        }
+        _ => (start.to_string(), end.map(str::to_string)),
+    }
+}
+
 /// Replace / insert / delete lines identified by `N#hh` anchors.
 pub fn hashline_edit(
     ws: &Path,
@@ -47,6 +64,8 @@ pub fn hashline_edit(
     end: Option<&str>,
     new_text: &str,
 ) -> Result<String, String> {
+    let (start, end) = split_range(start, end);
+    let (start, end) = (start.as_str(), end.as_deref());
     let (full, rel, mut doc) = read_doc(ws, path)?;
     let lang = lang_for(&rel);
     let before = syntax_errors(lang, &doc.to_text());
@@ -59,6 +78,12 @@ pub fn hashline_edit(
     let new_lines = text_to_lines(new_text);
     match op {
         "replace" | "" => {
+            if new_lines.is_empty() {
+                return Err(
+                    "`new_text` is empty, so a replace would delete the lines. Pass the replacement text, or use op `delete` to remove them."
+                        .into(),
+                );
+            }
             if new_lines.len() == (r1 - r0 + 1)
                 && new_lines.iter().zip(&doc.lines[r0..=r1]).all(|(a, b)| a == b)
             {
@@ -299,4 +324,55 @@ fn ast_cli(
         }
     }
     Ok(rewrite_report(ws, &per_file, matches.len()))
+}
+
+/// Several anchored edits to one file in a single atomic call. Every anchor refers to the file as
+/// it is now (not after earlier entries), exactly like a multi-hunk `apply`; built on that path.
+pub fn edit_batch(ws: &Path, path: &str, edits: &[serde_json::Value], cwd: Option<&Path>) -> Result<String, String> {
+    if edits.is_empty() {
+        return Err("`edits` is empty".into());
+    }
+    let mut patch = format!("*** Begin Patch\n*** Update File: {path}\n");
+    for (i, e) in edits.iter().enumerate() {
+        let get = |ks: &[&str]| ks.iter().find_map(|k| e.get(*k).and_then(|v| v.as_str()));
+        let n = i + 1;
+        let start = get(&["start"]).ok_or_else(|| format!("edits[{n}]: missing `start`"))?;
+        let (a, b) = split_range(start, get(&["end"]));
+        let range = match &b {
+            Some(b) => format!("{a}..{b}"),
+            None => a.clone(),
+        };
+        let text = get(&["new_text", "new_string", "newString", "content", "text"]).unwrap_or("");
+        let body = |patch: &mut String| {
+            for l in text.replace("\r\n", "\n").trim_end_matches('\n').split('\n') {
+                patch.push('+');
+                patch.push_str(l);
+                patch.push('\n');
+            }
+        };
+        match get(&["op"]).unwrap_or("replace") {
+            "replace" => {
+                if text.is_empty() {
+                    return Err(format!("edits[{n}]: new_text is empty (use op `delete` to remove lines)"));
+                }
+                patch.push_str(&format!("@@ {range}\n"));
+                body(&mut patch);
+            }
+            "delete" => patch.push_str(&format!("@@ delete {range}\n")),
+            "insert_after" | "insert_before" if text.is_empty() => {
+                return Err(format!("edits[{n}]: new_text is empty"));
+            }
+            "insert_after" => {
+                patch.push_str(&format!("@@ after {}\n", b.as_deref().unwrap_or(&a)));
+                body(&mut patch);
+            }
+            "insert_before" => {
+                patch.push_str(&format!("@@ before {a}\n"));
+                body(&mut patch);
+            }
+            other => return Err(format!("edits[{n}]: unknown op `{other}` (replace, insert_after, insert_before, delete)")),
+        }
+    }
+    patch.push_str("*** End Patch\n");
+    apply_patch(ws, &patch, cwd, false).map_err(|e| format!("{e}\n(no edits were applied)"))
 }

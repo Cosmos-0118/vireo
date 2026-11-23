@@ -7,6 +7,19 @@ use super::symbols::{find_symbol, lang_for, qualified, symbols};
 
 pub(crate) const MAX_VIEW_LINES: usize = 400;
 const MAX_VIEW_BYTES: usize = 30_000;
+/// One minified/generated line must not eat the whole budget (the hash stays that of the full line).
+const MAX_LINE_CHARS: usize = 2_000;
+
+fn show_line(doc: &Doc, i: usize) -> String {
+    let line = hl(i + 1, &doc.lines[i]);
+    let extra = line.chars().count().saturating_sub(MAX_LINE_CHARS);
+    if extra == 0 {
+        return line;
+    }
+    let mut s: String = line.chars().take(MAX_LINE_CHARS).collect();
+    s.push_str(&format!(" …[+{extra} chars on this line]"));
+    s
+}
 
 fn parse_line_range(t: &str) -> Option<(usize, Option<usize>)> {
     let re = lazy_re!(r"^(\d+)(?:#[0-9a-fA-F]{2})?(?:(?:\.\.|-)(\d+)?(?:#[0-9a-fA-F]{2})?)?$");
@@ -67,8 +80,8 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> 
         };
         let mut shown = 0usize;
         for i in from..=to {
-            let line = hl(i + 1, &doc.lines[i]);
-            if shown >= MAX_VIEW_LINES || out.len() + line.len() > MAX_VIEW_BYTES {
+            let line = show_line(&doc, i);
+            if shown >= MAX_VIEW_LINES || (shown > 0 && out.len() + line.len() > MAX_VIEW_BYTES) {
                 out.push_str(&format!(
                     "…[{} more lines; continue with: vx view {} {}..{}]\n",
                     to + 1 - i,
@@ -99,8 +112,8 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> 
             out.push_str(&format!("-- {label} --\n"));
         }
         for i in *from..=*to {
-            let line = hl(i + 1, &doc.lines[i]);
-            if shown >= MAX_VIEW_LINES || out.len() + line.len() > MAX_VIEW_BYTES {
+            let line = show_line(&doc, i);
+            if shown >= MAX_VIEW_LINES || (shown > 0 && out.len() + line.len() > MAX_VIEW_BYTES) {
                 out.push_str(&format!(
                     "…[budget reached; continue with: vx view {} {}..{}]\n",
                     rel,
@@ -120,11 +133,11 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> 
 /// Split a CLI `file[:target]` spec, preserving Windows drive letters (`C:\...`).
 pub fn split_view_spec(spec: &str) -> (&str, Option<&str>) {
     let s = spec.trim();
-    let Some(idx) = s.rfind(':') else { return (s, None) };
-    // Never split a Windows drive letter like `C:\foo` or `C:/foo`.
-    if idx == 1 && s.as_bytes()[0].is_ascii_alphabetic() {
-        return (s, None);
-    }
+    // Split at the FIRST colon so `a.rs:Foo:7` keeps `Foo:7` as the target, skipping a
+    // Windows drive letter like `C:\foo` or `C:/foo`.
+    let b = s.as_bytes();
+    let from = if b.len() > 1 && b[1] == b':' && b[0].is_ascii_alphabetic() { 2 } else { 0 };
+    let Some(idx) = s[from..].find(':').map(|i| i + from) else { return (s, None) };
     let after = &s[idx + 1..];
     if after.is_empty() || after.contains('/') || after.contains('\\') {
         return (s, None);

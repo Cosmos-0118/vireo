@@ -360,29 +360,48 @@ pub async fn write_file(
     Ok(Json(serde_json::json!({ "ok": true, "path": req.path })))
 }
 
-/// Largest pasted/dropped chat image accepted (bytes).
+/// Largest pasted/dropped chat attachment accepted (bytes).
 pub const ATTACHMENT_MAX_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Deserialize)]
 pub struct AttachmentQuery {
     pub ext: Option<String>,
+    /// Original file name (dropped files); only a sanitized stem is kept in the saved name.
+    pub name: Option<String>,
 }
 
-/// Saves a pasted chat image (raw request body) to a temp folder and returns its absolute
-/// path, so the agent can be pointed at it. Only common image extensions are accepted.
+/// Saves a pasted/dropped file (raw request body) to a temp folder and returns its absolute
+/// path, so the agent can be pointed at it. Extension and name are sanitized to plain
+/// alphanumerics so the result can never escape the folder or be an odd executable name.
 pub async fn save_attachment(
     Query(q): Query<AttachmentQuery>,
     body: axum::body::Bytes,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     if body.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "empty image".into()));
+        return Err((StatusCode::BAD_REQUEST, "empty file".into()));
     }
     let ext = q
         .ext
         .as_deref()
-        .map(|e| e.trim_start_matches('.').to_ascii_lowercase())
-        .filter(|e| matches!(e.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"))
+        .map(|e| {
+            e.trim_start_matches('.')
+                .chars()
+                .filter(char::is_ascii_alphanumeric)
+                .take(10)
+                .collect::<String>()
+                .to_ascii_lowercase()
+        })
+        .filter(|e| !e.is_empty())
         .unwrap_or_else(|| "png".into());
+    let stem: String = q
+        .name
+        .as_deref()
+        .unwrap_or("")
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        .take(40)
+        .collect();
+    let stem = if stem.is_empty() { "paste".to_string() } else { stem };
     let dir = std::env::temp_dir().join("vireo-attachments");
     tokio::fs::create_dir_all(&dir)
         .await
@@ -391,7 +410,7 @@ pub async fn save_attachment(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let full = dir.join(format!("paste-{nanos}.{ext}"));
+    let full = dir.join(format!("{stem}-{nanos}.{ext}"));
     tokio::fs::write(&full, &body)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

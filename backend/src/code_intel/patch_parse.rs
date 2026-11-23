@@ -121,9 +121,18 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
             i += 1;
             let mut body: Vec<String> = Vec::new();
             let mut blanks = 0usize;
+            // Forgiving form: when no line carries a `+`, the section is raw file content (the
+            // easy mistake). Mixed sections stay an error so a stray line is never silently kept.
+            let end = (i..lines.len()).find(|&k| is_file_header(lines[k])).unwrap_or(lines.len());
+            let section = &lines[i..end];
+            let literal = !section.iter().any(|b| b.starts_with('+')) && section.iter().any(|b| !b.trim().is_empty());
             while i < lines.len() && !is_file_header(lines[i]) {
                 let b = lines[i];
-                if let Some(rest) = b.strip_prefix('+') {
+                if literal && !b.trim().is_empty() {
+                    body.extend(std::iter::repeat(String::new()).take(blanks));
+                    blanks = 0;
+                    body.push(b.to_string());
+                } else if let Some(rest) = b.strip_prefix('+') {
                     body.extend(std::iter::repeat(String::new()).take(blanks));
                     blanks = 0;
                     body.push(strip_hashline_prefix(rest).to_string());
@@ -131,7 +140,7 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                     blanks += 1;
                 } else {
                     return Err(format!(
-                        "patch line {}: lines of `*** Add File: {p}` must start with `+` (got `{}`)",
+                        "patch line {}: lines of `*** Add File: {p}` must all start with `+` (or none do, for raw content); got `{}`",
                         i + 1,
                         clip(b, 60)
                     ));

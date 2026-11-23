@@ -154,6 +154,8 @@ pub(crate) fn run(
     let files = collect_files(target, &compiled.iter().map(|c| c.0).collect::<Vec<_>>());
     let results: Mutex<Vec<(String, Vec<(usize, String)>, usize)>> = Mutex::new(Vec::new());
     let write_err: Mutex<Option<String>> = Mutex::new(None);
+    // (path, original text) of every file already rewritten, so a later failure can undo them.
+    let written: Mutex<Vec<(PathBuf, String)>> = Mutex::new(Vec::new());
     let workers = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -161,7 +163,7 @@ pub(crate) fn run(
     let chunk = files.len().div_ceil(workers).max(1);
     std::thread::scope(|s| {
         for part in files.chunks(chunk) {
-            let (compiled, results, write_err) = (&compiled, &results, &write_err);
+            let (compiled, results, write_err, written) = (&compiled, &results, &write_err, &written);
             s.spawn(move || {
                 for (path, lang) in part {
                     let Some((_, pat, fix)) = compiled.iter().find(|c| c.0 == *lang) else {
@@ -173,6 +175,9 @@ pub(crate) fn run(
                     let rel = rel_of(ws, path);
                     match scan_file(&src, *lang, pat, fix.as_ref()) {
                         Some((found, Some(new_src), edits)) => {
+                            if write_err.lock().unwrap().is_some() {
+                                continue; // a write already failed: stop touching files
+                            }
                             if let Err(e) = std::fs::write(path, new_src.as_bytes()) {
                                 write_err
                                     .lock()
@@ -180,6 +185,7 @@ pub(crate) fn run(
                                     .get_or_insert(format!("cannot write {rel}: {e}"));
                                 continue;
                             }
+                            written.lock().unwrap().push((path.clone(), src.clone()));
                             results.lock().unwrap().push((rel, found, edits));
                         }
                         Some((found, None, _)) => results.lock().unwrap().push((rel, found, 0)),
@@ -190,7 +196,12 @@ pub(crate) fn run(
         }
     });
     if let Some(e) = write_err.into_inner().unwrap() {
-        return Err(e);
+        let undone = written.into_inner().unwrap();
+        let n = undone.len();
+        for (p, original) in undone {
+            let _ = std::fs::write(p, original.as_bytes());
+        }
+        return Err(if n > 0 { format!("{e}; rolled back {n} file(s) already rewritten") } else { e });
     }
     let mut results = results.into_inner().unwrap();
     results.sort_by(|a, b| a.0.cmp(&b.0));
@@ -243,7 +254,11 @@ fn scan_file(
     for e in edits.into_iter().rev() {
         bytes.splice(e.position..e.position + e.deleted_length, e.inserted_text);
     }
-    let new_src = String::from_utf8(bytes).ok()?;
+    let mut new_src = String::from_utf8(bytes).ok()?;
+    if src.contains("\r\n") {
+        // Keep CRLF files CRLF: rewrites are templated with bare `\n`.
+        new_src = new_src.replace("\r\n", "\n").replace('\n', "\r\n");
+    }
     Some((found, (new_src != src).then_some(new_src), n))
 }
 

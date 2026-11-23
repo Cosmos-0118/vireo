@@ -25,6 +25,7 @@ import {
   Zap,
 } from 'lucide-react';
 import { api, streamAgentChat } from '../api';
+import { isUsableDrag, readDrop, uploadDropped } from '../utils/dnd';
 import {
   CLI_PROVIDERS,
   CLI_PROVIDER_TOOL,
@@ -384,10 +385,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const [atBottom, setAtBottom] = useState(true);
-  // Context chips: the active file is on by default (per-path dismiss); changes are opt-in.
-  const [dismissedActive, setDismissedActive] = useState<string | null>(null);
+  // Context chips are opt-in: files via @ / the + picker / drag-and-drop, plus uncommitted changes.
   const [includeChanges, setIncludeChanges] = useState(false);
   const [extraFiles, setExtraFiles] = useState<string[]>([]);
+  const [dragOver, setDragOver] = useState(false);
   // Pasted images: previewed via an object URL, uploaded to disk so the agent can read the file.
   const [images, setImages] = useState<PastedImage[]>([]);
   const imagesRef = useRef<PastedImage[]>([]);
@@ -416,6 +417,24 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       return prev.filter((i) => i.id !== id);
     });
   const imagesBusy = images.some((i) => i.status === 'uploading');
+
+  const onComposerDrop = (e: React.DragEvent) => {
+    if (!isUsableDrag(e.dataTransfer)) return;
+    e.preventDefault();
+    setDragOver(false);
+    const { paths, files } = readDrop(e.dataTransfer);
+    if (paths.length) {
+      setExtraFiles((prev) => [...prev, ...paths.map((p) => p.rel).filter((r) => !prev.includes(r))]);
+    }
+    const dropped = files.filter((f) => f.type.startsWith('image/'));
+    if (dropped.length) addImages(dropped);
+    for (const f of files.filter((f) => !f.type.startsWith('image/'))) {
+      uploadDropped(f)
+        .then((p) => setExtraFiles((prev) => (prev.includes(p) ? prev : [...prev, p])))
+        .catch(() => onToast(`Couldn't attach ${f.name}`, true));
+    }
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
   const readyImages = images.filter((i) => i.status === 'ready' && i.path);
 
   const sessionEngine = supportsSessions(config.provider);
@@ -483,11 +502,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       return bInst - aInst;
     });
   }, [cliTools]);
-  const activeChip =
-    activeFilePath && activeFilePath !== dismissedActive && !extraFiles.includes(activeFilePath)
-      ? activeFilePath
-      : null;
-  const hasContext = !!activeChip || extraFiles.length > 0 || (includeChanges && changedFileCount > 0);
+  const hasContext = extraFiles.length > 0 || (includeChanges && changedFileCount > 0);
 
   // Engine readiness, shown as a dot in the composer and as the status card in the empty state.
   const engineName = cliToolId
@@ -627,7 +642,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   );
 
   const buildContextPrefix = (): string => {
-    const files = [...(activeChip ? [activeChip] : []), ...extraFiles];
+    const files = extraFiles;
     const parts: string[] = [];
     if (files.length) parts.push(`Files in focus: ${files.join(', ')}.`);
     if (includeChanges && changedFileCount > 0)
@@ -651,7 +666,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
         }: ${imagePaths.join(', ')}]\n\n`
       : '';
     const shownText = trimmed || (imagePaths.length > 1 ? 'See attached images.' : 'See attached image.');
-    const ctxFiles = [...(activeChip ? [activeChip] : []), ...extraFiles];
+    const ctxFiles = [...extraFiles];
     const ctxChanges = includeChanges && changedFileCount > 0 ? changedFileCount : undefined;
     const ctxImages = imagePaths.length || undefined;
     const promptText = buildContextPrefix() + imageNote + shownText;
@@ -1595,7 +1610,21 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
             })}
           </div>
         )}
-        <div className="relative rounded-lg border border-[var(--border)] bg-[var(--bg-input)] focus-within:border-[var(--accent)] transition-colors">
+        <div
+          onDragOver={(e) => {
+            if (!isUsableDrag(e.dataTransfer)) return;
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'copy';
+            if (!dragOver) setDragOver(true);
+          }}
+          onDragLeave={(e) => {
+            if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false);
+          }}
+          onDrop={onComposerDrop}
+          className={`relative rounded-lg border bg-[var(--bg-input)] focus-within:border-[var(--accent)] transition-colors ${
+            dragOver ? 'border-[var(--accent)] ring-1 ring-[var(--accent)]' : 'border-[var(--border)]'
+          }`}
+        >
           {/* Pasted image thumbnails */}
           {images.length > 0 && (
             <div className="flex flex-wrap items-center gap-1.5 px-2.5 pt-2">
@@ -1623,21 +1652,6 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
           {/* Row 1: context chips, only when something is attached */}
           {hasContext && (
             <div className="flex flex-wrap items-center gap-1 px-2.5 pt-2">
-            {activeChip && (
-              <span className="flex items-center gap-1 max-w-full h-5 pl-1.5 pr-1 rounded bg-[var(--bg-elevated)] text-[11px] text-[var(--text-primary)]">
-                <FileCode size={11} className="shrink-0 text-[var(--text-muted)]" />
-                <span className="truncate" title={activeChip}>
-                  {baseName(activeChip)}
-                </span>
-                <button
-                  onClick={() => setDismissedActive(activeChip)}
-                  className="text-[var(--text-dim)] hover:text-[var(--text-primary)] cursor-pointer"
-                  title="Remove from context"
-                >
-                  <X size={11} />
-                </button>
-              </span>
-            )}
             {extraFiles.map((f) => (
               <span
                 key={f}

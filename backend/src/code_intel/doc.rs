@@ -208,6 +208,26 @@ pub(crate) fn locate(
         let c = cands[0] as usize;
         return Ok((c, c + span));
     }
+    // Range length drifted (an earlier edit inside the block, or an off-by-one on `end`): when the
+    // start line is found exactly once nearby and the end line exactly once within ±5 of where it
+    // should be, the pair is unambiguous.
+    if cands.is_empty() {
+        let mut pairs = Vec::new();
+        for st in (base - 50)..=(base + 50) {
+            if st < 0 || st as usize >= n || line_hash(&doc.lines[st as usize]) != s.1 {
+                continue;
+            }
+            let want = st + span as isize;
+            for en in (want - 5).max(st)..=(want + 5) {
+                if en >= 0 && (en as usize) < n && line_hash(&doc.lines[en as usize]) == e.1 {
+                    pairs.push((st as usize, en as usize));
+                }
+            }
+        }
+        if pairs.len() == 1 {
+            return Ok(pairs[0]);
+        }
+    }
     let why = if cands.is_empty() { "no longer match" } else { "match several places" };
     let s_ok = s.0 >= 1 && s.0 <= n && line_hash(&doc.lines[s.0 - 1]) == s.1;
     let e_ok = e.0 >= 1 && e.0 <= n && line_hash(&doc.lines[e.0 - 1]) == e.1;
@@ -255,6 +275,23 @@ pub(crate) fn locate(
     };
     if n == 0 {
         detail = format!("anchors {}#{}..{}#{} {} in {} (file is empty)", s.0, s.1, e.0, e.1, why, rel);
+    }
+    // Say where a moved line went, so one retry with the right anchor is enough.
+    let moved = |label: &str, a: &(usize, String)| -> String {
+        let at: Vec<String> = (0..n)
+            .filter(|&i| i + 1 != a.0 && line_hash(&doc.lines[i]) == a.1)
+            .take(3)
+            .map(|i| doc.anchor(i))
+            .collect();
+        if at.is_empty() { String::new() } else { format!("\n{label} hash #{} also appears at: {}", a.1, at.join(", ")) }
+    };
+    if n > 0 {
+        if !s_ok {
+            detail.push_str(&moved("start", s));
+        }
+        if !e_ok && e != s {
+            detail.push_str(&moved("end", e));
+        }
     }
     Err(detail)
 }

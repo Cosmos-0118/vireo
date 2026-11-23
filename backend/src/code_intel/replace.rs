@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::check::clip;
 use super::doc::{line_hash, Doc};
+use super::patch::{apply_shift, closest_hint, indent_shift, seek_lines, MatchLevel};
 use super::search::{collect_files, GlobMatcher};
 use super::symbols::{lang_for, syntax_errors};
 use super::util::{missing_path_err, rel_of, resolve_with_cwd, top_level_dirs};
@@ -30,6 +31,8 @@ struct PlannedReplace {
     anchors: Vec<String>,
     preview_lines: Vec<String>,
     syntax_note: Option<String>,
+    /// Matched after ignoring indentation / trailing whitespace (reported to the caller).
+    loose: bool,
 }
 
 /// Atomic literal (default) or regex find-and-replace across a file, directory, or glob.
@@ -95,6 +98,7 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
 
     let mut plans: Vec<PlannedReplace> = Vec::new();
     let mut total_count = 0usize;
+    let mut miss_hint = String::new();
 
     for (full, rel) in files {
         if !single_explicit && full.metadata().map(|m| m.len() > 2_000_000).unwrap_or(true) {
@@ -112,6 +116,7 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
         };
         let doc = Doc::parse(&text);
         let use_crlf = doc.eol == "\r\n";
+        let mut loose = false;
 
         let (count, replaced, preview_lines) = if let Some(ref rx) = re {
             let mut count = 0usize;
@@ -144,10 +149,36 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
                 }
             }
             if count == 0 {
-                continue;
+                if !single_explicit {
+                    continue;
+                }
+                // One named file: tolerate indentation / trailing-whitespace drift (unique match
+                // only), else show the nearest real lines so the retry needs no extra read.
+                let old_lines: Vec<String> = old_lf.trim_end_matches('\n').split('\n').map(String::from).collect();
+                let new_lines: Vec<String> = new_lf.trim_end_matches('\n').split('\n').map(String::from).collect();
+                match seek_lines(&doc.lines, &old_lines, 0, false) {
+                    Ok(Some((at, level, _))) if matches!(level, MatchLevel::Rstrip | MatchLevel::Trim) => {
+                        let shift = indent_shift(&old_lines[0], &doc.lines[at]);
+                        let shifted: Vec<String> = match &shift {
+                            Some(s) => new_lines.iter().map(|l| apply_shift(l, s)).collect(),
+                            None => new_lines,
+                        };
+                        let mut d = Doc::parse(&text);
+                        d.lines.splice(at..at + old_lines.len(), shifted);
+                        let line_str = doc.lines[at].as_str();
+                        preview.push(format!("  {rel}:{}#{}| {}", at + 1, line_hash(line_str), line_str.trim()));
+                        loose = true;
+                        (1, d.to_text(), preview)
+                    }
+                    _ => {
+                        miss_hint = closest_hint(&doc, &old_lines);
+                        continue;
+                    }
+                }
+            } else {
+                let out = text.replace(&needle, &repl);
+                (count, out, preview)
             }
-            let out = text.replace(&needle, &repl);
-            (count, out, preview)
         };
 
         if replaced == text {
@@ -188,6 +219,7 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
             anchors,
             preview_lines,
             syntax_note,
+            loose,
         });
     }
 
@@ -200,7 +232,7 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
         }
     }
     if plans.is_empty() {
-        return Err(format!("no matches found for `{}`", clip(old, 60)));
+        return Err(format!("no matches found for `{}`{miss_hint}", clip(old, 60)));
     }
 
     if opts.dry_run {
@@ -237,13 +269,14 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
         let now = if p.anchors.is_empty() {
             String::new()
         } else {
-            format!("  now {}", p.anchors.join(", "))
+            format!("  new anchors: {}", p.anchors.join(", "))
         };
         out.push_str(&format!(
-            "M {}  ({} replacement{}){now}\n",
+            "M {}  ({} replacement{}{}){now}\n",
             p.rel,
             p.count,
-            if p.count == 1 { "" } else { "s" }
+            if p.count == 1 { "" } else { "s" },
+            if p.loose { ", matched ignoring indentation/whitespace" } else { "" }
         ));
     }
     if plans.len() > 40 {

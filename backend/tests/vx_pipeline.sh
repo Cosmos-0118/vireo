@@ -15,7 +15,7 @@ anchor_of() { # anchor_of <file> <exact line text> -> N#hh
 
 cd "$WS"; mkdir -p src web py go mini/src
 cp "$REPO/backend/src/agent.rs" "$REPO/backend/src/pty.rs" src/
-cp "$REPO/frontend/src/components/AgentPanel.tsx" web/
+cp "$REPO/frontend/src/components/AgentActivity.tsx" web/
 cp "$REPO/backend/src/agent.rs" src/agent.orig
 printf 'import os\n\n# helper\n@decorator\ndef alpha(x):\n    return x + 1\n\n\nclass Beta:\n    def run(self):\n        return 2\n\n    def stop(self):\n        return 3\n' > py/m.py
 printf 'package main\n\nimport "fmt"\n\n// Greet says hi.\nfunc Greet(n string) string {\n\treturn "hi " + n\n}\n\ntype Server struct{ Port int }\n\nfunc (s *Server) Start() error {\n\tfmt.Println(s.Port)\n\treturn nil\n}\n' > go/main.go
@@ -66,7 +66,8 @@ check "unknown symbol gives helpful error" 'echo "$NF" | grep -qi "not found"' "
 
 echo "== 3. hashline edits: drift, stale, insert, delete"
 A1=$(anchor_of src/agent.rs "const SYSTEM_PROMPT")
-A_LIST=$("$VX" view src/agent.rs 20..24 | sed -n '2p;6p' | sed -E 's/\|.*//')
+CM=$("$VX" search "pub struct ChatMessage" | grep -F "src/agent.rs:" | head -1 | sed -E 's/^[^:]+:([0-9]+)#.*/\1/')
+A_LIST=$("$VX" view src/agent.rs $((CM-1))..$((CM+3)) | sed -n '2p;6p' | sed -E 's/\|.*//')
 S=$(echo "$A_LIST" | sed -n 1p); E=$(echo "$A_LIST" | sed -n 2p)
 # shift the file down by 3 lines using an insert at the top
 H1=$("$VX" view src/agent.rs 1..1 | sed -n 2p | sed -E 's/\|.*//')
@@ -139,12 +140,12 @@ func (s *Server) Start() error {
 }
 EOF
 check "go method replace via Type::method" 'grep -q "port %d" go/main.go'
-O=$("$VX" outline web/AgentPanel.tsx); check "tsx outline of real component file" 'echo "$O" | grep -q "describeTool" && echo "$O" | grep -q "ToolRow"' "$(echo "$O" | head -5)"
-"$VX" symbol web/AgentPanel.tsx baseName --replace >/dev/null <<'EOF'
-const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p;
+O=$("$VX" outline web/AgentActivity.tsx); check "tsx outline of real component file" 'echo "$O" | grep -q "describeTool" && echo "$O" | grep -q "ActivityGroup"' "$(echo "$O" | head -5)"
+"$VX" symbol web/AgentActivity.tsx baseName --replace >/dev/null <<'EOF'
+export const baseName = (p: string) => p.split(/[\\/]/).pop() ?? p;
 EOF
-check "tsx arrow-const replace" 'grep -q "pop() ?? p" web/AgentPanel.tsx'
-check "tsx diff vs original limited to one line" '[ $(diff "$REPO/frontend/src/components/AgentPanel.tsx" web/AgentPanel.tsx | grep -c "^[0-9]") -eq 1 ]'
+check "tsx arrow-const replace" 'grep -q "pop() ?? p" web/AgentActivity.tsx'
+check "tsx diff vs original limited to one line" '[ $(diff "$REPO/frontend/src/components/AgentActivity.tsx" web/AgentActivity.tsx | grep -c "^[0-9]") -eq 1 ]'
 
 echo "== 7. search, map, create"
 S=$("$VX" search "fn same_dir"); check "search returns file:line#hash| text" 'echo "$S" | grep -qE "^src/pty.rs:[0-9]+#[0-9a-f]{2}\| "' "$S"

@@ -389,9 +389,10 @@ export const api = {
     if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
     return ((await res.json()) as { models: string[] }).models;
   },
-  /** Stores a pasted image on disk and returns its absolute path for the agent to read. */
-  saveAttachment: async (blob: Blob, ext: string): Promise<{ path: string }> => {
-    const res = await fetch(`/api/agent/attachment?ext=${encodeURIComponent(ext)}`, {
+  /** Stores a pasted/dropped file on disk and returns its absolute path for the agent to read. */
+  saveAttachment: async (blob: Blob, ext: string, name?: string): Promise<{ path: string }> => {
+    const qs = `ext=${encodeURIComponent(ext)}${name ? `&name=${encodeURIComponent(name)}` : ''}`;
+    const res = await fetch(`/api/agent/attachment?${qs}`, {
       method: 'POST',
       headers: { 'Content-Type': blob.type || 'application/octet-stream' },
       body: blob,
