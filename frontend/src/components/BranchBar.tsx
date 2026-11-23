@@ -549,7 +549,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
           title={fetched ? `Last ${fetched}` : undefined}
         >
           {statusIcon}
-          <span className="truncate min-w-0">{statusText}</span>
+          <span className="truncate min-w-0 leading-[16px]">{statusText}</span>
           {fetched && (
             <span className="hidden @[320px]:inline ml-auto pl-2 shrink-0 text-[var(--text-dim)]">{fetched}</span>
           )}
