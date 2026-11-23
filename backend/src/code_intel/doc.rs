@@ -153,7 +153,7 @@ pub(crate) fn read_doc_smart(
 
 pub(crate) fn parse_anchor(s: &str) -> Result<(usize, String), String> {
     let t = s.trim().trim_end_matches('|');
-    let bad = || format!("bad anchor `{s}` (expected like 189#a4)");
+    let bad = || format!("bad anchor `{s}` (expected like 189#a4, copied from view/search output)");
     let (n, h) = t.split_once('#').ok_or_else(bad)?;
     let n: usize = n.trim().parse().map_err(|_| bad())?;
     let h = h.trim().to_lowercase();

@@ -13,8 +13,11 @@ const PRIMARY_FONT = 'JetBrains Mono Variable';
 const FONT_FAMILY = `'${PRIMARY_FONT}', 'JetBrains Mono', 'Cascadia Code', Consolas, monospace`;
 const IS_WINDOWS = typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent);
 
-/** Debounce for fit + PTY resize while a splitter is being dragged (ConPTY redraws on every resize). */
-const RESIZE_DEBOUNCE_MS = 60;
+/**
+ * Debounce for the PTY resize only (ConPTY redraws the whole screen on every resize). The local
+ * grid is re-fitted every frame so the terminal follows a dragged splitter smoothly.
+ */
+const PTY_RESIZE_DEBOUNCE_MS = 90;
 /** Never push a smaller grid than this to the PTY; a collapsed/hidden host measures ~2x1. */
 const MIN_COLS = 10;
 const MIN_ROWS = 3;
@@ -249,7 +252,8 @@ export function usePtyTerminal(
       /** Apply visibility-dependent settings: cursor blink timer + WebGL context. */
       const sync = () => {
         try {
-          term.options.cursorBlink = wantLive();
+          const blink = wantLive();
+          if (term.options.cursorBlink !== blink) term.options.cursorBlink = blink;
         } catch {
           // some engines cannot change options live
         }
@@ -292,14 +296,21 @@ export function usePtyTerminal(
       };
 
       let resizeTimer = 0;
-      const refit = () => {
+      let fitFrame = 0;
+      const schedulePtyResize = () => {
         window.clearTimeout(resizeTimer);
-        resizeTimer = window.setTimeout(() => {
+        resizeTimer = window.setTimeout(sendResize, PTY_RESIZE_DEBOUNCE_MS);
+      };
+      // At most one fit per frame: reflow locally right away, tell the PTY once things settle.
+      const refit = () => {
+        if (fitFrame) return;
+        fitFrame = requestAnimationFrame(() => {
+          fitFrame = 0;
           if (fitNow()) {
             sync();
-            sendResize();
+            schedulePtyResize();
           }
-        }, RESIZE_DEBOUNCE_MS);
+        });
       };
       controlRef.current = { refit, sync };
 
@@ -395,6 +406,20 @@ export function usePtyTerminal(
       let attempt = 0;
       let reconnectTimer = 0;
       let ackTimer = 0;
+      // The server replays the screen history on every (re)connect. Painting that replay shows a
+      // blank screen and then a scroll-through (a visible flash), so keep the host invisible until
+      // the replay has been parsed. The timer is a safety net in case "ready" never arrives.
+      let revealTimer = 0;
+      const reveal = () => {
+        window.clearTimeout(revealTimer);
+        revealTimer = 0;
+        host.style.visibility = '';
+      };
+      const hideForReplay = () => {
+        host.style.visibility = 'hidden';
+        window.clearTimeout(revealTimer);
+        revealTimer = window.setTimeout(reveal, 1500);
+      };
       const connect = () => {
         const cols = Math.max(20, term.cols);
         const rows = Math.max(5, term.rows);
@@ -412,6 +437,7 @@ export function usePtyTerminal(
         sock = s;
         lastSent = ''; // always tell the (possibly pre-existing) shell our real size once
         replaying = true;
+        hideForReplay();
         let written = 0;
         let acked = 0;
         const sendAck = () => {
@@ -434,10 +460,12 @@ export function usePtyTerminal(
             if (ev.data.startsWith('{"type":"ready"')) {
               if (syncWrites) {
                 replaying = false;
+                requestAnimationFrame(reveal);
               } else {
                 // writes are ordered: this callback runs after all replayed bytes were parsed
                 term.write('', () => {
                   replaying = false;
+                  requestAnimationFrame(reveal);
                 });
               }
             } else {
@@ -466,6 +494,7 @@ export function usePtyTerminal(
         };
         s.onclose = (ev) => {
           if (disposed || sock !== s) return;
+          reveal();
           if (ev.code === 1000) {
             term.write('\r\n\x1b[90m' + exitMessage + '\x1b[0m\r\n');
             return;
@@ -484,6 +513,9 @@ export function usePtyTerminal(
 
       teardown = () => {
         window.clearTimeout(resizeTimer);
+        cancelAnimationFrame(fitFrame);
+        window.clearTimeout(revealTimer);
+        host.style.visibility = '';
         window.clearTimeout(reconnectTimer);
         window.clearTimeout(ackTimer);
         document.removeEventListener('visibilitychange', onVisibility);

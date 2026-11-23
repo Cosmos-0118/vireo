@@ -901,3 +901,41 @@ fn check_runs_custom_commands_in_the_right_folder() {
     assert_eq!(check::infer_dir(&ws, "npm --prefix web test"), None);
     assert_eq!(check::infer_dir(&ws, "echo hi"), None);
 }
+
+#[test]
+fn search_lists_lockfile_hits_last() {
+    let ws = tmp("search-noise");
+    std::fs::write(ws.join("a.rs"), "// needle\n").unwrap();
+    std::fs::write(ws.join("package-lock.json"), "needle\nneedle\nneedle\nneedle\n").unwrap();
+    let files_only = super::search::SearchOpts { files_only: true, ..Default::default() };
+    let r = super::search::search(&ws, "needle", &files_only).unwrap();
+    let (src, lock) = (r.find("a.rs").unwrap(), r.find("package-lock.json").unwrap());
+    assert!(src < lock, "source hit must precede the lockfile even with fewer hits: {r}");
+    // Naming the lockfile in scope opts out of the demotion.
+    let scoped = super::search::SearchOpts { path: Some("package-lock.json".into()), ..Default::default() };
+    assert!(super::search::search(&ws, "needle", &scoped).unwrap().contains("package-lock.json"));
+}
+
+#[test]
+fn view_continuation_hint_is_a_copyable_spec() {
+    let ws = tmp("view-hint");
+    let body: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(ws.join("big.txt"), body).unwrap();
+    let v = view(&ws, "big.txt", None, None).unwrap();
+    assert!(v.contains("continue with big.txt:401..500"), "{v}");
+    assert!(!v.contains("vx view"), "hint must work for both CLI and MCP callers: {v}");
+    // The hinted spec round-trips through the same entry point.
+    let next = view(&ws, "big.txt:401..500", None, None).unwrap();
+    assert!(next.contains("401#") && next.contains("500#"), "{next}");
+}
+
+#[test]
+fn bare_repo_map_has_directory_overview() {
+    let ws = tmp("map-overview");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("src/a.rs"), RS).unwrap();
+    std::fs::write(ws.join("b.rs"), "fn other() {}\n").unwrap();
+    let m = repo_map(&ws, None, None).unwrap();
+    assert!(m.starts_with("# 2 source files (") && m.contains("src 1"), "{m}");
+    assert!(!repo_map(&ws, Some("baz"), None).unwrap().starts_with("# "));
+}

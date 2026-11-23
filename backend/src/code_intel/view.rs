@@ -88,7 +88,7 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> 
             let line = show_line(&doc, i);
             if shown >= MAX_VIEW_LINES || (shown > 0 && out.len() + line.len() > MAX_VIEW_BYTES) {
                 out.push_str(&format!(
-                    "…[{} more lines; continue with: vx view {} {}..{}]\n",
+                    "…[{} more lines; continue with {}:{}..{}]\n",
                     to + 1 - i,
                     rel,
                     i + 1,
@@ -120,7 +120,7 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> 
             let line = show_line(&doc, i);
             if shown >= MAX_VIEW_LINES || (shown > 0 && out.len() + line.len() > MAX_VIEW_BYTES) {
                 out.push_str(&format!(
-                    "…[budget reached; continue with: vx view {} {}..{}]\n",
+                    "…[budget reached; continue with {}:{}..{}]\n",
                     rel,
                     i + 1,
                     to + 1

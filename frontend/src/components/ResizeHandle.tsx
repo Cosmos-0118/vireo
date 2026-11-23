@@ -1,4 +1,4 @@
-import React, { useCallback, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 interface ResizeHandleProps {
   /** 'vertical' = a vertical bar that resizes width; 'horizontal' = a horizontal bar that resizes height. */
@@ -39,6 +39,25 @@ const ResizeHandle: React.FC<ResizeHandleProps> = ({
   const vertical = orientation === 'vertical';
   const [dragging, setDragging] = useState(false);
   const start = useRef({ pos: 0, size: 0 });
+  // Pointer events can arrive faster than frames; every onChange re-renders the whole workbench,
+  // so coalesce to one update per frame (the last position wins) and flush when the drag ends.
+  const pending = useRef<number | null>(null);
+  const frame = useRef(0);
+  const lastSent = useRef(value);
+  const onChangeRef = useRef(onChange);
+  onChangeRef.current = onChange;
+
+  const flush = useCallback(() => {
+    if (frame.current) cancelAnimationFrame(frame.current);
+    frame.current = 0;
+    const next = pending.current;
+    pending.current = null;
+    if (next !== null && next !== lastSent.current) {
+      lastSent.current = next;
+      onChangeRef.current(next);
+    }
+  }, []);
+  useEffect(() => () => cancelAnimationFrame(frame.current), []);
 
   const clamp = useCallback(
     (n: number) => Math.round(Math.max(min, Math.min(Math.max(min, max), n))),
@@ -50,6 +69,8 @@ const ResizeHandle: React.FC<ResizeHandleProps> = ({
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
     start.current = { pos: vertical ? e.clientX : e.clientY, size: value };
+    lastSent.current = value;
+    pending.current = null;
     setDragging(true);
     document.body.style.cursor = vertical ? 'col-resize' : 'row-resize';
     document.body.style.userSelect = 'none';
@@ -59,13 +80,16 @@ const ResizeHandle: React.FC<ResizeHandleProps> = ({
     if (!dragging) return;
     const pos = vertical ? e.clientX : e.clientY;
     const next = clamp(start.current.size + (pos - start.current.pos) * direction);
-    if (next !== value) onChange(next);
+    if (next === lastSent.current && pending.current === null) return;
+    pending.current = next;
+    if (!frame.current) frame.current = requestAnimationFrame(flush);
   };
 
   const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
+    flush();
     setDragging(false);
     document.body.style.cursor = '';
     document.body.style.userSelect = '';

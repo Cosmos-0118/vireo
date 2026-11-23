@@ -800,7 +800,7 @@ fn symbol_op_doc(
             out.push('\n');
         }
         if r1 + 1 > r0 + MAX_VIEW_LINES {
-            out.push_str(&format!("…[{} more lines; vx view {rel} {}..{}]\n", r1 + 1 - (r0 + MAX_VIEW_LINES), r0 + MAX_VIEW_LINES + 1, r1 + 1));
+            out.push_str(&format!("…[{} more lines; continue with {rel}:{}..{}]\n", r1 + 1 - (r0 + MAX_VIEW_LINES), r0 + MAX_VIEW_LINES + 1, r1 + 1));
         }
         return Ok(out);
     }
@@ -944,8 +944,22 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
         order.push((i, score * 100 + rank[i] as i64));
     }
     order.sort_by(|a, b| b.1.cmp(&a.1).then(entries[a.0].rel.cmp(&entries[b.0].rel)));
-    let budget = if tokens.is_empty() { 8000 } else { 7000 };
+    // A bare `map` is an orientation overview, so keep it short; a query or dir earns more room.
+    let narrowed = dir.map_or(false, |d| !d.trim().is_empty());
+    let budget = if !tokens.is_empty() { 7000 } else if narrowed { 8000 } else { 4500 };
     let mut out = dir_note.unwrap_or_default();
+    if tokens.is_empty() {
+        // Directory histogram first: cheap orientation that lets the caller pick a `dir`.
+        let mut by_dir: HashMap<&str, usize> = HashMap::new();
+        for e in &entries {
+            let top = e.rel.split_once('/').map_or(".", |(d, _)| d);
+            *by_dir.entry(top).or_default() += 1;
+        }
+        let mut dirs: Vec<(&str, usize)> = by_dir.into_iter().collect();
+        dirs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+        let listed: Vec<String> = dirs.iter().take(8).map(|(d, n)| format!("{d} {n}")).collect();
+        out.push_str(&format!("# {} source files ({}); top-ranked below\n", entries.len(), listed.join(", ")));
+    }
     let mut shown = 0usize;
     for (i, _) in &order {
         let e = &entries[*i];

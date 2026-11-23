@@ -482,12 +482,25 @@ pub fn search(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Strin
     }
 }
 
+/// Lockfiles and minified/generated bundles: huge, repetitive, and almost never what a code
+/// search is after, so their hits are listed last instead of crowding out real source.
+fn is_low_signal(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel).to_lowercase();
+    name.ends_with(".lock")
+        || name.ends_with(".lockb")
+        || name.ends_with("-lock.json")
+        || name.ends_with("-lock.yaml")
+        || name == "go.sum"
+        || name.ends_with(".min.js")
+        || name.ends_with(".min.css")
+        || name.ends_with(".map")
+}
 fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, String> {
     if query.trim().is_empty() {
         return Err("empty query".into());
     }
     let mut scope = resolve_scope(ws, opts.path.as_deref(), &opts.globs, opts.cwd.as_deref())?;
-    let hits = match run_search_pass(ws, query, &scope.targets, &scope.globs, opts)? {
+    let mut hits = match run_search_pass(ws, query, &scope.targets, &scope.globs, opts)? {
         Some(h) => h,
         None => {
             // No files matched the glob at repo root: auto-retry with `**/` prefix!
@@ -528,6 +541,15 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
             }
         }
     };
+    // Asking for a lockfile/bundle by name or glob opts out of the demotion. Stable sort keeps the
+    // original order within each group.
+    let asked_for_noise = scope.targets.iter().chain(scope.globs.iter()).any(|t| {
+        let t = t.to_lowercase();
+        t.contains("lock") || t.contains(".min.") || t.contains(".map") || t.contains("go.sum")
+    });
+    if !asked_for_noise {
+        hits.sort_by_key(|h| is_low_signal(&h.0));
+    }
 
     let mut res = String::new();
     for n in &scope.notes {
@@ -547,7 +569,10 @@ fn search_once(ws: &Path, query: &str, opts: &SearchOpts) -> Result<String, Stri
             *counts.entry(file.as_str()).or_default() += 1;
         }
         let mut pairs: Vec<(&str, usize)> = counts.into_iter().collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        pairs.sort_by(|a, b| {
+            let noise = |f: &str| !asked_for_noise && is_low_signal(f);
+            noise(a.0).cmp(&noise(b.0)).then_with(|| b.1.cmp(&a.1)).then_with(|| a.0.cmp(b.0))
+        });
         for (i, (f, n)) in pairs.iter().enumerate() {
             if i >= limit {
                 res.push_str(&format!("…[{} more files]\n", pairs.len() - i));
