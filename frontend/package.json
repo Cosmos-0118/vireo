@@ -39,7 +39,7 @@
     "@xterm/xterm": "^6.0.0",
     "diff": "^8.0.4",
     "ghostty-web": "^0.4.0",
-    "lucide-react": "^0.511.0",
+    "lucide-react": "^1.77.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
