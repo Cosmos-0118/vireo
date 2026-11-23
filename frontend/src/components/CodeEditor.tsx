@@ -971,9 +971,13 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
             </div>
           )}
           {liveAt > 0 && (
-            <span className="flex items-center gap-1.5 text-[10.5px] px-1.5 py-0.5 rounded border border-[var(--added-fg)]/50 text-[var(--added-fg)] font-medium shrink-0">
-              <span className="live-dot w-1.5 h-1.5 rounded-full bg-[var(--added-fg)]" />
-              Updated on disk
+            <span
+              key={liveAt}
+              className="live-note flex items-center gap-1.5 text-[11px] text-[var(--text-dim)] shrink-0"
+              title="This file was updated on disk and reloaded"
+            >
+              <span className="live-ping relative w-1.5 h-1.5 rounded-full bg-[var(--added-fg)]" />
+              Synced from disk
             </span>
           )}
         </div>

@@ -554,7 +554,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     if (includeChanges && changedFileCount > 0)
       parts.push(`The workspace has ${changedFileCount} uncommitted changed file(s) (see git status/diff).`);
     return parts.length
-      ? `[Context from the editor — ${parts.join(' ')} Use read_file to inspect them if relevant.]\n\n`
+      ? `[Context from the editor — ${parts.join(' ')}${cliToolId ? '' : ' Use read_file to inspect them if relevant.'}]\n\n`
       : '';
   };
 

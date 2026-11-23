@@ -60,7 +60,7 @@ pub use view::{split_view_spec, view, view_many};
 
 /// Short usage hint injected into external agent CLIs (kept tiny on purpose: this is the whole
 /// per-turn "schema" cost of the vx tools).
-pub const AGENT_HINT: &str = "Vireo `vx` is available (via MCP tools `vx_*` when registered, and as `vx` on PATH): token-lean code tools.\n\
+pub const AGENT_HINT: &str = "Vireo `vx` is available (as MCP tools `mcp__vx__*` (load via ToolSearch if deferred) and as `vx` on PATH): token-lean code tools.\n\
 Prefer `vx` over cat/rg/sed/Python patch scripts. For edits: use `vx apply` (atomic multi-file/multi-hunk patch) or `vx replace` (atomic literal/regex replace across files) instead of shell/Python scripts; use `vx edit` / `vx symbol` (or native Edit) for single-spot tweaks.\n\
 - map [query] [--dir D]         ranked repo symbol map\n\
 - outline <file>                symbols as [start#hash..end#hash] ranges\n\

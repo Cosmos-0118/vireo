@@ -295,6 +295,19 @@ svg.lucide {
 }
 .live-dot { animation: live-dot 1.2s ease-in-out infinite; }
 
+/* One-shot "file reloaded from disk" note: fades in, rings once, fades out (matches the 3.5s timer). */
+@keyframes live-note {
+  0% { opacity: 0; transform: translateX(-3px); }
+  8%, 85% { opacity: 1; transform: none; }
+  100% { opacity: 0; }
+}
+@keyframes live-ping {
+  0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--added-fg) 55%, transparent); }
+  100% { box-shadow: 0 0 0 7px transparent; }
+}
+.live-note { animation: live-note 3.5s ease-out forwards; }
+.live-ping { animation: live-ping 1.1s ease-out 2; }
+
 /* ---- Agent activity: shimmering label for the step in progress ---- */
 @keyframes agent-shimmer {
   from { background-position: 100% 0; }

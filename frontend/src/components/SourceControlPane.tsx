@@ -176,6 +176,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
   const [stashesOpen, setStashesOpen] = useState(false);
   const [checkpointsOpen, setCheckpointsOpen] = useState(false);
   const [changesRatio, setChangesRatio] = useState(0.46); // split ratio between Changes & Graph
+  const [cleanRatio, setCleanRatio] = useState(0.22); // same, when there is nothing to change
   const splitContainerRef = useRef<HTMLDivElement>(null);
 
   // Changes filter
@@ -556,7 +557,8 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
     const rect = container.getBoundingClientRect();
     const onMove = (ev: MouseEvent) => {
       const rel = (ev.clientY - rect.top) / Math.max(1, rect.height);
-      setChangesRatio(Math.max(0.18, Math.min(0.82, rel)));
+      if (totalChanged > 0) setChangesRatio(Math.max(0.18, Math.min(0.82, rel)));
+      else setCleanRatio(Math.max(0.1, Math.min(0.82, rel)));
     };
     const onUp = () => {
       window.removeEventListener('mousemove', onMove);
@@ -1281,7 +1283,8 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
 
           {/* Resizable Split between CHANGES and GRAPH (VS Code Accordion style) */}
           <div ref={splitContainerRef} className="flex-1 flex flex-col min-h-0 overflow-hidden">
-            {/* SECTION 1: CHANGES */}
+            {/* SECTION 1: CHANGES (omitted entirely when the tree is clean) */}
+            {totalChanged > 0 && (
             <div
               style={
                 changesOpen && graphOpen && totalChanged > 0
@@ -1479,9 +1482,23 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
                 </div>
               )}
             </div>
+            )}
 
-            {/* Draggable Splitter between Changes & Graph */}
-            {changesOpen && graphOpen && totalChanged > 0 && (
+            {/* Clean tree: a quiet placeholder keeps the graph docked at the bottom and resizable */}
+            {totalChanged === 0 && (
+              <div
+                style={graphOpen ? { flex: `0 0 ${Math.round(cleanRatio * 100)}%` } : { flex: '1 1 auto' }}
+                className="flex flex-col items-center justify-center gap-1.5 min-h-0 overflow-hidden px-4 text-center"
+              >
+                <span className="flex items-center justify-center w-7 h-7 rounded-full bg-[var(--added-fg)]/10 text-[var(--added-fg)]">
+                  <Check size={14} strokeWidth={2.5} />
+                </span>
+                <span className="text-[12px] text-[var(--text-muted)]">No changes</span>
+              </div>
+            )}
+
+            {/* Draggable Splitter between Changes/placeholder & Graph */}
+            {graphOpen && (totalChanged === 0 || changesOpen) && (
               <div
                 onMouseDown={startSplitDrag}
                 className="h-[3px] cursor-row-resize bg-[var(--border)]/70 hover:bg-[var(--accent)] shrink-0 transition-colors"

@@ -356,8 +356,22 @@ export const BranchBar: React.FC<BranchBarProps> = ({
       statusText = `${sync.ahead} to push to ${upstreamLabel}`;
       break;
     default:
-      statusIcon = <Check size={11} className="shrink-0 text-[var(--added-fg)]" />;
-      statusText = sync.upstream ? `Up to date with ${upstreamLabel}` : 'Up to date';
+      statusIcon = (
+        <span className="flex items-center justify-center w-[11px] shrink-0">
+          <span className="w-[6px] h-[6px] rounded-full bg-[var(--added-fg)] shadow-[0_0_0_3px_color-mix(in_srgb,var(--added-fg)_16%,transparent)]" />
+        </span>
+      );
+      statusText = (
+        <>
+          <span className="text-[var(--text-muted)]">Up to date</span>
+          {sync.upstream && (
+            <span className="text-[var(--text-dim)]">
+              {' · '}
+              <span className="font-mono text-[10.5px]">{upstreamLabel}</span>
+            </span>
+          )}
+        </>
+      );
   }
 
   return (
