@@ -342,8 +342,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
   const [input, setInput] = useState('');
   const [running, setRunning] = useState(false);
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
-  // Activity groups the user opened/closed by hand, keyed `${messageId}:${partIndex}`.
-  // Untouched groups follow the default: open while they are the live step, collapsed after.
+  // Activity groups the user opened/closed by hand, keyed `${messageId}:${partIndex}` (collapsed by default).
   const [groupOpen, setGroupOpen] = useState<Record<string, boolean>>({});
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
@@ -1170,8 +1169,12 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                     );
                   })}
 
-                  {m.streaming && !pending && (
-                    <LiveStatus label={parts.length ? 'Thinking' : 'Starting'} since={m.startedAt} />
+                  {m.streaming && !pending && permRequests.length === 0 && questions.length === 0 && (
+                    <LiveStatus
+                      label={parts.length ? 'Thinking' : 'Starting'}
+                      since={m.startedAt}
+                      delayMs={parts.length ? 450 : 0}
+                    />
                   )}
 
                   {worked !== undefined && worked >= 1000 && (

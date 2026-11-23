@@ -362,14 +362,25 @@ const KIND_SUMMARY: Record<ToolKind, [string, string]> = {
   task: ['delegated {n} task', 'delegated {n} tasks'],
   other: ['used {n} tool', 'used {n} tools'],
 };
+const KIND_ACTIVE_SUMMARY: Record<ToolKind, [string, string]> = {
+  read: ['reading {n} file', 'reading {n} files'],
+  search: ['searching {n} time', 'searching {n} times'],
+  edit: ['editing {n} file', 'editing {n} files'],
+  command: ['running {n} command', 'running {n} commands'],
+  web: ['browsing {n} page', 'browsing {n} pages'],
+  plan: ['updating the plan', 'updating the plan'],
+  task: ['delegating {n} task', 'delegating {n} tasks'],
+  other: ['using {n} tool', 'using {n} tools'],
+};
 const KIND_ORDER: ToolKind[] = ['edit', 'read', 'search', 'command', 'web', 'task', 'plan', 'other'];
 
-function summarize(views: ToolView[]): string {
+function summarize(views: ToolView[], active = false): string {
   const counts = new Map<ToolKind, number>();
   for (const v of views) counts.set(v.kind, (counts.get(v.kind) ?? 0) + 1);
+  const table = active ? KIND_ACTIVE_SUMMARY : KIND_SUMMARY;
   const parts = KIND_ORDER.filter((k) => counts.has(k)).map((k) => {
     const n = counts.get(k)!;
-    return KIND_SUMMARY[k][n === 1 ? 0 : 1].replace('{n}', String(n));
+    return table[k][n === 1 ? 0 : 1].replace('{n}', String(n));
   });
   const s = parts.slice(0, 3).join(', ') + (parts.length > 3 ? ', …' : '');
   return s[0].toUpperCase() + s.slice(1);
@@ -587,18 +598,16 @@ const GroupTree: React.FC<GroupProps> = ({
 
   const statuses = tools.map((t) => toolStatus(t, turnActive));
   const views = tools.map(describeTool);
-  const runningIdx = statuses.lastIndexOf('running');
-  const running = runningIdx >= 0;
+  const running = statuses.includes('running');
   const failed = statuses.filter((s) => s === 'failed').length;
   const blocked = statuses.filter((s) => s === 'blocked').length;
   const doneCount = statuses.filter((s) => s !== 'running').length;
   const starts = tools.map((t) => t.startedAt).filter((x): x is number => x !== undefined);
   const ends = tools.map((t) => t.endedAt).filter((x): x is number => x !== undefined);
   const span = !running && starts.length && ends.length ? Math.max(...ends) - Math.min(...starts) : undefined;
-  const cur = running ? views[runningIdx] : undefined;
   const kinds = new Set(views.map((v) => v.kind));
   const GroupIcon = kinds.size === 1 ? GROUP_ICON[views[0].kind] : ListTree;
-  const [verb, ...restWords] = summarize(views).split(' ');
+  const [verb, ...restWords] = summarize(views, running && doneCount === 0).split(' ');
 
   return (
     <div>
@@ -615,14 +624,8 @@ const GroupTree: React.FC<GroupProps> = ({
           )}
         </span>
         <span className="min-w-0 truncate">
-          {cur ? (
-            <span className="agent-shimmer">{cur.intent || `${cur.active} ${cur.subject}`.trim()}</span>
-          ) : (
-            <>
-              <span className="font-medium text-[var(--text-primary)]">{verb}</span>{' '}
-              <span className="text-[var(--text-muted)]">{restWords.join(' ')}</span>
-            </>
-          )}
+          <span className="font-medium text-[var(--text-primary)]">{verb}</span>{' '}
+          <span className="text-[var(--text-muted)]">{restWords.join(' ')}</span>
         </span>
         <ChevronDown
           size={12}
@@ -664,43 +667,36 @@ const GroupTree: React.FC<GroupProps> = ({
 };
 
 export const ActivityGroup: React.FC<GroupProps> = (props) => {
-  const { tools, turnActive } = props;
-  if (tools.length === 0) return null;
-
-  // Steps still in flight at the tail sit below the (collapsible) completed group so it is obvious
-  // where execution is right now without expanding past history.
-  let split = tools.length;
-  while (split > 0 && toolStatus(tools[split - 1], turnActive) === 'running') split--;
-  if (split === 0 || split === tools.length) return <GroupTree {...props} />;
-
-  return (
-    <div>
-      <GroupTree {...props} tools={tools.slice(0, split)} />
-      <div className="py-0.5">
-        {tools.slice(split).map((t) => (
-          <ToolStep
-            key={t.id}
-            tool={t}
-            turnActive={turnActive}
-            open={!!props.expanded[t.id]}
-            onToggle={() => props.onToggleTool(t.id)}
-            onOpenDiff={props.onOpenDiff}
-            changeFor={props.changeFor}
-          />
-        ))}
-      </div>
-    </div>
-  );
+  if (props.tools.length === 0) return null;
+  return <GroupTree {...props} />;
 };
 
 /** Live "what is the agent doing" line at the foot of a streaming turn. */
-export const LiveStatus: React.FC<{ label: string; since?: number }> = ({ label, since }) => (
-  <div className="flex items-center gap-2 h-6 pl-[3px] text-[12px]">
-    <span className="relative flex w-[14px] h-[14px] items-center justify-center">
-      <span className="absolute w-2 h-2 rounded-full bg-[var(--accent)] opacity-40 animate-ping" />
-      <span className="relative w-1.5 h-1.5 rounded-full bg-[var(--accent)]" />
-    </span>
-    <span className="agent-shimmer">{label}</span>
-    {since !== undefined && <Elapsed since={since} className="text-[10.5px] text-[var(--text-dim)]" />}
-  </div>
-);
+export const LiveStatus: React.FC<{ label: string; since?: number; delayMs?: number }> = ({
+  label,
+  since,
+  delayMs = 0,
+}) => {
+  const [visible, setVisible] = useState(delayMs <= 0);
+  useEffect(() => {
+    if (visible) return;
+    if (delayMs <= 0) {
+      setVisible(true);
+      return;
+    }
+    const timer = window.setTimeout(() => setVisible(true), delayMs);
+    return () => window.clearTimeout(timer);
+  }, [visible, delayMs]);
+
+  if (!visible) return null;
+
+  return (
+    <div className="flex items-center gap-2 h-6 pl-[3px] text-[12px]">
+      <span className="relative flex w-[14px] h-[14px] items-center justify-center">
+        <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent)] live-dot" />
+      </span>
+      <span className="agent-shimmer">{label}</span>
+      {since !== undefined && <Elapsed since={since} className="text-[10.5px] text-[var(--text-dim)]" />}
+    </div>
+  );
+};
