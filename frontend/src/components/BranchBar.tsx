@@ -303,7 +303,14 @@ export const BranchBar: React.FC<BranchBarProps> = ({
   const syncDisabled = busy || sync.kind === 'blocked';
   const counts =
     sync.kind === 'diverged' || sync.kind === 'pull' || sync.kind === 'push' ? (
-      <SyncCounts ahead={sync.ahead} behind={sync.behind} />
+      // With a visible "Push"/"Pull" label + icon, the badge is just the number;
+      // otherwise (compact, or Sync with both directions) it carries the arrows.
+      <SyncCounts
+        ahead={sync.ahead}
+        behind={sync.behind}
+        variant="badge"
+        arrows={!isLarge || sync.kind === 'diverged'}
+      />
     ) : null;
 
   /* Status line ---------------------------------------------------------- */
@@ -427,7 +434,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
               onClick={() => setSyncMenuOpen((v) => !v)}
               disabled={syncDisabled}
               aria-label="More sync actions"
-              className={`flex items-center px-1 rounded-r-md border border-l-0 cursor-pointer disabled:opacity-50 ${
+              className={`flex items-center justify-center w-[24px] rounded-r-md border border-l-0 cursor-pointer disabled:opacity-50 ${
                 primary.emphasis
                   ? 'bg-[var(--accent)] border-[var(--accent)] text-[var(--accent-fg)] hover:brightness-110 shadow-[inset_1px_0_0_rgba(0,0,0,0.2)]'
                   : 'bg-[var(--bg-elevated)] border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'

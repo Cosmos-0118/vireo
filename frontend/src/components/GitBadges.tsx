@@ -5,51 +5,53 @@ import type { GitRef } from '../types';
 const SYNC_OUT = 'var(--accent-hover)';
 const SYNC_IN = 'color-mix(in srgb, #a78bfa 75%, var(--text-primary))';
 
-/** Row marker for a commit that is not pushed (outgoing) or not pulled (incoming). */
+/**
+ * Row marker for a commit that is not pushed (outgoing) or not pulled (incoming).
+ * A bare tinted arrow, like GitHub Desktop / Tower; no box, so it reads as a glyph
+ * next to the message rather than another badge competing with ref labels.
+ */
 export const SyncMark: React.FC<{ dir: 'outgoing' | 'incoming'; size?: number }> = ({ dir, size = 14 }) => {
-  const color = dir === 'outgoing' ? SYNC_OUT : SYNC_IN;
   const Icon = dir === 'outgoing' ? ArrowUp : ArrowDown;
   return (
     <span
       role="img"
       aria-label={dir === 'outgoing' ? 'Not pushed' : 'Incoming, not pulled'}
-      className="inline-flex items-center justify-center shrink-0 rounded-[4px] relative top-px"
-      style={{
-        width: size,
-        height: size,
-        color,
-        background: `color-mix(in srgb, ${color} 16%, transparent)`,
-        boxShadow: `inset 0 0 0 1px color-mix(in srgb, ${color} 34%, transparent)`,
-      }}
+      className="inline-flex items-center justify-center shrink-0"
+      style={{ width: size, height: size, color: dir === 'outgoing' ? SYNC_OUT : SYNC_IN }}
     >
-      <Icon size={size - 5} strokeWidth={2.75} />
+      <Icon size={size - 1} strokeWidth={2.25} />
     </span>
   );
 };
 
-/** Compact ahead/behind counts ("↓2 ↑1") that inherit the surrounding text colour. */
-export const SyncCounts: React.FC<{ ahead: number; behind: number; className?: string }> = ({
-  ahead,
-  behind,
-  className = '',
-}) => {
+/**
+ * Ahead/behind counts ("↓2 ↑1").
+ * - `plain`: inherits the surrounding text colour, no chrome (lists, status lines).
+ * - `badge`: a single rounded counter for use on a filled button.
+ * `arrows={false}` drops the direction glyphs when the button icon already shows it.
+ */
+export const SyncCounts: React.FC<{
+  ahead: number;
+  behind: number;
+  className?: string;
+  variant?: 'plain' | 'badge';
+  arrows?: boolean;
+}> = ({ ahead, behind, className = '', variant = 'plain', arrows = true }) => {
   if (ahead <= 0 && behind <= 0) return null;
-  const chip =
-    'inline-flex items-center gap-px h-[15px] pl-[2px] pr-[4px] rounded-[4px] bg-current/12 font-mono text-[10.5px] font-medium leading-none tabular-nums';
+  const part = (n: number, Icon: typeof ArrowUp) => (
+    <span className="inline-flex items-center gap-[1px]">
+      {arrows && <Icon size={variant === 'badge' ? 10 : 11} strokeWidth={2.5} className="shrink-0" />}
+      {n}
+    </span>
+  );
+  const shell =
+    variant === 'badge'
+      ? 'h-[16px] min-w-[16px] justify-center px-[5px] rounded-full bg-white/20 text-[10.5px] font-semibold'
+      : 'text-[11px] font-medium';
   return (
-    <span className={`inline-flex items-center gap-1 ${className}`}>
-      {behind > 0 && (
-        <span className={chip}>
-          <ArrowDown size={10} strokeWidth={2.75} />
-          {behind}
-        </span>
-      )}
-      {ahead > 0 && (
-        <span className={chip}>
-          <ArrowUp size={10} strokeWidth={2.75} />
-          {ahead}
-        </span>
-      )}
+    <span className={`inline-flex items-center gap-1.5 leading-none tabular-nums shrink-0 ${shell} ${className}`}>
+      {behind > 0 && part(behind, ArrowDown)}
+      {ahead > 0 && part(ahead, ArrowUp)}
     </span>
   );
 };
@@ -173,16 +175,17 @@ export const RefLabel: React.FC<{
   return (
     <span
       title={tooltip ? refTitle(d) : undefined}
-      className="inline-flex items-center gap-[3px] h-[17px] px-[5px] rounded-[4px] text-[10.5px] font-medium leading-none shrink-0 min-w-0"
+      className="inline-flex items-center gap-[3px] h-[18px] px-[6px] rounded-[5px] text-[10.5px] font-medium shrink-0 min-w-0"
       style={{
         maxWidth,
         color: solid ? '#fff' : color,
-        background: solid ? color : `color-mix(in srgb, ${color} 16%, transparent)`,
-        boxShadow: solid ? undefined : `inset 0 0 0 1px color-mix(in srgb, ${color} 38%, transparent)`,
+        background: solid ? color : `color-mix(in srgb, ${color} 14%, transparent)`,
+        boxShadow: solid ? undefined : `inset 0 0 0 1px color-mix(in srgb, ${color} 32%, transparent)`,
       }}
     >
       <RefIcon kind={d.ref.kind} size={10} />
-      <span className="truncate">{d.ref.name}</span>
+      {/* Explicit line box: `truncate` clips overflow, so leading-none would cut descenders (g, p, y). */}
+      <span className="truncate leading-[16px]">{d.ref.name}</span>
       {d.syncedWith.length > 0 && <Cloud size={10} className="shrink-0 opacity-80" />}
     </span>
   );
@@ -226,7 +229,7 @@ export const RefBadges: React.FC<{
         <span
           key={kind}
           title={tooltips ? list.map(refTitle).join('\n') : undefined}
-          className="inline-flex items-center gap-[2px] h-[17px] px-1 rounded-[4px] text-[10px] font-medium leading-none shrink-0 text-[var(--text-muted)] bg-[var(--bg-elevated)] shadow-[inset_0_0_0_1px_var(--border)]"
+          className="inline-flex items-center gap-[2px] h-[18px] px-[5px] rounded-[5px] text-[10px] font-medium leading-none shrink-0 text-[var(--text-muted)] bg-[var(--bg-elevated)] shadow-[inset_0_0_0_1px_var(--border)]"
         >
           <RefIcon kind={kind} size={10} />
           {list.length > 1 && <span className="tabular-nums">{list.length}</span>}
