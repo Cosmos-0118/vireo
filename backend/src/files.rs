@@ -138,7 +138,7 @@ pub async fn get_workspace(State(state): State<AppState>) -> Json<WorkspaceInfo>
     let name = ws
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("workspace")
+        .unwrap_or(if ws.as_os_str().is_empty() { "Vireo" } else { "workspace" })
         .to_string();
     Json(WorkspaceInfo {
         path: ws.to_string_lossy().to_string(),
@@ -190,11 +190,11 @@ pub async fn pick_workspace(
     State(state): State<AppState>,
 ) -> Result<Json<Option<WorkspaceInfo>>, (StatusCode, String)> {
     let current = state.workspace_path().await;
-    let picked = rfd::AsyncFileDialog::new()
-        .set_title("Open Folder")
-        .set_directory(&current)
-        .pick_folder()
-        .await;
+    let mut dialog = rfd::AsyncFileDialog::new().set_title("Open Folder");
+    if !current.as_os_str().is_empty() {
+        dialog = dialog.set_directory(&current);
+    }
+    let picked = dialog.pick_folder().await;
 
     let Some(folder) = picked else {
         return Ok(Json(None));

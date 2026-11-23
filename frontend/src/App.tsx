@@ -306,8 +306,15 @@ export function App() {
 
   const loadWorkspaceData = useCallback(async () => {
     try {
+      const current = await api.getWorkspace();
+      if (!current.path) {
+        // No folder is open yet: show the empty shell and wait for the user to open one.
+        setWorkspace(current);
+        setWsDraft('');
+        return;
+      }
       const [ws, status, files, taskList] = await Promise.all([
-        api.getWorkspace(),
+        Promise.resolve(current),
         api.gitStatus(),
         api.listFiles(),
         api.getTasks(),

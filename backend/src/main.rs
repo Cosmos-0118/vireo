@@ -253,9 +253,16 @@ fn parse_args() -> CliArgs {
         port = 4317;
     }
 
-    let workspace = dir.unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-    });
+    // No folder is opened unless one is passed explicitly: the launch directory is the install
+    // dir (or System32) for a normally started app, so it must never be used as a workspace.
+    // An empty path means "no workspace"; the user opens one from the UI.
+    let Some(workspace) = dir else {
+        return CliArgs {
+            port,
+            workspace: PathBuf::new(),
+            server_only,
+        };
+    };
     let canonical = std::fs::canonicalize(&workspace).unwrap_or(workspace);
     let cleaned = PathBuf::from(
         canonical
@@ -341,6 +348,10 @@ fn build_router(
         .route("/ws/pty", get(pty::ws_pty))
         .route("/api/pty/kill", post(pty::kill_pty))
         .route("/ws/events", get(ws_events))
+        .layer(axum::middleware::from_fn_with_state(
+            app_state.clone(),
+            require_workspace,
+        ))
         .with_state(app_state)
         .fallback(serve_embedded)
         .layer(
@@ -357,6 +368,24 @@ fn build_router(
                 .allow_methods(Any)
                 .allow_headers(Any),
         )
+}
+
+/// Routes that operate on the open folder are refused while no folder is open.
+async fn require_workspace(
+    State(state): State<AppState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path();
+    let needs_ws = path.starts_with("/api/files")
+        || path.starts_with("/api/git")
+        || path == "/api/tasks"
+        || path == "/api/agent/chat"
+        || path == "/ws/pty";
+    if needs_ws && state.workspace_path().await.as_os_str().is_empty() {
+        return (StatusCode::CONFLICT, "No folder is open").into_response();
+    }
+    next.run(req).await
 }
 
 /// WebView2 launch flags: switch off Edge's background services (updater, sync, telemetry,
@@ -394,7 +423,11 @@ fn main() {
 
     if cli.server_only {
         println!("Vireo server running at http://{}", bound_addr);
-        println!("Workspace: {}", cli.workspace.display());
+        if cli.workspace.as_os_str().is_empty() {
+            println!("Workspace: (none - open a folder from the UI)");
+        } else {
+            println!("Workspace: {}", cli.workspace.display());
+        }
         rt.block_on(async move {
             axum::serve(listener, app_router)
                 .await

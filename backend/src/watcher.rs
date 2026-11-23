@@ -52,6 +52,9 @@ enum Msg {
 /// the root non-recursively, every non-ignored top-level directory recursively, and only the
 /// `.git` files that matter (HEAD, index, refs/heads).
 fn watch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
+    if ws.as_os_str().is_empty() {
+        return;
+    }
     let _ = w.watch(ws, RecursiveMode::NonRecursive);
     if let Ok(rd) = std::fs::read_dir(ws) {
         for entry in rd.flatten() {
@@ -73,6 +76,9 @@ fn watch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
 }
 
 fn unwatch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
+    if ws.as_os_str().is_empty() {
+        return;
+    }
     let _ = w.unwatch(ws);
     if let Ok(rd) = std::fs::read_dir(ws) {
         for entry in rd.flatten() {
