@@ -259,7 +259,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
 
   useEffect(() => {
     fetchBranches();
-  }, [fetchBranches, workspacePath, gitStatus?.branch, gitStatus?.head_hash]);
+  }, [fetchBranches, workspacePath, gitStatus?.branch, gitStatus?.head_hash, gitStatus?.ahead, gitStatus?.behind]);
 
   useEffect(() => {
     const t = window.setTimeout(() => {

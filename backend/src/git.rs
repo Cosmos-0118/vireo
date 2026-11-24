@@ -374,6 +374,10 @@ fn git_command(ws: &Path, args: &[&str]) -> Result<tokio::process::Command, Stri
         prev = a;
     }
     let mut cmd = background_command("git");
+    // Read-only commands (status, diff) must not refresh and rewrite `.git/index`: that write is
+    // itself a watcher event, so every refresh would trigger another one, and it contends with
+    // user-run git commands on `index.lock`. Writes that need the lock still take it.
+    cmd.env("GIT_OPTIONAL_LOCKS", "0");
     cmd.args(["-c", "protocol.ext.allow=never", "-c", "protocol.fd.allow=never"])
         .args(args)
         .current_dir(ws);

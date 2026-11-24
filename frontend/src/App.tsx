@@ -364,19 +364,28 @@ export function App() {
   }, []);
 
   const refreshGit = useCallback(async () => {
-    const f = gitFetchRef.current;
-    const seq = ++f.seq;
-    const startedAt = Date.now();
-    try {
-      const status = await api.gitStatus();
-      // A slower, older request must not overwrite a newer answer (it can predate an agent edit).
-      if (seq < f.applied) return;
-      f.applied = seq;
-      f.startedAt = startedAt;
-      setGitStatus(status);
-    } catch {
-      // ignore transient error
-    }
+    const attempt = async (retries: number): Promise<void> => {
+      const f = gitFetchRef.current;
+      const seq = ++f.seq;
+      const startedAt = Date.now();
+      try {
+        const status = await api.gitStatus();
+        // A slower, older request must not overwrite a newer answer (it can predate an agent edit).
+        if (seq < f.applied) return;
+        f.applied = seq;
+        f.startedAt = startedAt;
+        setGitStatus(status);
+      } catch {
+        // A failed fetch (git busy, backend restarting) must not leave the sidebar stale until the
+        // user hits refresh: retry unless a newer request has been issued meanwhile.
+        if (retries > 0) {
+          window.setTimeout(() => {
+            if (f.seq === seq) void attempt(retries - 1);
+          }, 400);
+        }
+      }
+    };
+    await attempt(2);
   }, []);
 
   const loadWorkspaceData = useCallback(async () => {
@@ -650,18 +659,25 @@ export function App() {
       if (!firstAt) firstAt = now;
       window.clearTimeout(flushTimer);
       // The backend watcher already debounces; this only merges back-to-back messages (watcher
-      // batch + tool notification). Trailing 80 ms, never later than 400 ms after the first.
-      flushTimer = window.setTimeout(flush, Math.max(0, Math.min(80, firstAt + 400 - now)));
+      // batch + tool notification). Trailing 40 ms, never later than 250 ms after the first.
+      flushTimer = window.setTimeout(flush, Math.max(0, Math.min(40, firstAt + 250 - now)));
     };
     const onVisible = () => {
       if (!document.hidden && dirty) scheduleFlush();
     };
     document.addEventListener('visibilitychange', onVisible);
+    const onFocus = () => refreshGit();
+    window.addEventListener('focus', onFocus);
 
     const connect = () => {
       if (closed) return;
       sock = new WebSocket(wsUrl('/ws/events'));
-      sock.onopen = () => setLiveConnected(true);
+      sock.onopen = () => {
+        setLiveConnected(true);
+        // Events sent while the socket was down are lost: resync.
+        refreshGit();
+        setFsVersion((v) => v + 1);
+      };
       sock.onclose = () => {
         setLiveConnected(false);
         if (!closed) {
@@ -709,6 +725,7 @@ export function App() {
       if (timer) clearTimeout(timer);
       window.clearTimeout(flushTimer);
       document.removeEventListener('visibilitychange', onVisible);
+      window.removeEventListener('focus', onFocus);
       sock?.close();
     };
   }, [refreshGit, loadWorkspaceData]);

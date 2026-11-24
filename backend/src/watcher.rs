@@ -7,15 +7,34 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
 /// Quiet period after the last event before a batch is flushed.
-const DEBOUNCE: Duration = Duration::from_millis(260);
+const DEBOUNCE: Duration = Duration::from_millis(120);
 /// A batch is flushed at the latest this long after its first event, so a continuous stream of
 /// writes (build output, `npm install`) cannot starve the UI of updates.
-const MAX_BATCH_AGE: Duration = Duration::from_millis(600);
+const MAX_BATCH_AGE: Duration = Duration::from_millis(400);
 /// Paths reported per event. Past this the batch is reported as "something changed" (empty list),
 /// which clients treat as a full refresh.
 const MAX_REPORTED_PATHS: usize = 200;
 /// Hard cap on the pending set so a huge burst cannot grow memory without bound.
 const MAX_PENDING: usize = 2000;
+
+/// `.git` entries whose change alters what source control shows (branch, staging, upstream
+/// counts, stashes, in-progress merge/rebase). Object storage, logs and `*.lock` files are noise.
+fn git_path_relevant(rel: &str) -> bool {
+    if rel.ends_with(".lock") {
+        return false;
+    }
+    matches!(
+        rel,
+        ".git/HEAD"
+            | ".git/index"
+            | ".git/packed-refs"
+            | ".git/MERGE_HEAD"
+            | ".git/CHERRY_PICK_HEAD"
+            | ".git/REVERT_HEAD"
+            | ".git/rebase-merge"
+            | ".git/rebase-apply"
+    ) || rel.starts_with(".git/refs/")
+}
 
 fn should_ignore_path(workspace: &Path, path: &Path) -> bool {
     let rel = match path.strip_prefix(workspace) {
@@ -25,15 +44,8 @@ fn should_ignore_path(workspace: &Path, path: &Path) -> bool {
     for comp in rel.components() {
         if let Some(s) = comp.as_os_str().to_str() {
             if s == ".git" {
-                // Allow .git/HEAD and .git/index so branch/staging changes trigger refresh
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
-                if rel_str == ".git/HEAD"
-                    || rel_str == ".git/index"
-                    || rel_str.starts_with(".git/refs/heads/")
-                {
-                    return false;
-                }
-                return true;
+                return !git_path_relevant(&rel_str);
             }
             if is_ignored_dir_name(s) {
                 return true;
@@ -72,7 +84,7 @@ fn watch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
     }
     let git = ws.join(".git");
     let _ = w.watch(&git, RecursiveMode::NonRecursive);
-    let _ = w.watch(&git.join("refs").join("heads"), RecursiveMode::Recursive);
+    let _ = w.watch(&git.join("refs"), RecursiveMode::Recursive);
 }
 
 fn unwatch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
@@ -89,7 +101,7 @@ fn unwatch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
     }
     let git = ws.join(".git");
     let _ = w.unwatch(&git);
-    let _ = w.unwatch(&git.join("refs").join("heads"));
+    let _ = w.unwatch(&git.join("refs"));
 }
 
 pub fn spawn_watcher(
@@ -197,7 +209,14 @@ pub fn spawn_watcher(
                         pending.insert(rel, seq);
                     }
                 }
-                Some(Msg::Fs(Err(_))) | None => {}
+                Some(Msg::Fs(Err(_))) => {
+                    // Dropped events (e.g. Windows buffer overflow): anything may have changed.
+                    let now = Instant::now();
+                    first_event.get_or_insert(now);
+                    last_event = Some(now);
+                    overflow = true;
+                }
+                None => {}
             }
 
             if let (Some(first), Some(last)) = (first_event, last_event) {
@@ -221,4 +240,31 @@ pub fn spawn_watcher(
     });
 
     retarget_tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn git_internals_filter() {
+        let ws = Path::new("/w");
+        let ign = |p: &str| should_ignore_path(ws, &ws.join(p));
+        for ok in [
+            ".git/HEAD",
+            ".git/index",
+            ".git/packed-refs",
+            ".git/MERGE_HEAD",
+            ".git/refs/heads/main",
+            ".git/refs/remotes/origin/main",
+            ".git/refs/stash",
+            ".git/rebase-merge",
+        ] {
+            assert!(!ign(ok), "{ok} must be watched");
+        }
+        for noisy in [".git/index.lock", ".git/objects/ab/cd", ".git/logs/HEAD", ".git/FETCH_HEAD", ".git/refs/heads/x.lock"] {
+            assert!(ign(noisy), "{noisy} must be ignored");
+        }
+        assert!(!ign("src/main.rs"));
+    }
 }
