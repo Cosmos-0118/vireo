@@ -1,5 +1,6 @@
 import { TerminalWindow } from '@phosphor-icons/react';
 import { EmptyState } from './ui/EmptyState';
+import { withShortcut } from '../keybindings';
 import React, { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import {
   Check,
@@ -555,7 +556,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
             <button
               onClick={onClosePanel}
               className="p-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer"
-              title="Hide terminal (Ctrl+`)"
+              title={withShortcut('Hide terminal', 'toggleTerminal')}
             >
               <X size={15} />
             </button>

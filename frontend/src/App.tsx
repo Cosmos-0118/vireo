@@ -17,6 +17,7 @@ import {
   GitCommitHorizontal,
   GitCompare,
   GitFork,
+  Keyboard,
   Minus,
   Palette,
   PanelBottom,
@@ -33,6 +34,7 @@ import {
 } from 'lucide-react';
 import { diffLines } from 'diff';
 import { AgentSettingsProvider } from './agentSettings';
+import { findAction, shortcutLabel, withShortcut, useKeybindings, type ActionId } from './keybindings';
 import { api, wsUrl } from './api';
 import { gitWriteActive } from './utils/gitWrites';
 import {
@@ -87,6 +89,9 @@ const DiffViewer = lazy(() =>
 const SettingsPage = lazy(() =>
   import('./components/SettingsPage').then((m) => ({ default: m.SettingsPage }))
 );
+const ShortcutsPage = lazy(() =>
+  import('./components/ShortcutsPage').then((m) => ({ default: m.ShortcutsPage }))
+);
 const CommitGraphView = lazy(() =>
   import('./components/CommitGraphView').then((m) => ({ default: m.CommitGraphView }))
 );
@@ -120,6 +125,7 @@ function trimToBudget<V>(map: Map<string, V>, sizeOf: (v: V) => number, budget =
 const ZOOM_MIN = 0.7;
 const ZOOM_MAX = 2.0;
 const ZOOM_STEP = 0.1;
+const REPEATABLE = new Set<ActionId>(['zoomIn', 'zoomOut', 'nextTab', 'prevTab']);
 /** Minimum time between automatic follow-edits tab switches. */
 const FOLLOW_SWITCH_DWELL_MS = 700;
 /** Dirty files whose current text is captured up front as their pre-agent snapshot. */
@@ -316,6 +322,8 @@ export function App() {
   const seededRef = useRef<Map<string, number>>(new Map());
   const pillTimerRef = useRef<number | undefined>(undefined);
   const tabsRef = useRef<OpenTab[]>([]);
+  const actionsRef = useRef<Partial<Record<ActionId, () => void>>>({});
+  useKeybindings(); // re-render so tooltips follow rebinding
   const gitStatusRef = useRef<GitStatusRes | null>(null);
   /**
    * `git status` requests resolve out of order. `seq` numbers requests, `applied` is the newest one
@@ -450,7 +458,7 @@ export function App() {
       setFileData(null);
       return;
     }
-    if (activeTab.mode === 'graph' || activeTab.mode === 'settings') {
+    if (activeTab.mode === 'graph' || activeTab.mode === 'settings' || activeTab.mode === 'shortcuts') {
       return;
     }
     const id = activeTab.id;
@@ -696,49 +704,19 @@ export function App() {
     };
   }, [refreshGit, loadWorkspaceData]);
 
-  // Global VS Code keyboard & zoom shortcuts
+  // Global keyboard shortcuts (bindings come from ./keybindings; handlers are in `actionsRef`).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const mod = e.ctrlKey || e.metaKey;
-      if (!mod) return;
-
-      const inXterm = !!(e.target as HTMLElement | null)?.closest?.('.xterm');
-
-      if (e.key === '=' || e.key === '+' || e.code === 'Equal' || e.code === 'NumpadAdd') {
-        e.preventDefault();
-        e.stopPropagation();
-        adjustZoom((z) => z + ZOOM_STEP);
-      } else if (
-        e.key === '-' ||
-        e.key === '_' ||
-        e.code === 'Minus' ||
-        e.code === 'NumpadSubtract'
-      ) {
-        e.preventDefault();
-        e.stopPropagation();
-        adjustZoom((z) => z - ZOOM_STEP);
-      } else if (e.key === '0' || e.code === 'Digit0' || e.code === 'Numpad0') {
-        e.preventDefault();
-        e.stopPropagation();
-        adjustZoom(1.0);
-      } else if (e.key.toLowerCase() === 'p' && !inXterm) {
-        e.preventDefault();
-        setQuickOpenVisible((v) => !v);
-      } else if (e.shiftKey && e.key.toLowerCase() === 'f') {
-        e.preventDefault();
-        setShowSidebar(true);
-        setSidebarTab('search');
-      } else if (e.shiftKey && e.key.toLowerCase() === 'g' && !inXterm) {
-        e.preventDefault();
-        setShowSidebar(true);
-        setSidebarTab('changes');
-      } else if (e.key === '`') {
-        e.preventDefault();
-        setShowTerminal((v) => !v);
-      } else if (e.key.toLowerCase() === 'b' && !inXterm) {
-        e.preventDefault();
-        setShowSidebar((v) => !v);
-      }
+      const def = findAction(e);
+      if (!def) return;
+      // Like VS Code, app shortcuts also work while the terminal has focus.
+      const run = actionsRef.current[def.id];
+      if (!run) return;
+      e.preventDefault();
+      e.stopPropagation();
+      // Holding a key must not flicker toggles; zoom and tab cycling may repeat.
+      if (e.repeat && !REPEATABLE.has(def.id)) return;
+      run();
     };
 
     const onWheel = (e: WheelEvent) => {
@@ -1320,6 +1298,14 @@ export function App() {
     setActiveTabId(id);
   }, []);
 
+  const openShortcutsTab = useCallback(() => {
+    const id = 'shortcuts';
+    setTabs((prev) =>
+      prev.some((t) => t.id === id) ? prev : [...prev, { id, path: 'Keyboard Shortcuts', mode: 'shortcuts' }]
+    );
+    setActiveTabId(id);
+  }, []);
+
   const closeTab = (id: string) => {
     contentCacheRef.current.delete(id);
     setTabs((prev) => {
@@ -1619,6 +1605,42 @@ export function App() {
     else setShowAgent((v) => !v);
   };
 
+  const cycleTab = (dir: 1 | -1) => {
+    const list = tabsRef.current;
+    if (list.length < 2) return;
+    const i = list.findIndex((t) => t.id === activeTabIdRef.current);
+    setActiveTabId(list[(i + dir + list.length) % list.length].id);
+  };
+  const showSidebarView = (tab: SidebarTab) => {
+    setShowSidebar(true);
+    setSidebarTab(tab);
+  };
+
+  // Re-assigned every render so the global key handler always sees fresh closures.
+  actionsRef.current = {
+    quickOpen: () => setQuickOpenVisible((v) => !v),
+    openSettings: openSettingsTab,
+    openShortcuts: openShortcutsTab,
+    saveFile: () => window.dispatchEvent(new CustomEvent('vireo:save-file')),
+    toggleSidebar,
+    toggleTerminal: () => setShowTerminal((v) => !v),
+    toggleAgent,
+    showExplorer: () => showSidebarView('explorer'),
+    showSearch: () => showSidebarView('search'),
+    showSourceControl: () => showSidebarView('changes'),
+    openGitGraph: () => openGraphTab(),
+    closeTab: () => {
+      const id = activeTabIdRef.current;
+      if (id) closeTab(id);
+    },
+    closeAllTabs: () => closeTabsWhere(() => true),
+    nextTab: () => cycleTab(1),
+    prevTab: () => cycleTab(-1),
+    zoomIn: () => adjustZoom((z) => z + ZOOM_STEP),
+    zoomOut: () => adjustZoom((z) => z - ZOOM_STEP),
+    zoomReset: () => adjustZoom(1.0),
+  };
+
   const activeFileStatus =
     activeTab && (activeTab.mode === 'diff' || activeTab.mode === 'code')
       ? gitStatus?.files.find((f) => f.path === activeTab.path)
@@ -1756,7 +1778,7 @@ export function App() {
         >
           <Search size={13} className="shrink-0" />
           <span className="flex-1 text-left truncate">Search files, themes, and tasks</span>
-          <kbd className="text-[10.5px] font-mono text-[var(--text-dim)]">Ctrl+P</kbd>
+          <kbd className="text-[10.5px] font-mono text-[var(--text-dim)]">{shortcutLabel('quickOpen')}</kbd>
         </button>
 
         {/* Right: actions, layout toggles, window controls */}
@@ -1852,9 +1874,9 @@ export function App() {
             {/* Layout Toggles */}
             {(
               [
-                { on: widths.sidebarVisible, toggle: toggleSidebar, Icon: PanelLeft, label: 'Toggle Sidebar (Ctrl+B)' },
-                { on: showTerminal, toggle: () => setShowTerminal((v) => !v), Icon: PanelBottom, label: 'Toggle Terminal (Ctrl+`)' },
-                { on: widths.agentVisible, toggle: toggleAgent, Icon: PanelRight, label: 'Toggle Agent Panel' },
+                { on: widths.sidebarVisible, toggle: toggleSidebar, Icon: PanelLeft, label: withShortcut('Toggle Sidebar', 'toggleSidebar') },
+                { on: showTerminal, toggle: () => setShowTerminal((v) => !v), Icon: PanelBottom, label: withShortcut('Toggle Terminal', 'toggleTerminal') },
+                { on: widths.agentVisible, toggle: toggleAgent, Icon: PanelRight, label: withShortcut('Toggle Agent Panel', 'toggleAgent') },
               ] as const
             ).map(({ on, toggle, Icon, label }) => (
               <button
@@ -1945,6 +1967,7 @@ export function App() {
                 fsVersion={fsVersion}
                 recentPaths={tabPulse}
                 onAskAgent={handleAskAgent}
+                onOpenShortcuts={openShortcutsTab}
               />
             </div>
             <ResizeHandle
@@ -1984,6 +2007,7 @@ export function App() {
               onToast={showToast}
               fsVersion={fsVersion}
               onAskAgent={handleAskAgent}
+              onOpenShortcuts={openShortcutsTab}
             />
           </div>
         )}
@@ -2005,6 +2029,8 @@ export function App() {
                     ? 'Git Graph'
                     : tab.mode === 'settings'
                     ? 'Settings'
+                    : tab.mode === 'shortcuts'
+                    ? 'Keyboard Shortcuts'
                     : tab.mode === 'commit-diff'
                     ? `${baseName} (${tab.commitShortHash})`
                     : tab.mode === 'compare-diff'
@@ -2038,6 +2064,8 @@ export function App() {
                       <GitFork size={14} className="text-[var(--accent)] shrink-0" />
                     ) : tab.mode === 'settings' ? (
                       <Settings size={14} className="text-[var(--accent)] shrink-0" />
+                    ) : tab.mode === 'shortcuts' ? (
+                      <Keyboard size={14} className="text-[var(--accent)] shrink-0" />
                     ) : tab.mode === 'commit-diff' ? (
                       <GitCommitHorizontal size={14} className="text-[var(--accent)] shrink-0" />
                     ) : tab.mode === 'diff' || tab.mode === 'compare-diff' ? (
@@ -2107,7 +2135,7 @@ export function App() {
                     onClick={() => setQuickOpenVisible(true)}
                     className="px-3.5 py-2 rounded-lg bg-[var(--accent)] text-[var(--accent-fg)] font-medium cursor-pointer hover:opacity-95 transition-opacity"
                   >
-                    Quick Open (Ctrl+P)
+                    {withShortcut('Quick Open', 'quickOpen')}
                   </button>
                   {gitStatus?.is_repo && (
                     <button
@@ -2138,7 +2166,7 @@ export function App() {
                     onClick={() => setShowTerminal(true)}
                     className="px-3.5 py-2 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
                   >
-                    Open Terminal (Ctrl+`)
+                    {withShortcut('Open Terminal', 'toggleTerminal')}
                   </button>
                 </div>
               </div>
@@ -2151,6 +2179,16 @@ export function App() {
                 }
               >
                 <SettingsPage />
+              </Suspense>
+            ) : activeTab.mode === 'shortcuts' ? (
+              <Suspense
+                fallback={
+                  <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-dim)]">
+                    Loading Shortcuts...
+                  </div>
+                }
+              >
+                <ShortcutsPage />
               </Suspense>
             ) : activeTab.mode === 'graph' ? (
               <Suspense
@@ -2537,7 +2575,7 @@ export function App() {
         </div>
 
         <div className="flex items-stretch pr-1">
-          <div className="group flex items-stretch" title="Zoom (Ctrl+= / Ctrl+- / Ctrl+0)">
+          <div className="group flex items-stretch" title={`Zoom (${shortcutLabel('zoomIn')} / ${shortcutLabel('zoomOut')} / ${shortcutLabel('zoomReset')})`}>
             <button
               onClick={() => adjustZoom((z) => z - ZOOM_STEP)}
               className="px-1.5 flex items-center opacity-0 group-hover:opacity-80 hover:!opacity-100 status-item"

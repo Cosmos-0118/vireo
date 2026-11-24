@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { matchesAction } from '../keybindings';
 import {
   AlertTriangle,
   ChevronDown,
@@ -117,9 +118,10 @@ export const RunMenu: React.FC<RunMenuProps> = ({
   // F5 runs the primary task (restarts it when it is already running).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== 'F5' || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
-      if (!primary || (e.target as HTMLElement | null)?.closest?.('.xterm')) return;
+      if (!matchesAction(e, 'runPrimary')) return;
       e.preventDefault();
+      // F5 must never reload the app; only run when there is a task and the terminal isn't focused (htop etc.).
+      if (!primary || (e.target as HTMLElement | null)?.closest?.('.xterm')) return;
       onRun(primary);
     };
     window.addEventListener('keydown', onKey);

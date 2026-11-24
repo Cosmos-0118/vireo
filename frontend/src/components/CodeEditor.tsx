@@ -592,13 +592,17 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     }
   };
 
+  // Ctrl+S is a global shortcut (see keybindings.ts), so it saves even when focus is outside the editor.
+  const handleSaveRef = useRef(handleSave);
+  handleSaveRef.current = handleSave;
+  useEffect(() => {
+    const onSave = () => void handleSaveRef.current();
+    window.addEventListener('vireo:save-file', onSave);
+    return () => window.removeEventListener('vireo:save-file', onSave);
+  }, []);
+
   useEffect(() => {
     if (!containerRef.current || binary) return;
-
-    const saveRef = () => {
-      handleSave();
-      return true;
-    };
 
     // A theme change recreates the view; carry unsaved edits across instead of reloading from disk.
     const carried = carryRef.current && carryRef.current.path === path ? carryRef.current : null;
@@ -641,7 +645,6 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
         highlightActiveLineGutter(),
         history(),
         keymap.of([
-          { key: 'Mod-s', run: saveRef },
           { key: 'Alt-]', run: () => navRef.current(1) },
           { key: 'Alt-[', run: () => navRef.current(-1) },
           ...defaultKeymap,

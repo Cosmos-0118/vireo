@@ -2,8 +2,10 @@ import React, { Suspense, lazy, useRef } from 'react';
 import {
   Files,
   GitBranch,
+  Keyboard,
   Search,
 } from 'lucide-react';
+import { useKeybindings, withShortcut } from '../keybindings';
 import type { CommitFileChange, GitStatusRes } from '../types';
 const FileExplorer = lazy(() => import('./FileExplorer').then((m) => ({ default: m.FileExplorer })));
 const SearchPane = lazy(() => import('./SearchPane').then((m) => ({ default: m.SearchPane })));
@@ -35,6 +37,8 @@ interface SidebarProps {
   onToast: (msg: string, isError?: boolean) => void;
   fsVersion: number;
   onAskAgent: (text: string) => void;
+  /** Open the Keyboard Shortcuts tab. */
+  onOpenShortcuts: () => void;
   /** path -> pulse key for files an agent just changed. */
   recentPaths?: Record<string, number>;
   /** Render only the icon rail (panel collapsed) so the icons stay reachable. */
@@ -57,10 +61,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToast,
   fsVersion,
   onAskAgent,
+  onOpenShortcuts,
   recentPaths,
   railOnly = false,
 }) => {
   const totalChanged = gitStatus?.files.length ?? 0;
+  useKeybindings(); // refresh tooltips when shortcuts are rebound
   const seen = useRef({ explorer: false, search: false });
   if (activeTab === 'explorer') seen.current.explorer = true;
   if (activeTab === 'search') seen.current.search = true;
@@ -76,7 +82,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               ? 'text-[var(--text-primary)] bg-[var(--bg-active)]'
               : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
           }`}
-          title="Source Control & Git Graph (Ctrl+Shift+G)"
+          title={withShortcut('Source Control & Git Graph', 'showSourceControl')}
         >
           {activeTab === 'changes' && (
             <span className="absolute -left-1.5 top-2 bottom-2 w-[3px] rounded-r bg-[var(--accent)]" />
@@ -96,7 +102,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               ? 'text-[var(--text-primary)] bg-[var(--bg-active)]'
               : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
           }`}
-          title="File Explorer"
+          title={withShortcut('File Explorer', 'showExplorer')}
         >
           {activeTab === 'explorer' && (
             <span className="absolute -left-1.5 top-2 bottom-2 w-[3px] rounded-r bg-[var(--accent)]" />
@@ -111,12 +117,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
               ? 'text-[var(--text-primary)] bg-[var(--bg-active)]'
               : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
           }`}
-          title="Search in Files (Ctrl+Shift+F)"
+          title={withShortcut('Search in Files', 'showSearch')}
         >
           {activeTab === 'search' && (
             <span className="absolute -left-1.5 top-2 bottom-2 w-[3px] rounded-r bg-[var(--accent)]" />
           )}
           <Search size={19} />
+        </button>
+
+        <button
+          onClick={onOpenShortcuts}
+          className="mt-auto w-9 h-9 flex items-center justify-center rounded-lg cursor-pointer transition-colors text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]"
+          title={withShortcut('Keyboard Shortcuts', 'openShortcuts')}
+          aria-label="Keyboard Shortcuts"
+        >
+          <Keyboard size={19} />
         </button>
       </div>
 

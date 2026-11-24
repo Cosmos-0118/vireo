@@ -249,7 +249,7 @@ export interface CommandRes {
 export interface OpenTab {
   id: string;
   path: string;
-  mode: 'diff' | 'code' | 'commit-diff' | 'compare-diff' | 'graph' | 'settings';
+  mode: 'diff' | 'code' | 'commit-diff' | 'compare-diff' | 'graph' | 'settings' | 'shortcuts';
   staged?: boolean;
   line?: number;
   col?: number;
