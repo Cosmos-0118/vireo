@@ -1,0 +1,17 @@
+# Changelog
+
+## v0.5.0
+
+**Highlights:** Vireo now ships a built-in, polyglot release workflow, so versioning and release notes no longer depend on external tooling. Code intelligence gets better MCP checks and editing, and the editor gains customizable keyboard shortcuts with a dedicated shortcuts page. This release has no breaking changes.
+
+### Features
+
+- **release:** Add polyglot release workflow (`337368d`)
+- **code-intel:** Improve MCP checks and editing (`812a9a5`)
+- **ui:** Add customizable keyboard shortcuts and shortcuts page (`bc18fa2`)
+
+### Documentation
+
+- Update README checksums for Vireo v0.4.1 (`4f2187a`)
+
+**Full Changelog**: https://github.com/Cosmos-0118/vireo/compare/v0.4.1...v0.5.0

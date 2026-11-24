@@ -523,7 +523,7 @@ fn main() {
             )
         }
         "release" => {
-            const ACTIONS: [&str; 6] = ["status", "preflight", "notes", "bump", "publish", "verify"];
+            const ACTIONS: [&str; 7] = ["status", "preflight", "notes", "bump", "publish", "verify", "activity"];
             let (action, rest) = match pos.first().map(String::as_str) {
                 Some(a) if ACTIONS.contains(&a) => (a.to_string(), &pos[1..]),
                 Some(a) => fail(&format!("unknown release action `{a}` ({})\n{USAGE}", ACTIONS.join("|"))),
@@ -544,6 +544,7 @@ fn main() {
                     "assets": flag_vals("--asset"),
                     "only": flag_vals("--only"),
                     "json": has("--json"),
+                    "source": cli_source(),
                 }),
             )
         }
@@ -562,6 +563,12 @@ fn main() {
         }
         Err(e) => fail(&format!("Error: {e}")),
     }
+}
+
+/// `agent` when `vx` runs inside a coding agent (so the Releases page credits it), else `cli`.
+fn cli_source() -> &'static str {
+    const AGENT_ENV: [&str; 6] = ["CLAUDECODE", "CODEX_SANDBOX", "CODEX_HOME", "GEMINI_CLI", "CURSOR_AGENT", "VIREO_AGENT"];
+    if AGENT_ENV.iter().any(|k| std::env::var_os(k).is_some()) { "agent" } else { "cli" }
 }
 
 #[cfg(test)]

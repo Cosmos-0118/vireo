@@ -19,6 +19,7 @@ export type ActionId =
   | 'showSearch'
   | 'showSourceControl'
   | 'openGitGraph'
+  | 'openReleases'
   | 'closeTab'
   | 'closeAllTabs'
   | 'nextTab'
@@ -57,6 +58,7 @@ export const ACTIONS: ActionDef[] = [
   { id: 'showSearch', label: 'Search in Files', group: 'Sidebar', default: 'Mod+Shift+F' },
   { id: 'showSourceControl', label: 'Show Source Control', group: 'Sidebar', default: 'Mod+Shift+G' },
   { id: 'openGitGraph', label: 'Open Git Graph', group: 'Sidebar', default: 'Mod+Alt+G' },
+  { id: 'openReleases', label: 'Open Releases', group: 'Sidebar', default: 'Mod+Alt+R' },
   // Tabs
   { id: 'closeTab', label: 'Close Active Tab', group: 'Tabs', default: 'Mod+W' },
   { id: 'closeAllTabs', label: 'Close All Tabs', group: 'Tabs', default: 'Mod+Shift+W' },

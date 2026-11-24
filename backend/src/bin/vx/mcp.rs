@@ -17,7 +17,7 @@ or {path, symbol, new_text}; or {path, old_text, new_text} (no anchors needed, r
 - apply {patch: \"*** Update File: a.rs\\n@@ 12#ab..15#cd\\n+new line\"}\n\
 - replace {old, new, path?, glob?, regex?, expected?, dry_run?}\n\
 - check {cmd?, dir?, warnings?}: a build still running after 60s continues in the background and returns a job id; call check {job} to wait for it.\n\
-- release {action?: status|preflight|notes|bump|publish|verify, version?: patch|minor|major|prerelease|X.Y.Z, dry_run?, skip_tests?, write?, changelog?, notes_file?, publish?, no_push?, assets?, only?}: polyglot release engine; run publish with dry_run first.\n\
+- release {action?: status|preflight|notes|bump|publish|verify|activity, version?: patch|minor|major|prerelease|X.Y.Z, dry_run?, skip_tests?, write?, changelog?, notes_file?, publish?, no_push?, assets?, only?}: polyglot release engine. Flow: status -> notes {write:true} (then edit the draft) -> publish {dry_run:true} (show the plan) -> publish. Every step appears live on the user's Releases page.\n\
 Anchors `N#hh` come from view/search/edit output; edits return fresh anchors, so no re-view is needed.";
 
 pub fn mcp_tools(read_only: bool) -> Value {
@@ -157,11 +157,11 @@ pub fn mcp_tools(read_only: bool) -> Value {
             }),
             json!({
                 "name": "release",
-                "description": "Release engineering across Rust/Node/Tauri/.NET/Python/Java/Go/installers. `status` (default): stacks, version files + drift, commits since last tag, suggested bump, CI mode. `preflight`: clean tree, branch, remote sync, free tag, gh auth, build gate. `notes`: Conventional-Commit release notes (`write` saves an editable draft, `changelog` prepends CHANGELOG.md). `bump`: atomic lossless version sync of every manifest + lockfile (`dry_run` previews). `publish`: preflight -> bump -> commit -> tag -> push (CI tag workflows) or draft GitHub release (`publish: true` makes it public); ALWAYS call with dry_run first and show the plan to the user. `verify`: remote tag, release state, CI run.",
+                "description": "Release engineering across Rust/Node/Tauri/.NET/Python/Java/Go/installers. `status` (default): stacks, version files + drift, commits since last tag, suggested bump, CI mode. `preflight`: clean tree, branch, remote sync, free tag, gh auth, build gate. `notes`: Conventional-Commit release notes (`write` saves an editable draft, `changelog` prepends CHANGELOG.md). `bump`: atomic lossless version sync of every manifest + lockfile (`dry_run` previews). `publish`: preflight -> bump -> commit -> tag -> push (CI tag workflows) or draft GitHub release (`publish: true` makes it public); ALWAYS call with dry_run first and show the plan to the user. `verify`: remote tag, release state, CI run. `activity`: recent release actions by the user, agents and the CLI. Every action you take shows live on the user's Releases page, so write notes with `notes {write:true}`, polish that file, then `publish {dry_run:true}` before `publish`.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["status", "preflight", "notes", "bump", "publish", "verify"] },
+                        "action": { "type": "string", "enum": ["status", "preflight", "notes", "bump", "publish", "verify", "activity"] },
                         "version": { "type": "string", "description": "patch | minor | major | prerelease | X.Y.Z[-pre]. Omit to use the suggested version" },
                         "dry_run": { "type": "boolean", "description": "bump/publish: report what would happen, change nothing" },
                         "skip_tests": { "type": "boolean", "description": "preflight/publish: skip the build & test gate" },
@@ -246,6 +246,12 @@ pub fn handle_mcp_request(ws: &Path, read_only: bool, req: &Value) -> Option<Val
                     }
                 }
             }
+            if name == "release" {
+                // Credited to the agent in the Releases page activity feed.
+                if let Some(o) = args.as_object_mut() {
+                    o.insert("source".into(), json!("agent"));
+                }
+            }
             if read_only && !matches!(name, "map" | "view" | "search") {
                 return ok(json!({
                     "content": [{ "type": "text", "text": format!("Error: `{name}` is disabled in read-only mode") }],
@@ -287,7 +293,7 @@ fn runs_concurrently(req: &Value) -> bool {
     req["method"] == "tools/call"
         && (matches!(p["name"].as_str(), Some("map" | "view" | "search" | "check"))
             // Read-only release stages (preflight can run a long build) must not block the pipe.
-            || (p["name"] == "release" && matches!(p["arguments"]["action"].as_str().unwrap_or("status"), "status" | "preflight" | "verify")))
+            || (p["name"] == "release" && matches!(p["arguments"]["action"].as_str().unwrap_or("status"), "status" | "preflight" | "verify" | "activity")))
 }
 
 fn send(line: &Value) -> bool {

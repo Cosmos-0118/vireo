@@ -1,4 +1,4 @@
-//! HTTP bridge to the release engine (`code_intel::release`), used by the Releases sidebar pane.
+//! HTTP bridge to the release engine (`code_intel::release`), used by the Releases page.
 
 use axum::{extract::State, http::StatusCode, Json};
 use serde_json::Value;
@@ -15,6 +15,7 @@ pub async fn run(
     let ws = state.workspace_path().await;
     if let Some(o) = body.as_object_mut() {
         o.insert("json".into(), Value::Bool(true));
+        o.insert("source".into(), Value::String("ui".into()));
     }
     let out = tokio::task::spawn_blocking(move || crate::code_intel::run_op(&ws, "release", &body))
         .await

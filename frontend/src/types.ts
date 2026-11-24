@@ -249,7 +249,7 @@ export interface CommandRes {
 export interface OpenTab {
   id: string;
   path: string;
-  mode: 'diff' | 'code' | 'commit-diff' | 'compare-diff' | 'graph' | 'settings' | 'shortcuts';
+  mode: 'diff' | 'code' | 'commit-diff' | 'compare-diff' | 'graph' | 'settings' | 'shortcuts' | 'release';
   staged?: boolean;
   line?: number;
   col?: number;
@@ -439,6 +439,36 @@ export interface ReleaseStatus {
   notes_path: string;
   notes_exists: boolean;
   config: boolean;
+  /** Uncommitted tracked files (first 20). */
+  dirty_files: string[];
+  /** Most recent release tags, newest first. */
+  releases: ReleaseTag[];
+}
+
+export interface ReleaseTag {
+  tag: string;
+  version: string;
+  prerelease: boolean;
+  date: string | null;
+  commit: string | null;
+}
+
+/** One entry of the release activity log (Releases page, agents over MCP, or `vx release`). */
+export interface ReleaseActivity {
+  id: string;
+  ts: number;
+  source: 'ui' | 'agent' | 'cli';
+  action: 'preflight' | 'notes' | 'bump' | 'publish' | 'verify';
+  phase: 'running' | 'done';
+  ok?: boolean;
+  dry_run?: boolean;
+  version?: string | null;
+  tag?: string | null;
+  summary?: string;
+  url?: string | null;
+  path?: string | null;
+  /** ReleaseReport (preflight/verify) or ReleaseOutcome (publish). */
+  detail?: ReleaseReport | ReleaseOutcome | null;
 }
 
 export interface ReleaseCheck {

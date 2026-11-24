@@ -18,6 +18,7 @@ import {
   GitCompare,
   GitFork,
   Keyboard,
+  Rocket,
   Minus,
   Palette,
   PanelBottom,
@@ -91,6 +92,9 @@ const SettingsPage = lazy(() =>
 );
 const ShortcutsPage = lazy(() =>
   import('./components/ShortcutsPage').then((m) => ({ default: m.ShortcutsPage }))
+);
+const ReleasePage = lazy(() =>
+  import('./components/release/ReleasePage').then((m) => ({ default: m.ReleasePage }))
 );
 const CommitGraphView = lazy(() =>
   import('./components/CommitGraphView').then((m) => ({ default: m.CommitGraphView }))
@@ -458,7 +462,12 @@ export function App() {
       setFileData(null);
       return;
     }
-    if (activeTab.mode === 'graph' || activeTab.mode === 'settings' || activeTab.mode === 'shortcuts') {
+    if (
+      activeTab.mode === 'graph' ||
+      activeTab.mode === 'settings' ||
+      activeTab.mode === 'shortcuts' ||
+      activeTab.mode === 'release'
+    ) {
       return;
     }
     const id = activeTab.id;
@@ -1298,6 +1307,12 @@ export function App() {
     setActiveTabId(id);
   }, []);
 
+  const openReleaseTab = useCallback(() => {
+    const id = 'release';
+    setTabs((prev) => (prev.some((t) => t.id === id) ? prev : [...prev, { id, path: 'Releases', mode: 'release' }]));
+    setActiveTabId(id);
+  }, []);
+
   const openShortcutsTab = useCallback(() => {
     const id = 'shortcuts';
     setTabs((prev) =>
@@ -1629,6 +1644,7 @@ export function App() {
     showSearch: () => showSidebarView('search'),
     showSourceControl: () => showSidebarView('changes'),
     openGitGraph: () => openGraphTab(),
+    openReleases: openReleaseTab,
     closeTab: () => {
       const id = activeTabIdRef.current;
       if (id) closeTab(id);
@@ -1968,6 +1984,8 @@ export function App() {
                 recentPaths={tabPulse}
                 onAskAgent={handleAskAgent}
                 onOpenShortcuts={openShortcutsTab}
+                onOpenRelease={openReleaseTab}
+                releaseActive={activeTab?.mode === 'release'}
               />
             </div>
             <ResizeHandle
@@ -2008,6 +2026,8 @@ export function App() {
               fsVersion={fsVersion}
               onAskAgent={handleAskAgent}
               onOpenShortcuts={openShortcutsTab}
+                onOpenRelease={openReleaseTab}
+                releaseActive={activeTab?.mode === 'release'}
             />
           </div>
         )}
@@ -2031,6 +2051,8 @@ export function App() {
                     ? 'Settings'
                     : tab.mode === 'shortcuts'
                     ? 'Keyboard Shortcuts'
+                    : tab.mode === 'release'
+                    ? 'Releases'
                     : tab.mode === 'commit-diff'
                     ? `${baseName} (${tab.commitShortHash})`
                     : tab.mode === 'compare-diff'
@@ -2066,6 +2088,8 @@ export function App() {
                       <Settings size={14} className="text-[var(--accent)] shrink-0" />
                     ) : tab.mode === 'shortcuts' ? (
                       <Keyboard size={14} className="text-[var(--accent)] shrink-0" />
+                    ) : tab.mode === 'release' ? (
+                      <Rocket size={14} className="text-[var(--accent)] shrink-0" />
                     ) : tab.mode === 'commit-diff' ? (
                       <GitCommitHorizontal size={14} className="text-[var(--accent)] shrink-0" />
                     ) : tab.mode === 'diff' || tab.mode === 'compare-diff' ? (
@@ -2118,6 +2142,29 @@ export function App() {
             onKeyDownCapture={() => (userActivityRef.current = Date.now())}
             onPointerDownCapture={() => (userActivityRef.current = Date.now())}
           >
+            {/* Releases stays mounted while its tab is open so choices and results survive tab switches. */}
+            {tabs.some((t) => t.mode === 'release') && (
+              <div className={activeTab?.mode === 'release' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
+                <Suspense
+                  fallback={
+                    <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-dim)]">
+                      Loading Releases...
+                    </div>
+                  }
+                >
+                  <ReleasePage
+                    active={activeTab?.mode === 'release'}
+                    fsVersion={fsVersion}
+                    theme={activeTheme}
+                    onOpenFile={(p) => openFile(p)}
+                    onAskAgent={handleAskAgent}
+                    onShowChanges={() => showSidebarView('changes')}
+                    onRefreshGit={refreshGit}
+                    onToast={showToast}
+                  />
+                </Suspense>
+              </div>
+            )}
             {!activeTab ? (
               <div className="flex-1 min-h-0 overflow-y-auto flex flex-col items-center justify-center-safe p-8 text-center gap-5">
                 <VireoLogo size={56} className="drop-shadow-lg" />
@@ -2170,7 +2217,7 @@ export function App() {
                   </button>
                 </div>
               </div>
-            ) : activeTab.mode === 'settings' ? (
+            ) : activeTab.mode === 'release' ? null : activeTab.mode === 'settings' ? (
               <Suspense
                 fallback={
                   <div className="flex-1 flex items-center justify-center text-xs text-[var(--text-dim)]">

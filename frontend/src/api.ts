@@ -29,6 +29,7 @@ import type {
   ReleaseFileChange,
   ReleaseNotesRes,
   ReleaseOutcome,
+  ReleaseActivity,
   ReleaseReport,
   ReleaseRunOpts,
   ReleaseStatus,
@@ -136,6 +137,7 @@ export const api = {
       ? releaseRun<ReleaseOutcome>('publish', o)
       : trackGitWrite(() => releaseRun<ReleaseOutcome>('publish', o)),
   releaseVerify: (o: ReleaseRunOpts = {}) => releaseRun<ReleaseReport>('verify', o),
+  releaseActivity: () => releaseRun<{ items: ReleaseActivity[] }>('activity'),
 
   gitStatus: () => jsonFetch<GitStatusRes>('/api/git/status'),
   gitDiff: (path: string, staged = false) =>

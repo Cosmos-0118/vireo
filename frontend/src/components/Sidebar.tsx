@@ -10,10 +10,9 @@ import { useKeybindings, withShortcut } from '../keybindings';
 import type { CommitFileChange, GitStatusRes } from '../types';
 const FileExplorer = lazy(() => import('./FileExplorer').then((m) => ({ default: m.FileExplorer })));
 const SearchPane = lazy(() => import('./SearchPane').then((m) => ({ default: m.SearchPane })));
-const ReleasePane = lazy(() => import('./ReleasePane').then((m) => ({ default: m.ReleasePane })));
 import { SourceControlPane } from './SourceControlPane';
 
-export type SidebarTab = 'changes' | 'explorer' | 'search' | 'releases';
+export type SidebarTab = 'changes' | 'explorer' | 'search';
 
 interface SidebarProps {
   activeTab: SidebarTab;
@@ -41,6 +40,10 @@ interface SidebarProps {
   onAskAgent: (text: string) => void;
   /** Open the Keyboard Shortcuts tab. */
   onOpenShortcuts: () => void;
+  /** Open the Releases page (an editor tab, not a sidebar view). */
+  onOpenRelease: () => void;
+  /** The Releases tab is the active editor tab. */
+  releaseActive?: boolean;
   /** path -> pulse key for files an agent just changed. */
   recentPaths?: Record<string, number>;
   /** Render only the icon rail (panel collapsed) so the icons stay reachable. */
@@ -64,15 +67,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
   fsVersion,
   onAskAgent,
   onOpenShortcuts,
+  onOpenRelease,
+  releaseActive = false,
   recentPaths,
   railOnly = false,
 }) => {
   const totalChanged = gitStatus?.files.length ?? 0;
   useKeybindings(); // refresh tooltips when shortcuts are rebound
-  const seen = useRef({ explorer: false, search: false, releases: false });
+  const seen = useRef({ explorer: false, search: false });
   if (activeTab === 'explorer') seen.current.explorer = true;
   if (activeTab === 'search') seen.current.search = true;
-  if (activeTab === 'releases') seen.current.releases = true;
 
   return (
     <div className="flex h-full bg-[var(--bg-sidebar)] border-r border-[var(--border)] select-none">
@@ -129,16 +133,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </button>
 
         <button
-          onClick={() => onTabChange('releases')}
+          onClick={onOpenRelease}
           className={`relative w-9 h-9 flex items-center justify-center rounded-lg cursor-pointer transition-colors ${
-            activeTab === 'releases'
+            releaseActive
               ? 'text-[var(--text-primary)] bg-[var(--bg-active)]'
               : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
           }`}
-          title="Releases"
+          title={withShortcut('Releases', 'openReleases')}
           aria-label="Releases"
         >
-          {activeTab === 'releases' && (
+          {releaseActive && (
             <span className="absolute -left-1.5 top-2 bottom-2 w-[3px] rounded-r bg-[var(--accent)]" />
           )}
           <Rocket size={19} />
@@ -204,21 +208,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
             fsVersion={fsVersion}
             onOpenFile={onOpenFile}
             onOpenDiff={onOpenDiff}
-            onAskAgent={onAskAgent}
-            onRefreshGit={onRefreshGit}
-            onToast={onToast}
-          />
-          </Suspense>
-        </div>
-        )}
-
-        {seen.current.releases && (
-        <div className={activeTab === 'releases' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
-          <Suspense fallback={null}>
-          <ReleasePane
-            active={activeTab === 'releases'}
-            fsVersion={fsVersion}
-            onOpenFile={onOpenFile}
             onAskAgent={onAskAgent}
             onRefreshGit={onRefreshGit}
             onToast={onToast}

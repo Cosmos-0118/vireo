@@ -206,3 +206,34 @@ fn publish_commits_bumps_tags_and_refuses_unsafe_states() {
     assert!(run(&ws, &json!({ "action": "bump" })).unwrap_err().contains("usage"));
     assert!(run(&ws, &json!({ "action": "nope" })).unwrap_err().contains("unknown release action"));
 }
+
+#[test]
+fn activity_log_tracks_source_and_collapses_running_entries() {
+    let ws = tmp("activity");
+    init(&ws);
+    write(&ws, "package.json", "{\n  \"name\": \"a\",\n  \"version\": \"0.1.0\"\n}\n");
+    sh(&ws, &["add", "."]);
+    sh(&ws, &["commit", "-q", "-m", "feat: first"]);
+
+    // An agent writes notes; the UI runs checks. Both land in the log with their source.
+    run(&ws, &json!({ "action": "notes", "version": "0.2.0", "write": true, "source": "agent" })).unwrap();
+    run(&ws, &json!({ "action": "preflight", "version": "0.2.0", "skip_tests": true, "source": "ui" })).unwrap();
+    let items: Value = serde_json::from_str(&run(&ws, &json!({ "action": "activity", "json": true })).unwrap()).unwrap();
+    let items = items["items"].as_array().unwrap();
+    assert_eq!(items.len(), 2);
+    assert_eq!((items[0]["action"].as_str(), items[0]["source"].as_str()), (Some("preflight"), Some("ui")));
+    assert_eq!((items[1]["action"].as_str(), items[1]["source"].as_str()), (Some("notes"), Some("agent")));
+    assert_eq!(items[1]["tag"], "v0.2.0");
+    // The log lives in the git dir, so it never dirties the working tree.
+    assert_eq!(sh(&ws, &["status", "--porcelain", "--", "package.json"]), "");
+    assert!(ws.join(".git").join("vireo-release-activity.jsonl").is_file());
+
+    // A `running` entry is replaced by the entry that finishes it.
+    activity::record(&ws, 7, "agent", "publish", json!({ "phase": "running", "tag": "v0.2.0" }));
+    assert_eq!(activity::read(&ws, 10)[0]["phase"], "running");
+    activity::record(&ws, 7, "agent", "publish", json!({ "ok": true, "tag": "v0.2.0" }));
+    let items = activity::read(&ws, 10);
+    assert_eq!(items.len(), 3);
+    assert_eq!((items[0]["phase"].as_str(), items[0]["ok"].as_bool()), (Some("done"), Some(true)));
+    let _ = std::fs::remove_dir_all(&ws);
+}

@@ -1,10 +1,11 @@
-//! Polyglot release engine behind `vx release` and the Releases sidebar pane.
+//! Polyglot release engine behind `vx release` and the Releases page.
 //!
 //! Stages: `status` (inspect & plan) → `preflight` (gates) → `notes` (Conventional-Commit
 //! changelog) → `bump` (atomic version sync across stacks) → `publish` (commit, tag, push or
 //! draft GitHub release) → `verify`. Every stage is a plain function over [`Ctx`]; [`run`] is the
 //! single entry point and renders text for agents or JSON (`"json": true`) for the UI.
 
+mod activity;
 mod flow;
 mod manifest;
 mod notes;
@@ -203,6 +204,45 @@ struct StatusOut {
     notes_path: String,
     notes_exists: bool,
     config: bool,
+    /// Uncommitted tracked files (first 20), so the UI can say exactly what blocks a release.
+    dirty_files: Vec<String>,
+    /// Most recent release tags, newest first.
+    releases: Vec<PastRelease>,
+}
+
+#[derive(Serialize)]
+struct PastRelease {
+    tag: String,
+    version: String,
+    prerelease: bool,
+    date: Option<String>,
+    commit: Option<String>,
+}
+
+fn past_releases(ctx: &Ctx, n: usize) -> Vec<PastRelease> {
+    let tags: Vec<&Tag> = ctx.tags.iter().take(n).collect();
+    if tags.is_empty() {
+        return Vec::new();
+    }
+    let refs: Vec<String> = tags.iter().map(|t| format!("refs/tags/{}", t.name)).collect();
+    let mut args = vec![
+        "for-each-ref",
+        "--format=%(refname:short)%09%(creatordate:iso-strict)%09%(if)%(*objectname)%(then)%(*objectname:short)%(else)%(objectname:short)%(end)",
+    ];
+    args.extend(refs.iter().map(String::as_str));
+    let meta = git_ok(&ctx.ws, &args).unwrap_or_default();
+    let info = |name: &str| {
+        meta.lines().find_map(|l| {
+            let mut p = l.split('\t');
+            (p.next()? == name).then(|| (p.next().map(str::to_string), p.next().map(str::to_string)))
+        })
+    };
+    tags.iter()
+        .map(|t| {
+            let (date, commit) = info(&t.name).unwrap_or((None, None));
+            PastRelease { tag: t.name.clone(), version: t.ver.to_string(), prerelease: t.ver.is_pre(), date, commit }
+        })
+        .collect()
 }
 
 fn status(ctx: &Ctx) -> StatusOut {
@@ -226,13 +266,17 @@ fn status(ctx: &Ctx) -> StatusOut {
     let suggested = ctx.suggestion(&cs);
     let tag = suggested.version.as_deref().and_then(Ver::parse).map(|v| ctx.tag_for(&v)).unwrap_or_default();
     let notes_path = ctx.notes_path(&tag);
+    let dirty_out = git_ok(ws, &["diff", "--name-only", "HEAD"]).unwrap_or_default();
+    let dirty: Vec<&str> = dirty_out.lines().filter(|l| !l.trim().is_empty()).collect();
     StatusOut {
         version: ctx.base().to_string(),
         latest_tag: ctx.tags.first().map(|t| t.name.clone()),
         latest_stable: ctx.tags.iter().find(|t| !t.ver.is_pre()).map(|t| t.name.clone()),
         tag_prefix: ctx.prefix(),
         branch: git_ok(ws, &["rev-parse", "--abbrev-ref", "HEAD"]).ok(),
-        dirty: git_ok(ws, &["diff", "--name-only", "HEAD"]).map(|s| s.lines().count()).unwrap_or(0),
+        dirty: dirty.len(),
+        dirty_files: dirty.iter().take(20).map(|s| s.to_string()).collect(),
+        releases: past_releases(ctx, 8),
         stacks,
         drift: if seen.len() > 1 { seen } else { Vec::new() },
         commits_since: cs.len(),
@@ -357,12 +401,21 @@ fn flag(a: &Value, k: &str) -> bool {
 }
 
 /// `vx release <action>` entry point. Text for agents, or JSON (`json: true`) for the UI.
+/// Every state-changing action (and each gate run) is written to the activity log with its
+/// `source` (`ui`, `agent` or `cli`) so the Releases page can show who did what.
 pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
     let action = s(a, "action").unwrap_or("status");
     let as_json = flag(a, "json");
+    let source = s(a, "source").unwrap_or("cli");
+    let pretty = |v: Value| serde_json::to_string(&v).map_err(|e| e.to_string());
+    if action == "activity" {
+        let items = activity::read(ws, 60);
+        return if as_json { pretty(json!({ "items": items })) } else { Ok(activity::render(&items)) };
+    }
     let ctx = Ctx::load(ws)?;
     let version = s(a, "version");
-    let pretty = |v: Value| serde_json::to_string(&v).map_err(|e| e.to_string());
+    let id = activity::now_ms();
+    let log = |action: &str, entry: Value| activity::record(ws, id, source, action, entry);
     match action {
         "status" => {
             let st = status(&ctx);
@@ -374,6 +427,13 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
         "preflight" => {
             let target = ctx.target(version)?;
             let report = flow::preflight(&ctx, &target, !flag(a, "skip_tests"));
+            let failed = report.checks.iter().filter(|c| c.status == "fail").count();
+            let warned = report.checks.iter().filter(|c| c.status == "warn").count();
+            log("preflight", json!({
+                "ok": report.ok, "version": report.version, "tag": report.tag,
+                "summary": if failed > 0 { format!("{failed} check(s) failed") } else if warned > 0 { format!("passed with {warned} warning(s)") } else { "all checks passed".into() },
+                "detail": serde_json::to_value(&report).unwrap_or(Value::Null),
+            }));
             if as_json {
                 return pretty(serde_json::to_value(&report).map_err(|e| e.to_string())?);
             }
@@ -399,6 +459,12 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
             if flag(a, "changelog") {
                 msgs.push(prepend_changelog(ws, &n.markdown, &tag, &target)?);
             }
+            if !msgs.is_empty() {
+                log("notes", json!({
+                    "ok": true, "version": target.to_string(), "tag": tag, "path": path,
+                    "summary": format!("{} commit(s) · {}", n.commits, msgs.join(" · ")),
+                }));
+            }
             if as_json {
                 return pretty(json!({
                     "version": target.to_string(), "tag": tag, "markdown": n.markdown, "commits": n.commits,
@@ -418,6 +484,10 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
             let dry = flag(a, "dry_run");
             if !dry {
                 manifest::write_all(ws, &changes)?;
+                log("bump", json!({
+                    "ok": true, "version": target.to_string(), "tag": ctx.tag_for(&target),
+                    "summary": format!("{} → {target} in {} file(s)", ctx.base(), changes.len()),
+                }));
             }
             if as_json {
                 return pretty(json!({ "version": target.to_string(), "dry_run": dry, "files": changes }));
@@ -435,7 +505,33 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
                 assets: strs(a, "assets"),
                 only: strs(a, "only"),
             };
-            let out = flow::publish(&ctx, &opts)?;
+            let want = ctx.target(version).ok();
+            let (want_ver, want_tag) = (want.as_ref().map(|v| v.to_string()), want.as_ref().map(|v| ctx.tag_for(v)));
+            if !opts.dry_run {
+                log("publish", json!({
+                    "phase": "running", "dry_run": false, "version": want_ver, "tag": want_tag,
+                    "summary": "releasing…",
+                }));
+            }
+            let out = match flow::publish(&ctx, &opts) {
+                Ok(o) => o,
+                Err(e) => {
+                    log("publish", json!({
+                        "ok": false, "dry_run": opts.dry_run, "version": want_ver, "tag": want_tag, "summary": e,
+                    }));
+                    return Err(e);
+                }
+            };
+            let summary = if out.ok {
+                if out.dry_run { "plan ready, nothing changed".to_string() } else { format!("released {}", out.tag) }
+            } else {
+                let failed = out.preflight.iter().chain(&out.steps).filter(|c| c.status == "fail").count();
+                if out.dry_run { format!("blocked: {failed} check(s) failed") } else { format!("stopped: {failed} step(s) failed") }
+            };
+            log("publish", json!({
+                "ok": out.ok, "dry_run": out.dry_run, "version": out.version, "tag": out.tag, "url": out.url,
+                "summary": summary, "detail": serde_json::to_value(&out).unwrap_or(Value::Null),
+            }));
             if as_json {
                 return pretty(serde_json::to_value(&out).map_err(|e| e.to_string())?);
             }
@@ -447,11 +543,16 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
                 None => ctx.tags.first().map(|t| t.ver.clone()).ok_or("no release tag to verify; pass a version")?,
             };
             let report = flow::verify(&ctx, &target);
+            log("verify", json!({
+                "ok": report.ok, "version": report.version, "tag": report.tag,
+                "summary": if report.ok { "release verified".to_string() } else { "verification found problems".to_string() },
+                "detail": serde_json::to_value(&report).unwrap_or(Value::Null),
+            }));
             if as_json {
                 return pretty(serde_json::to_value(&report).map_err(|e| e.to_string())?);
             }
             Ok(report.render())
         }
-        other => Err(format!("unknown release action `{other}` (status|preflight|notes|bump|publish|verify)")),
+        other => Err(format!("unknown release action `{other}` (status|preflight|notes|bump|publish|verify|activity)")),
     }
 }

@@ -12,7 +12,7 @@ pub const USAGE: &str = "vx <map|outline|view|search|apply|replace|edit|symbol|c
   vx create <file> [--force] [--text T|--file F]\n\
   vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
   vx check [--raw] [--warnings] [--timeout S] [--dir D] [--cmd C | cmd args...]\n\
-  vx release [status|preflight|notes|bump|publish|verify] [patch|minor|major|prerelease|X.Y.Z] [--dry-run] [--skip-tests] [--write] [--changelog] [--notes-file F] [--publish] [--no-push] [--asset G]... [--only FILE]... [--json]\n\
+  vx release [status|preflight|notes|bump|publish|verify|activity] [patch|minor|major|prerelease|X.Y.Z] [--dry-run] [--skip-tests] [--write] [--changelog] [--notes-file F] [--publish] [--no-push] [--asset G]... [--only FILE]... [--json]\n\
   vx mcp [--workspace DIR] [--read-only]";
 
 pub const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, atomic patches & replace, smart search, symbol ops, repo map, build check, MCP server\n\
@@ -44,6 +44,7 @@ pub const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, ato
       publish [ver] [--dry-run] [--no-push] [--publish] [--skip-tests] [--notes-file F] [--asset GLOB]...\n\
                                   preflight -> bump -> commit -> tag -> push (CI-tag repos) or draft GitHub release (--publish makes it public). ALWAYS --dry-run first.\n\
       verify [ver]                remote tag, GitHub release state + assets, CI run for the tag\n\
+      activity                    recent release actions (Releases page, agents, CLI), newest first\n\
       Custom version files / assets / checks: `.vireo/release.json` ({\"files\":[{\"path\",\"pattern\"}],\"exclude\":[],\"assets\":[],\"checks\":[],\"mode\":\"ci|gh|local\"}).\n\
   vx mcp [--workspace DIR] [--read-only]\n\
                                   stdio MCP JSON-RPC 2.0 server exposing vx tools with zero shell quoting\n\
