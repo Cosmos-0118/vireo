@@ -2,9 +2,22 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
+use std::sync::Arc;
 use std::path::Path;
 
 use super::code_intel;
+
+/// Sent in the MCP `initialize` reply: exact argument shapes, so a host that lazy-loads tool
+/// schemas needs no extra round trip to learn them.
+const MCP_INSTRUCTIONS: &str = "vx tool arguments (JSON):\n\
+- view {path, target?: \"10..50\" | \"10..30,80..100\" | \"Symbol\", outline?: true} or {specs: [\"a.rs:10..50\", \"b.rs:Foo\"]}\n\
+- search {query, path?, glob?, literal?, ignore_case?, context?, files_only?}\n\
+- edit {path, start: \"12#ab..15#cd\" | \"top\" | \"bottom\" | \"imports\", new_text, op?: replace|insert_after|insert_before|delete}; \
+or {path, symbol, new_text}; or {path, old_text, new_text} (no anchors needed, returns fresh ones); or {path, edits: [{start, end?, op?, new_text}]}\n\
+- apply {patch: \"*** Update File: a.rs\\n@@ 12#ab..15#cd\\n+new line\"}\n\
+- replace {old, new, path?, glob?, regex?, expected?, dry_run?}\n\
+- check {cmd?, dir?, warnings?}: a build still running after 60s continues in the background and returns a job id; call check {job} to wait for it.\n\
+Anchors `N#hh` come from view/search/edit output; edits return fresh anchors, so no re-view is needed.";
 
 pub fn mcp_tools(read_only: bool) -> Value {
     let mut tools = vec![
@@ -101,6 +114,7 @@ pub fn mcp_tools(read_only: bool) -> Value {
                         "end": { "type": "string", "description": "Optional end anchor when `start` is a single anchor" },
                         "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"], "description": "Default replace (needs new_text); use delete to remove lines" },
                         "new_text": { "type": "string", "description": "Replacement / inserted text" },
+                        "old_text": { "type": "string", "description": "No anchors yet (e.g. you read the file another way)? Pass the exact text to replace instead of `start`; it must occur once. Returns fresh N#hash anchors for follow-up edits" },
                         "edits": { "type": "array", "description": "Several edits to this file in ONE atomic call; anchors all refer to the file as it is now. Each: {start, end?, op?, new_text?}", "items": { "type": "object" } },
                         "symbol": { "type": "string", "description": "Instead of anchors: edit a whole symbol by name (op replace / insert_after / delete)" }
                     },
@@ -125,7 +139,7 @@ pub fn mcp_tools(read_only: bool) -> Value {
             }),
             json!({
                 "name": "check",
-                "description": "Run build/typecheck/tests (auto-detected or custom `cmd`) and return deduplicated anchored errors, rustc labels/notes, and failing test output.",
+                "description": "Run build/typecheck/tests (auto-detected or custom `cmd`) and return deduplicated anchored errors, rustc labels/notes, and failing test output. A check still running after `wait` seconds (default 60) keeps running in the background and returns a job id: call again with {job} to wait for it.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -133,7 +147,9 @@ pub fn mcp_tools(read_only: bool) -> Value {
                         "dir": { "type": "string", "description": "Folder to run in (auto-detected checks or `cmd`); unique names like `frontend` auto-resolve" },
                         "raw": { "type": "boolean" },
                         "warnings": { "type": "boolean" },
-                        "timeout": { "type": "integer" }
+                        "timeout": { "type": "integer", "description": "Hard kill after this many seconds in total (default 900)" },
+                        "wait": { "type": "integer", "description": "Seconds to wait before returning a background job id (default 60)" },
+                        "job": { "type": "string", "description": "Job id from an earlier `⏳ still running` reply: wait for that check and report it" }
                     }
                 },
                 "annotations": { "readOnlyHint": false }
@@ -189,6 +205,7 @@ pub fn handle_mcp_request(ws: &Path, read_only: bool, req: &Value) -> Option<Val
             ok(json!({
                 "protocolVersion": ver,
                 "capabilities": { "tools": { "listChanged": false } },
+                "instructions": MCP_INSTRUCTIONS,
                 "serverInfo": { "name": "vx", "version": env!("CARGO_PKG_VERSION") }
             }))
         }
@@ -196,7 +213,17 @@ pub fn handle_mcp_request(ws: &Path, read_only: bool, req: &Value) -> Option<Val
         "tools/list" => ok(json!({ "tools": mcp_tools(read_only) })),
         "tools/call" => {
             let name = req["params"]["name"].as_str().unwrap_or("");
-            let args = req["params"].get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let mut args = req["params"].get("arguments").cloned().unwrap_or_else(|| json!({}));
+            if name == "check" {
+                // Background long builds before the host's own tool timeout fires, and let the build
+                // itself run far longer than one MCP call.
+                if let Some(o) = args.as_object_mut() {
+                    o.entry("wait").or_insert(json!(60));
+                    if o.get("job").is_none() {
+                        o.entry("timeout").or_insert(json!(900));
+                    }
+                }
+            }
             if read_only && !matches!(name, "map" | "view" | "search") {
                 return ok(json!({
                     "content": [{ "type": "text", "text": format!("Error: `{name}` is disabled in read-only mode") }],
@@ -231,30 +258,61 @@ pub fn handle_mcp_request(ws: &Path, read_only: bool, req: &Value) -> Option<Val
     }
 }
 
+/// Tools that never write source files. They run on worker threads so a slow `check` (or a big
+/// `search`) can't block the requests queued behind it on the single stdio pipe.
+fn runs_concurrently(req: &Value) -> bool {
+    req["method"] == "tools/call" && matches!(req["params"]["name"].as_str(), Some("map" | "view" | "search" | "check"))
+}
+
+fn send(line: &Value) -> bool {
+    let Ok(mut s) = serde_json::to_string(line) else { return true };
+    s.push('\n');
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock(); // one lock per message: replies from worker threads never interleave
+    out.write_all(s.as_bytes()).is_ok() && out.flush().is_ok()
+}
+
 pub fn run_mcp(ws: &Path, read_only: bool) {
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    let ws: Arc<std::path::PathBuf> = Arc::new(ws.to_path_buf());
+    let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for line in BufReader::new(stdin.lock()).lines() {
         let Ok(line) = line else { break };
         let t = line.trim();
         if t.is_empty() {
             continue;
         }
-        let resp = match serde_json::from_str::<Value>(t) {
-            Ok(req) => handle_mcp_request(ws, read_only, &req),
-            Err(e) => Some(json!({
-                "jsonrpc": "2.0",
-                "id": Value::Null,
-                "error": { "code": -32700, "message": format!("parse error: {e}") }
-            })),
-        };
-        if let Some(r) = resp {
-            if let Ok(s) = serde_json::to_string(&r) {
-                if writeln!(out, "{s}").is_err() || out.flush().is_err() {
+        match serde_json::from_str::<Value>(t) {
+            Ok(req) if runs_concurrently(&req) => {
+                workers.retain(|h| !h.is_finished());
+                let ws = Arc::clone(&ws);
+                workers.push(std::thread::spawn(move || {
+                    if let Some(r) = handle_mcp_request(&ws, read_only, &req) {
+                        send(&r);
+                    }
+                }));
+            }
+            Ok(req) => {
+                if let Some(r) = handle_mcp_request(&ws, read_only, &req) {
+                    if !send(&r) {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                let r = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32700, "message": format!("parse error: {e}") }
+                });
+                if !send(&r) {
                     break;
                 }
             }
         }
+    }
+    // stdin closed: let in-flight replies finish (piped/scripted use) before the process exits.
+    for w in workers {
+        let _ = w.join();
     }
 }

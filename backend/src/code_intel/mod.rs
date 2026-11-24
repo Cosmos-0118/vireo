@@ -69,12 +69,12 @@ Prefer `vx` over cat/rg/sed/Python patch scripts. For edits: use `vx apply` (ato
 - search <regex> [path] [-g G] [-C N] [-F] [-l]   anchored grep (smart path/glob resolution, context, literal, files-only)\n\
 - apply [--file F] [--dry-run]  atomic multi-file V4A patch (`*** Update File:` + `@@ 12#ab..15#cd`/`@@ after`/`@@ delete` with `+` lines, or classic `@@` context)\n\
 - replace <old> <new> [path] [-g G] [-r] [--dry-run] [--expected N]   atomic literal/regex replace across files\n\
-- edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]   (MCP: `start` may be a range `12#ab..15#cd`; `edits:[{start,end?,op?,new_text}]` batches several atomically; `symbol` instead of `start` edits a whole symbol)\n\
+- edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]   (MCP: `start` may be a range `12#ab..15#cd`; `edits:[{start,end?,op?,new_text}]` batches several atomically; `symbol` instead of `start` edits a whole symbol; `old_text`+`new_text` replaces exact text with no anchors and returns fresh ones)\n\
 - Familiar names work: file_path/old_string/new_string/pattern/content/name. `search` retries as literal text when a regex finds nothing. `view a.rs:Foo` or `Foo:7` reads a symbol.\n\
 - symbol <file> <name> [--replace|--insert-after|--delete] [--text T|--file F]\n\
 - create <file> [--force] [--text T|--file F]\n\
 - ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
-- check [--raw] [--warnings] [--timeout S] [cmd ...]   build/test runner with anchored errors, rustc notes/labels, and failing test output\n\
+- check [--raw] [--warnings] [--timeout S] [cmd ...]   build/test runner with anchored errors, rustc notes/labels, and failing test output (MCP: still running after 60s -> background job id; `check {job}` waits for it)\n\
 From a shell on Windows, prefer MCP or `--file F` over piping multi-line code. Edits print new anchors and syntax errors immediately; `vx help` has details.";
 
 fn s<'a>(args: &'a Value, k: &str) -> Option<&'a str> {
@@ -165,7 +165,11 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
                         expected: if a["replace_all"].as_bool().unwrap_or(false) { None } else { Some(1) },
                         ..Default::default()
                     };
-                    return replace_text(ws, old, s(a, "new_text").unwrap_or(""), &opts);
+                    let msg = replace_text(ws, old, s(a, "new_text").unwrap_or(""), &opts)?;
+                    return Ok(match edit::anchors_after_replace(ws, need("path")?, cwd.as_deref(), s(a, "new_text").unwrap_or("")) {
+                        Some(snip) => format!("{msg}\n{snip}"),
+                        None => msg,
+                    });
                 }
             }
             // `top` / `bottom` / `imports` need no anchor: same path as a one-entry batch.
@@ -227,6 +231,8 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
                 raw: a["raw"].as_bool().unwrap_or(false),
                 warnings: a["warnings"].as_bool().unwrap_or(false),
                 dir: s(a, "dir").map(str::to_string),
+                wait: a["wait"].as_u64(),
+                job: s(a, "job").map(str::to_string),
                 cwd: cwd.clone(),
             },
         ),

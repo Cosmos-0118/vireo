@@ -424,3 +424,26 @@ pub fn edit_batch(ws: &Path, path: &str, edits: &[serde_json::Value], cwd: Optio
     patch.push_str("*** End Patch\n");
     apply_patch(ws, &patch, cwd, false).map_err(|e| format!("{e}\n(no edits were applied)"))
 }
+
+/// Fresh `N#hh` anchors for `new_text` after an anchor-free (`old_text`) replace, so a caller that
+/// never viewed the file can keep editing by anchor without a re-read.
+pub(crate) fn anchors_after_replace(ws: &Path, path: &str, cwd: Option<&Path>, new_text: &str) -> Option<String> {
+    let new_lines = text_to_lines(new_text);
+    let k = new_lines.len();
+    if k == 0 || new_text.trim().is_empty() {
+        return None;
+    }
+    let (_, _, doc, _) = read_doc_smart(ws, path, cwd).ok()?;
+    let a = (0..=doc.lines.len().checked_sub(k)?).find(|&i| doc.lines[i..i + k] == new_lines[..])?;
+    let b = a + k - 1;
+    let head = if a == b {
+        format!("New anchor: {}.", doc.anchor(a))
+    } else {
+        format!("New anchors: {}..{}.", doc.anchor(a), doc.anchor(b))
+    };
+    if k > 12 {
+        return Some(head);
+    }
+    let last = doc.lines.len() - 1;
+    Some(format!("{head}\n{}", doc.hashlines(a.saturating_sub(2), (b + 2).min(last)).trim_end()))
+}

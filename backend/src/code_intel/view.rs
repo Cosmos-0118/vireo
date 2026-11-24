@@ -3,10 +3,12 @@
 use std::path::Path;
 
 use super::doc::{hl, read_doc_smart, Doc};
-use super::symbols::{find_symbol, lang_for, qualified, symbols};
+use super::symbols::{find_symbol, lang_for, qualified, symbols, Lang};
 
-pub(crate) const MAX_VIEW_LINES: usize = 400;
-pub(crate) const MAX_VIEW_BYTES: usize = 30_000;
+// Kept well under what MCP hosts inline from a tool result: past roughly 15-16 KB they
+// middle-truncate and spill the text to a side file, which destroys the very anchors we print.
+pub(crate) const MAX_VIEW_LINES: usize = 300;
+pub(crate) const MAX_VIEW_BYTES: usize = 14_000;
 /// One minified/generated line must not eat the whole budget (the hash stays that of the full line).
 const MAX_LINE_CHARS: usize = 2_000;
 
@@ -21,6 +23,24 @@ pub(crate) fn show_line(doc: &Doc, i: usize) -> String {
     s
 }
 
+/// Compact outline (`[start#h..end#h] signature`) of the symbols at or after row `from`, so a
+/// capped whole-file view still shows where everything in the unshown rest lives.
+fn tail_outline(rel: &str, doc: &Doc, from: usize) -> String {
+    let Some(lang) = lang_for(rel).filter(|l| *l != Lang::Json) else { return String::new() };
+    let syms = symbols(lang, &doc.to_text());
+    let rest: Vec<_> = syms.iter().filter(|s| s.depth <= 1 && s.end >= from).collect();
+    if rest.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("-- outline of the rest --\n");
+    for s in rest.iter().take(40) {
+        out.push_str(&format!("{}[{}..{}] {}\n", "  ".repeat(s.depth), doc.anchor(s.start), doc.anchor(s.end), s.sig));
+    }
+    if rest.len() > 40 {
+        out.push_str(&format!("…[{} more symbols; `outline` lists all]\n", rest.len() - 40));
+    }
+    out
+}
 fn parse_line_range(t: &str) -> Option<(usize, Option<usize>)> {
     let re = lazy_re!(r"^(\d+)(?:#[0-9a-fA-F]{2})?(?:(?:\.\.|-)(\d+)?(?:#[0-9a-fA-F]{2})?)?$");
     let c = re.captures(t.trim())?;
@@ -92,6 +112,9 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> 
                     i + 1,
                     to + 1
                 ));
+                if label.is_none() {
+                    out.push_str(&tail_outline(&rel, &doc, i));
+                }
                 break;
             }
             out.push_str(&line);

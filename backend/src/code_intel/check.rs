@@ -3,10 +3,15 @@
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::doc::hl;
-use super::util::{ignored_dir, norm_slashes, rel_of, resolve_existing, run_capture, shell_command};
+use super::util::{
+    ignored_dir, norm_slashes, rel_of, resolve_existing, run_capture_into, shell_command, Capture, RunOut,
+};
 
 pub(crate) struct Diag {
     file: String,
@@ -477,6 +482,10 @@ pub struct CheckOpts {
     pub dir: Option<String>,
     /// The caller's working directory (CLI): a custom command runs there when no `dir` is given.
     pub cwd: Option<PathBuf>,
+    /// Seconds to wait before parking a still-running check as a background job (MCP). `None` blocks.
+    pub wait: Option<u64>,
+    /// Id of a parked job to resume waiting on.
+    pub job: Option<String>,
 }
 
 /// Manifest(s) that mark the project root a command's program works from.
@@ -553,7 +562,150 @@ fn short_label(cmd: &str) -> String {
     }
 }
 
+type Job = (String, String, String); // (folder prefix, command line, label)
+
+/// A running (or just-finished) check: its worker thread reports through `rx`.
+struct Running {
+    rx: mpsc::Receiver<Result<RunOut, String>>,
+    cap: Capture,
+    job: Job,
+    started: Instant,
+}
+
+/// A check promoted to the background after its `wait` window, plus the jobs still queued behind it.
+struct Suspended {
+    run: Running,
+    queue: VecDeque<Job>,
+    custom_cmd: bool,
+    timeout_secs: u64,
+}
+
+static SUSPENDED: Mutex<Vec<(String, Suspended)>> = Mutex::new(Vec::new());
+static NEXT_JOB: AtomicUsize = AtomicUsize::new(1);
+/// Default wait for a `job` poll when the caller gives none.
+const POLL_WAIT_SECS: u64 = 60;
+
+fn start_job(ws: &Path, job: Job, timeout_secs: u64) -> Running {
+    let mut c = shell_command(&job.1);
+    c.current_dir(if job.0.is_empty() { ws.to_path_buf() } else { ws.join(job.0.trim_end_matches('/')) });
+    let cap = Capture::default();
+    let (tx, rx) = mpsc::channel();
+    let (cap2, dur) = (cap.clone(), Duration::from_secs(timeout_secs.max(5)));
+    std::thread::spawn(move || {
+        let _ = tx.send(run_capture_into(c, dur, cap2));
+    });
+    Running { rx, cap, job, started: Instant::now() }
+}
+
+/// Append the report for one finished job.
+fn render_job(
+    ws: &Path,
+    report: &mut String,
+    out: RunOut,
+    (prefix, _, label): &Job,
+    custom_cmd: bool,
+    timeout_secs: u64,
+    opts: &CheckOpts,
+) {
+    let raw = strip_ansi(&format!("{}\n{}", out.stdout, out.stderr));
+    if out.timed_out {
+        report.push_str(&format!("✖ {label}: timed out after {timeout_secs}s (raise with --timeout S)\n"));
+        return;
+    }
+    if opts.raw {
+        let mark = if out.code == 0 { "✔" } else { "✖" };
+        report.push_str(&format!("{mark} {label} exit {} ({:.1}s):\n{}\n", out.code, out.secs, raw_view(&raw)));
+        return;
+    }
+    let diags = parse_diags(&raw, prefix);
+    let errors = diags.iter().filter(|d| d.error).count();
+    let warns = diags.len() - errors;
+    let tests = test_summary(&raw).map(|t| format!(", tests: {t}")).unwrap_or_default();
+    if out.code == 0 && errors == 0 {
+        let quiet = if custom_cmd && diags.is_empty() && tests.is_empty() { quiet_note(&raw) } else { String::new() };
+        report.push_str(&format!(
+            "✔ {label} ok ({:.1}s{tests}{quiet}){}\n",
+            out.secs,
+            if warns > 0 { format!(", {warns} warning(s){}", if opts.warnings { ":" } else { " (list: --warnings)" }) } else { String::new() }
+        ));
+        if opts.warnings && warns > 0 {
+            let w: Vec<&Diag> = diags.iter().filter(|d| !d.error).collect();
+            render_list(ws, report, &w, 15);
+        }
+    } else if errors > 0 {
+        report.push_str(&render_diags(ws, &diags, label, out.secs, opts.warnings));
+    } else {
+        let tail = compress_plain(&raw);
+        let tail = if tail.trim().is_empty() { "(no output)".to_string() } else { tail };
+        let hint = env_hint(&raw).map(|h| format!("{h}\n")).unwrap_or_default();
+        report.push_str(&format!("✖ {label} failed (exit {}, {:.1}s{tests}):\n{hint}{}\n", out.code, out.secs, tail));
+    }
+}
+
+/// Run queued jobs in order. With a `wait` window, a job still running when it closes is parked
+/// (not killed) and a `⏳ … job` line tells the caller how to poll it.
+fn drive(
+    ws: &Path,
+    mut queue: VecDeque<Job>,
+    mut report: String,
+    custom_cmd: bool,
+    timeout_secs: u64,
+    opts: &CheckOpts,
+    mut resumed: Option<Running>,
+) -> Result<String, String> {
+    loop {
+        let run = match resumed.take() {
+            Some(r) => r,
+            None => match queue.pop_front() {
+                Some(job) => start_job(ws, job, timeout_secs),
+                None => break,
+            },
+        };
+        let got = match opts.wait {
+            Some(w) => run.rx.recv_timeout(Duration::from_secs(w)),
+            None => run.rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        match got {
+            Ok(Ok(out)) => render_job(ws, &mut report, out, &run.job, custom_cmd, timeout_secs, opts),
+            Ok(Err(e)) => report.push_str(&format!("✖ {}: failed to start: {e}\n", run.job.2)),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                report.push_str(&format!("✖ {}: runner stopped unexpectedly\n", run.job.2));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let id = format!("chk-{}", NEXT_JOB.fetch_add(1, Ordering::Relaxed));
+                let latest = run.cap.last_line().map(|l| format!("; latest: {}", clip(&l, 100))).unwrap_or_default();
+                report.push_str(&format!(
+                    "⏳ {} still running after {:.0}s (job {id}{latest}). Poll with check {{\"job\":\"{id}\"}} (waits up to {}s more); it is killed at {timeout_secs}s total.\n",
+                    run.job.2,
+                    run.started.elapsed().as_secs_f64(),
+                    opts.wait.unwrap_or(POLL_WAIT_SECS),
+                ));
+                let mut all = SUSPENDED.lock().unwrap_or_else(|e| e.into_inner());
+                if all.len() >= 8 {
+                    all.remove(0);
+                }
+                all.push((id, Suspended { run, queue, custom_cmd, timeout_secs }));
+                return Ok(report);
+            }
+        }
+    }
+    let max = if opts.raw { 24_000 } else { 12_000 };
+    Ok(report.chars().take(max).collect())
+}
+
 pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64, opts: CheckOpts) -> Result<String, String> {
+    if let Some(id) = opts.job.as_deref().map(str::trim).filter(|j| !j.is_empty()) {
+        let taken = {
+            let mut all = SUSPENDED.lock().unwrap_or_else(|e| e.into_inner());
+            all.iter().position(|(k, _)| k == id).map(|i| all.remove(i).1)
+        };
+        let Some(s) = taken else {
+            return Err(format!("unknown check job `{id}` (already reported, or this server restarted)"));
+        };
+        let opts = CheckOpts { wait: opts.wait.or(Some(POLL_WAIT_SECS)), ..opts };
+        // Earlier jobs' results were already part of the first reply; keep only what follows.
+        return drive(ws, s.queue, String::new(), s.custom_cmd, s.timeout_secs, &opts, Some(s.run));
+    }
     let cmd = cmd.map(str::trim).filter(|c| !c.is_empty());
     // Folder: explicit `dir` > caller's cwd (custom command) > inferred from the command's manifest.
     let explicit = match opts.dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
@@ -564,7 +716,7 @@ pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64, opts: CheckOpts) -
         None => None,
     };
     let mut report = String::new();
-    let jobs: Vec<(String, String, String)> = match (cmd, explicit) {
+    let jobs: Vec<Job> = match (cmd, explicit) {
         (Some(c), Some((prefix, note))) => {
             if let Some(n) = note {
                 report.push_str(&format!("{n}\n"));
@@ -594,57 +746,12 @@ pub fn check(ws: &Path, cmd: Option<&str>, timeout_secs: u64, opts: CheckOpts) -
         return Err("no project detected (Cargo.toml / tsconfig.json / go.mod / *.sln / *.csproj); pass a command, e.g. vx check npm test (and `dir` to pick a folder)".into());
     }
     let multi = jobs.len() > 1 || jobs.iter().any(|(p, ..)| !p.is_empty());
-    let jobs: Vec<(String, String, String)> = jobs
+    let jobs: VecDeque<Job> = jobs
         .into_iter()
         .map(|(p, c, l)| {
             let l = if multi && !p.is_empty() { format!("{l} [{}]", p.trim_end_matches('/')) } else { l };
             (p, c, l)
         })
         .collect();
-    for (prefix, command_line, label) in jobs {
-        let mut c = shell_command(&command_line);
-        c.current_dir(if prefix.is_empty() { ws.to_path_buf() } else { ws.join(prefix.trim_end_matches('/')) });
-        let out = match run_capture(c, Duration::from_secs(timeout_secs.max(5))) {
-            Ok(o) => o,
-            Err(e) => {
-                report.push_str(&format!("✖ {label}: failed to start: {e}\n"));
-                continue;
-            }
-        };
-        let raw = strip_ansi(&format!("{}\n{}", out.stdout, out.stderr));
-        if out.timed_out {
-            report.push_str(&format!("✖ {label}: timed out after {timeout_secs}s (raise with --timeout S)\n"));
-            continue;
-        }
-        if opts.raw {
-            let mark = if out.code == 0 { "✔" } else { "✖" };
-            report.push_str(&format!("{mark} {label} exit {} ({:.1}s):\n{}\n", out.code, out.secs, raw_view(&raw)));
-            continue;
-        }
-        let diags = parse_diags(&raw, &prefix);
-        let errors = diags.iter().filter(|d| d.error).count();
-        let warns = diags.len() - errors;
-        let tests = test_summary(&raw).map(|t| format!(", tests: {t}")).unwrap_or_default();
-        if out.code == 0 && errors == 0 {
-            let quiet = if cmd.is_some() && diags.is_empty() && tests.is_empty() { quiet_note(&raw) } else { String::new() };
-            report.push_str(&format!(
-                "✔ {label} ok ({:.1}s{tests}{quiet}){}\n",
-                out.secs,
-                if warns > 0 { format!(", {warns} warning(s){}", if opts.warnings { ":" } else { " (list: --warnings)" }) } else { String::new() }
-            ));
-            if opts.warnings && warns > 0 {
-                let w: Vec<&Diag> = diags.iter().filter(|d| !d.error).collect();
-                render_list(ws, &mut report, &w, 15);
-            }
-        } else if errors > 0 {
-            report.push_str(&render_diags(ws, &diags, &label, out.secs, opts.warnings));
-        } else {
-            let tail = compress_plain(&raw);
-            let tail = if tail.trim().is_empty() { "(no output)".to_string() } else { tail };
-            let hint = env_hint(&raw).map(|h| format!("{h}\n")).unwrap_or_default();
-            report.push_str(&format!("✖ {label} failed (exit {}, {:.1}s{tests}):\n{hint}{}\n", out.code, out.secs, tail));
-        }
-    }
-    let max = if opts.raw { 24_000 } else { 12_000 };
-    Ok(report.chars().take(max).collect())
+    drive(ws, jobs, report, cmd.is_some(), timeout_secs, &opts, None)
 }

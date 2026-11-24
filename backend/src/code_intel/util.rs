@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use walkdir::WalkDir;
 
 static PATH_PROVIDER: OnceLock<fn() -> OsString> = OnceLock::new();
 
@@ -140,7 +139,51 @@ fn pump<R: Read + Send + 'static>(mut r: R, buf: Arc<Mutex<Vec<u8>>>) -> std::th
     })
 }
 
-pub(crate) fn run_capture(mut cmd: Command, timeout: Duration) -> Result<RunOut, String> {
+/// Output buffers shared with a running child's reader threads, so a caller can peek at progress.
+#[derive(Clone, Default)]
+pub(crate) struct Capture {
+    pub out: Arc<Mutex<Vec<u8>>>,
+    pub err: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Capture {
+    /// Last non-empty line of stderr, else stdout (cargo prints `Compiling x (n/m)` to stderr).
+    pub fn last_line(&self) -> Option<String> {
+        let tail = |b: &Arc<Mutex<Vec<u8>>>| -> Option<String> {
+            let g = b.lock().ok()?;
+            let from = g.len().saturating_sub(4096);
+            String::from_utf8_lossy(&g[from..])
+                .split(['\n', '\r'])
+                .map(|l| l.trim())
+                .rev()
+                .find(|l| !l.is_empty())
+                .map(str::to_string)
+        };
+        tail(&self.err).or_else(|| tail(&self.out))
+    }
+}
+
+/// Kill a child and everything it spawned. On Windows `Child::kill` only ends the direct child
+/// (the shell wrapper), leaving cargo/rustc/test binaries running and holding pipes and locks.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = command("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub(crate) fn run_capture(cmd: Command, timeout: Duration) -> Result<RunOut, String> {
+    run_capture_into(cmd, timeout, Capture::default())
+}
+
+pub(crate) fn run_capture_into(mut cmd: Command, timeout: Duration, cap: Capture) -> Result<RunOut, String> {
     let start = Instant::now();
     let mut child = cmd
         .stdin(Stdio::null())
@@ -148,8 +191,7 @@ pub(crate) fn run_capture(mut cmd: Command, timeout: Duration) -> Result<RunOut,
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| e.to_string())?;
-    let out_buf = Arc::new(Mutex::new(Vec::new()));
-    let err_buf = Arc::new(Mutex::new(Vec::new()));
+    let (out_buf, err_buf) = (cap.out, cap.err);
     let t1 = child.stdout.take().map(|s| pump(s, out_buf.clone()));
     let t2 = child.stderr.take().map(|s| pump(s, err_buf.clone()));
     let mut timed_out = false;
@@ -160,8 +202,7 @@ pub(crate) fn run_capture(mut cmd: Command, timeout: Duration) -> Result<RunOut,
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     timed_out = true;
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    kill_tree(&mut child);
                     break -1;
                 }
                 // Short jobs (rg, git) finish in a few ms: back off from 1ms up to 40ms.
@@ -188,12 +229,146 @@ pub(crate) fn run_capture(mut cmd: Command, timeout: Duration) -> Result<RunOut,
     })
 }
 
+/// Split a command line into argv when it needs no shell at all (no operators, expansion or
+/// escapes). Anything a shell would interpret returns `None`, so quoting stays the shell's job.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn split_simple_command(cmd: &str) -> Option<Vec<String>> {
+    let chars: Vec<char> = cmd.trim().chars().collect();
+    let mut args: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut has_tok = false;
+    let mut quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        match quote {
+            Some('\'') => {
+                if c == '\'' {
+                    if chars.get(i + 1) == Some(&'\'') {
+                        return None; // `''` escape: leave to the shell
+                    }
+                    quote = None;
+                } else {
+                    cur.push(c);
+                }
+            }
+            Some(_) => match c {
+                '"' => quote = None,
+                '$' | '`' | '\n' | '\r' => return None,
+                '\\' if chars.get(i + 1) == Some(&'"') => return None,
+                _ => cur.push(c),
+            },
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    has_tok = true;
+                }
+                c if c.is_whitespace() => {
+                    if has_tok {
+                        args.push(std::mem::take(&mut cur));
+                        has_tok = false;
+                    }
+                }
+                '|' | '&' | ';' | '<' | '>' | '(' | ')' | '{' | '}' | '$' | '`' | '*' | '?' | '%' | '~' | '@' | '#'
+                | '!' | ',' => return None,
+                _ => {
+                    cur.push(c);
+                    has_tok = true;
+                }
+            },
+        }
+        i += 1;
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if has_tok {
+        args.push(cur);
+    }
+    (!args.is_empty()).then_some(args)
+}
+
+/// Windows PowerShell 5.1 has no `&&` / `||`. Rewrites a pure top-level `A && B && C` (or `||`)
+/// chain into statements it runs the same way; anything else is returned unchanged.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn rewrite_chain_operators(cmd: &str) -> String {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut ops: Vec<&str> = Vec::new();
+    let (mut cur, mut quote, mut depth, mut i) = (String::new(), None::<char>, 0i32, 0usize);
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            cur.push(c);
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '(' | '{' | '[' => depth += 1,
+            ')' | '}' | ']' => depth -= 1,
+            '&' | '|' if depth == 0 && chars.get(i + 1) == Some(&c) => {
+                ops.push(if c == '&' { "&&" } else { "||" });
+                parts.push(std::mem::take(&mut cur));
+                i += 2;
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+        i += 1;
+    }
+    if ops.is_empty() || quote.is_some() || ops.iter().any(|o| *o != ops[0]) || cmd.contains(';') {
+        return cmd.to_string();
+    }
+    parts.push(cur);
+    let guard = if ops[0] == "&&" { "$?" } else { "-not $?" };
+    let mut out = parts[0].trim().to_string();
+    for p in &parts[1..] {
+        out.push_str(&format!("; if ({guard}) {{ {} }}", p.trim()));
+    }
+    out
+}
+
+#[cfg(windows)]
+fn installed_program(name: &str) -> Option<PathBuf> {
+    let r = PathBuf::from(resolve_program(name));
+    r.is_file().then_some(r)
+}
+
+/// Build the process for a `check`-style command line. Windows: a plain command (`cargo test -p x`)
+/// runs directly, so quoting survives and the child is the real program (killable as one);
+/// otherwise PowerShell 7 (`pwsh`) when installed, else Windows PowerShell 5.1 with `&&` / `||`
+/// chains rewritten.
 pub(crate) fn shell_command(cmd: &str) -> Command {
-    if cfg!(windows) {
+    #[cfg(windows)]
+    {
+        if let Some(argv) = split_simple_command(cmd) {
+            let head = &argv[0];
+            if !head.contains(['/', '\\', ':']) {
+                if let Some(exe) = installed_program(head).filter(|p| {
+                    p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+                }) {
+                    let mut c = command(&exe.to_string_lossy());
+                    c.args(&argv[1..]);
+                    return c;
+                }
+            }
+        }
+        if installed_program("pwsh").is_some() {
+            let mut c = command("pwsh.exe");
+            c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd]);
+            return c;
+        }
         let mut c = command("powershell.exe");
-        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd]);
+        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &rewrite_chain_operators(cmd)]);
         c
-    } else {
+    }
+    #[cfg(not(windows))]
+    {
         let mut c = command("sh");
         c.args(["-lc", cmd]);
         c
@@ -294,6 +469,33 @@ pub(crate) fn top_level_dirs(ws: &Path) -> Vec<String> {
     dirs
 }
 
+/// Workspace-relative `(path, is_dir)` entries (gitignore-aware, capped). Deliberately uncached:
+/// writes resolve through this and must see a file created a moment ago (ambiguity checks).
+fn workspace_entries(ws: &Path) -> Vec<(String, bool)> {
+    let walk = ignore::WalkBuilder::new(ws)
+        .hidden(true)
+        .sort_by_file_path(|a, b| a.cmp(b))
+        .filter_entry(|e| {
+            let name = e.file_name().to_string_lossy();
+            e.depth() == 0 || !(e.file_type().is_some_and(|t| t.is_dir()) && ignored_dir(&name))
+        })
+        .build();
+    let mut list = Vec::new();
+    for e in walk.flatten() {
+        if e.depth() == 0 {
+            continue;
+        }
+        if list.len() >= 6000 {
+            break;
+        }
+        let Some(t) = e.file_type() else { continue };
+        if t.is_dir() || t.is_file() {
+            list.push((rel_of(ws, e.path()), t.is_dir()));
+        }
+    }
+    list
+}
+
 /// Find workspace-relative files and/or directories matching `raw` by path suffix (e.g.
 /// `src/components/BranchBar.tsx` -> `frontend/src/components/BranchBar.tsx`) or basename.
 pub(crate) fn find_path_candidates(
@@ -315,33 +517,15 @@ pub(crate) fn find_path_candidates(
     let has_slash = q_low.contains('/');
     let mut exact_suffix = Vec::new();
     let mut basename_hits = Vec::new();
-    let mut seen = 0usize;
-    let walk = WalkDir::new(ws).sort_by_file_name().into_iter().filter_entry(|e| {
-        let name = e.file_name().to_string_lossy();
-        e.depth() == 0 || !(name.starts_with('.') || (e.file_type().is_dir() && ignored_dir(&name)))
-    });
-    for e in walk.flatten() {
-        if e.depth() == 0 {
+    for (rel, is_dir) in workspace_entries(ws) {
+        if (is_dir && !want_dirs) || (!is_dir && !want_files) {
             continue;
         }
-        seen += 1;
-        if seen > 6000 {
-            break;
-        }
-        let is_dir = e.file_type().is_dir();
-        let is_file = e.file_type().is_file();
-        if (is_dir && !want_dirs) || (is_file && !want_files) || (!is_dir && !is_file) {
-            continue;
-        }
-        let rel = rel_of(ws, e.path());
         let rel_low = rel.to_lowercase();
         if rel_low == q_low || rel_low.ends_with(&suffix) {
             exact_suffix.push(rel);
-        } else if !has_slash {
-            let name = e.file_name().to_string_lossy().to_lowercase();
-            if name == q_low {
-                basename_hits.push(rel);
-            }
+        } else if !has_slash && rel_low.rsplit('/').next() == Some(q_low.as_str()) {
+            basename_hits.push(rel);
         }
     }
     let mut out = if !exact_suffix.is_empty() { exact_suffix } else { basename_hits };

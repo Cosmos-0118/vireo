@@ -519,7 +519,7 @@ fn check_reports_silent_passes_and_environment_causes() {
     assert!(ok.contains("ok (") && ok.contains("exit 0, no output"), "{ok}");
     let chatty = check::check(&ws, Some("echo hello"), 30, opts.clone()).unwrap();
     assert!(chatty.contains("1 output line(s), last: hello"), "{chatty}");
-    let env = check::check(&ws, Some("echo cl.exe not found && exit 1"), 30, opts.clone()).unwrap();
+    let env = check::check(&ws, Some("echo \"cl.exe not found\"; exit 1"), 30, opts.clone()).unwrap();
     assert!(env.contains("✖") && env.contains("hint: MSVC build tools"), "{env}");
     assert!(check::check_failed(&env));
 }
@@ -956,11 +956,11 @@ fn view_continuation_hint_is_a_copyable_spec() {
     let body: String = (1..=500).map(|i| format!("line {i}\n")).collect();
     std::fs::write(ws.join("big.txt"), body).unwrap();
     let v = view(&ws, "big.txt", None, None).unwrap();
-    assert!(v.contains("continue with big.txt:401..500"), "{v}");
+    assert!(v.contains("continue with big.txt:301..500"), "{v}");
     assert!(!v.contains("vx view"), "hint must work for both CLI and MCP callers: {v}");
     // The hinted spec round-trips through the same entry point.
-    let next = view(&ws, "big.txt:401..500", None, None).unwrap();
-    assert!(next.contains("401#") && next.contains("500#"), "{next}");
+    let next = view(&ws, "big.txt:301..500", None, None).unwrap();
+    assert!(next.contains("301#") && next.contains("500#"), "{next}");
 }
 
 #[test]
@@ -1048,4 +1048,64 @@ fn repo_map_skips_hidden_dirs() {
     std::fs::write(ws.join("a.rs"), "fn shown_one() {}\n").unwrap();
     let m = repo_map(&ws, None, None).unwrap();
     assert!(m.contains("shown_one") && !m.contains("hidden_one"), "{m}");
+}
+
+#[test]
+fn simple_commands_split_without_a_shell() {
+    use super::util::split_simple_command as split;
+    assert_eq!(
+        split(r#"cargo test -p foo --config 'build.rustflags=["-C", "x"]'"#).unwrap(),
+        ["cargo", "test", "-p", "foo", "--config", r#"build.rustflags=["-C", "x"]"#]
+    );
+    assert_eq!(split(r#"npx tsc "src dir""#).unwrap(), ["npx", "tsc", "src dir"]);
+    for shelly in ["a && b", "a | b", "echo $env:X", "echo \"$x\"", "a > out", "a; b", "ls *.rs", "a `b"] {
+        assert!(split(shelly).is_none(), "{shelly}");
+    }
+}
+
+#[test]
+fn chain_operators_are_rewritten_for_windows_powershell() {
+    use super::util::rewrite_chain_operators as rw;
+    assert_eq!(rw("cargo fmt --check && cargo clippy"), "cargo fmt --check; if ($?) { cargo clippy }");
+    assert_eq!(rw("a || b || c"), "a; if (-not $?) { b }; if (-not $?) { c }");
+    assert_eq!(rw("echo 'a && b'"), "echo 'a && b'");
+    assert_eq!(rw("a && b || c"), "a && b || c");
+    assert_eq!(rw("cargo test"), "cargo test");
+}
+
+#[test]
+fn long_checks_park_as_jobs_and_resume() {
+    let ws = tmp("check-job");
+    let slow = if cfg!(windows) { "Start-Sleep -Seconds 3; Write-Output done" } else { "sleep 3; echo done" };
+    let opts = check::CheckOpts { wait: Some(1), ..Default::default() };
+    let first = check::check(&ws, Some(slow), 60, opts).unwrap();
+    assert!(first.contains('⏳') && first.contains("job chk-"), "{first}");
+    assert!(!check::check_failed(&first));
+    let id = first.split("job ").nth(1).unwrap().split(|c: char| !(c.is_alphanumeric() || c == '-')).next().unwrap().to_string();
+    let polled = check::CheckOpts { job: Some(id.clone()), wait: Some(30), ..Default::default() };
+    let done = check::check(&ws, None, 60, polled.clone()).unwrap();
+    assert!(done.contains("ok ("), "{done}");
+    assert!(check::check(&ws, None, 60, polled).is_err(), "a reported job is gone");
+}
+
+#[test]
+fn capped_whole_file_view_outlines_the_rest() {
+    let ws = tmp("view-tail");
+    let mut src = String::new();
+    for i in 0..400 {
+        src.push_str(&format!("fn f{i}() {{ let _ = {i}; }}\n"));
+    }
+    std::fs::write(ws.join("big.rs"), &src).unwrap();
+    let out = view(&ws, "big.rs", None, None).unwrap();
+    assert!(out.contains("more lines; continue with big.rs:"), "{out}");
+    assert!(out.contains("-- outline of the rest --") && out.contains("fn f300") && out.contains("more symbols"), "{out}");
+    assert!(out.len() < 18_000, "{}", out.len());
+}
+
+#[test]
+fn old_text_edit_returns_fresh_anchors() {
+    let ws = tmp("edit-oldtext");
+    std::fs::write(ws.join("a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+    let r = run_op(&ws, "edit", &json!({"path": "a.rs", "old_text": "fn b() {}", "new_text": "fn b2() {}"})).unwrap();
+    assert!(r.contains("New anchor: 2#") && r.contains("fn b2() {}"), "{r}");
 }

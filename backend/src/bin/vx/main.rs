@@ -342,7 +342,12 @@ fn main() {
     };
 
     if cmd == "mcp" {
-        let target_ws = flag_val(&["--workspace"]).map(PathBuf::from).unwrap_or(ws);
+        // An MCP server's cwd is whatever the host launched it from (often the IDE's install
+        // folder), so `VIREO_WORKSPACE` wins here even when cwd isn't inside it.
+        let target_ws = flag_val(&["--workspace"])
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("VIREO_WORKSPACE").map(PathBuf::from).filter(|w| w.is_dir()))
+            .unwrap_or(ws);
         mcp::run_mcp(&target_ws, has("--read-only"));
         return;
     }
