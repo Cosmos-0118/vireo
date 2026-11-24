@@ -1,4 +1,4 @@
-use super::check::{compress_plain, parse_diags, render_diags, test_summary};
+use super::check::{compress_plain, env_hint, parse_diags, render_diags, test_summary};
 use super::search::builtin_search;
 use super::symbols::{find_symbol, qualified};
 use super::*;
@@ -263,6 +263,40 @@ fn apply_patch_anchored_multi_hunk_and_atomic_failure() {
     assert!(a_after.contains("    10\n    + 1\n") && a_after.contains("    2\n    // added\n"), "{a_after}");
     assert_eq!(std::fs::read_to_string(ws.join("b.rs")).unwrap(), "const X: i32 = 42;\n");
     assert_eq!(std::fs::read_to_string(ws.join("c.rs")).unwrap(), "pub fn c() {}\n");
+}
+
+#[test]
+fn apply_patch_tolerates_diff_style_minus_lines_in_anchored_hunks() {
+    let ws = tmp("apply-minus");
+    std::fs::write(ws.join("a.rs"), "let a = 1;\nlet b = 2;\nlet c = 3;\n").unwrap();
+    let b = format!("2#{}", line_hash("let b = 2;"));
+    // `-old` echo next to `+new`: the anchor already names the replaced line.
+    let ok = format!("*** Update File: a.rs\n@@ {b}\n-let b = 2;\n+let b = 20;\n");
+    apply_patch(&ws, &ok, None, false).unwrap();
+    assert_eq!(std::fs::read_to_string(ws.join("a.rs")).unwrap(), "let a = 1;\nlet b = 20;\nlet c = 3;\n");
+
+    // Only `-` lines would silently delete the range: refused, file untouched.
+    let b2 = format!("2#{}", line_hash("let b = 20;"));
+    let only_minus = format!("*** Update File: a.rs\n@@ {b2}\n-let b = 20;\n");
+    let err = apply_patch(&ws, &only_minus, None, false).unwrap_err();
+    assert!(err.contains("no `+` lines") && err.contains("@@ delete"), "{err}");
+    assert!(std::fs::read_to_string(ws.join("a.rs")).unwrap().contains("let b = 20;"));
+
+    // Context (space-prefixed) lines are still rejected, with a message that says what to do.
+    let ctx = format!("*** Update File: a.rs\n@@ {b2}\n let a = 1;\n+let b = 5;\n");
+    let err = apply_patch(&ws, &ctx, None, false).unwrap_err();
+    assert!(err.contains("no `-` or context lines are needed"), "{err}");
+}
+
+#[test]
+fn env_hint_names_the_missing_program() {
+    let ps = "npx : The term 'npx' is not recognized as the name of a cmdlet, function, script file, or operable program.\n    + CategoryInfo          : ObjectNotFound: (npx:String) [], CommandNotFoundException\n";
+    let h = env_hint(ps).unwrap();
+    assert!(h.contains("`npx`") && h.contains("PATH"), "{h}");
+    let cmd = "'node' is not recognized as an internal or external command,\n";
+    assert!(env_hint(cmd).unwrap().contains("`node`"));
+    assert!(env_hint("bash: cargo: command not found\n").unwrap().contains("`cargo`"));
+    assert!(env_hint("error[E0308]: mismatched types\n").is_none());
 }
 
 #[test]

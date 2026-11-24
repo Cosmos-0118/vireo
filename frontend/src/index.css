@@ -177,6 +177,12 @@ svg.lucide {
   height: 100%;
 }
 
+/* xterm paints its viewport pure black; the grid rarely fills the host exactly, so that showed
+   as a black bar under the last row. Let the terminal theme background show through. */
+.xterm .xterm-viewport {
+  background-color: transparent !important;
+}
+
 .xterm-viewport {
   overflow-y: auto !important;
 }

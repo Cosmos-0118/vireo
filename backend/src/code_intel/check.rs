@@ -345,26 +345,68 @@ pub(crate) fn compress_plain(raw: &str) -> String {
     out.chars().take(6000).collect()
 }
 
+/// Name of the program a shell reported as missing (PowerShell, cmd.exe and POSIX sh wordings).
+fn missing_program(raw: &str) -> Option<String> {
+    let clean = |s: &str| {
+        let s = s.trim().trim_matches(|c| c == '\'' || c == '"' || c == '`');
+        (!s.is_empty() && s.len() <= 60 && !s.contains(char::is_whitespace)).then(|| s.to_string())
+    };
+    for line in raw.lines() {
+        let line = line.trim();
+        // PowerShell: "The term 'npx' is not recognized as ..."
+        if let Some(rest) = line.split("The term '").nth(1) {
+            if let Some(name) = rest.split('\'').next().and_then(clean) {
+                return Some(name);
+            }
+        }
+        // PowerShell: "+ CategoryInfo : ObjectNotFound: (npx:String) [], ..."
+        if let Some(rest) = line.split("ObjectNotFound: (").nth(1) {
+            if let Some(name) = rest.split(':').next().and_then(clean) {
+                return Some(name);
+            }
+        }
+        // cmd.exe: "'npx' is not recognized as an internal or external command"
+        if let Some(head) = line.split(" is not recognized as an internal").next().filter(|h| h.len() < line.len()) {
+            if let Some(name) = clean(head) {
+                return Some(name);
+            }
+        }
+        // sh: "npx: command not found" / "sh: 1: npx: not found"
+        for tail in [": command not found", ": not found"] {
+            if let Some(head) = line.strip_suffix(tail) {
+                if let Some(name) = head.rsplit(':').next().and_then(clean) {
+                    return Some(name);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Environment problems that look like code failures: said first, so tail-trimming can't hide them.
-fn env_hint(raw: &str) -> Option<&'static str> {
+pub(crate) fn env_hint(raw: &str) -> Option<String> {
     let l = raw.to_ascii_lowercase();
     if (l.contains("cl.exe") || l.contains("link.exe")) && (l.contains("not found") || l.contains("not be found")) {
-        return Some("hint: MSVC build tools are not on PATH for this shell (environment problem, not a code error). Run from a VS Developer shell or source the repo's msvc-env.ps1 (Enter-MsvcEnv), then retry.");
+        return Some("hint: MSVC build tools are not on PATH for this shell (environment problem, not a code error). Run from a VS Developer shell or source the repo's msvc-env.ps1 (Enter-MsvcEnv), then retry.".into());
     }
-    if l.contains("command not found") || l.contains("is not recognized as an internal or external command") || l.contains("program not found") {
-        return Some("hint: a required program is missing or not on PATH (environment problem, not a code error).");
+    let ps_missing = l.contains("commandnotfoundexception") || l.contains("is not recognized as the name of a cmdlet");
+    if ps_missing || l.contains("command not found") || l.contains("is not recognized as an internal or external command") || l.contains("program not found") {
+        let what = missing_program(raw).map(|p| format!("`{p}`")).unwrap_or_else(|| "a required program".into());
+        return Some(format!(
+            "hint: {what} was not found on PATH (environment problem, not a code error). vx runs commands in a non-interactive shell with the app's PATH, so tools set up only by a shell profile (nvm, fnm, volta, conda) are invisible: add its folder to the system PATH, or call it by absolute path."
+        ));
     }
     if l.contains("os error 32") || l.contains("lnk1104") || l.contains("being used by another process") || l.contains("text file busy") {
-        return Some("hint: a file is locked by a running process, likely the app or a previous build (environment problem, not a code error). Stop that process, or use a check that doesn't relink (e.g. `cargo check`).");
+        return Some("hint: a file is locked by a running process, likely the app or a previous build (environment problem, not a code error). Stop that process, or use a check that doesn't relink (e.g. `cargo check`).".into());
     }
     if l.contains("eaddrinuse") || l.contains("os error 10048") || l.contains("address already in use") {
-        return Some("hint: a TCP port is already in use by another process (environment problem, not a code error).");
+        return Some("hint: a TCP port is already in use by another process (environment problem, not a code error).".into());
     }
     if l.contains("failed to download") || l.contains("enotfound") || l.contains("could not resolve host") || l.contains("unable to update registry") || l.contains("network is unreachable") {
-        return Some("hint: the network or package registry is unreachable (environment problem, not a code error). Retry, or run offline if dependencies are already cached.");
+        return Some("hint: the network or package registry is unreachable (environment problem, not a code error). Retry, or run offline if dependencies are already cached.".into());
     }
     if l.contains("eperm") || l.contains("eacces") || l.contains("access is denied") || l.contains("permission denied") {
-        return Some("hint: a permission error blocked the command (environment problem, not a code error). Check file ownership and that no process holds the file.");
+        return Some("hint: a permission error blocked the command (environment problem, not a code error). Check file ownership and that no process holds the file.".into());
     }
     None
 }

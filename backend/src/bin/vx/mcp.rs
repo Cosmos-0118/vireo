@@ -59,7 +59,7 @@ pub fn mcp_tools(read_only: bool) -> Value {
         tools.extend([
             json!({
                 "name": "apply",
-                "description": "Apply a multi-file/multi-hunk V4A patch atomically (`*** Update File:` / `*** Add File:` / `*** Delete File:`, optionally wrapped in `*** Begin Patch` / `*** End Patch`). Supports hashline-anchored hunks (`@@ 12#ab..15#cd`, `@@ after 12#ab`, `@@ before 12#ab`, `@@ delete 12#ab..15#cd` with `+` lines), anchor-free `@@ top` / `@@ bottom` / `@@ after imports` (inserts after the file's import block and skips imports already present; no view needed), and classic `@@` context hunks (` `, `-`, `+`). All anchors refer to pre-patch lines. Paths auto-resolve unique suffixes (`components/X.tsx` -> `frontend/src/components/X.tsx`); new files go next to an existing matching folder.",
+                "description": "Apply a multi-file/multi-hunk V4A patch atomically (`*** Update File:` / `*** Add File:` / `*** Delete File:`, optionally wrapped in `*** Begin Patch` / `*** End Patch`). Supports hashline-anchored hunks (`@@ 12#ab..15#cd`, `@@ after 12#ab`, `@@ before 12#ab`, `@@ delete 12#ab..15#cd`; write ONLY `+` lines there: the anchors already name the replaced lines, so no `-`/context lines (a stray `-old` echo is ignored)), anchor-free `@@ top` / `@@ bottom` / `@@ after imports` (inserts after the file's import block and skips imports already present; no view needed), and classic `@@` context hunks (` `, `-`, `+`). All anchors refer to pre-patch lines. Paths auto-resolve unique suffixes (`components/X.tsx` -> `frontend/src/components/X.tsx`); new files go next to an existing matching folder.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {

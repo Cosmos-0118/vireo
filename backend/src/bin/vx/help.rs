@@ -51,7 +51,7 @@ Uses the V4A patch envelope with hashline-anchored hunks (preferred) or classic 
 \n\
   *** Begin Patch                  (optional if starting directly with `*** Update File:` / `*** Add File:`)\n\
   *** Update File: src/app.rs\n\
-  @@ 12#ab..15#cd                  # replace lines 12..15 with the `+` lines (no old text needed)\n\
+  @@ 12#ab..15#cd                  # replace lines 12..15 with the `+` lines (no old text, no `-`/context lines)\n\
   +let x = 2;\n\
   @@ after 40#ef                   # insert `+` lines after line 40 (also: `before 40#ef`)\n\
   +log(\"ok\");\n\

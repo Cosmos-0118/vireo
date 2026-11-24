@@ -193,6 +193,9 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
             }
             let mut hunks: Vec<Hunk> = Vec::new();
             let mut pending_blanks = 0usize;
+            // `-` lines tolerated inside anchored hunks: (hunk index, patch line). The anchors already
+            // name the replaced lines, so a diff-style `-old` line is redundant, never content.
+            let mut echoed_minus: Vec<(usize, usize)> = Vec::new();
             while i < lines.len() && !is_file_header(lines[i]) {
                 let b = lines[i];
                 let line_no = i + 1;
@@ -240,6 +243,7 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                         header: "@@".into(),
                     });
                 }
+                let cur_idx = hunks.len() - 1;
                 let Some(cur) = hunks.last_mut() else { continue };
                 match cur {
                     Hunk::BadAnchor { .. } => {}
@@ -264,11 +268,14 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                             new.push(strip_hashline_prefix(rest).to_string());
                         } else if b.trim().is_empty() {
                             pending_blanks += 1;
+                        } else if b.starts_with('-') {
+                            // diff-style echo of a line being replaced/deleted: harmless, skip it
+                            echoed_minus.push((cur_idx, line_no));
                         } else {
                             let what = if *kind == AnchorKind::Delete {
                                 "takes no body lines"
                             } else {
-                                "takes only `+` lines (the anchors already say which lines change)"
+                                "takes only `+` lines (every line to write must start with `+`; the anchors already say which lines change, so no `-` or context lines are needed)"
                             };
                             return Err(format!(
                                 "patch line {line_no}: anchored hunk `{header}` {what}; got `{}`",
@@ -291,6 +298,17 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                                 clip(b, 60)
                             ));
                         }
+                    }
+                }
+            }
+            // A replace/insert hunk made only of `-` lines would silently become a deletion (or a
+            // no-op) when the author most likely forgot the `+` prefixes: refuse instead.
+            for (idx, line_no) in &echoed_minus {
+                if let Some(Hunk::Anchored { kind, new, header, .. }) = hunks.get(*idx) {
+                    if *kind != AnchorKind::Delete && new.is_empty() {
+                        return Err(format!(
+                            "patch line {line_no}: anchored hunk `{header}` has `-` lines but no `+` lines. Prefix every line to write with `+`; to remove the lines use `@@ delete A#h..B#h`"
+                        ));
                     }
                 }
             }

@@ -168,6 +168,10 @@ async function buildGhostty(opts: PtyTerminalOptions, host: HTMLElement): Promis
   const fit = new g.FitAddon();
   term.loadAddon(fit);
   term.open(host);
+  // ghostty-web makes the host contenteditable (for IME/paste), so the browser draws its own
+  // text caret there on top of the canvas cursor: the "second cursor".
+  host.style.caretColor = 'transparent';
+  host.style.outline = 'none';
   return { term: term as unknown as Terminal, fit, engine: 'ghostty' };
 }
 
@@ -344,25 +348,39 @@ export function usePtyTerminal(
           return HANDLED;
         }
         if (key === 'v') {
-          // Don't preventDefault: the browser then fires a native `paste` event (handled below),
-          // which carries the clipboard without the permission prompt navigator.clipboard.read*
-          // triggers.
-          return HANDLED;
+          // Must report "not handled" for both engines: ghostty-web preventDefault()s any key
+          // its handler claims, which would cancel the native `paste` event (handled below) that
+          // carries the clipboard without the permission prompt navigator.clipboard.read* shows.
+          return false;
         }
         return !HANDLED;
       });
 
-      // term.paste honours bracketed-paste mode and normalises newlines. When the clipboard holds
-      // an image (no text), CLI agents read it from the OS clipboard themselves once they get
-      // their image-paste key, so forward that instead of pasting nothing.
-      const pasteImageKey = IS_WINDOWS ? 'v' : ''; // Alt+V on Windows, Ctrl+V elsewhere
+      // term.paste honours bracketed-paste mode; xterm.js also normalises newlines to CR,
+      // ghostty-web does not, so do it here for both (idempotent).
+      const pasteText = (text: string) => {
+        if (disposed || !text) return;
+        term.paste(text.replace(/\r?\n/g, '\r'));
+      };
+      // Image on the clipboard (no text): the browser already holds the bytes, so save them
+      // straight to disk through the local backend and paste the path. CLI agents treat a pasted
+      // image path as an attachment. This skips the agent's own (slow) OS-clipboard read via a
+      // spawned PowerShell; that key remains the fallback if the upload fails.
+      const pasteImageKey = IS_WINDOWS ? '\x1bv' : '\x16'; // Alt+V on Windows, Ctrl+V elsewhere
       const onPaste = (ev: ClipboardEvent) => {
         ev.preventDefault();
         ev.stopPropagation();
         if (disposed) return;
-        const text = ev.clipboardData?.getData('text/plain');
-        if (text) term.paste(text);
-        else sendInput(pasteImageKey);
+        const dt = ev.clipboardData;
+        const text = dt?.getData('text/plain');
+        if (text) return pasteText(text);
+        const images = Array.from(dt?.files ?? []).filter((f) => f.type.startsWith('image/'));
+        if (images.length === 0) return sendInput(pasteImageKey);
+        Promise.allSettled(images.map(uploadDropped)).then((res) => {
+          const saved = res.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
+          if (saved.length > 0) pasteText(saved.map(shellQuote).join(' ') + ' ');
+          else if (!disposed) sendInput(pasteImageKey);
+        });
       };
       host.addEventListener('paste', onPaste, true);
 
