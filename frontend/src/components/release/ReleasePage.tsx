@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AlertTriangle,
   Bot,
+  ChevronRight,
   Code2,
   ExternalLink,
   Eye,
@@ -21,11 +22,12 @@ import type {
   ReleaseOutcome,
   ReleaseReport,
   ReleaseStatus,
+  ReleaseTag,
 } from '../../types';
 import type { LiteTheme } from '../../themes';
 import { FileIcon } from '../FileIcon';
 import { MarkdownMessage } from '../MarkdownView';
-import { ActivityFeed, activityTitle } from './ActivityFeed';
+import { activityTitle } from './ActivityFeed';
 import { ReviewDialog } from './ReviewDialog';
 import { CheckList, Panel, Spinner, TONE, Toggle, btnGhost, btnPrimary, btnQuiet, isLock, splitPath, tint } from './ui';
 
@@ -398,7 +400,7 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
         {running && (
           <Banner tone="accent" icon={<Spinner size={15} />}>
             <b>{running.source === 'agent' ? 'An agent is' : running.source === 'cli' ? 'The terminal is' : 'Vireo is'} releasing {running.tag}.</b>{' '}
-            Steps appear under Activity as they finish.
+            The page updates as each step finishes.
           </Banner>
         )}
         {!running && agentPlan && !dialog && (
@@ -598,53 +600,11 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
           ) : (
             <ul>
               {status.releases.map((r, i) => (
-                <li key={r.tag} className="flex gap-6 py-5 border-b border-[var(--border)] last:border-b-0">
-                  <div className="w-[130px] shrink-0 text-[12px] text-[var(--text-muted)] leading-6" title={r.date ?? undefined}>
-                    {r.date ? new Date(r.date).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : ''}
-                    {r.commit && <div className="font-mono text-[11px] text-[var(--text-dim)]">{r.commit.slice(0, 7)}</div>}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2 leading-6">
-                      <Tag size={14} className="shrink-0 text-[var(--text-dim)]" />
-                      <span className="font-mono text-[15px] font-semibold text-[var(--text-primary)]">{r.tag}</span>
-                      {i === 0 && !r.prerelease && (
-                        <span className="text-[11px] px-1.5 rounded-full border leading-[18px]" style={{ color: TONE.ok, borderColor: tint('ok', 40) }}>
-                          Latest
-                        </span>
-                      )}
-                      {r.prerelease && (
-                        <span className="text-[11px] px-1.5 rounded-full border leading-[18px]" style={{ color: TONE.warn, borderColor: tint('warn', 40) }}>
-                          Pre-release
-                        </span>
-                      )}
-                      {status.repo && (
-                        <button
-                          className="ml-auto p-1 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer"
-                          title="Open on GitHub"
-                          onClick={() => openUrl(`https://github.com/${status.repo}/releases/tag/${r.tag}`)}
-                        >
-                          <ExternalLink size={13} />
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                </li>
+                <ReleaseRow key={r.tag} release={r} latest={i === 0 && !r.prerelease} repo={status.repo} theme={theme} onOpenUrl={openUrl} />
               ))}
             </ul>
           )}
         </section>
-
-        {/* Activity */}
-        {activity.length > 0 && (
-          <section className="mt-6">
-            <h2 className="mb-2 text-[12px] font-medium uppercase tracking-wider text-[var(--text-dim)]">Activity</h2>
-            <Panel className="overflow-hidden">
-              <div className="max-h-[320px] overflow-y-auto">
-                <ActivityFeed items={activity} onOpen={openActivity} onOpenFile={onOpenFile} onOpenUrl={openUrl} />
-              </div>
-            </Panel>
-          </section>
-        )}
       </div>
 
       {dialog && (
@@ -719,5 +679,98 @@ function ReadinessLine({ counts, dirty }: { counts: { ok: number; bad: number; w
       <span className="w-2 h-2 rounded-full shrink-0" style={{ background: TONE[tone] }} />
       {text}
     </div>
+  );
+}
+
+function ReleaseRow({
+  release: r,
+  latest,
+  repo,
+  theme,
+  onOpenUrl,
+}: {
+  release: ReleaseTag;
+  latest: boolean;
+  repo: string | null;
+  theme: LiteTheme;
+  onOpenUrl: (url: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [body, setBody] = useState<{ markdown: string; source: string } | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !body) {
+      setFailed(false);
+      api
+        .releaseBody(r.tag)
+        .then(setBody)
+        .catch(() => setFailed(true));
+    }
+  };
+
+  return (
+    <li className="border-b border-[var(--border)] last:border-b-0">
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        onClick={toggle}
+        onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggle())}
+        className="flex gap-6 py-4 cursor-pointer hover:bg-[var(--bg-hover)] rounded-md px-2 -mx-2"
+      >
+        <div className="w-[130px] shrink-0 text-[12px] text-[var(--text-muted)] leading-6" title={r.date ?? undefined}>
+          {r.date ? new Date(r.date).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : ''}
+          {r.commit && <div className="font-mono text-[11px] text-[var(--text-dim)]">{r.commit.slice(0, 7)}</div>}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 leading-6">
+            <ChevronRight size={14} className="shrink-0 text-[var(--text-dim)] transition-transform" style={{ transform: open ? 'rotate(90deg)' : undefined }} />
+            <span className="font-mono text-[15px] font-semibold text-[var(--text-primary)]">{r.tag}</span>
+            {latest && (
+              <span className="text-[11px] px-1.5 rounded-full border leading-[18px]" style={{ color: TONE.ok, borderColor: tint('ok', 40) }}>
+                Latest
+              </span>
+            )}
+            {r.prerelease && (
+              <span className="text-[11px] px-1.5 rounded-full border leading-[18px]" style={{ color: TONE.warn, borderColor: tint('warn', 40) }}>
+                Pre-release
+              </span>
+            )}
+            {repo && (
+              <button
+                className="ml-auto p-1 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-active)] cursor-pointer"
+                title="Open on GitHub"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onOpenUrl(`https://github.com/${repo}/releases/tag/${r.tag}`);
+                }}
+              >
+                <ExternalLink size={13} />
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      {open && (
+        <div className="mb-4 ml-[154px] rounded-md border border-[var(--border)] px-5 py-4 select-text">
+          {failed ? (
+            <span className="text-[12px]" style={{ color: TONE.fail }}>
+              Could not load the release notes.
+            </span>
+          ) : !body ? (
+            <span className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
+              <Spinner /> Loading release notes…
+            </span>
+          ) : body.markdown ? (
+            <MarkdownMessage content={body.markdown} theme={theme} variant="document" />
+          ) : (
+            <span className="text-[12px] text-[var(--text-muted)]">No release notes for {r.tag}.</span>
+          )}
+        </div>
+      )}
+    </li>
   );
 }

@@ -553,6 +553,14 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
             }
             Ok(report.render())
         }
-        other => Err(format!("unknown release action `{other}` (status|preflight|notes|bump|publish|verify|activity)")),
+        "body" => {
+            let tag = s(a, "tag").ok_or("`body` needs a tag")?;
+            let (source, markdown) = flow::release_body(&ctx, tag);
+            if as_json {
+                return pretty(json!({ "tag": tag, "source": source, "markdown": markdown }));
+            }
+            Ok(markdown)
+        }
+        other => Err(format!("unknown release action `{other}` (status|preflight|notes|bump|publish|verify|activity|body)")),
     }
 }

@@ -79,6 +79,23 @@ fn gh_cmd(ws: &Path, args: &[&str], secs: u64) -> Result<(bool, String, String),
     Ok((r.code == 0, r.stdout.trim().to_string(), r.stderr.trim().to_string()))
 }
 
+/// Notes for an existing release tag, as GitHub shows them: the release body from `gh` when
+/// available, else the saved notes file. Returns `(source, markdown)`.
+pub fn release_body(ctx: &Ctx, tag: &str) -> (&'static str, String) {
+    if ctx.mode() != "local" {
+        if let Ok((true, body, _)) = gh_cmd(&ctx.ws, &["release", "view", tag, "--json", "body", "--jq", ".body"], 20) {
+            if !body.trim().is_empty() {
+                return ("github", body);
+            }
+        }
+    }
+    let rel = ctx.notes_path(tag);
+    match std::fs::read_to_string(ctx.ws.join(&rel)) {
+        Ok(t) if !t.trim().is_empty() => ("file", t),
+        _ => ("none", String::new()),
+    }
+}
+
 fn has_origin(ws: &Path) -> bool {
     git(ws, &["remote", "get-url", "origin"]).is_ok_and(|g| g.ok)
 }

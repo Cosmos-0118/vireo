@@ -512,6 +512,12 @@ export interface ReleaseOutcome {
   url: string | null;
 }
 
+export interface ReleaseBody {
+  tag: string;
+  source: 'github' | 'file' | 'none';
+  markdown: string;
+}
+
 export interface ReleaseNotesRes {
   version: string;
   tag: string;
@@ -523,6 +529,7 @@ export interface ReleaseNotesRes {
 }
 
 export interface ReleaseRunOpts {
+  tag?: string;
   version?: string;
   dry_run?: boolean;
   skip_tests?: boolean;
