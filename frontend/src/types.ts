@@ -431,9 +431,13 @@ export interface ReleaseStatus {
   breaking: number;
   feats: number;
   fixes: number;
+  unconventional?: number;
   suggested: { bump: string; version: string | null; reason: string };
   bumps: Record<string, string>;
   ci_workflows: string[];
+  ci_reads_notes?: boolean;
+  ci_notes_source?: string | null;
+  ci_notes_warning?: string | null;
   mode: 'ci' | 'gh' | 'local';
   repo: string | null;
   notes_path: string;
@@ -526,6 +530,11 @@ export interface ReleaseNotesRes {
   compare_url: string | null;
   written: string | null;
   messages: string[];
+  tag_exists?: boolean;
+  range?: string;
+  unconventional?: number;
+  warnings?: string[];
+  diff_stat?: string | null;
 }
 
 export interface ReleaseRunOpts {

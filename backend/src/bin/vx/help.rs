@@ -37,9 +37,9 @@ pub const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, ato
   vx check [--raw] [--warnings] [--timeout S] [--dir D] [cmd ...]\n\
                                   run cargo/tsc/go or any command (e.g. `vx check cargo test -p x`); deduplicated anchored errors, rustc notes/labels, failing test blocks; exits 1 on failure\n\
   vx release [action] [version]   polyglot release engine (Rust/Node/Tauri/.NET/Python/Java/Go/installers); exits 1 when a gate fails\n\
-      status                      detected stacks, version files + drift, commits since last tag, suggested bump, CI/release mode\n\
-      preflight [ver] [--skip-tests]   gates: clean tree, branch, remote sync, free tag, version order, gh auth, build/typecheck\n\
-      notes [ver] [--write] [--changelog] [--notes-file F]   Conventional-Commit release notes + compare link (--write saves the draft to edit; --changelog prepends CHANGELOG.md)\n\
+      status                      detected stacks, version files + drift, commits since last tag, suggested bump, CI mode & workflow notes wiring\n\
+      preflight [ver] [--skip-tests]   gates: clean tree, branch, remote sync, free tag, version order, CI tag/notes wiring, gh auth, build/typecheck\n\
+      notes [ver] [--write] [--changelog] [--notes-file F]   release notes + diffstat context (Conventional Commits + fallback; warns on existing tags; --write saves clean draft; --changelog prepends CHANGELOG.md)\n\
       bump <patch|minor|major|prerelease|X.Y.Z> [--dry-run] [--only FILE]...   atomic, lossless version sync of every version file + lockfile\n\
       publish [ver] [--dry-run] [--no-push] [--publish] [--skip-tests] [--notes-file F] [--asset GLOB]...\n\
                                   preflight -> bump -> commit -> tag -> push (CI-tag repos) or draft GitHub release (--publish makes it public). ALWAYS --dry-run first.\n\

@@ -237,3 +237,174 @@ fn activity_log_tracks_source_and_collapses_running_entries() {
     assert_eq!((items[0]["phase"].as_str(), items[0]["ok"].as_bool()), (Some("done"), Some(true)));
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+#[test]
+fn non_conventional_commits_categorize_and_include_diff_context() {
+    let ws = tmp("nonconv");
+    init(&ws);
+    write(&ws, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.4.0\"\n");
+    write(&ws, "README.md", "# App\n");
+    sh(&ws, &["add", "."]);
+    sh(&ws, &["commit", "-qm", "Initial commit"]);
+    sh(&ws, &["tag", "-a", "v0.4.0", "-m", "v0.4.0"]);
+
+    let commits = [
+        ("src/theme.rs", "pub fn dark() {}\n", "Add dark mode support\n\nAdds a toggle in settings.\n\nCo-Authored-By: Bot <b@x.com>"),
+        ("src/path.rs", "pub fn ok() {}\n", "Fix crash on empty workspace"),
+        ("src/tests.rs", "fn t() {}\n", "Add unit tests for parser"),
+        ("README.md", "# App\nInstall steps\n", "Update README install steps"),
+        ("src/ui.rs", "pub fn btn() {}\n", "UI: fix button alignment"),
+        ("src/prev.rs", "pub fn p() {}\n", "Feature: live preview"),
+        ("src/sp.rs", "pub fn s() {}\n", "[fix] handle spaces in path"),
+        ("src/em.rs", "pub fn e() {}\n", "✨ Emoji feature"),
+        ("src/misc.rs", "pub fn m() {}\n", "miscellaneous tweak"),
+    ];
+    for (file, body, msg) in commits {
+        write(&ws, file, body);
+        sh(&ws, &["add", "."]);
+        sh(&ws, &["commit", "-qm", msg]);
+    }
+
+    let st = run(&ws, &json!({ "action": "status" })).unwrap();
+    assert!(st.contains("non-conventional"), "{st}");
+
+    let out = run(&ws, &json!({ "action": "notes", "version": "0.5.0", "write": true })).unwrap();
+    assert!(out.contains("⚠ "), "{out}");
+    assert!(out.contains("Change context (not written to the notes file):"), "{out}");
+    assert!(out.contains("src/theme.rs"), "{out}");
+    assert!(out.contains("Adds a toggle in settings."), "{out}");
+    assert!(!out.contains("Co-Authored-By"), "trailers stripped: {out}");
+
+    // Saved markdown file must remain clean (no warnings, no diffstat footer).
+    let saved = std::fs::read_to_string(ws.join(".vireo/release-notes/v0.5.0.md")).unwrap();
+    assert!(!saved.contains("⚠") && !saved.contains("Change context"), "{saved}");
+    assert!(saved.contains("### Features\n\n") && saved.contains("Add dark mode support") && saved.contains("Live preview") && saved.contains("Emoji feature"), "{saved}");
+    assert!(saved.contains("### Bug Fixes\n\n") && saved.contains("Fix crash on empty workspace") && saved.contains("UI: fix button alignment") && saved.contains("Handle spaces in path"), "{saved}");
+    assert!(saved.contains("### Documentation\n\n- Update README install steps"), "{saved}");
+    assert!(saved.contains("### Dependencies & Maintenance\n\n- Add unit tests for parser"), "{saved}");
+    assert!(saved.contains("### Other Changes\n\n- Miscellaneous tweak"), "{saved}");
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn notes_for_existing_tag_scopes_to_tag_warns_and_protects_file() {
+    let ws = tmp("existing-tag");
+    init(&ws);
+    write(&ws, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.4.2\"\n");
+    sh(&ws, &["add", "."]);
+    sh(&ws, &["commit", "-qm", "chore: init"]);
+    sh(&ws, &["tag", "-a", "v0.4.1", "-m", "v0.4.1"]);
+
+    write(&ws, "a.rs", "pub fn a() {}\n");
+    sh(&ws, &["add", "."]);
+    sh(&ws, &["commit", "-qm", "fix: bug shipped in 0.4.2"]);
+    sh(&ws, &["tag", "-a", "v0.4.2", "-m", "v0.4.2"]);
+
+    // Two newer, unreleased commits after v0.4.2.
+    write(&ws, "b.rs", "pub fn b() {}\n");
+    sh(&ws, &["add", "."]);
+    sh(&ws, &["commit", "-qm", "feat: unreleased feature one"]);
+    write(&ws, "c.rs", "pub fn c() {}\n");
+    sh(&ws, &["add", "."]);
+    sh(&ws, &["commit", "-qm", "fix: unreleased fix two"]);
+
+    let text = run(&ws, &json!({ "action": "notes", "version": "0.4.2" })).unwrap();
+    assert!(text.contains("⚠ tag `v0.4.2` already exists"), "{text}");
+    assert!(text.contains("2 unreleased commit(s)"), "{text}");
+    assert!(text.contains("Bug shipped in 0.4.2"), "{text}");
+    assert!(!text.contains("Unreleased feature one") && !text.contains("Unreleased fix two"), "{text}");
+
+    let j: Value = serde_json::from_str(&run(&ws, &json!({ "action": "notes", "version": "0.4.2", "json": true })).unwrap()).unwrap();
+    assert_eq!(j["tag_exists"], true);
+    assert_eq!(j["range"], "v0.4.1..v0.4.2");
+    assert_eq!(j["commits"], 1);
+
+    // Writing once backfills cleanly, but a second write refuses to overwrite released notes.
+    write(&ws, ".github/release-notes/v0.4.2.md", "## v0.4.2\n\nHand-written notes.\n");
+    let err = run(&ws, &json!({ "action": "notes", "version": "0.4.2", "write": true })).unwrap_err();
+    assert!(err.contains("already exists") && err.contains("refusing to overwrite"), "{err}");
+    assert!(std::fs::read_to_string(ws.join(".github/release-notes/v0.4.2.md")).unwrap().contains("Hand-written notes."));
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn ci_workflow_inspection_flags_notes_gap_and_validates_tags() {
+    let ws = tmp("ci-gap");
+    init(&ws);
+    write(&ws, "Cargo.toml", "[package]\nname = \"app\"\nversion = \"0.1.0\"\n");
+    // A non-release CI workflow with `tags:` under workflow_dispatch must NOT be misclassified.
+    write(
+        &ws,
+        ".github/workflows/ci.yml",
+        "name: CI\non:\n  push:\n    branches: [main]\n  workflow_dispatch:\n    inputs:\n      tags:\n        type: string\njobs:\n  test:\n    runs-on: ubuntu-latest\n",
+    );
+    // A tag-triggered release workflow that writes a temp notes file + --generate-notes,
+    // without reading any repo release-notes file.
+    write(
+        &ws,
+        ".github/workflows/release.yml",
+        "name: Release\non:\n  push:\n    tags:\n      - \"v[0-9]+.[0-9]+.[0-9]+*\"\njobs:\n  release:\n    steps:\n      - run: |\n          Set-Content \"$env:RUNNER_TEMP/release-notes.md\" \"checksums\"\n          gh release create $env:TAG --notes-file \"$env:RUNNER_TEMP/release-notes.md\" --generate-notes\n",
+    );
+    sh(&ws, &["add", "."]);
+    sh(&ws, &["commit", "-qm", "feat: initial"]);
+
+    let st_json: Value = serde_json::from_str(&run(&ws, &json!({ "action": "status", "json": true })).unwrap()).unwrap();
+    assert_eq!(st_json["ci_workflows"], json!(["release.yml"]));
+    assert_eq!(st_json["ci_reads_notes"], false);
+    assert!(st_json["ci_notes_warning"].as_str().unwrap().contains("does not appear to read"));
+
+    let st_text = run(&ws, &json!({ "action": "status" })).unwrap();
+    assert!(st_text.contains("⚠ CI workflow (release.yml) does not appear to read"), "{st_text}");
+
+    let pre = run(&ws, &json!({ "action": "preflight", "version": "0.1.0", "skip_tests": true })).unwrap();
+    assert!(pre.contains("⚠ CI release notes"), "{pre}");
+
+    let dry = run(&ws, &json!({ "action": "publish", "version": "0.1.0", "dry_run": true, "skip_tests": true })).unwrap();
+    assert!(dry.contains("⚠ Release notes") && dry.contains("not read by release.yml"), "{dry}");
+
+    // Now update the workflow to read `.github/release-notes/<tag>.md` (before the dir even exists).
+    write(
+        &ws,
+        ".github/workflows/release.yml",
+        "name: Release\non:\n  push:\n    tags:\n      - \"v[0-9]+.[0-9]+.[0-9]+*\"\njobs:\n  release:\n    steps:\n      - run: |\n          $notesFile = \".github/release-notes/$env:TAG.md\"\n          gh release create $env:TAG --notes-file \"$env:RUNNER_TEMP/release-notes.md\"\n",
+    );
+    let ctx = Ctx::load(&ws).unwrap();
+    assert_eq!(ctx.notes_path("v0.1.0"), ".github/release-notes/v0.1.0.md");
+
+    let st2: Value = serde_json::from_str(&run(&ws, &json!({ "action": "status", "json": true })).unwrap()).unwrap();
+    assert_eq!(st2["ci_reads_notes"], true);
+    assert!(st2["ci_notes_warning"].is_null(), "{st2}");
+
+    let pre2 = run(&ws, &json!({ "action": "preflight", "version": "0.1.0", "skip_tests": true })).unwrap();
+    assert!(pre2.contains("✔ CI release notes — `release.yml` reads `.github/release-notes/<tag>.md`"), "{pre2}");
+
+    // Tag pattern mismatch is flagged if tag_prefix doesn't match `v*`.
+    assert!(ci::tag_matches_patterns("v0.7.0", &["v[0-9]+.[0-9]+.[0-9]+*".to_string()]));
+    assert!(ci::tag_matches_patterns("v0.7.0-rc.1", &["v[0-9]+.[0-9]+.[0-9]+*".to_string()]));
+    assert!(!ci::tag_matches_patterns("0.7.0", &["v[0-9]+.[0-9]+.[0-9]+*".to_string()]));
+    let _ = std::fs::remove_dir_all(&ws);
+}
+
+#[test]
+fn cargo_workspace_lockfile_sync_and_precommitted_as_is_publish() {
+    let ws = tmp("ws-cargo");
+    init(&ws);
+    write(&ws, "Cargo.toml", "[workspace]\nmembers = [\"crates/foo\"]\n\n[workspace.package]\nversion = \"0.1.0\"\n");
+    write(&ws, "crates/foo/Cargo.toml", "[package]\nname = \"foo\"\nversion.workspace = true\n");
+    write(&ws, "Cargo.lock", "[[package]]\nname = \"foo\"\nversion = \"0.1.0\"\n");
+    let m = manifest::scan(&ws, &Config::default());
+    let changes = manifest::plan(&m, &[], &v("0.2.0"));
+    assert!(changes.iter().any(|c| c.path == "Cargo.toml" && c.new.contains("version = \"0.2.0\"")));
+    assert!(changes.iter().any(|c| c.path == "Cargo.lock" && c.new.contains("name = \"foo\"\nversion = \"0.2.0\"")));
+
+    // Pre-bumped version + pre-committed notes file in `.github/release-notes/` must tag cleanly
+    // instead of failing on an empty `git commit`.
+    manifest::write_all(&ws, &changes).unwrap();
+    write(&ws, ".github/release-notes/v0.2.0.md", "## v0.2.0\n\n- Ready\n");
+    sh(&ws, &["add", "."]);
+    sh(&ws, &["commit", "-qm", "chore: prepare v0.2.0"]);
+    let out = run(&ws, &json!({ "action": "publish", "version": "0.2.0", "skip_tests": true })).unwrap();
+    assert!(!out.contains('✖'), "{out}");
+    assert_eq!(sh(&ws, &["tag", "--list"]), "v0.2.0");
+    let _ = std::fs::remove_dir_all(&ws);
+}

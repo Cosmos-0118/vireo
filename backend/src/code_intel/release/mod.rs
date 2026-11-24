@@ -6,6 +6,7 @@
 //! single entry point and renders text for agents or JSON (`"json": true`) for the UI.
 
 mod activity;
+mod ci;
 mod flow;
 mod manifest;
 mod notes;
@@ -13,6 +14,7 @@ mod semver;
 #[cfg(test)]
 mod tests;
 
+use ci::{CiWorkflow, NotesWiring};
 use manifest::{FileChange, Kind, Manifest};
 use notes::{git_ok, Commit, Tag};
 use semver::Ver;
@@ -111,18 +113,23 @@ impl Ctx {
         notes::commits(&self.ws, self.prev_tag(target).map(|t| t.name.as_str()))
     }
 
+    /// Detailed analysis of workflow files that run on a pushed tag.
+    pub fn ci_workflow_details(&self) -> Vec<CiWorkflow> {
+        ci::scan_workflows(&self.ws)
+    }
+
     /// Workflow files that run on a pushed tag.
     pub fn ci_workflows(&self) -> Vec<String> {
-        let Ok(rd) = std::fs::read_dir(self.ws.join(".github/workflows")) else { return Vec::new() };
-        let re = lazy_re!(r"(?m)^\s*push:\s*\n(?:[ \t]+.*\n|\s*\n)*?[ \t]+tags:");
-        let mut out: Vec<String> = rd
-            .flatten()
-            .filter(|e| matches!(e.path().extension().and_then(|x| x.to_str()), Some("yml" | "yaml")))
-            .filter(|e| std::fs::read_to_string(e.path()).is_ok_and(|t| re.is_match(&t.replace("\r\n", "\n") )))
-            .filter_map(|e| e.file_name().to_str().map(str::to_string))
-            .collect();
-        out.sort();
-        out
+        self.ci_workflow_details().into_iter().map(|w| w.file).collect()
+    }
+
+    /// Repo-relative notes directory read by a tag-triggered CI workflow, if any.
+    pub fn ci_notes_dir(&self) -> Option<String> {
+        let wfs = self.ci_workflow_details();
+        wfs.iter()
+            .filter(|w| w.creates_release)
+            .find_map(|w| w.notes_dir.clone())
+            .or_else(|| wfs.into_iter().find_map(|w| w.notes_dir))
     }
 
     pub fn mode(&self) -> String {
@@ -134,12 +141,59 @@ impl Ctx {
         }
     }
 
-    /// Where the release notes for `tag` live: next to hand-written ones when the repo keeps them.
+    /// Where the release notes for `tag` live: follows the CI workflow's notes dir when present,
+    /// else next to hand-written ones in `.github/release-notes/`, else `.vireo/release-notes/`.
     pub fn notes_path(&self, tag: &str) -> String {
+        if let Some(dir) = self.ci_notes_dir() {
+            return format!("{dir}/{tag}.md");
+        }
         if self.ws.join(".github/release-notes").is_dir() {
             format!(".github/release-notes/{tag}.md")
         } else {
             format!(".vireo/release-notes/{tag}.md")
+        }
+    }
+
+    /// True when `publish` should stage and commit `notes_rel` alongside the version bump.
+    pub fn should_stage_notes(&self, notes_rel: &str) -> bool {
+        let rel = notes_rel.replace('\\', "/");
+        let rel = rel.trim_start_matches("./");
+        if rel.starts_with(".github/") || rel.starts_with("docs/") {
+            return true;
+        }
+        self.ci_notes_dir().is_some_and(|d| {
+            let prefix = format!("{}/", d.trim_end_matches('/'));
+            rel.starts_with(&prefix)
+        })
+    }
+
+    pub fn changelog_has(&self, tag: &str, ver: &Ver) -> bool {
+        let Ok(old) = std::fs::read_to_string(self.ws.join("CHANGELOG.md")) else { return false };
+        old.lines().any(|l| l.starts_with("## ") && (l.contains(tag) || l.contains(&format!("[{ver}]"))))
+    }
+
+    /// Warning when in `ci` mode and the tag-triggered workflow won't pick up `notes_rel`.
+    pub fn ci_notes_warning(&self, notes_rel: &str, tag: Option<&str>, ver: Option<&Ver>) -> Option<String> {
+        if self.mode() != "ci" {
+            return None;
+        }
+        let wfs = self.ci_workflow_details();
+        match ci::evaluate_notes_wiring(&wfs, notes_rel) {
+            NotesWiring::NoCi | NotesWiring::Aligned { .. } => None,
+            NotesWiring::Mismatch { workflow, expected, actual } => Some(format!(
+                "CI workflow `{workflow}` reads `{expected}`, not `{actual}` — write notes to `{expected}` or update the workflow"
+            )),
+            NotesWiring::Changelog { workflow } => match (tag, ver) {
+                (Some(t), Some(v)) if !self.changelog_has(t, v) => Some(format!(
+                    "CI workflow `{workflow}` reads `CHANGELOG.md`, which has no entry for `{t}` yet (run `vx release notes --changelog`)"
+                )),
+                _ => None,
+            },
+            NotesWiring::Missing { workflows, auto_notes } => Some(format!(
+                "CI workflow ({}) does not appear to read `{notes_rel}` or `CHANGELOG.md`{}; notes written by `vx` won't reach GitHub unless the workflow reads them",
+                workflows.join(", "),
+                if auto_notes { " (uses GitHub auto-generated notes)" } else { "" }
+            )),
         }
     }
 
@@ -195,10 +249,14 @@ struct StatusOut {
     breaking: usize,
     feats: usize,
     fixes: usize,
+    unconventional: usize,
     suggested: notes::Suggestion,
     /// `patch|minor|major|prerelease` -> the version each would produce.
     bumps: BTreeMap<&'static str, String>,
     ci_workflows: Vec<String>,
+    ci_reads_notes: bool,
+    ci_notes_source: Option<String>,
+    ci_notes_warning: Option<String>,
     mode: String,
     repo: Option<String>,
     notes_path: String,
@@ -248,7 +306,7 @@ fn past_releases(ctx: &Ctx, n: usize) -> Vec<PastRelease> {
 fn status(ctx: &Ctx) -> StatusOut {
     let ws = &ctx.ws;
     let cs = ctx.commits_since(None);
-    let count = |k: &str| cs.iter().filter(|c| c.kind == k).count();
+    let explicit = |k: &str| cs.iter().filter(|c| !c.inferred && c.kind == k).count();
     let mut stacks: Vec<&'static str> = ctx.manifests.iter().map(|m| m.stack).collect();
     if ws.join("go.mod").is_file() {
         stacks.push("Go");
@@ -264,10 +322,27 @@ fn status(ctx: &Ctx) -> StatusOut {
         }
     }
     let suggested = ctx.suggestion(&cs);
-    let tag = suggested.version.as_deref().and_then(Ver::parse).map(|v| ctx.tag_for(&v)).unwrap_or_default();
-    let notes_path = ctx.notes_path(&tag);
+    let suggested_ver = suggested.version.as_deref().and_then(Ver::parse);
+    let tag = suggested_ver.as_ref().map(|v| ctx.tag_for(v)).unwrap_or_default();
+    let notes_path = ctx.notes_path(if tag.is_empty() { "<tag>" } else { &tag });
+    let notes_exists = !tag.is_empty() && ws.join(&notes_path).is_file();
     let dirty_out = git_ok(ws, &["diff", "--name-only", "HEAD"]).unwrap_or_default();
     let dirty: Vec<&str> = dirty_out.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mode = ctx.mode();
+    let wfs = ctx.ci_workflow_details();
+    let ci_workflows: Vec<String> = wfs.iter().map(|w| w.file.clone()).collect();
+    let wiring = ci::evaluate_notes_wiring(&wfs, &notes_path);
+    let (ci_reads_notes, ci_notes_source) = match &wiring {
+        NotesWiring::Aligned { source, .. } => (true, Some(source.clone())),
+        NotesWiring::Changelog { .. } => (true, Some("CHANGELOG.md".to_string())),
+        NotesWiring::Mismatch { expected, .. } => (true, Some(expected.clone())),
+        NotesWiring::Missing { .. } | NotesWiring::NoCi => (false, None),
+    };
+    let ci_notes_warning = ctx.ci_notes_warning(
+        &notes_path,
+        (!tag.is_empty()).then_some(tag.as_str()),
+        suggested_ver.as_ref(),
+    );
     StatusOut {
         version: ctx.base().to_string(),
         latest_tag: ctx.tags.first().map(|t| t.name.clone()),
@@ -281,17 +356,21 @@ fn status(ctx: &Ctx) -> StatusOut {
         drift: if seen.len() > 1 { seen } else { Vec::new() },
         commits_since: cs.len(),
         breaking: cs.iter().filter(|c| c.breaking).count(),
-        feats: count("feat"),
-        fixes: count("fix") + count("perf"),
+        feats: explicit("feat"),
+        fixes: explicit("fix") + explicit("perf"),
+        unconventional: notes::unconventional_count(&cs),
         bumps: ["patch", "minor", "major", "prerelease"]
             .into_iter()
             .filter_map(|b| Some((b, ctx.base().resolve(b).ok()?.to_string())))
             .collect(),
         suggested,
-        ci_workflows: ctx.ci_workflows(),
-        mode: ctx.mode(),
+        ci_workflows,
+        ci_reads_notes,
+        ci_notes_source,
+        ci_notes_warning,
+        mode,
         repo: notes::github_repo(ws).map(|(o, r)| format!("{o}/{r}")),
-        notes_exists: ws.join(&notes_path).is_file(),
+        notes_exists,
         notes_path,
         config: ws.join(DEFAULT_CONFIG_PATH).is_file(),
         manifests: ctx.manifests.clone(),
@@ -323,19 +402,38 @@ fn render_status(s: &StatusOut) -> String {
         o.push_str(&format!("⚠ version drift: {} (a bump aligns them)\n", s.drift.join(", ")));
     }
     let since = s.latest_stable.as_deref().map(|t| format!(" since {t}")).unwrap_or_default();
-    o.push_str(&format!("commits{since}: {} ({} breaking, {} feat, {} fix/perf)\n", s.commits_since, s.breaking, s.feats, s.fixes));
+    if s.commits_since > 0 && s.unconventional == s.commits_since && s.breaking == 0 {
+        o.push_str(&format!("commits{since}: {} (non-conventional; review changes to choose bump)\n", s.commits_since));
+    } else if s.unconventional > 0 {
+        o.push_str(&format!(
+            "commits{since}: {} ({} breaking, {} feat, {} fix/perf, {} non-conventional)\n",
+            s.commits_since, s.breaking, s.feats, s.fixes, s.unconventional
+        ));
+    } else {
+        o.push_str(&format!("commits{since}: {} ({} breaking, {} feat, {} fix/perf)\n", s.commits_since, s.breaking, s.feats, s.fixes));
+    }
     o.push_str(&format!(
         "suggested: {} → {} ({})\n",
         s.suggested.bump,
         s.suggested.version.as_deref().unwrap_or("-"),
         s.suggested.reason
     ));
+    let ci_detail = if s.ci_workflows.is_empty() {
+        String::new()
+    } else if let Some(src) = &s.ci_notes_source {
+        format!(" (tag-triggered: {} · reads {src})", s.ci_workflows.join(", "))
+    } else {
+        format!(" (tag-triggered: {})", s.ci_workflows.join(", "))
+    };
     o.push_str(&format!(
         "release mode: {}{}{}\n",
         s.mode,
-        if s.ci_workflows.is_empty() { String::new() } else { format!(" (tag-triggered: {})", s.ci_workflows.join(", ")) },
+        ci_detail,
         s.repo.as_ref().map(|r| format!(" · github.com/{r}")).unwrap_or_default()
     ));
+    if let Some(w) = &s.ci_notes_warning {
+        o.push_str(&format!("⚠ {w}\n"));
+    }
     if let Some(v) = &s.suggested.version {
         o.push_str(&format!("next: vx release preflight {v} · vx release notes {v} --write · vx release publish {v} --dry-run\n"));
     }
@@ -442,19 +540,76 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
         "notes" => {
             let target = ctx.target(version)?;
             let tag = ctx.tag_for(&target);
-            let cs = ctx.commits_since(Some(&target));
-            let n = notes::build_notes(ws, &tag, ctx.prev_tag(Some(&target)), &cs);
+            let prev = ctx.prev_tag(Some(&target));
+            let tag_exists = notes::tag_exists(ws, &tag);
+            let upper = if tag_exists { tag.as_str() } else { "HEAD" };
+            let range = prev.map(|t| format!("{}..{upper}", t.name)).unwrap_or_else(|| upper.to_string());
+            let cs = notes::commits_between(ws, prev.map(|t| t.name.as_str()), upper);
+            let n = notes::build_notes(ws, &tag, prev, &cs);
+            let unconv = notes::unconventional_count(&cs);
+            let diff_stat = if cs.is_empty() { None } else { notes::diff_stat(ws, prev.map(|t| t.name.as_str()), upper, 15) };
+
+            let target_notes_rel = s(a, "notes_file").map(str::to_string).unwrap_or_else(|| ctx.notes_path(&tag));
+            let mut warnings: Vec<String> = Vec::new();
+            if tag_exists {
+                let unreleased = ctx.commits_since(None);
+                let next = ctx
+                    .suggestion(&unreleased)
+                    .version
+                    .or_else(|| ctx.base().resolve("patch").ok().map(|v| v.to_string()));
+                if !unreleased.is_empty() {
+                    let hint = next.as_deref().map(|v| format!("; for the next release use `{v}`")).unwrap_or_default();
+                    warnings.push(format!(
+                        "tag `{tag}` already exists — showing commits in `{range}`, not the {} unreleased commit(s) after it{hint}",
+                        unreleased.len()
+                    ));
+                } else {
+                    warnings.push(format!(
+                        "tag `{tag}` already exists — showing commits in `{range}` (pass `patch|minor|major` or a newer version for a new release)"
+                    ));
+                }
+            } else if let Some(latest) = ctx.tags.first().filter(|latest| target <= latest.ver) {
+                warnings.push(format!(
+                    "version `{target}` is older than latest tag `{}` on this branch — range `{range}` includes commits from newer releases",
+                    latest.name
+                ));
+            }
+            if let Some(w) = ctx.ci_notes_warning(&target_notes_rel, Some(&tag), Some(&target)) {
+                warnings.push(w);
+            }
+            if unconv > 0 {
+                let inferred_n = cs.iter().filter(|c| c.inferred).count();
+                let how = if inferred_n > 0 {
+                    format!(" ({inferred_n} categorized heuristically from subjects)")
+                } else {
+                    String::new()
+                };
+                warnings.push(format!(
+                    "{unconv}/{} commit(s) do not use Conventional Commits{how} — review against the change summary before publishing",
+                    cs.len()
+                ));
+            }
+
             let mut msgs: Vec<String> = Vec::new();
             let mut path = None;
             if flag(a, "write") || s(a, "notes_file").is_some() {
-                let rel = s(a, "notes_file").map(str::to_string).unwrap_or_else(|| ctx.notes_path(&tag));
-                let full = ws.join(&rel);
+                let full = ws.join(&target_notes_rel);
+                if tag_exists && full.is_file() {
+                    let next = ctx
+                        .suggestion(&ctx.commits_since(None))
+                        .version
+                        .or_else(|| ctx.base().resolve("patch").ok().map(|v| v.to_string()));
+                    let hint = next.as_deref().map(|v| format!(" or pass `{v}` for the next release")).unwrap_or_default();
+                    return Err(format!(
+                        "tag `{tag}` already exists and `{target_notes_rel}` is already written; refusing to overwrite released notes (edit `{target_notes_rel}` directly{hint})"
+                    ));
+                }
                 if let Some(dir) = full.parent() {
                     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
                 }
-                std::fs::write(&full, &n.markdown).map_err(|e| format!("{rel}: {e}"))?;
-                msgs.push(format!("wrote {rel}"));
-                path = Some(rel);
+                std::fs::write(&full, &n.markdown).map_err(|e| format!("{target_notes_rel}: {e}"))?;
+                msgs.push(format!("wrote {target_notes_rel}"));
+                path = Some(target_notes_rel.clone());
             }
             if flag(a, "changelog") {
                 msgs.push(prepend_changelog(ws, &n.markdown, &tag, &target)?);
@@ -469,11 +624,44 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
                 return pretty(json!({
                     "version": target.to_string(), "tag": tag, "markdown": n.markdown, "commits": n.commits,
                     "compare_url": n.compare_url, "written": path, "messages": msgs,
+                    "tag_exists": tag_exists, "range": range, "unconventional": unconv,
+                    "warnings": warnings, "diff_stat": diff_stat,
                 }));
             }
-            let mut out = n.markdown;
+            let mut out = String::new();
+            for w in &warnings {
+                out.push_str(&format!("⚠ {w}\n"));
+            }
+            if !warnings.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&n.markdown);
             for m in msgs {
                 out.push_str(&format!("\n— {m}"));
+            }
+            let bodies: Vec<String> = cs
+                .iter()
+                .filter(|c| !c.body.is_empty())
+                .take(8)
+                .map(|c| {
+                    let snippet: String = c.body.chars().take(180).collect();
+                    let ell = if c.body.chars().count() > 180 { "…" } else { "" };
+                    format!("- `{}` {}: {snippet}{ell}", c.hash, c.subject)
+                })
+                .collect();
+            if diff_stat.is_some() || !bodies.is_empty() {
+                out.push_str("\n\n---\nChange context (not written to the notes file):\n");
+                if let Some(stat) = &diff_stat {
+                    out.push_str(stat);
+                    out.push('\n');
+                }
+                if !bodies.is_empty() {
+                    out.push_str("\nCommit details:\n");
+                    for b in bodies {
+                        out.push_str(&b);
+                        out.push('\n');
+                    }
+                }
             }
             Ok(out)
         }

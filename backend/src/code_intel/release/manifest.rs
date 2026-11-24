@@ -410,11 +410,30 @@ fn classify(name: &str) -> Option<Kind> {
     })
 }
 
+fn cargo_inherits_workspace_version(text: &str) -> bool {
+    let re = lazy_re!(r#"^\s*version(?:\s*\.\s*workspace\s*=\s*true|\s*=\s*\{[^}]*\bworkspace\s*=\s*true\b)"#);
+    let mut in_pkg = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_pkg = t == "[package]";
+        } else if in_pkg && re.is_match(t) {
+            return true;
+        }
+    }
+    false
+}
+
 fn make(path: String, kind: Kind, text: String) -> Option<Manifest> {
     let base = path.rsplit('/').next().unwrap_or(&path).to_string();
     let (spans, extra) = spans_for(kind, &base, &text);
     let (spans, name) = if kind == Kind::Cargo { (spans, extra.clone()) } else { (spans, None) };
-    let note = if kind == Kind::Cargo { None } else { extra };
+    let note = if kind == Kind::Cargo {
+        (spans.is_empty() && name.is_some() && cargo_inherits_workspace_version(&text))
+            .then(|| "inherits workspace.package.version".to_string())
+    } else {
+        extra
+    };
     if spans.is_empty() && note.is_none() && kind != Kind::CargoLock {
         return None;
     }
@@ -556,14 +575,32 @@ pub fn plan(manifests: &[Manifest], only: &[String], new: &Ver) -> Vec<FileChang
         .filter(|m| m.kind == Kind::Cargo)
         .filter_map(|m| Some((m.path.clone(), m.name.clone()?)))
         .collect();
+    let ws_bumped_dirs: Vec<&str> = chosen
+        .iter()
+        .filter(|m| m.kind == Kind::Cargo && m.text.contains("[workspace.package]"))
+        .map(|m| dir_of(&m.path))
+        .collect();
     let mut out: Vec<FileChange> = chosen.iter().filter_map(|m| splice(m, &m.spans, new)).collect();
     for m in manifests {
         let spans = match m.kind {
             Kind::CargoLock => {
-                // Only crates whose nearest lock is this one, and only those being bumped.
+                // Only crates whose nearest lock is this one, and only those being bumped
+                // (including workspace members that inherit `workspace.package.version`).
                 let owned = lock_members(&m.path, &all_crates);
-                let names: HashSet<String> =
+                let mut names: HashSet<String> =
                     crates.iter().filter(|(_, n)| owned.contains(n)).map(|(_, n)| n.clone()).collect();
+                for member in manifests.iter().filter(|x| {
+                    x.kind == Kind::Cargo
+                        && x.spans.is_empty()
+                        && x.note.as_deref() == Some("inherits workspace.package.version")
+                        && ws_bumped_dirs.iter().any(|d| within(d, &x.path))
+                }) {
+                    if let Some(n) = &member.name {
+                        if owned.contains(n) {
+                            names.insert(n.clone());
+                        }
+                    }
+                }
                 lock_spans(&m.text, &names)
             }
             Kind::NpmLock => {

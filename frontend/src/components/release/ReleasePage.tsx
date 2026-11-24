@@ -72,7 +72,7 @@ const MODE: Record<ReleaseStatus['mode'], { title: string; text: string; finish:
 const SEMVER = /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
 const POLL_MS = 3000;
 
-type Notes = { path: string; markdown: string; draft: boolean; commits?: number } | null;
+type Notes = { path: string; markdown: string; draft: boolean; commits?: number; tagExists?: boolean; warnings?: string[] } | null;
 type Dialog = { plan: ReleaseOutcome | null; outcome: ReleaseOutcome | null; verify: ReleaseReport | null; fromAgent?: boolean };
 
 export const ReleasePage: React.FC<ReleasePageProps> = ({
@@ -161,16 +161,18 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
     }
     try {
       const f = await api.readFile(notesPath);
-      setNotes({ path: notesPath, markdown: f.content, draft: true });
+      const exists = status?.releases.some((r) => r.tag === tag) ?? false;
+      const warnings = exists ? [`Tag ${tag} already exists. Choose a newer version for a new release.`] : undefined;
+      setNotes({ path: notesPath, markdown: f.content, draft: true, tagExists: exists, warnings });
     } catch {
       try {
         const r = await api.releaseNotes({ version: target });
-        setNotes({ path: notesPath, markdown: r.markdown, draft: false, commits: r.commits });
+        setNotes({ path: notesPath, markdown: r.markdown, draft: false, commits: r.commits, tagExists: r.tag_exists, warnings: r.warnings });
       } catch {
         setNotes(null);
       }
     }
-  }, [notesPath, target, targetValid]);
+  }, [notesPath, status?.releases, tag, target, targetValid]);
 
   useEffect(() => {
     if (!active) return;
@@ -431,6 +433,12 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
                 <span className="text-[11.5px] text-[var(--text-muted)]">{mode.title}</span>
               </div>
               <p className="mt-0.5 text-[12px] text-[var(--text-muted)]">{mode.text}</p>
+              {status.mode === 'ci' && status.ci_notes_warning && (
+                <p className="mt-2 flex items-start gap-1.5 text-[12px] leading-snug" style={{ color: TONE.warn }}>
+                  <AlertTriangle size={13} className="mt-0.5 shrink-0" />
+                  <span>{status.ci_notes_warning}</span>
+                </p>
+              )}
 
               <div className="mt-4 flex flex-wrap items-center gap-3">
                 <div className="inline-flex rounded-md border border-[var(--border)] overflow-hidden divide-x divide-[var(--border)]">
@@ -487,6 +495,21 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
                     </Seg>
                   </div>
                 </div>
+                {notes?.warnings && notes.warnings.filter((w) => w !== status.ci_notes_warning).length > 0 && (
+                  <div
+                    className="px-4 py-2 border-b border-[var(--border)] flex flex-col gap-1 text-[11.5px] leading-snug"
+                    style={{ background: tint('warn', 8), color: TONE.warn }}
+                  >
+                    {notes.warnings
+                      .filter((w) => w !== status.ci_notes_warning)
+                      .map((w, i) => (
+                        <div key={i} className="flex items-start gap-1.5">
+                          <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                          <span>{w}</span>
+                        </div>
+                      ))}
+                  </div>
+                )}
                 <div className="max-h-[320px] overflow-y-auto px-5 py-4">
                   {!notes ? (
                     <span className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
@@ -546,7 +569,7 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
                           </button>
                           <span className="ml-auto font-mono text-[11.5px] text-[var(--text-muted)] whitespace-nowrap">
                             {m.version ?? '—'}
-                            {!off && targetValid && m.version !== target && <span style={{ color: TONE.ok }}> → {target}</span>}
+                            {!off && targetValid && m.version != null && m.version !== target && <span style={{ color: TONE.ok }}> → {target}</span>}
                           </span>
                         </li>
                       );

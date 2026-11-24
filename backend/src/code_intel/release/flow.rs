@@ -1,6 +1,7 @@
 //! Gated release flow: preflight checks, publish (bump → commit → tag → push / draft release),
 //! and post-release verification.
 
+use super::ci::{self, NotesWiring};
 use super::manifest::{self, FileChange};
 use super::notes::{self, git, git_ok, git_t};
 use super::semver::Ver;
@@ -213,13 +214,59 @@ pub fn preflight(ctx: &Ctx, target: &Ver, tests: bool) -> Report {
         });
     }
 
-    // Release mode.
-    let wf = ctx.ci_workflows();
+    // Release mode & CI workflow wiring.
+    let wfs = ctx.ci_workflow_details();
+    let wf_names: Vec<String> = wfs.iter().map(|w| w.file.clone()).collect();
     v.push(match mode.as_str() {
-        "ci" => ck("mode", "ok", "Release mode", format!("pushing `{tag}` triggers {}", if wf.is_empty() { "CI".to_string() } else { wf.join(", ") })),
+        "ci" => {
+            if !wfs.is_empty() && !wfs.iter().any(|w| ci::tag_matches_patterns(&tag, &w.tag_patterns)) {
+                ck(
+                    "mode",
+                    "warn",
+                    "Release mode",
+                    format!("`{tag}` does not match `push.tags` filters in {}; CI may not trigger", wf_names.join(", ")),
+                )
+            } else {
+                ck(
+                    "mode",
+                    "ok",
+                    "Release mode",
+                    format!("pushing `{tag}` triggers {}", if wf_names.is_empty() { "CI".to_string() } else { wf_names.join(", ") }),
+                )
+            }
+        }
         "gh" => ck("mode", "ok", "Release mode", "draft GitHub release created with `gh`"),
         _ => ck("mode", "ok", "Release mode", "local: commit and tag only"),
     });
+    if mode == "ci" && !wfs.is_empty() {
+        let notes_rel = ctx.notes_path(&tag);
+        v.push(match ci::evaluate_notes_wiring(&wfs, &notes_rel) {
+            NotesWiring::Aligned { workflow, source } => {
+                ck("ci-notes", "ok", "CI release notes", format!("`{workflow}` reads `{source}`"))
+            }
+            NotesWiring::Mismatch { workflow, expected, actual } => {
+                ck("ci-notes", "warn", "CI release notes", format!("`{workflow}` reads `{expected}`, not `{actual}`"))
+            }
+            NotesWiring::Changelog { workflow } => {
+                if ctx.changelog_has(&tag, target) {
+                    ck("ci-notes", "ok", "CI release notes", format!("`{workflow}` reads `CHANGELOG.md` (has `{tag}`)"))
+                } else {
+                    ck("ci-notes", "warn", "CI release notes", format!("`{workflow}` reads `CHANGELOG.md`, which has no entry for `{tag}` yet"))
+                }
+            }
+            NotesWiring::Missing { workflows, auto_notes } => ck(
+                "ci-notes",
+                "warn",
+                "CI release notes",
+                format!(
+                    "{} does not read `{notes_rel}` or `CHANGELOG.md`{}; written notes won't reach GitHub",
+                    workflows.join(", "),
+                    if auto_notes { " (uses GitHub auto-generated notes)" } else { "" }
+                ),
+            ),
+            NotesWiring::NoCi => unreachable!(),
+        });
+    }
 
     // Build / test gate.
     v.push(if !tests {
@@ -364,9 +411,56 @@ pub fn publish(ctx: &Ctx, o: &PublishOpts) -> Result<Outcome, String> {
     }
     let cs = ctx.commits_since(Some(&target));
     let generated = notes::build_notes(ws, &tag, ctx.prev_tag(Some(&target)), &cs).markdown;
-    step(&mut out, "notes", "ok", "Release notes", if have_notes { format!("using {notes_rel}") } else { format!("generated from {} commit(s) → {notes_rel}", cs.len()) });
+    let stage_notes = ctx.should_stage_notes(&notes_rel);
+    let base_notes = if have_notes {
+        format!("using {notes_rel}")
+    } else {
+        format!("generated from {} commit(s) → {notes_rel}", cs.len())
+    };
+    if mode == "ci" {
+        let wfs = ctx.ci_workflow_details();
+        match ci::evaluate_notes_wiring(&wfs, &notes_rel) {
+            NotesWiring::Aligned { workflow, .. } => step(
+                &mut out,
+                "notes",
+                "ok",
+                "Release notes",
+                format!(
+                    "{base_notes} ({}read by `{workflow}`)",
+                    if stage_notes { "committed with release; " } else { "" }
+                ),
+            ),
+            NotesWiring::Mismatch { workflow, expected, .. } => step(
+                &mut out,
+                "notes",
+                "warn",
+                "Release notes",
+                format!("{base_notes} — `{workflow}` reads `{expected}`, so these notes won't reach GitHub"),
+            ),
+            NotesWiring::Changelog { workflow } => step(
+                &mut out,
+                "notes",
+                if ctx.changelog_has(&tag, &target) { "ok" } else { "warn" },
+                "Release notes",
+                format!("{base_notes} (`{workflow}` reads `CHANGELOG.md`)"),
+            ),
+            NotesWiring::Missing { workflows, .. } => step(
+                &mut out,
+                "notes",
+                "warn",
+                "Release notes",
+                format!(
+                    "{base_notes} — not read by {}{}",
+                    workflows.join(", "),
+                    if stage_notes { "" } else { " and not committed; won't reach GitHub" }
+                ),
+            ),
+            NotesWiring::NoCi => step(&mut out, "notes", "ok", "Release notes", base_notes),
+        }
+    } else {
+        step(&mut out, "notes", "ok", "Release notes", base_notes);
+    }
     out.notes_path = Some(notes_rel.clone());
-    let stage_notes = notes_rel.starts_with(".github/") || notes_rel.starts_with("docs/");
 
     let assets = expand_assets(ws, &[o.assets.clone(), ctx.cfg.assets.clone()].concat());
     if mode == "gh" && !assets.is_empty() {
@@ -378,7 +472,7 @@ pub fn publish(ctx: &Ctx, o: &PublishOpts) -> Result<Outcome, String> {
     step(&mut out, "push", if can_push { "ok" } else { "skip" }, "Push", if can_push { format!("atomic push of `{branch}` + `{tag}` to origin") } else if o.no_push { "--no-push: stays local".into() } else { "no origin remote: stays local".into() });
     match (mode.as_str(), can_push) {
         ("ci", true) => step(&mut out, "release", "ok", "Release", format!("CI builds and publishes after the tag push ({})", ctx.ci_workflows().join(", "))),
-        ("gh", true) => step(&mut out, "release", "ok", "GitHub release", if o.publish { "created as draft, then published".into() } else { "created as DRAFT: review, then `vx release publish --publish` or promote on GitHub".into() }),
+        ("gh", true) => step(&mut out, "release", "ok", "GitHub release", if o.publish { "created as draft, then published".into() } else { format!("created as DRAFT: review, then promote on GitHub or run `gh release edit {tag} --draft=false`") }),
         _ => {}
     }
     out.files = changes;
@@ -408,6 +502,9 @@ pub fn publish(ctx: &Ctx, o: &PublishOpts) -> Result<Outcome, String> {
     }
     let rollback = |out: &mut Outcome, why: String| {
         manifest::restore(ws, &out.files);
+        if !have_notes {
+            let _ = std::fs::remove_file(&full_notes);
+        }
         let _ = git(ws, &["reset", "-q"]);
         out.ok = false;
         out.steps.push(ck("commit", "fail", "Commit", format!("{why}. Version files were restored.")));
@@ -416,6 +513,7 @@ pub fn publish(ctx: &Ctx, o: &PublishOpts) -> Result<Outcome, String> {
     if stage_notes {
         add.push(notes_rel.clone());
     }
+    let mut committed = false;
     if !add.is_empty() {
         let mut args = vec!["add", "--"];
         args.extend(add.iter().map(String::as_str));
@@ -423,17 +521,29 @@ pub fn publish(ctx: &Ctx, o: &PublishOpts) -> Result<Outcome, String> {
             rollback(&mut out, e);
             return Ok(out);
         }
-        if let Err(e) = git_ok(ws, &["commit", "-q", "-m", &format!("chore(release): {tag}")]) {
-            rollback(&mut out, e);
-            return Ok(out);
+        // Only commit when staging actually introduced changes (e.g. an as-is release whose
+        // notes file was already committed in an earlier commit has nothing to commit).
+        let has_staged = !git(ws, &["diff", "--cached", "--quiet"]).is_ok_and(|g| g.ok);
+        if has_staged {
+            if let Err(e) = git_ok(ws, &["commit", "-q", "-m", &format!("chore(release): {tag}")]) {
+                rollback(&mut out, e);
+                return Ok(out);
+            }
+            committed = true;
         }
     }
     if let Err(e) = git_ok(ws, &["tag", "-a", &tag, "-m", &tag]) {
         out.ok = false;
-        step(&mut out, "tag", "fail", "Tag", format!("{e}. The release commit exists locally; fix and run `git tag -a {tag} -m {tag}`"));
+        let extra = if committed { " The release commit exists locally;" } else { "" };
+        step(&mut out, "tag", "fail", "Tag", format!("{e}.{extra} fix and run `git tag -a {tag} -m {tag}`"));
         return Ok(out);
     }
-    step(&mut out, "commit", "ok", "Commit & tag", format!("`chore(release): {tag}` + `{tag}`"));
+    let commit_detail = if committed {
+        format!("`chore(release): {tag}` + `{tag}`")
+    } else {
+        format!("tagged HEAD as `{tag}` (no version/notes diff to commit)")
+    };
+    step(&mut out, "commit", "ok", "Commit & tag", commit_detail);
 
     if !can_push {
         step(&mut out, "push", "skip", "Push", format!("stayed local. Push with `git push --atomic origin {branch} {tag}`"));
