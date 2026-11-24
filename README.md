@@ -90,6 +90,7 @@ Working with coding agents means reviewing diffs, steering tool calls, running c
 | `vx search` | Search with ripgrep |
 | `vx ast` | Structural search and rewrite (built-in ast-grep engine; an installed `ast-grep` is used only for other languages) |
 | `vx check` | Run cargo, tsc, go, or any command with compressed diagnostics |
+| `vx release` | Polyglot release engine (also the **Releases** sidebar pane): `status`, `preflight`, `notes`, `bump`, `publish`, `verify`. Syncs versions across Cargo, npm, Tauri, .NET, Python, Maven/Gradle, Go and installer files, builds Conventional-Commit notes, gates on a clean/synced tree and a free tag, then tags and pushes (tag-triggered CI) or creates a draft GitHub release. Always preview with `vx release publish --dry-run`. Extra version files, assets and checks go in `.vireo/release.json`. |
 
 ## Get started
 

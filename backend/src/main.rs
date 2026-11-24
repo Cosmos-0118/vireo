@@ -8,6 +8,7 @@ mod code_intel;
 mod files;
 mod git;
 mod pty;
+mod release;
 mod secrets;
 mod state;
 mod tasks;
@@ -314,6 +315,7 @@ fn build_router(
             "/api/tasks/custom",
             post(tasks::save_custom_task).delete(tasks::delete_custom_task),
         )
+        .route("/api/release", post(release::run))
         .route("/api/git/status", get(git::get_status))
         .route("/api/git/diff", get(git::get_diff))
         .route("/api/git/stage", post(git::stage_files))

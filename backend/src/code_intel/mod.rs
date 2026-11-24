@@ -25,6 +25,7 @@ mod doc;
 mod edit;
 mod patch;
 mod patch_parse;
+mod release;
 mod replace;
 mod search;
 mod symbols;
@@ -74,6 +75,7 @@ Prefer `vx` over cat/rg/sed/Python patch scripts. For edits: use `vx apply` (ato
 - symbol <file> <name> [--replace|--insert-after|--delete] [--text T|--file F]\n\
 - create <file> [--force] [--text T|--file F]\n\
 - ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
+- release [status|preflight|notes|bump|publish|verify] [patch|minor|major|X.Y.Z] [--dry-run]   release engine across Rust/Node/.NET/Python/Java/Go: version sync, notes, gates, tag/push/draft release (always `publish --dry-run` first)\n\
 - check [--raw] [--warnings] [--timeout S] [cmd ...]   build/test runner with anchored errors, rustc notes/labels, and failing test output (MCP: still running after 60s -> background job id; `check {job}` waits for it)\n\
 From a shell on Windows, prefer MCP or `--file F` over piping multi-line code. Edits print new anchors and syntax errors immediately; `vx help` has details.";
 
@@ -222,6 +224,7 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
             a["dry_run"].as_bool().unwrap_or(false),
             cwd.as_deref(),
         ),
+        "release" => release::run(ws, a),
         "apply" => apply_patch(ws, need("patch")?, cwd.as_deref(), a["dry_run"].as_bool().unwrap_or(false)),
         "check" => check(
             ws,
@@ -284,6 +287,7 @@ fn with_aliases(op: &str, a: &Value) -> Value {
         "ast" => &[("pattern", &["query"]), ("rewrite", &["replacement"]), ("lang", &["language"])],
         "apply" => &[("patch", &["input", "diff"])],
         "check" => &[("cmd", &["command"])],
+        "release" => &[("action", &["command", "subcommand"]), ("version", &["bump", "target"])],
         _ => &[],
     };
     let mut out = obj.clone();

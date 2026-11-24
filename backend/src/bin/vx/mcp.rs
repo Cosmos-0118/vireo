@@ -17,6 +17,7 @@ or {path, symbol, new_text}; or {path, old_text, new_text} (no anchors needed, r
 - apply {patch: \"*** Update File: a.rs\\n@@ 12#ab..15#cd\\n+new line\"}\n\
 - replace {old, new, path?, glob?, regex?, expected?, dry_run?}\n\
 - check {cmd?, dir?, warnings?}: a build still running after 60s continues in the background and returns a job id; call check {job} to wait for it.\n\
+- release {action?: status|preflight|notes|bump|publish|verify, version?: patch|minor|major|prerelease|X.Y.Z, dry_run?, skip_tests?, write?, changelog?, notes_file?, publish?, no_push?, assets?, only?}: polyglot release engine; run publish with dry_run first.\n\
 Anchors `N#hh` come from view/search/edit output; edits return fresh anchors, so no re-view is needed.";
 
 pub fn mcp_tools(read_only: bool) -> Value {
@@ -155,6 +156,27 @@ pub fn mcp_tools(read_only: bool) -> Value {
                 "annotations": { "readOnlyHint": false }
             }),
             json!({
+                "name": "release",
+                "description": "Release engineering across Rust/Node/Tauri/.NET/Python/Java/Go/installers. `status` (default): stacks, version files + drift, commits since last tag, suggested bump, CI mode. `preflight`: clean tree, branch, remote sync, free tag, gh auth, build gate. `notes`: Conventional-Commit release notes (`write` saves an editable draft, `changelog` prepends CHANGELOG.md). `bump`: atomic lossless version sync of every manifest + lockfile (`dry_run` previews). `publish`: preflight -> bump -> commit -> tag -> push (CI tag workflows) or draft GitHub release (`publish: true` makes it public); ALWAYS call with dry_run first and show the plan to the user. `verify`: remote tag, release state, CI run.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["status", "preflight", "notes", "bump", "publish", "verify"] },
+                        "version": { "type": "string", "description": "patch | minor | major | prerelease | X.Y.Z[-pre]. Omit to use the suggested version" },
+                        "dry_run": { "type": "boolean", "description": "bump/publish: report what would happen, change nothing" },
+                        "skip_tests": { "type": "boolean", "description": "preflight/publish: skip the build & test gate" },
+                        "write": { "type": "boolean", "description": "notes: save the draft to .github/release-notes/<tag>.md (or .vireo/release-notes/) so it can be edited before publish" },
+                        "changelog": { "type": "boolean", "description": "notes: also prepend the section to CHANGELOG.md" },
+                        "notes_file": { "type": "string", "description": "notes/publish: notes markdown file to write / use as the release body" },
+                        "publish": { "type": "boolean", "description": "publish (gh mode): promote the draft release to public" },
+                        "no_push": { "type": "boolean", "description": "publish: commit and tag locally only" },
+                        "assets": { "type": "array", "items": { "type": "string" }, "description": "publish (gh mode): globs of files to attach (a SHA256SUMS.txt is added)" },
+                        "only": { "type": "array", "items": { "type": "string" }, "description": "bump/publish: limit to these version files (default all)" }
+                    }
+                },
+                "annotations": { "readOnlyHint": false }
+            }),
+            json!({
                 "name": "create",
                 "description": "Create a new file (refuses to overwrite unless force=true). Parent folders are created.",
                 "inputSchema": {
@@ -232,7 +254,7 @@ pub fn handle_mcp_request(ws: &Path, read_only: bool, req: &Value) -> Option<Val
             }
             let (op, payload) = match name {
                 "view" if args["outline"].as_bool() == Some(true) => ("outline", args),
-                "map" | "view" | "search" | "apply" | "replace" | "edit" | "symbol" | "check" | "create" | "ast" => (name, args),
+                "map" | "view" | "search" | "apply" | "replace" | "edit" | "symbol" | "check" | "create" | "ast" | "release" => (name, args),
                 other => {
                     return ok(json!({
                         "content": [{ "type": "text", "text": format!("Error: unknown tool `{other}`") }],
@@ -242,7 +264,7 @@ pub fn handle_mcp_request(ws: &Path, read_only: bool, req: &Value) -> Option<Val
             };
             match code_intel::run_op(ws, op, &payload) {
                 Ok(text) => {
-                    let is_err = op == "check" && code_intel::check_failed(&text);
+                    let is_err = matches!(op, "check" | "release") && code_intel::check_failed(&text);
                     ok(json!({
                         "content": [{ "type": "text", "text": text }],
                         "isError": is_err
@@ -261,7 +283,11 @@ pub fn handle_mcp_request(ws: &Path, read_only: bool, req: &Value) -> Option<Val
 /// Tools that never write source files. They run on worker threads so a slow `check` (or a big
 /// `search`) can't block the requests queued behind it on the single stdio pipe.
 fn runs_concurrently(req: &Value) -> bool {
-    req["method"] == "tools/call" && matches!(req["params"]["name"].as_str(), Some("map" | "view" | "search" | "check"))
+    let p = &req["params"];
+    req["method"] == "tools/call"
+        && (matches!(p["name"].as_str(), Some("map" | "view" | "search" | "check"))
+            // Read-only release stages (preflight can run a long build) must not block the pipe.
+            || (p["name"] == "release" && matches!(p["arguments"]["action"].as_str().unwrap_or("status"), "status" | "preflight" | "verify")))
 }
 
 fn send(line: &Value) -> bool {

@@ -26,6 +26,12 @@ import type {
   SearchOptions,
   SearchRes,
   TasksRes,
+  ReleaseFileChange,
+  ReleaseNotesRes,
+  ReleaseOutcome,
+  ReleaseReport,
+  ReleaseRunOpts,
+  ReleaseStatus,
   TreeEntry,
   WorkspaceInfo,
 } from './types';
@@ -40,6 +46,13 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
     throw new Error(txt || `HTTP ${res.status}`);
   }
   return res.json() as Promise<T>;
+}
+
+function releaseRun<T>(action: string, opts: ReleaseRunOpts = {}): Promise<T> {
+  return jsonFetch<T>('/api/release', {
+    method: 'POST',
+    body: JSON.stringify({ action, ...opts }),
+  });
 }
 
 export const api = {
@@ -112,6 +125,17 @@ export const api = {
     jsonFetch<{ ok: boolean }>(`/api/tasks/custom?id=${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
+
+  releaseStatus: () => releaseRun<ReleaseStatus>('status'),
+  releasePreflight: (o: ReleaseRunOpts = {}) => releaseRun<ReleaseReport>('preflight', o),
+  releaseNotes: (o: ReleaseRunOpts = {}) => releaseRun<ReleaseNotesRes>('notes', o),
+  releaseBump: (version: string, o: ReleaseRunOpts = {}) =>
+    releaseRun<{ version: string; dry_run: boolean; files: ReleaseFileChange[] }>('bump', { ...o, version }),
+  releasePublish: (o: ReleaseRunOpts = {}) =>
+    o.dry_run
+      ? releaseRun<ReleaseOutcome>('publish', o)
+      : trackGitWrite(() => releaseRun<ReleaseOutcome>('publish', o)),
+  releaseVerify: (o: ReleaseRunOpts = {}) => releaseRun<ReleaseReport>('verify', o),
 
   gitStatus: () => jsonFetch<GitStatusRes>('/api/git/status'),
   gitDiff: (path: string, staged = false) =>

@@ -3,15 +3,17 @@ import {
   Files,
   GitBranch,
   Keyboard,
+  Rocket,
   Search,
 } from 'lucide-react';
 import { useKeybindings, withShortcut } from '../keybindings';
 import type { CommitFileChange, GitStatusRes } from '../types';
 const FileExplorer = lazy(() => import('./FileExplorer').then((m) => ({ default: m.FileExplorer })));
 const SearchPane = lazy(() => import('./SearchPane').then((m) => ({ default: m.SearchPane })));
+const ReleasePane = lazy(() => import('./ReleasePane').then((m) => ({ default: m.ReleasePane })));
 import { SourceControlPane } from './SourceControlPane';
 
-export type SidebarTab = 'changes' | 'explorer' | 'search';
+export type SidebarTab = 'changes' | 'explorer' | 'search' | 'releases';
 
 interface SidebarProps {
   activeTab: SidebarTab;
@@ -67,9 +69,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const totalChanged = gitStatus?.files.length ?? 0;
   useKeybindings(); // refresh tooltips when shortcuts are rebound
-  const seen = useRef({ explorer: false, search: false });
+  const seen = useRef({ explorer: false, search: false, releases: false });
   if (activeTab === 'explorer') seen.current.explorer = true;
   if (activeTab === 'search') seen.current.search = true;
+  if (activeTab === 'releases') seen.current.releases = true;
 
   return (
     <div className="flex h-full bg-[var(--bg-sidebar)] border-r border-[var(--border)] select-none">
@@ -123,6 +126,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <span className="absolute -left-1.5 top-2 bottom-2 w-[3px] rounded-r bg-[var(--accent)]" />
           )}
           <Search size={19} />
+        </button>
+
+        <button
+          onClick={() => onTabChange('releases')}
+          className={`relative w-9 h-9 flex items-center justify-center rounded-lg cursor-pointer transition-colors ${
+            activeTab === 'releases'
+              ? 'text-[var(--text-primary)] bg-[var(--bg-active)]'
+              : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
+          }`}
+          title="Releases"
+          aria-label="Releases"
+        >
+          {activeTab === 'releases' && (
+            <span className="absolute -left-1.5 top-2 bottom-2 w-[3px] rounded-r bg-[var(--accent)]" />
+          )}
+          <Rocket size={19} />
         </button>
 
         <button
@@ -185,6 +204,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
             fsVersion={fsVersion}
             onOpenFile={onOpenFile}
             onOpenDiff={onOpenDiff}
+            onAskAgent={onAskAgent}
+            onRefreshGit={onRefreshGit}
+            onToast={onToast}
+          />
+          </Suspense>
+        </div>
+        )}
+
+        {seen.current.releases && (
+        <div className={activeTab === 'releases' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
+          <Suspense fallback={null}>
+          <ReleasePane
+            active={activeTab === 'releases'}
+            fsVersion={fsVersion}
+            onOpenFile={onOpenFile}
             onAskAgent={onAskAgent}
             onRefreshGit={onRefreshGit}
             onToast={onToast}

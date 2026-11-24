@@ -165,6 +165,10 @@ fn flag_takes_value(cmd: &str, flag: &str) -> bool {
                 | "-l"
                 | "--lang"
                 | "--workspace"
+                | "--version"
+                | "--notes-file"
+                | "--asset"
+                | "--only"
                 | "-w"
         ),
     }
@@ -282,6 +286,10 @@ fn main() {
         "ast" => &["-r", "--rewrite", "-l", "--lang", "--dry-run"],
         "check" => &["--cmd", "--timeout", "--raw", "--warnings", "--dir"],
         "mcp" => &["--workspace", "--read-only"],
+        "release" => &[
+            "--version", "--dry-run", "--skip-tests", "--write", "--changelog", "--notes-file", "--publish", "--no-push",
+            "--asset", "--only", "--json",
+        ],
         _ => &[],
     };
     for (name, _) in &flags {
@@ -514,6 +522,31 @@ fn main() {
                 }),
             )
         }
+        "release" => {
+            const ACTIONS: [&str; 6] = ["status", "preflight", "notes", "bump", "publish", "verify"];
+            let (action, rest) = match pos.first().map(String::as_str) {
+                Some(a) if ACTIONS.contains(&a) => (a.to_string(), &pos[1..]),
+                Some(a) => fail(&format!("unknown release action `{a}` ({})\n{USAGE}", ACTIONS.join("|"))),
+                None => ("status".to_string(), &pos[..]),
+            };
+            (
+                "release",
+                json!({
+                    "action": action,
+                    "version": flag_val(&["--version"]).or_else(|| rest.first().cloned()),
+                    "dry_run": has("--dry-run"),
+                    "skip_tests": has("--skip-tests"),
+                    "write": has("--write"),
+                    "changelog": has("--changelog"),
+                    "publish": has("--publish"),
+                    "no_push": has("--no-push"),
+                    "notes_file": flag_val(&["--notes-file"]),
+                    "assets": flag_vals("--asset"),
+                    "only": flag_vals("--only"),
+                    "json": has("--json"),
+                }),
+            )
+        }
         other => fail(&format!("unknown command `{other}`\n{USAGE}")),
     };
 
@@ -523,7 +556,7 @@ fn main() {
             if !out.ends_with('\n') {
                 println!("{out}");
             }
-            if op == "check" && code_intel::check_failed(&out) {
+            if matches!(op, "check" | "release") && !payload["json"].as_bool().unwrap_or(false) && code_intel::check_failed(&out) {
                 std::process::exit(1);
             }
         }

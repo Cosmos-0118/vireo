@@ -1,6 +1,6 @@
 //! CLI help and usage text for `vx`.
 
-pub const USAGE: &str = "vx <map|outline|view|search|apply|replace|edit|symbol|create|ast|check|mcp> ...   (vx help for details)\n\
+pub const USAGE: &str = "vx <map|outline|view|search|apply|replace|edit|symbol|create|ast|check|release|mcp> ...   (vx help for details)\n\
   vx map [query] [--dir D]\n\
   vx outline <file>\n\
   vx view <file> [symbol|A..B,C..D]  |  vx view <file:A..B> <file2:C..D> ...\n\
@@ -12,6 +12,7 @@ pub const USAGE: &str = "vx <map|outline|view|search|apply|replace|edit|symbol|c
   vx create <file> [--force] [--text T|--file F]\n\
   vx ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
   vx check [--raw] [--warnings] [--timeout S] [--dir D] [--cmd C | cmd args...]\n\
+  vx release [status|preflight|notes|bump|publish|verify] [patch|minor|major|prerelease|X.Y.Z] [--dry-run] [--skip-tests] [--write] [--changelog] [--notes-file F] [--publish] [--no-push] [--asset G]... [--only FILE]... [--json]\n\
   vx mcp [--workspace DIR] [--read-only]";
 
 pub const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, atomic patches & replace, smart search, symbol ops, repo map, build check, MCP server\n\
@@ -35,6 +36,15 @@ pub const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, ato
                                   ast-grep structural search; -r rewrites files IN PLACE, --dry-run only lists\n\
   vx check [--raw] [--warnings] [--timeout S] [--dir D] [cmd ...]\n\
                                   run cargo/tsc/go or any command (e.g. `vx check cargo test -p x`); deduplicated anchored errors, rustc notes/labels, failing test blocks; exits 1 on failure\n\
+  vx release [action] [version]   polyglot release engine (Rust/Node/Tauri/.NET/Python/Java/Go/installers); exits 1 when a gate fails\n\
+      status                      detected stacks, version files + drift, commits since last tag, suggested bump, CI/release mode\n\
+      preflight [ver] [--skip-tests]   gates: clean tree, branch, remote sync, free tag, version order, gh auth, build/typecheck\n\
+      notes [ver] [--write] [--changelog] [--notes-file F]   Conventional-Commit release notes + compare link (--write saves the draft to edit; --changelog prepends CHANGELOG.md)\n\
+      bump <patch|minor|major|prerelease|X.Y.Z> [--dry-run] [--only FILE]...   atomic, lossless version sync of every version file + lockfile\n\
+      publish [ver] [--dry-run] [--no-push] [--publish] [--skip-tests] [--notes-file F] [--asset GLOB]...\n\
+                                  preflight -> bump -> commit -> tag -> push (CI-tag repos) or draft GitHub release (--publish makes it public). ALWAYS --dry-run first.\n\
+      verify [ver]                remote tag, GitHub release state + assets, CI run for the tag\n\
+      Custom version files / assets / checks: `.vireo/release.json` ({\"files\":[{\"path\",\"pattern\"}],\"exclude\":[],\"assets\":[],\"checks\":[],\"mode\":\"ci|gh|local\"}).\n\
   vx mcp [--workspace DIR] [--read-only]\n\
                                   stdio MCP JSON-RPC 2.0 server exposing vx tools with zero shell quoting\n\
 \n\

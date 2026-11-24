@@ -406,3 +406,101 @@ export interface SteerRes {
   turn_id?: string;
   reason?: string;
 }
+
+// ---- Releases (`vx release` engine) ----
+
+export interface ReleaseManifest {
+  path: string;
+  kind: string;
+  stack: string;
+  version: string | null;
+  note: string | null;
+}
+
+export interface ReleaseStatus {
+  version: string;
+  latest_tag: string | null;
+  latest_stable: string | null;
+  tag_prefix: string;
+  branch: string | null;
+  dirty: number;
+  stacks: string[];
+  manifests: ReleaseManifest[];
+  drift: string[];
+  commits_since: number;
+  breaking: number;
+  feats: number;
+  fixes: number;
+  suggested: { bump: string; version: string | null; reason: string };
+  bumps: Record<string, string>;
+  ci_workflows: string[];
+  mode: 'ci' | 'gh' | 'local';
+  repo: string | null;
+  notes_path: string;
+  notes_exists: boolean;
+  config: boolean;
+}
+
+export interface ReleaseCheck {
+  id: string;
+  status: 'ok' | 'warn' | 'fail' | 'skip';
+  label: string;
+  detail: string;
+}
+
+export interface ReleaseReport {
+  version: string;
+  tag: string;
+  ok: boolean;
+  checks: ReleaseCheck[];
+}
+
+export interface ReleaseChange {
+  line: number;
+  before: string;
+  after: string;
+}
+
+export interface ReleaseFileChange {
+  path: string;
+  kind: string;
+  from: string | null;
+  to: string;
+  changes: ReleaseChange[];
+}
+
+export interface ReleaseOutcome {
+  ok: boolean;
+  dry_run: boolean;
+  version: string;
+  tag: string;
+  mode: string;
+  preflight: ReleaseCheck[];
+  steps: ReleaseCheck[];
+  files: ReleaseFileChange[];
+  notes_path: string | null;
+  url: string | null;
+}
+
+export interface ReleaseNotesRes {
+  version: string;
+  tag: string;
+  markdown: string;
+  commits: number;
+  compare_url: string | null;
+  written: string | null;
+  messages: string[];
+}
+
+export interface ReleaseRunOpts {
+  version?: string;
+  dry_run?: boolean;
+  skip_tests?: boolean;
+  write?: boolean;
+  changelog?: boolean;
+  notes_file?: string;
+  publish?: boolean;
+  no_push?: boolean;
+  only?: string[];
+  assets?: string[];
+}
