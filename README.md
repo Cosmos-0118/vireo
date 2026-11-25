@@ -54,7 +54,7 @@ Working with coding agents means reviewing diffs, steering tool calls, running c
   </tr>
   <tr>
     <td width="50%"><img src="docs/screenshots/agent.png" alt="Agent panel next to the diff and terminal" /><br /><sub><b>Agent panel</b>: chat or run a CLI agent next to the diff and terminal.</sub></td>
-    <td width="50%"><img src="docs/screenshots/theme-light.png" alt="GitHub Light theme" /><br /><sub><b>Themes</b>: six built-in themes, plus VS Code <code>.json</code> import.</sub></td>
+    <td width="50%"><img src="docs/screenshots/theme-light.png" alt="GitHub Light theme" /><br /><sub><b>Themes</b>: 22 built-in dark and light themes, plus VS Code <code>.json</code> import.</sub></td>
   </tr>
 </table>
 
