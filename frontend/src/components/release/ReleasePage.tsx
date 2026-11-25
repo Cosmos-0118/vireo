@@ -389,7 +389,7 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
 
   return (
     <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto bg-[var(--bg-base)] select-text">
-      <div className="mx-auto w-full max-w-[860px] px-8 py-8" style={{ zoom: scale }}>
+      <div className="mx-auto w-full max-w-[1400px] px-6 @[1100px]:px-10 py-6" style={{ zoom: scale }}>
         {/* Header */}
         <header className="flex items-center gap-3 pb-4 border-b border-[var(--border)]">
           <div className="min-w-0 flex-1">
@@ -628,14 +628,14 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
         )}
 
         {/* Release list */}
-        <section className="mt-6">
+        <section className="mt-4">
           {status.releases.length === 0 ? (
             <div className="py-12 text-center text-[12.5px] text-[var(--text-muted)]">
               <Tag size={22} className="mx-auto mb-2 text-[var(--text-dim)]" />
               No releases yet.
             </div>
           ) : (
-            <ul>
+            <ul className="flex flex-col gap-2">
               {status.releases.map((r, i) => (
                 <ReleaseRow key={r.tag} release={r} latest={i === 0 && !r.prerelease} repo={status.repo} theme={theme} onOpenUrl={openUrl} />
               ))}
@@ -750,50 +750,46 @@ function ReleaseRow({
   };
 
   return (
-    <li className="border-b border-[var(--border)] last:border-b-0">
+    <li className="rounded-lg border border-[var(--border)] bg-[var(--bg-panel)] overflow-hidden">
       <div
         role="button"
         tabIndex={0}
         aria-expanded={open}
         onClick={toggle}
         onKeyDown={(e) => (e.key === 'Enter' || e.key === ' ') && (e.preventDefault(), toggle())}
-        className="flex gap-6 py-4 cursor-pointer hover:bg-[var(--bg-hover)] rounded-md px-2 -mx-2"
+        className="flex items-center gap-2.5 h-11 px-4 cursor-pointer hover:bg-[var(--bg-hover)]"
       >
-        <div className="w-[130px] shrink-0 text-[12px] text-[var(--text-muted)] leading-6" title={r.date ?? undefined}>
+        <ChevronRight size={14} className="shrink-0 text-[var(--text-dim)] transition-transform" style={{ transform: open ? 'rotate(90deg)' : undefined }} />
+        <span className="font-mono text-[14px] font-semibold text-[var(--text-primary)]">{r.tag}</span>
+        {latest && (
+          <span className="text-[11px] px-1.5 rounded-full border leading-[18px]" style={{ color: TONE.ok, borderColor: tint('ok', 40) }}>
+            Latest
+          </span>
+        )}
+        {r.prerelease && (
+          <span className="text-[11px] px-1.5 rounded-full border leading-[18px]" style={{ color: TONE.warn, borderColor: tint('warn', 40) }}>
+            Pre-release
+          </span>
+        )}
+        <span className="ml-auto flex items-center gap-3 text-[12px] text-[var(--text-muted)]" title={r.date ?? undefined}>
+          {r.commit && <span className="font-mono text-[11.5px] text-[var(--text-dim)]">{r.commit.slice(0, 7)}</span>}
           {r.date ? new Date(r.date).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' }) : ''}
-          {r.commit && <div className="font-mono text-[11px] text-[var(--text-dim)]">{r.commit.slice(0, 7)}</div>}
-        </div>
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2 leading-6">
-            <ChevronRight size={14} className="shrink-0 text-[var(--text-dim)] transition-transform" style={{ transform: open ? 'rotate(90deg)' : undefined }} />
-            <span className="font-mono text-[15px] font-semibold text-[var(--text-primary)]">{r.tag}</span>
-            {latest && (
-              <span className="text-[11px] px-1.5 rounded-full border leading-[18px]" style={{ color: TONE.ok, borderColor: tint('ok', 40) }}>
-                Latest
-              </span>
-            )}
-            {r.prerelease && (
-              <span className="text-[11px] px-1.5 rounded-full border leading-[18px]" style={{ color: TONE.warn, borderColor: tint('warn', 40) }}>
-                Pre-release
-              </span>
-            )}
-            {repo && (
-              <button
-                className="ml-auto p-1 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-active)] cursor-pointer"
-                title="Open on GitHub"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onOpenUrl(`https://github.com/${repo}/releases/tag/${r.tag}`);
-                }}
-              >
-                <ExternalLink size={13} />
-              </button>
-            )}
-          </div>
-        </div>
+        </span>
+        {repo && (
+          <button
+            className="p-1 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-active)] cursor-pointer"
+            title="Open on GitHub"
+            onClick={(e) => {
+              e.stopPropagation();
+              onOpenUrl(`https://github.com/${repo}/releases/tag/${r.tag}`);
+            }}
+          >
+            <ExternalLink size={13} />
+          </button>
+        )}
       </div>
       {open && (
-        <div className="mb-4 ml-[154px] rounded-md border border-[var(--border)] px-5 py-4 select-text">
+        <div className="border-t border-[var(--border)] px-6 py-4 select-text">
           {failed ? (
             <span className="text-[12px]" style={{ color: TONE.fail }}>
               Could not load the release notes.

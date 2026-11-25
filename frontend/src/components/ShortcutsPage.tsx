@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from 'react';
-import { Keyboard, Lock, RotateCcw, Search, X } from 'lucide-react';
+import { Lock, RotateCcw, Search, X } from 'lucide-react';
 import {
   ACTIONS,
   FIXED_SHORTCUTS,
@@ -39,29 +39,41 @@ const Keys: React.FC<{ binding: string; dim?: boolean }> = ({ binding, dim }) =>
   );
 };
 
-const Group: React.FC<{ title: string; count: number; children: React.ReactNode }> = ({ title, count, children }) => (
-  <section className="mb-5 break-inside-avoid overflow-hidden rounded-lg border border-[var(--border)] bg-[var(--bg-panel)]">
-    <h3 className="flex items-center justify-between h-8 px-4 border-b border-[var(--border)] bg-[var(--bg-sidebar)] text-[10.5px] font-semibold uppercase tracking-[0.08em] text-[var(--text-dim)]">
-      {title}
-      <span className="font-mono font-normal tracking-normal tabular-nums">{count}</span>
-    </h3>
-    <div className="divide-y divide-[var(--border)]/60">{children}</div>
-  </section>
-);
-
-const SectionHeading: React.FC<{ icon: React.ReactNode; title: string; note: string }> = ({ icon, title, note }) => (
-  <div className="flex items-baseline gap-2 mb-3">
-    <span className="self-center text-[var(--text-dim)]">{icon}</span>
-    <h2 className="text-[12.5px] font-semibold text-[var(--text-primary)]">{title}</h2>
-    <span className="min-w-0 truncate text-[11.5px] text-[var(--text-dim)]">{note}</span>
-  </div>
-);
-
-// Groups flow into 1–3 balanced columns depending on the pane width (not the window).
-const COLUMNS = 'columns-1 @[860px]:columns-2 @[1380px]:columns-3 gap-5';
-
 const iconBtn =
   'w-6 h-6 inline-flex items-center justify-center rounded text-[var(--text-dim)] cursor-pointer hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:invisible';
+
+/** Score one query token against text: substring (word-start best) beats an in-order subsequence; -1 = no match. */
+function tokenScore(token: string, text: string): number {
+  const at = text.indexOf(token);
+  if (at >= 0) return 1000 - at + (at === 0 || /[\s+]/.test(text[at - 1]) ? 200 : 0);
+  let ti = 0;
+  let run = 0;
+  let score = 0;
+  let prev = -2;
+  for (let i = 0; i < text.length && ti < token.length; i++) {
+    if (text[i] !== token[ti]) continue;
+    run = i === prev + 1 ? run + 1 : 0;
+    score += 10 + run * 8 + (i === 0 || /[\s+]/.test(text[i - 1]) ? 15 : 0);
+    prev = i;
+    ti++;
+  }
+  return ti === token.length ? score : -1;
+}
+
+/** Every whitespace-separated token must match; higher = better. */
+function fuzzyScore(query: string, text: string): number {
+  let total = 0;
+  for (const t of query.split(/\s+/).filter(Boolean)) {
+    const s = tokenScore(t, text);
+    if (s < 0) return -1;
+    total += s;
+  }
+  return total;
+}
+
+type Row =
+  | { kind: 'action'; group: string; action: ActionDef; hay: string }
+  | { kind: 'fixed'; group: string; label: string; keys: string; hay: string };
 
 export const ShortcutsPage: React.FC = () => {
   const overrides = useKeybindings(); // re-render on change
@@ -102,27 +114,35 @@ export const ShortcutsPage: React.FC = () => {
     };
   }, [recording]);
 
-  const q = query.trim().toLowerCase();
-  const matches = (label: string, binding: string) =>
-    !q || label.toLowerCase().includes(q) || formatBinding(binding).toLowerCase().includes(q);
-
-  const groups = useMemo(
-    () =>
-      GROUP_ORDER.map((g) => ({
-        group: g,
-        actions: ACTIONS.filter((a) => a.group === g && matches(a.label, getBinding(a.id))),
-      })).filter((g) => g.actions.length > 0),
+  // One linear list: customizable groups first, then built-ins, each group in order.
+  const rows = useMemo<Row[]>(() => {
+    const out: Row[] = [];
+    for (const g of GROUP_ORDER) {
+      for (const a of ACTIONS.filter((x) => x.group === g)) {
+        const keys = [getBinding(a.id), ...(a.alts ?? [])].map((k) => formatBinding(k)).join(' ');
+        out.push({ kind: 'action', group: g, action: a, hay: `${a.label} ${g} ${keys}`.toLowerCase() });
+      }
+    }
+    for (const g of FIXED_SHORTCUTS) {
+      for (const i of g.items) {
+        out.push({ kind: 'fixed', group: g.group, label: i.label, keys: i.keys, hay: `${i.label} ${g.group} ${formatBinding(i.keys)}`.toLowerCase() });
+      }
+    }
+    return out;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [q, overrides]
-  );
-  const fixed = FIXED_SHORTCUTS.map((g) => ({
-    ...g,
-    items: g.items.filter((i) => matches(i.label, i.keys)),
-  })).filter((g) => g.items.length > 0);
+  }, [overrides]);
+
+  const q = query.trim().toLowerCase();
+  const visible = useMemo(() => {
+    if (!q) return rows;
+    return rows
+      .map((r) => ({ r, s: fuzzyScore(q, r.hay) }))
+      .filter((x) => x.s >= 0)
+      .sort((a, b) => b.s - a.s)
+      .map((x) => x.r);
+  }, [rows, q]);
 
   const customCount = Object.keys(overrides).length;
-  const totalCount = ACTIONS.length + FIXED_SHORTCUTS.reduce((n, g) => n + g.items.length, 0);
-  const nothing = groups.length === 0 && fixed.length === 0;
 
   const applyPending = () => {
     if (!pending) return;
@@ -134,195 +154,162 @@ export const ShortcutsPage: React.FC = () => {
     setPending(null);
   };
 
-  return (
-    <div className="@container flex-1 min-h-0 overflow-y-auto bg-[var(--bg-base)]">
-      {/* Sticky header: title, stats, search and reset stay reachable while scrolling */}
-      <div className="sticky top-0 z-[2] border-b border-[var(--border)] bg-[var(--bg-base)]/95 backdrop-blur-sm">
-        <div className="mx-auto w-full max-w-[1680px] px-6 @[1200px]:px-10 pt-6 pb-4">
-          <header className="flex flex-wrap items-end justify-between gap-x-6 gap-y-3">
-            <div className="min-w-0">
-              <h1 className="flex items-center gap-2 text-[17px] font-semibold tracking-tight text-[var(--text-primary)]">
-                <Keyboard size={17} className="text-[var(--accent)]" />
-                Keyboard Shortcuts
-              </h1>
-              <p className="mt-1 text-[12px] text-[var(--text-dim)]">
-                Click a shortcut to change it. Esc cancels, <X size={10} className="inline -mt-px" /> unbinds,{' '}
-                <RotateCcw size={10} className="inline -mt-px" /> restores the default.
-              </p>
+  const renderRow = (r: Row, showGroup: boolean) => {
+    if (r.kind === 'fixed') {
+      return (
+        <div key={`f:${r.group}:${r.keys}:${r.label}`} className="flex items-center justify-between gap-4 min-h-[38px] px-3 hover:bg-[var(--bg-hover)]/50">
+          <div className="min-w-0 flex items-center gap-2 text-[13px] text-[var(--text-muted)]">
+            <span className="truncate" title={r.label}>{r.label}</span>
+            {showGroup && <span className="shrink-0 text-[11px] text-[var(--text-dim)]">{r.group}</span>}
+          </div>
+          <span className="shrink-0 inline-flex items-center gap-2" title="Built-in: can't be changed">
+            <Lock size={11} className="text-[var(--text-dim)]" />
+            <Keys binding={r.keys} dim />
+          </span>
+        </div>
+      );
+    }
+    const a = r.action;
+    const binding = getBinding(a.id);
+    const isRec = recording === a.id;
+    const custom = isCustomized(a.id);
+    const isPending = pending?.id === a.id;
+    return (
+      <div
+        key={a.id}
+        className={`group/row relative px-3 transition-colors hover:bg-[var(--bg-hover)]/50 ${isRec ? 'bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]' : ''}`}
+      >
+        {custom && <span className="absolute left-0 top-2 bottom-2 w-[2px] rounded-r bg-[var(--accent)]" title="Customized" />}
+        <div className="flex items-center justify-between gap-4 min-h-[38px]">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-[13px] text-[var(--text-primary)]">
+              <span className="truncate" title={a.label}>{a.label}</span>
+              {showGroup && <span className="shrink-0 text-[11px] text-[var(--text-dim)]">{r.group}</span>}
             </div>
-            <div className="flex items-center gap-2 w-full @[700px]:w-auto">
-              <div className="relative flex-1 @[700px]:w-[340px] @[700px]:flex-none">
-                <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[var(--text-dim)]" />
-                <input
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search by action or key (e.g. terminal, Ctrl+B)"
-                  className="w-full h-8 pl-8 pr-7 rounded-md bg-[var(--bg-input)] border border-[var(--border)] text-[12.5px] text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none focus:border-[var(--accent)]"
-                />
-                {query && (
-                  <button
-                    type="button"
-                    onClick={() => setQuery('')}
-                    aria-label="Clear search"
-                    className="absolute right-1.5 top-1/2 -translate-y-1/2 p-0.5 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] cursor-pointer"
-                  >
-                    <X size={12} />
-                  </button>
-                )}
+            {a.alts && (
+              <div className="text-[11px] text-[var(--text-dim)] truncate" title="Always-on alternates">
+                also {a.alts.map((x) => formatBinding(x)).join(', ')}
               </div>
+            )}
+          </div>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => {
+                setPending(null);
+                setHint(null);
+                setRecording(isRec ? null : a.id);
+              }}
+              title={isRec ? 'Press the new shortcut (Esc to cancel)' : 'Click to change'}
+              className={`min-w-[132px] h-7 px-2 inline-flex items-center justify-end rounded-md border cursor-pointer transition-colors ${
+                isRec
+                  ? 'justify-center border-[var(--accent)] bg-[color-mix(in_srgb,var(--accent)_12%,transparent)] text-[12px] text-[var(--accent)]'
+                  : 'border-transparent hover:border-[var(--border)] hover:bg-[var(--bg-elevated)]'
+              }`}
+            >
+              {isRec ? 'Press keys…' : <Keys binding={binding} />}
+            </button>
+            <button
+              type="button"
+              onClick={() => setBinding(a.id, '')}
+              disabled={!binding}
+              title="Unbind"
+              aria-label={`Unbind ${a.label}`}
+              className={`${iconBtn} opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100`}
+            >
+              <X size={12} />
+            </button>
+            <button
+              type="button"
+              onClick={() => resetBinding(a.id)}
+              disabled={!custom}
+              title={`Reset to default (${formatBinding(a.default) || 'unbound'})`}
+              aria-label={`Reset ${a.label}`}
+              className={iconBtn}
+            >
+              <RotateCcw size={12} />
+            </button>
+          </div>
+        </div>
+        {isRec && hint && <div className="pb-2 text-[11.5px] text-[var(--modified-fg)]">{hint}</div>}
+        {isPending && pending && (
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2 text-[12px] text-[var(--text-muted)]">
+            <span className="min-w-0">
+              <b className="font-mono text-[var(--text-primary)]">{formatBinding(pending.binding)}</b> is already used by{' '}
+              {pending.conflicts.map((c) => `“${c.label}”`).join(', ')}.
+            </span>
+            <span className="flex items-center gap-1.5 shrink-0">
+              <button type="button" onClick={() => setPending(null)} className="h-6 px-2 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--bg-hover)]">
+                Cancel
+              </button>
+              <button type="button" onClick={applyPending} className="h-6 px-2 rounded bg-[var(--accent)] text-[var(--accent-fg)] cursor-pointer hover:opacity-90">
+                Reassign
+              </button>
+            </span>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // Group headings only when browsing (not while a search ranks results across groups).
+  const body: React.ReactNode[] = [];
+  let last = '';
+  for (const r of visible) {
+    const gKey = `${r.kind}:${r.group}`;
+    if (!q && gKey !== last) {
+      last = gKey;
+      body.push(
+        <h3 key={`h:${gKey}`} className="px-3 pt-5 pb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--text-dim)] first:pt-1">
+          {r.group}
+          {r.kind === 'fixed' && <span className="ml-1.5 normal-case tracking-normal font-normal">· built-in</span>}
+        </h3>
+      );
+    }
+    body.push(renderRow(r, !!q));
+  }
+
+  return (
+    <div className="flex-1 min-h-0 overflow-y-auto bg-[var(--bg-base)]">
+      <div className="sticky top-0 z-[2] bg-[var(--bg-base)]/95 backdrop-blur-sm border-b border-[var(--border)]">
+        <div className="mx-auto w-full max-w-[920px] px-6 py-3 flex items-center gap-2">
+          <div className="relative flex-1">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-dim)]" />
+            <input
+              autoFocus
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search shortcuts…"
+              spellCheck={false}
+              className="w-full h-9 pl-9 pr-8 rounded-md bg-[var(--bg-input)] border border-[var(--border)] text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none focus:border-[var(--accent)]"
+            />
+            {query && (
               <button
                 type="button"
-                onClick={resetAllBindings}
-                disabled={customCount === 0}
-                className="shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] text-[12px] text-[var(--text-muted)] cursor-pointer hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-40 disabled:cursor-default disabled:hover:bg-[var(--bg-elevated)]"
+                onClick={() => setQuery('')}
+                aria-label="Clear search"
+                className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] cursor-pointer"
               >
-                <RotateCcw size={12} />
-                Reset all{customCount > 0 ? ` (${customCount})` : ''}
+                <X size={13} />
               </button>
-            </div>
-          </header>
-          <div className="mt-3 flex items-center gap-3 text-[11px] text-[var(--text-dim)] tabular-nums">
-            <span>{totalCount} shortcuts</span>
-            <span className="w-px h-3 bg-[var(--border)]" />
-            <span>{ACTIONS.length} customizable</span>
-            <span className="w-px h-3 bg-[var(--border)]" />
-            <span className={customCount > 0 ? 'text-[var(--accent)]' : ''}>{customCount} changed</span>
+            )}
           </div>
+          {customCount > 0 && (
+            <button
+              type="button"
+              onClick={resetAllBindings}
+              className="shrink-0 inline-flex items-center gap-1.5 h-9 px-3 rounded-md border border-[var(--border)] text-[12px] text-[var(--text-muted)] cursor-pointer hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            >
+              <RotateCcw size={12} />
+              Reset all ({customCount})
+            </button>
+          )}
         </div>
       </div>
 
-      <div className="mx-auto w-full max-w-[1680px] px-6 @[1200px]:px-10 py-6">
-        {groups.length > 0 && (
-          <SectionHeading icon={<Keyboard size={13} />} title="Customizable" note="Your bindings, saved across restarts." />
-        )}
-        <div className={COLUMNS}>
-          {groups.map(({ group, actions }) => (
-            <Group key={group} title={group} count={actions.length}>
-              {actions.map((a) => {
-                const binding = getBinding(a.id);
-                const isRec = recording === a.id;
-                const custom = isCustomized(a.id);
-                const isPending = pending?.id === a.id;
-                return (
-                  <div
-                    key={a.id}
-                    className={`group/row relative px-4 py-2 transition-colors hover:bg-[var(--bg-hover)]/50 ${
-                      isRec ? 'bg-[color-mix(in_srgb,var(--accent)_6%,transparent)]' : ''
-                    }`}
-                  >
-                    {custom && <span className="absolute left-0 top-2 bottom-2 w-[2px] rounded-r bg-[var(--accent)]" title="Customized" />}
-                    <div className="flex items-center justify-between gap-3 min-h-[28px]">
-                      <div className="min-w-0">
-                        <div className="text-[13px] text-[var(--text-primary)] truncate" title={a.label}>
-                          {a.label}
-                        </div>
-                        {a.alts && (
-                          <div className="mt-0.5 text-[11px] text-[var(--text-dim)] truncate" title="Always-on alternates">
-                            also {a.alts.map((x) => formatBinding(x)).join(', ')}
-                          </div>
-                        )}
-                      </div>
-                      <div className="flex items-center gap-1 shrink-0">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setPending(null);
-                            setHint(null);
-                            setRecording(isRec ? null : a.id);
-                          }}
-                          title={isRec ? 'Press the new shortcut (Esc to cancel)' : 'Click to change'}
-                          className={`min-w-[132px] h-7 px-2 inline-flex items-center justify-end rounded-md border cursor-pointer transition-colors ${
-                            isRec
-                              ? 'justify-center border-[var(--accent)] bg-[color-mix(in_srgb,var(--accent)_12%,transparent)] text-[12px] text-[var(--accent)]'
-                              : 'border-transparent hover:border-[var(--border)] hover:bg-[var(--bg-elevated)]'
-                          }`}
-                        >
-                          {isRec ? 'Press keys…' : <Keys binding={binding} />}
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setBinding(a.id, '')}
-                          disabled={!binding}
-                          title="Unbind"
-                          aria-label={`Unbind ${a.label}`}
-                          className={`${iconBtn} opacity-0 group-hover/row:opacity-100 focus-visible:opacity-100`}
-                        >
-                          <X size={12} />
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => resetBinding(a.id)}
-                          disabled={!custom}
-                          title={`Reset to default (${formatBinding(a.default) || 'unbound'})`}
-                          aria-label={`Reset ${a.label}`}
-                          className={iconBtn}
-                        >
-                          <RotateCcw size={12} />
-                        </button>
-                      </div>
-                    </div>
-                    {isRec && hint && <div className="mt-1.5 text-[11.5px] text-[var(--modified-fg)]">{hint}</div>}
-                    {isPending && pending && (
-                      <div className="mt-2 flex flex-wrap items-center justify-between gap-x-3 gap-y-2 rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2 text-[12px] text-[var(--text-muted)]">
-                        <span className="min-w-0">
-                          <b className="font-mono text-[var(--text-primary)]">{formatBinding(pending.binding)}</b> is already
-                          used by {pending.conflicts.map((c) => `“${c.label}”`).join(', ')}.
-                        </span>
-                        <span className="flex items-center gap-1.5 shrink-0">
-                          <button
-                            type="button"
-                            onClick={() => setPending(null)}
-                            className="h-6 px-2 rounded border border-[var(--border)] cursor-pointer hover:bg-[var(--bg-hover)]"
-                          >
-                            Cancel
-                          </button>
-                          <button
-                            type="button"
-                            onClick={applyPending}
-                            className="h-6 px-2 rounded bg-[var(--accent)] text-[var(--accent-fg)] cursor-pointer hover:opacity-90"
-                          >
-                            Reassign
-                          </button>
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
-            </Group>
-          ))}
-        </div>
-
-        {fixed.length > 0 && (
-          <div className={groups.length > 0 ? 'mt-6' : ''}>
-            <SectionHeading
-              icon={<Lock size={12} />}
-              title="Built-in"
-              note="Owned by the editor, terminal and dialogs; can’t be changed here."
-            />
-            <div className={COLUMNS}>
-              {fixed.map((g) => (
-                <Group key={g.group} title={g.group} count={g.items.length}>
-                  {g.items.map((i) => (
-                    <div
-                      key={i.keys + i.label}
-                      className="flex items-center justify-between gap-3 min-h-[44px] px-4 py-2 hover:bg-[var(--bg-hover)]/50"
-                    >
-                      <div className="min-w-0 text-[13px] text-[var(--text-muted)] truncate" title={i.label}>
-                        {i.label}
-                      </div>
-                      <span className="shrink-0">
-                        <Keys binding={i.keys} dim />
-                      </span>
-                    </div>
-                  ))}
-                </Group>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {nothing && (
+      <div className="mx-auto w-full max-w-[920px] px-6 py-4 pb-10">
+        {body}
+        {visible.length === 0 && (
           <div className="py-16 text-center text-[12.5px] text-[var(--text-dim)]">No shortcuts match “{query}”.</div>
         )}
       </div>
