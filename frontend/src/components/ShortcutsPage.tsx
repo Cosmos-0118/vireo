@@ -82,13 +82,20 @@ export const ShortcutsPage: React.FC = () => {
   const [hint, setHint] = useState<string | null>(null);
   const [pending, setPending] = useState<{ id: ActionId; binding: string; conflicts: ActionDef[] } | null>(null);
 
-  // Scale the whole page up on large screens, like the Releases page (fixed px sizes otherwise look tiny).
+  // Gently scale up on very large screens. Layout decisions use the *effective* (post-zoom) width,
+  // otherwise zoom shrinks the layout box and two columns get cramped and truncate labels.
   const scrollRef = useRef<HTMLDivElement>(null);
   const [scale, setScale] = useState(1);
+  const [wide, setWide] = useState(false);
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const update = () => setScale(Math.min(2, Math.max(1, el.clientWidth / 1000)));
+    const update = () => {
+      const w = el.clientWidth;
+      const s = Math.min(1.5, Math.max(1, w / 1500));
+      setScale(s);
+      setWide(w / s >= 1100);
+    };
     update();
     const ro = new ResizeObserver(update);
     ro.observe(el);
@@ -280,9 +287,9 @@ export const ShortcutsPage: React.FC = () => {
   }
 
   return (
-    <div ref={scrollRef} className="@container flex-1 min-h-0 overflow-y-auto bg-[var(--bg-base)] select-none">
+    <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto bg-[var(--bg-base)] select-none">
       <div className="sticky top-0 z-[2] bg-[var(--bg-base)]/95 backdrop-blur-sm border-b border-[var(--border)]">
-        <div className="mx-auto w-full max-w-[1400px] px-6 @[1100px]:px-10 pt-5 pb-3" style={{ zoom: scale }}>
+        <div className={`mx-auto w-full max-w-[1400px] ${wide ? 'px-10' : 'px-6'} pt-5 pb-3`} style={{ zoom: scale }}>
           <div className="flex items-end justify-between gap-4 pb-3">
             <div className="min-w-0">
               <h1 className="text-[20px] font-semibold tracking-tight text-[var(--text-primary)]">Keyboard Shortcuts</h1>
@@ -325,8 +332,8 @@ export const ShortcutsPage: React.FC = () => {
         </div>
       </div>
 
-      <div className="mx-auto w-full max-w-[1400px] px-6 @[1100px]:px-10 py-5 pb-12" style={{ zoom: scale }}>
-        <div className={q ? '' : '@[1100px]:columns-2 @[1100px]:gap-x-5'}>
+      <div className={`mx-auto w-full max-w-[1400px] ${wide ? 'px-10' : 'px-6'} py-5 pb-12`} style={{ zoom: scale }}>
+        <div className={q || !wide ? '' : 'columns-2 gap-x-5'}>
           {sections.map((s) => (
             <section key={s.key} className="break-inside-avoid mb-5 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)]/40 overflow-hidden">
               <h3 className="flex items-center gap-2 h-9 px-3 border-b border-[var(--border)] text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--text-dim)]">
