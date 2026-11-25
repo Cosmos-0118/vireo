@@ -21,6 +21,7 @@ import {
   Rocket,
   Minus,
   Palette,
+  Sparkles,
   PanelBottom,
   PanelLeft,
   PanelRight,
@@ -156,6 +157,16 @@ export function App() {
     () => localStorage.getItem('vireo-theme') || BUILTIN_THEMES[0].id
   );
   const activeTheme = themes.find((t) => t.id === themeId) || BUILTIN_THEMES[0];
+  const themeGroups = useMemo(() => {
+    const builtinIds = new Set(BUILTIN_THEMES.map((t) => t.id));
+    const groups: { label: string; original?: boolean; items: LiteTheme[] }[] = [
+      { label: 'Vireo Originals', original: true, items: themes.filter((t) => t.origin === 'vireo') },
+      { label: 'Dark', items: themes.filter((t) => builtinIds.has(t.id) && !t.origin && t.type === 'dark') },
+      { label: 'Light', items: themes.filter((t) => builtinIds.has(t.id) && !t.origin && t.type === 'light') },
+      { label: 'Imported', items: themes.filter((t) => !builtinIds.has(t.id)) },
+    ];
+    return groups.filter((g) => g.items.length > 0);
+  }, [themes]);
 
   const themeMetaJson = (theme: LiteTheme) =>
     JSON.stringify({ type: theme.type, vars: theme.vars });
@@ -2082,31 +2093,55 @@ export function App() {
                 <Palette size={15} />
               </button>
               {showThemeMenu && (
-                <div className="absolute right-0 top-full mt-1.5 w-60 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 py-1.5">
-                  <div className="px-3 py-1 text-[11px] uppercase font-semibold tracking-wider text-[var(--text-dim)]">
-                    Color Theme
+                <div className="absolute right-0 top-full mt-1.5 w-72 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 flex flex-col max-h-[min(75vh,640px)]">
+                  <div className="overflow-y-auto py-1.5">
+                    {themeGroups.map((group) => (
+                      <div key={group.label} className="pb-1">
+                        <div className="px-3 pt-1.5 pb-1 text-[11px] uppercase font-semibold tracking-wider text-[var(--text-dim)] flex items-center gap-1.5">
+                          {group.original && <Sparkles size={11} className="text-[var(--accent)]" />}
+                          {group.label}
+                        </div>
+                        {group.items.map((th) => {
+                          const active = th.id === activeTheme.id;
+                          return (
+                            <button
+                              key={th.id}
+                              onClick={() => {
+                                selectTheme(th);
+                                setShowThemeMenu(false);
+                              }}
+                              title={th.tagline ?? th.name}
+                              className={`w-full text-left px-3 py-1.5 text-[13px] flex items-center justify-between gap-3 cursor-pointer ${
+                                active
+                                  ? 'bg-[var(--accent)] text-[var(--accent-fg)]'
+                                  : 'hover:bg-[var(--bg-hover)] text-[var(--text-primary)]'
+                              }`}
+                            >
+                              <span className="min-w-0 flex flex-col">
+                                <span className="truncate">{th.name}</span>
+                                {th.tagline && (
+                                  <span className={`truncate text-[11px] ${active ? 'opacity-80' : 'text-[var(--text-dim)]'}`}>
+                                    {th.tagline}
+                                  </span>
+                                )}
+                              </span>
+                              <span
+                                className="shrink-0 flex h-4 w-10 overflow-hidden rounded-full border border-white/20"
+                                style={{ background: th.vars['--bg-base'] }}
+                                aria-hidden
+                              >
+                                <span className="flex-1" style={{ background: th.vars['--bg-base'] }} />
+                                <span className="flex-1" style={{ background: th.syntax.keyword }} />
+                                <span className="flex-1" style={{ background: th.syntax.string }} />
+                                <span className="flex-1" style={{ background: th.vars['--accent'] }} />
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    ))}
                   </div>
-                  {themes.map((th) => (
-                    <button
-                      key={th.id}
-                      onClick={() => {
-                        selectTheme(th);
-                        setShowThemeMenu(false);
-                      }}
-                      className={`w-full text-left px-3 py-2 text-[13px] flex items-center justify-between cursor-pointer ${
-                        th.id === activeTheme.id
-                          ? 'bg-[var(--accent)] text-[var(--accent-fg)]'
-                          : 'hover:bg-[var(--bg-hover)] text-[var(--text-primary)]'
-                      }`}
-                    >
-                      <span>{th.name}</span>
-                      <span
-                        className="w-3.5 h-3.5 rounded-full border border-white/25"
-                        style={{ background: th.vars['--bg-base'] }}
-                      />
-                    </button>
-                  ))}
-                  <div className="border-t border-[var(--border)] mt-1.5 pt-1.5 px-2">
+                  <div className="shrink-0 border-t border-[var(--border)] py-1.5 px-2">
                     <button
                       onClick={() => themeFileInputRef.current?.click()}
                       className="w-full py-1.5 px-2 text-[12.5px] text-left whitespace-nowrap rounded hover:bg-[var(--bg-hover)] text-[var(--accent)] flex items-center gap-1.5 cursor-pointer"
