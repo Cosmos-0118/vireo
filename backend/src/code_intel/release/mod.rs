@@ -725,6 +725,23 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
             }
             Ok(out.render())
         }
+        "draft" => {
+            let target = ctx.target(version).ok();
+            let (want_ver, want_tag) = (target.as_ref().map(|v| v.to_string()), target.as_ref().map(|v| ctx.tag_for(v)));
+            let dry = flag(a, "dry_run");
+            match flow::draft(&ctx, version, s(a, "notes_file"), dry) {
+                Ok(text) => {
+                    if !dry {
+                        log("draft", json!({ "ok": true, "version": want_ver, "tag": want_tag, "summary": "draft release staged" }));
+                    }
+                    Ok(text)
+                }
+                Err(e) => {
+                    log("draft", json!({ "ok": false, "dry_run": dry, "version": want_ver, "tag": want_tag, "summary": e }));
+                    Err(e)
+                }
+            }
+        }
         "verify" => {
             let target = match version {
                 Some(v) => ctx.base().resolve(v)?,
@@ -749,6 +766,6 @@ pub fn run(ws: &Path, a: &Value) -> Result<String, String> {
             }
             Ok(markdown)
         }
-        other => Err(format!("unknown release action `{other}` (status|preflight|notes|bump|publish|verify|activity|body)")),
+        other => Err(format!("unknown release action `{other}` (status|preflight|notes|bump|draft|publish|verify|activity|body)")),
     }
 }

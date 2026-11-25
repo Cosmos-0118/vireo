@@ -392,7 +392,7 @@ fn missing_program(raw: &str) -> Option<String> {
 pub(crate) fn env_hint(raw: &str) -> Option<String> {
     let l = raw.to_ascii_lowercase();
     if (l.contains("cl.exe") || l.contains("link.exe")) && (l.contains("not found") || l.contains("not be found")) {
-        return Some("hint: MSVC build tools are not on PATH for this shell (environment problem, not a code error). Run from a VS Developer shell or source the repo's msvc-env.ps1 (Enter-MsvcEnv), then retry.".into());
+        return Some("hint: MSVC build tools are not on PATH for this shell (environment problem, not a code error). vx loads Visual Studio's environment automatically when it finds an install; none was found or loading failed. Install the 'Desktop development with C++' workload, set VX_VCVARS to the full path of vcvars64.bat, or run from a VS Developer shell (repo: msvc-env.ps1, Enter-MsvcEnv), then retry.".into());
     }
     let ps_missing = l.contains("commandnotfoundexception") || l.contains("is not recognized as the name of a cmdlet");
     if ps_missing || l.contains("command not found") || l.contains("is not recognized as an internal or external command") || l.contains("program not found") {

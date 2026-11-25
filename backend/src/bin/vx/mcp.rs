@@ -20,7 +20,7 @@ Edit, pick one:
 - replace {old, new, path?, glob?, regex?, expected?, dry_run?}: literal by default; regex replacement uses $1 / ${1}
 - apply {patch: "*** Update File: a.rs\n@@ 12#ab..15#cd\n+new line"}; other hunks: @@ symbol Foo::bar (+lines replace it) · @@ after symbol Foo · @@ delete symbol Foo · @@ top|bottom|after imports
 - check {cmd?, dir?, warnings?}: a build still running after 60s returns a job id; call check {job} to wait.
-- release {action?: status|preflight|notes|bump|publish|verify|activity, version?, dry_run?, ...}: `status` (default) says what to do next; always publish {dry_run:true} first."##;
+- release {action?: status|preflight|notes|bump|draft|publish|verify|activity, version?, dry_run?, ...}: `status` (default) says what to do next; `draft` stages a private GitHub draft (CI-mode tag pushes publish publicly); always publish {dry_run:true} first."##;
 
 pub fn mcp_tools(read_only: bool) -> Value {
     let mut tools = vec![
@@ -160,11 +160,11 @@ pub fn mcp_tools(read_only: bool) -> Value {
             }),
             json!({
                 "name": "release",
-                "description": "Release engine (Rust/Node/Tauri/.NET/Python/Java/Go). `status` (default) shows stacks, version drift, commits since the last tag and the exact next command. Others: preflight, notes (write:true saves an editable draft), bump, publish, verify, activity. Always publish {dry_run:true} first and show the plan; every action shows live on the user's Releases page.",
+                "description": "Release engine (Rust/Node/Tauri/.NET/Python/Java/Go). `status` (default) shows stacks, version drift, commits since the last tag and the exact next command. Others: preflight, notes (write:true saves an editable draft), bump, draft (stage a private GitHub draft release from the notes; no tag or push), publish, verify, activity. In CI mode a tag push publishes publicly, so run draft first. Always publish {dry_run:true} first and show the plan; every action shows live on the user's Releases page.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "enum": ["status", "preflight", "notes", "bump", "publish", "verify", "activity"] },
+                        "action": { "type": "string", "enum": ["status", "preflight", "notes", "bump", "draft", "publish", "verify", "activity"] },
                         "version": { "type": "string", "description": "patch | minor | major | prerelease | X.Y.Z[-pre]. Omit to use the suggested version" },
                         "dry_run": { "type": "boolean", "description": "bump/publish: report what would happen, change nothing" },
                         "skip_tests": { "type": "boolean", "description": "preflight/publish: skip the build & test gate" },

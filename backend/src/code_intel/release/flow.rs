@@ -279,7 +279,11 @@ pub fn preflight(ctx: &Ctx, target: &Ver, tests: bool) -> Report {
             let opts = CheckOpts { raw: false, warnings: false, dir: None, cwd: Some(ws.clone()), wait: None, job: None };
             match check(ws, cmd, 900, opts) {
                 Ok(r) if check_failed(&r) => {
-                    failure = Some(first_lines(&r.lines().filter(|l| l.starts_with('✖')).collect::<Vec<_>>().join("\n"), 3));
+                    // Environment hints (e.g. "MSVC build tools are not on PATH") name the real cause;
+                    // show them first so the failure isn't a bare exit code.
+                    let mut lines: Vec<&str> = r.lines().filter(|l| l.starts_with("hint:")).collect();
+                    lines.extend(r.lines().filter(|l| l.starts_with('✖')));
+                    failure = Some(first_lines(&lines.join("\n"), 4));
                     break;
                 }
                 Ok(r) => summary = first_lines(&r, 1),
@@ -471,7 +475,7 @@ pub fn publish(ctx: &Ctx, o: &PublishOpts) -> Result<Outcome, String> {
     let can_push = !o.no_push && has_origin(ws);
     step(&mut out, "push", if can_push { "ok" } else { "skip" }, "Push", if can_push { format!("atomic push of `{branch}` + `{tag}` to origin") } else if o.no_push { "--no-push: stays local".into() } else { "no origin remote: stays local".into() });
     match (mode.as_str(), can_push) {
-        ("ci", true) => step(&mut out, "release", "ok", "Release", format!("CI builds and publishes after the tag push ({})", ctx.ci_workflows().join(", "))),
+        ("ci", true) => step(&mut out, "release", "ok", "Release", format!("CI builds and PUBLISHES publicly after the tag push ({}); to stage a private draft first, run `release draft {}`", ctx.ci_workflows().join(", "), target)),
         ("gh", true) => step(&mut out, "release", "ok", "GitHub release", if o.publish { "created as draft, then published".into() } else { format!("created as DRAFT: review, then promote on GitHub or run `gh release edit {tag} --draft=false`") }),
         _ => {}
     }
@@ -614,6 +618,56 @@ pub fn publish(ctx: &Ctx, o: &PublishOpts) -> Result<Outcome, String> {
     Ok(out)
 }
 
+/// Stage a GitHub DRAFT release for the target version from its notes file, without bumping,
+/// committing, tagging or pushing. In CI mode the draft is what the later tag push fills in (the
+/// workflow attaches the build to an existing release and keeps these notes), so nothing is public
+/// until the draft is promoted. Re-running updates the draft's notes in place.
+pub fn draft(ctx: &Ctx, version: Option<&str>, notes_file: Option<&str>, dry_run: bool) -> Result<String, String> {
+    let ws = &ctx.ws;
+    let target = ctx.target(version)?;
+    let tag = ctx.tag_for(&target);
+    let (owner, repo) = notes::github_repo(ws).ok_or("no GitHub `origin` remote: a draft release needs one")?;
+    let notes_rel = notes_file.map(str::to_string).unwrap_or_else(|| ctx.notes_path(&tag));
+    if !ws.join(&notes_rel).is_file() {
+        return Err(format!("notes file `{notes_rel}` does not exist; run `release notes {target} --write` first"));
+    }
+    match gh_cmd(ws, &["auth", "status"], 20) {
+        Ok((true, ..)) => {}
+        Ok((false, ..)) | Err(_) => return Err("GitHub CLI is not authenticated: run `gh auth login`".into()),
+    }
+    let branch = git_ok(ws, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_else(|_| "HEAD".into());
+    let existing = gh_cmd(ws, &["release", "view", &tag, "--json", "isDraft", "--jq", ".isDraft"], 30).ok().filter(|r| r.0).map(|r| r.1 == "true");
+    if existing == Some(false) {
+        return Err(format!("`{tag}` is already a published release; nothing to draft"));
+    }
+    let mut title = repo.clone();
+    if let Some(c) = title.get(..1) {
+        title = format!("{}{}", c.to_uppercase(), &title[1..]);
+    }
+    let title = format!("{title} {tag}");
+    let verb = if existing.is_some() { "update the notes of the existing draft" } else { "create a draft" };
+    let next = match ctx.mode().as_str() {
+        "ci" => format!("next: `release publish {target}` bumps, tags and pushes; CI then builds and fills this draft. Publish it with `gh release edit {tag} --draft=false`."),
+        _ => format!("next: `release publish {target}` to bump and tag; promote the draft with `gh release edit {tag} --draft=false`."),
+    };
+    if dry_run {
+        return Ok(format!("draft {tag} (dry run): would {verb} on {owner}/{repo} from `{notes_rel}` (target `{branch}`); nothing changed\n{next}"));
+    }
+    let (ok, out, err) = if existing.is_some() {
+        gh_cmd(ws, &["release", "edit", &tag, "--title", &title, "--notes-file", &notes_rel], 60)?
+    } else {
+        let mut args = vec!["release", "create", &tag, "--draft", "--target", &branch, "--title", &title, "--notes-file", &notes_rel];
+        if target.is_pre() {
+            args.push("--prerelease");
+        }
+        gh_cmd(ws, &args, 60)?
+    };
+    if !ok {
+        return Err(format!("gh failed: {}", first_lines(&err, 3)));
+    }
+    let url = out.lines().last().unwrap_or("");
+    Ok(format!("draft {tag}: {} from `{notes_rel}` \u{2192} {url}\nstill a draft: nothing is public, no tag pushed\n{next}", if existing.is_some() { "notes updated" } else { "created" }))
+}
 pub fn verify(ctx: &Ctx, target: &Ver) -> Report {
     let ws = &ctx.ws;
     let tag = ctx.tag_for(target);

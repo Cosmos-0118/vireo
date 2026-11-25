@@ -69,7 +69,7 @@ pub const AGENT_HINT: &str = r##"Vireo `vx`: token-lean code tools (MCP `mcp__vx
 - replace <old> <new> [path] [-g G] [-r] [--dry-run] [--expected N]: atomic across files; regex groups `$1`/`\1` (MCP: `rules: [{old, new, regex?}]` for several at once)
 - apply [--file F]: atomic multi-file patch. Hunks: `@@ 12#ab..15#cd` (+ lines replace), `@@ after 12#ab`, `@@ delete A#h..B#h`, `@@ symbol Foo::bar` (+ lines replace the symbol), `@@ after symbol Foo`, `@@ delete symbol Foo`, `@@ top|bottom|after imports`, or classic `@@` context
 - symbol <file> <name> [--replace|--insert-after|--delete] · create <file> [--force] · ast '<pat>' [-r '<rewrite>'] [-l lang]
-- check [cmd...]: build/test with anchored errors (MCP: long builds return a job id; call check {job}) · release [status|preflight|notes|bump|publish|verify]: `status` says what to do next; `publish --dry-run` first
+- check [cmd...]: build/test with anchored errors (MCP: long builds return a job id; call check {job}) · release [status|preflight|notes|bump|draft|publish|verify]: `status` says what to do next; `publish --dry-run` first
 Anchors `N#hh` come from view/search/edit output and edits return fresh ones, so never re-read after editing. On Windows prefer MCP or `--file F` over piping multi-line code. `vx help` has details."##;
 
 fn s<'a>(args: &'a Value, k: &str) -> Option<&'a str> {

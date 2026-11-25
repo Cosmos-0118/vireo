@@ -344,6 +344,105 @@ fn installed_program(name: &str) -> Option<PathBuf> {
 /// otherwise PowerShell 7 (`pwsh`) when installed, else Windows PowerShell 5.1 with `&&` / `||`
 /// chains rewritten.
 pub(crate) fn shell_command(cmd: &str) -> Command {
+    let c = shell_command_raw(cmd);
+    #[cfg(windows)]
+    let c = with_msvc(c, cmd);
+    c
+}
+
+/// Windows: `vcvars64.bat` of the newest Visual Studio install. `VX_VCVARS` (full path) overrides.
+#[cfg(windows)]
+fn find_vcvars64() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("VX_VCVARS").map(PathBuf::from).filter(|p| p.is_file()) {
+        return Some(p);
+    }
+    let rel = ["VC", "Auxiliary", "Build", "vcvars64.bat"];
+    let roots: Vec<PathBuf> = ["ProgramFiles", "ProgramFiles(x86)"]
+        .iter()
+        .filter_map(|k| std::env::var_os(k))
+        .map(|p| PathBuf::from(p).join("Microsoft Visual Studio"))
+        .filter(|p| p.is_dir())
+        .collect();
+    // Scan <root>/<year or major>/<edition>/VC/Auxiliary/Build. Majors below 100 (18 = VS 2026) are
+    // newer than any year-named folder (2022), so rank them above.
+    let mut found: Vec<(u32, PathBuf)> = Vec::new();
+    for root in &roots {
+        for ver in std::fs::read_dir(root).into_iter().flatten().flatten() {
+            let n: u32 = ver.file_name().to_string_lossy().parse().unwrap_or(0);
+            for ed in std::fs::read_dir(ver.path()).into_iter().flatten().flatten() {
+                let bat = rel.iter().fold(ed.path(), |p, s| p.join(s));
+                if bat.is_file() {
+                    found.push((if n < 100 { n + 3000 } else { n }, bat));
+                }
+            }
+        }
+    }
+    found.sort_by(|a, b| b.0.cmp(&a.0));
+    found.into_iter().next().map(|(_, p)| p)
+}
+
+/// Windows: the C++ build environment (`vcvars64.bat`) as the variables that differ from this
+/// process's, or `None` when `cl.exe` is already on PATH, no Visual Studio is found, or loading
+/// it failed. Loaded once per process (it takes a second or two).
+#[cfg(windows)]
+fn msvc_env() -> Option<&'static Vec<(String, String)>> {
+    static ENV: OnceLock<Option<Vec<(String, String)>>> = OnceLock::new();
+    ENV.get_or_init(|| {
+        if installed_program("cl").is_some() {
+            return None;
+        }
+        use std::os::windows::process::CommandExt;
+        let bat = find_vcvars64()?;
+        let mut c = Command::new("cmd.exe");
+        c.raw_arg(format!("/d /s /c \"call \"{}\" >nul 2>&1 && set\"", bat.display()));
+        c.creation_flags(0x0800_0000);
+        let out = run_capture(c, Duration::from_secs(60)).ok().filter(|o| o.code == 0)?;
+        let vars: Vec<(String, String)> = out
+            .stdout
+            .lines()
+            .filter_map(|l| l.split_once('='))
+            .filter(|(k, _)| !k.is_empty() && !k.starts_with('='))
+            .filter(|(k, v)| std::env::var_os(k).map_or(true, |cur| cur.to_string_lossy() != *v))
+            .map(|(k, v)| (k.to_string(), v.trim_end().to_string()))
+            .collect();
+        (!vars.is_empty()).then_some(vars)
+    })
+    .as_ref()
+}
+
+/// Windows: give Rust/C++/.NET build commands the Visual Studio environment when it isn't already
+/// loaded, so `cargo` finds `cl.exe`/`link.exe` without a Developer shell.
+#[cfg(windows)]
+fn with_msvc(mut c: Command, cmd: &str) -> Command {
+    let l = cmd.to_ascii_lowercase();
+    if !["cargo", "rustc", "cmake", "msbuild", "tauri"].iter().any(|k| l.contains(k)) {
+        return c;
+    }
+    let Some(vars) = msvc_env() else { return c };
+    let norm = |p: &Path| p.to_string_lossy().trim_end_matches(['\\', '/']).to_lowercase();
+    for (k, v) in vars {
+        if k.eq_ignore_ascii_case("PATH") {
+            // Keep whatever PATH the command already has (the app's), and add only what VS brings.
+            let base = c
+                .get_envs()
+                .find(|(n, _)| n.to_string_lossy().eq_ignore_ascii_case("PATH"))
+                .and_then(|(_, val)| val.map(|x| x.to_os_string()))
+                .or_else(|| std::env::var_os("PATH"))
+                .unwrap_or_default();
+            let have: std::collections::HashSet<String> = std::env::split_paths(&base).map(|d| norm(&d)).collect();
+            let mut dirs: Vec<PathBuf> = std::env::split_paths(v).filter(|d| !have.contains(&norm(d))).collect();
+            dirs.extend(std::env::split_paths(&base));
+            if let Ok(joined) = std::env::join_paths(dirs) {
+                c.env("PATH", joined);
+            }
+        } else {
+            c.env(k, v);
+        }
+    }
+    c
+}
+
+fn shell_command_raw(cmd: &str) -> Command {
     #[cfg(windows)]
     {
         if let Some(argv) = split_simple_command(cmd) {
