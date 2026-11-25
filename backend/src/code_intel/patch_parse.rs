@@ -52,6 +52,14 @@ pub(crate) enum Hunk {
         new: Vec<String>,
         header: String,
     },
+    /// `@@ symbol Foo::bar` / `@@ after|before|delete symbol Foo`: a whole declaration, found by
+    /// name in the pre-patch file, replaced (`+` lines), deleted, or used as an insertion point.
+    Symbol {
+        kind: AnchorKind,
+        name: String,
+        new: Vec<String>,
+        header: String,
+    },
     Context {
         ctx: Option<String>,
         body: Vec<(u8, String)>,
@@ -105,6 +113,18 @@ fn parse_anchored_header(h: &str) -> Option<(AnchorKind, (usize, String), (usize
     Some((kind, s, e))
 }
 
+/// `symbol Foo::bar`, `after symbol Foo`, `before symbol Foo`, `delete symbol Foo`.
+fn parse_symbol_header(h: &str) -> Option<(AnchorKind, String)> {
+    let re = lazy_re!(r"^(?i:(after|before|replace|delete)\s+)?(?i:symbol)\s+(\S.*)$");
+    let c = re.captures(h.trim())?;
+    let kind = match c.get(1).map(|m| m.as_str().to_ascii_lowercase()).as_deref() {
+        Some("after") => AnchorKind::After,
+        Some("before") => AnchorKind::Before,
+        Some("delete") => AnchorKind::Delete,
+        _ => AnchorKind::Replace,
+    };
+    Some((kind, c[2].trim().to_string()))
+}
 fn looks_like_anchored_header(h: &str) -> bool {
     let t = h.trim();
     let re = lazy_re!(r"^(?i:(after|before|replace|delete)\s+)?\d+(?:#\S*|\s*\.\.\s*\d+\S*)?$");
@@ -205,6 +225,8 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                     let h = h.trim().trim_end_matches("@@").trim();
                     if let Some(at) = parse_edge(h) {
                         hunks.push(Hunk::Edge { at, new: Vec::new(), header: format!("@@ {h}") });
+                    } else if let Some((kind, name)) = parse_symbol_header(h) {
+                        hunks.push(Hunk::Symbol { kind, name, new: Vec::new(), header: format!("@@ {h}") });
                     } else if let Some((kind, start, end)) = parse_anchored_header(h) {
                         hunks.push(Hunk::Anchored {
                             kind,
@@ -261,7 +283,7 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                             ));
                         }
                     }
-                    Hunk::Anchored { new, header, kind, .. } => {
+                    Hunk::Anchored { new, header, kind, .. } | Hunk::Symbol { new, header, kind, .. } => {
                         if let Some(rest) = b.strip_prefix('+') {
                             new.extend(std::iter::repeat(String::new()).take(pending_blanks));
                             pending_blanks = 0;
@@ -304,7 +326,7 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
             // A replace/insert hunk made only of `-` lines would silently become a deletion (or a
             // no-op) when the author most likely forgot the `+` prefixes: refuse instead.
             for (idx, line_no) in &echoed_minus {
-                if let Some(Hunk::Anchored { kind, new, header, .. }) = hunks.get(*idx) {
+                if let Some(Hunk::Anchored { kind, new, header, .. } | Hunk::Symbol { kind, new, header, .. }) = hunks.get(*idx) {
                     if *kind != AnchorKind::Delete && new.is_empty() {
                         return Err(format!(
                             "patch line {line_no}: anchored hunk `{header}` has `-` lines but no `+` lines. Prefix every line to write with `+`; to remove the lines use `@@ delete A#h..B#h`"

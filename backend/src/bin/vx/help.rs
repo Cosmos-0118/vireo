@@ -18,15 +18,15 @@ pub const USAGE: &str = "vx <map|outline|view|search|apply|replace|edit|symbol|c
 pub const HELP: &str = "vx - token-lean code tools: hash-anchored view/edit, atomic patches & replace, smart search, symbol ops, repo map, build check, MCP server\n\
 \n\
   vx map [query] [--dir D]        ranked file/symbol map; a query narrows by file or symbol name\n\
-  vx outline <file>               symbols as [start#hash..end#hash] ranges (markdown: headings; auto-resolves unique paths)\n\
-  vx view <file> [symbol|A..B,C..D]\n\
-                                  lines as N#hash|code; accepts comma-separated ranges/symbols or batch `file:A..B file2:C..D`\n\
+  vx outline <file> [file2 ...]     symbols as [start#hash..end#hash] ranges (markdown: headings; auto-resolves unique paths)\n\
+  vx view <file> [symbol|A..B,C..D]  (also `vx view <file> 10..20 40..50` or `<file> Foo Bar`)\n\
+                                  lines as N#hash|code; accepts comma-separated ranges/symbols or batch `file:A..B file2:C..D` (the output budget is shared across files)\n\
   vx search <regex> [path] [-g G]... [-C N] [-F] [-i] [-l] [--limit N]\n\
                                   anchored search (`file:N#hash| text`); auto-recovers monorepo paths/globs (e.g. `src/**` -> `**/src/**`),\n\
                                   `-C N` prints anchored context lines, `-F` literal search, `-l` files with hit counts\n\
   vx apply [--file F] [--dry-run] atomic multi-file/multi-hunk V4A patch (anchored `@@ A#h..B#h` or context `@@` hunks; `vx help apply`)\n\
   vx replace <old> <new> [path] [-g G]... [-r] [--dry-run] [--expected N] [--all-files]\n\
-                                  atomic literal (default) or regex (`-r`) replace across 1 or many files with syntax checks & CRLF preservation\n\
+                                  atomic literal (default) or regex (`-r`; groups `$1`/`\\1`, `^`/`$` per line) replace across 1 or many files with syntax checks & CRLF preservation\n\
   vx edit <file> A#h[..B#h]       replace those lines with new code from stdin, --file F, or --text\n\
   vx edit <file> top|bottom|imports   insert there with no anchors (`imports`: after the import block, skips duplicates)\n\
          [--insert-after|--insert-before|--delete]   (aliases --after/--before/--remove work; unknown flags are rejected)\n\
@@ -71,6 +71,8 @@ Uses the V4A patch envelope with hashline-anchored hunks (preferred) or classic 
   +use std::fmt;\n\
   @@ top                           # also `@@ bottom`; `top` stays below a shebang / `//!` / 'use client'\n\
   +// header\n\
+  @@ symbol Foo::bar               # replace the whole symbol with the `+` lines (also: `after symbol Foo`, `before symbol Foo`, `delete symbol Foo`)\n\
+  +fn bar() {}\n\
   @@ fn helper() {                 # classic V4A context hunk: ' ' context, '-' remove, '+' add\n\
    let a = 1;\n\
   -let b = 2;\n\

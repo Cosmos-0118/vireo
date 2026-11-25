@@ -352,17 +352,19 @@ fn main() {
     if cmd == "mcp" {
         // An MCP server's cwd is whatever the host launched it from (often the IDE's install
         // folder), so `VIREO_WORKSPACE` wins here even when cwd isn't inside it.
-        let target_ws = flag_val(&["--workspace"])
+        let explicit = flag_val(&["--workspace"])
             .map(PathBuf::from)
-            .or_else(|| std::env::var_os("VIREO_WORKSPACE").map(PathBuf::from).filter(|w| w.is_dir()))
-            .unwrap_or(ws);
-        mcp::run_mcp(&target_ws, has("--read-only"));
+            .or_else(|| std::env::var_os("VIREO_WORKSPACE").map(PathBuf::from).filter(|w| w.is_dir()));
+        let locked = explicit.is_some();
+        let target_ws = explicit.unwrap_or(ws);
+        mcp::run_mcp(&target_ws, has("--read-only"), locked);
         return;
     }
 
     let cwd_s = cwd.to_string_lossy().to_string();
 
     let (op, payload): (&str, Value) = match cmd {
+        "outline" if pos.len() > 1 => ("outline", json!({ "specs": pos, "cwd": cwd_s })),
         "outline" => ("outline", json!({ "path": need(0, "<file>"), "cwd": cwd_s })),
         "view" => {
             if pos.is_empty() {
@@ -371,19 +373,20 @@ fn main() {
             if pos.len() == 1 {
                 let (p, t) = code_intel::split_view_spec(&pos[0]);
                 ("view", json!({ "path": p, "target": t, "cwd": cwd_s }))
-            } else if pos.len() == 2 {
+            } else {
+                // `view a.rs 10..20 40..50` / `view a.rs Foo Bar`: when no later argument is a file
+                // (or a `file:target` spec), they are targets inside the first file.
                 let (_, t0) = code_intel::split_view_spec(&pos[0]);
-                let (p1, t1) = code_intel::split_view_spec(&pos[1]);
-                let second_is_file = t1.is_some()
-                    || cwd.join(p1).is_file()
-                    || ws.join(p1).is_file();
-                if t0.is_none() && !second_is_file {
-                    ("view", json!({ "path": pos[0], "target": pos[1], "cwd": cwd_s }))
+                let rest_are_targets = t0.is_none()
+                    && pos[1..].iter().all(|s| {
+                        let (p, t) = code_intel::split_view_spec(s);
+                        t.is_none() && !cwd.join(p).is_file() && !ws.join(p).is_file()
+                    });
+                if rest_are_targets {
+                    ("view", json!({ "path": pos[0], "target": pos[1..].join(","), "cwd": cwd_s }))
                 } else {
                     ("view", json!({ "specs": pos, "cwd": cwd_s }))
                 }
-            } else {
-                ("view", json!({ "specs": pos, "cwd": cwd_s }))
             }
         }
         "map" => (

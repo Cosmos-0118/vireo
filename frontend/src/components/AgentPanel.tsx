@@ -857,7 +857,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
                   : m
               )
             );
-            if (['write_file', 'edit_file', 'symbol_edit', 'ast'].includes(res.name)) {
+            if (['write_file', 'edit_file', 'symbol_edit', 'ast', 'apply_patch', 'replace_text'].includes(res.name)) {
               onRefreshGit();
             }
           },

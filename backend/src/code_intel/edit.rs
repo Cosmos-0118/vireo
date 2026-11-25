@@ -365,60 +365,122 @@ fn ast_cli(
     Ok(rewrite_report(ws, &per_file, matches.len()))
 }
 
-/// Several anchored edits to one file in a single atomic call. Every anchor refers to the file as
-/// it is now (not after earlier entries), exactly like a multi-hunk `apply`; built on that path.
+/// Several edits in a single atomic call, built on the `apply` patch path. Every anchor refers to
+/// the file as it is now (not after earlier entries). Each entry picks its target one of three ways
+/// (`start` anchors, `old_text` exact text, or `symbol` name) and may carry its own `path`, so one
+/// call can edit several files; `path` is the default for entries without one.
 pub fn edit_batch(ws: &Path, path: &str, edits: &[serde_json::Value], cwd: Option<&Path>) -> Result<String, String> {
     if edits.is_empty() {
         return Err("`edits` is empty".into());
     }
-    let mut patch = format!("*** Begin Patch\n*** Update File: {path}\n");
+    // Group entries per file (first-appearance order) so each file is one `Update File` section.
+    let mut files: Vec<(String, Vec<(usize, &serde_json::Value)>)> = Vec::new();
     for (i, e) in edits.iter().enumerate() {
-        let get = |ks: &[&str]| ks.iter().find_map(|k| e.get(*k).and_then(|v| v.as_str()));
-        let n = i + 1;
-        let start = get(&["start"]).ok_or_else(|| format!("edits[{n}]: missing `start`"))?;
-        let (a, b) = split_range(start, get(&["end"]));
-        let range = match &b {
-            Some(b) => format!("{a}..{b}"),
-            None => a.clone(),
-        };
-        let text = get(&["new_text", "new_string", "newString", "content", "text"]).unwrap_or("");
-        let body = |patch: &mut String| {
-            for l in text.replace("\r\n", "\n").trim_end_matches('\n').split('\n') {
-                patch.push('+');
-                patch.push_str(l);
-                patch.push('\n');
-            }
-        };
-        // `start: "top" | "bottom" | "imports"` inserts there whatever the op says (except delete).
-        if super::patch_parse::parse_edge(start).is_some() {
-            if text.is_empty() || get(&["op"]) == Some("delete") {
-                return Err(format!("edits[{n}]: `{start}` inserts lines; pass new_text (delete needs anchors)"));
-            }
-            patch.push_str(&format!("@@ {}\n", start.trim()));
-            body(&mut patch);
-            continue;
+        let p = e.get("path").and_then(|v| v.as_str()).filter(|p| !p.trim().is_empty()).unwrap_or(path).trim();
+        if p.is_empty() {
+            return Err(format!("edits[{}]: missing `path` (pass it per edit or once at the top)", i + 1));
         }
-        match get(&["op"]).unwrap_or("replace") {
-            "replace" => {
-                if text.is_empty() {
-                    return Err(format!("edits[{n}]: new_text is empty (use op `delete` to remove lines)"));
+        match files.iter_mut().find(|(f, _)| f == p) {
+            Some((_, list)) => list.push((i + 1, e)),
+            None => files.push((p.to_string(), vec![(i + 1, e)])),
+        }
+    }
+    let mut patch = String::from("*** Begin Patch\n");
+    for (file, list) in &files {
+        patch.push_str(&format!("*** Update File: {file}\n"));
+        for (n, e) in list {
+            let n = *n;
+            let get = |ks: &[&str]| ks.iter().find_map(|k| e.get(*k).and_then(|v| v.as_str()));
+            let text = get(&["new_text", "new_string", "newString", "content", "text"]).unwrap_or("");
+            let body = |patch: &mut String| {
+                for l in text.replace("\r\n", "\n").trim_end_matches('\n').split('\n') {
+                    patch.push('+');
+                    patch.push_str(l);
+                    patch.push('\n');
                 }
-                patch.push_str(&format!("@@ {range}\n"));
+            };
+            let op = get(&["op"]).unwrap_or("replace");
+            // `symbol`: a whole declaration by name, no anchors.
+            if get(&["start"]).is_none() {
+                if let Some(sym) = get(&["symbol"]) {
+                    let head = match op {
+                        "replace" => "symbol",
+                        "delete" => "delete symbol",
+                        "insert_after" => "after symbol",
+                        "insert_before" => "before symbol",
+                        other => return Err(format!("edits[{n}]: unknown op `{other}` (replace, insert_after, insert_before, delete)")),
+                    };
+                    if op != "delete" && text.is_empty() {
+                        return Err(format!("edits[{n}]: new_text is empty (use op `delete` to remove the symbol)"));
+                    }
+                    patch.push_str(&format!("@@ {head} {}\n", sym.trim()));
+                    if op != "delete" {
+                        body(&mut patch);
+                    }
+                    continue;
+                }
+                // `old_text`: exact text (indentation-tolerant) replaced with `new_text`, no anchors.
+                if let Some(old) = get(&["old_text", "old_string", "oldString", "old"]) {
+                    if old.trim().is_empty() {
+                        return Err(format!("edits[{n}]: old_text is empty"));
+                    }
+                    if let Ok((_, _, doc, _)) = read_doc_smart(ws, file, cwd) {
+                        let hay = doc.to_text().replace("\r\n", "\n");
+                        let needle = old.replace("\r\n", "\n");
+                        let hits = hay.matches(needle.as_str()).count();
+                        if hits > 1 {
+                            return Err(format!("edits[{n}]: old_text occurs {hits} times in {file}; include more surrounding text so it is unique"));
+                        }
+                    }
+                    patch.push_str("@@\n");
+                    for l in old.replace("\r\n", "\n").trim_end_matches('\n').split('\n') {
+                        patch.push('-');
+                        patch.push_str(l);
+                        patch.push('\n');
+                    }
+                    if !text.is_empty() {
+                        body(&mut patch);
+                    }
+                    continue;
+                }
+            }
+            let start = get(&["start"]).ok_or_else(|| format!("edits[{n}]: needs `start` (anchor), `old_text`, or `symbol`"))?;
+            let (a, b) = split_range(start, get(&["end"]));
+            let range = match &b {
+                Some(b) => format!("{a}..{b}"),
+                None => a.clone(),
+            };
+            // `start: "top" | "bottom" | "imports"` inserts there whatever the op says (except delete).
+            if super::patch_parse::parse_edge(start).is_some() {
+                if text.is_empty() || op == "delete" {
+                    return Err(format!("edits[{n}]: `{start}` inserts lines; pass new_text (delete needs anchors)"));
+                }
+                patch.push_str(&format!("@@ {}\n", start.trim()));
                 body(&mut patch);
+                continue;
             }
-            "delete" => patch.push_str(&format!("@@ delete {range}\n")),
-            "insert_after" | "insert_before" if text.is_empty() => {
-                return Err(format!("edits[{n}]: new_text is empty"));
+            match op {
+                "replace" => {
+                    if text.is_empty() {
+                        return Err(format!("edits[{n}]: new_text is empty (use op `delete` to remove lines)"));
+                    }
+                    patch.push_str(&format!("@@ {range}\n"));
+                    body(&mut patch);
+                }
+                "delete" => patch.push_str(&format!("@@ delete {range}\n")),
+                "insert_after" | "insert_before" if text.is_empty() => {
+                    return Err(format!("edits[{n}]: new_text is empty"));
+                }
+                "insert_after" => {
+                    patch.push_str(&format!("@@ after {}\n", b.as_deref().unwrap_or(&a)));
+                    body(&mut patch);
+                }
+                "insert_before" => {
+                    patch.push_str(&format!("@@ before {a}\n"));
+                    body(&mut patch);
+                }
+                other => return Err(format!("edits[{n}]: unknown op `{other}` (replace, insert_after, insert_before, delete)")),
             }
-            "insert_after" => {
-                patch.push_str(&format!("@@ after {}\n", b.as_deref().unwrap_or(&a)));
-                body(&mut patch);
-            }
-            "insert_before" => {
-                patch.push_str(&format!("@@ before {a}\n"));
-                body(&mut patch);
-            }
-            other => return Err(format!("edits[{n}]: unknown op `{other}` (replace, insert_after, insert_before, delete)")),
         }
     }
     patch.push_str("*** End Patch\n");

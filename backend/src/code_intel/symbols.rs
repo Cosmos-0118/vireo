@@ -253,9 +253,13 @@ struct Spec {
 }
 
 const CSHARP: Spec = Spec {
-    containers: &["namespace_declaration", "class_declaration", "struct_declaration", "interface_declaration", "record_declaration", "record_struct_declaration"],
-    leaves: &["method_declaration", "constructor_declaration", "destructor_declaration", "property_declaration", "enum_declaration", "delegate_declaration"],
-    transparent: &[],
+    containers: &["namespace_declaration", "file_scoped_namespace_declaration", "class_declaration", "struct_declaration", "interface_declaration", "record_declaration", "record_struct_declaration"],
+    leaves: &[
+        "method_declaration", "constructor_declaration", "destructor_declaration", "property_declaration", "enum_declaration", "delegate_declaration",
+        "local_function_statement", "event_declaration", "event_field_declaration", "indexer_declaration", "operator_declaration", "conversion_operator_declaration",
+    ],
+    // C# 9 top-level programs wrap every statement (and local function) in `global_statement`.
+    transparent: &["global_statement"],
     docs: &["comment"],
 };
 
@@ -545,6 +549,26 @@ impl<'a> Walk<'a> {
         }
     }
 
+    /// A C# 9 top-level program (`Program.cs` with no class) has no declarations to list, so
+    /// give its executable statements one anchored `<top-level>` range.
+    fn csharp_top_level(&mut self, root: Node) {
+        let mut c = root.walk();
+        let mut span: Option<(usize, usize)> = None;
+        for n in root.named_children(&mut c) {
+            if n.kind() != "global_statement" || n.named_child(0).is_some_and(|s| s.kind() == "local_function_statement") {
+                continue;
+            }
+            let (s, e) = rows(n);
+            span = Some(span.map_or((s, e), |(s0, e0)| (s0.min(s), e0.max(e))));
+        }
+        let Some((start, end)) = span else { return };
+        let pos = self.out.iter().position(|s| s.start > start).unwrap_or(self.out.len());
+        self.out.insert(
+            pos,
+            Sym { name: "<top-level>".into(), kind: "top-level".into(), container: None, start, end, sig: "<top-level statements>".into(), depth: 0 },
+        );
+    }
+
     fn go(&mut self, parent: Node) {
         const DOCS: &[&str] = &["comment"];
         let mut c = parent.walk();
@@ -595,7 +619,10 @@ pub fn symbols(lang: Lang, src: &str) -> Vec<Sym> {
         Lang::Py => w.py(root, None, 0),
         Lang::Go => w.go(root),
         Lang::Json => {}
-        Lang::CSharp => w.generic(root, None, 0, &CSHARP),
+        Lang::CSharp => {
+            w.generic(root, None, 0, &CSHARP);
+            w.csharp_top_level(root);
+        }
         Lang::Java => w.generic(root, None, 0, &JAVA),
         Lang::C => w.generic(root, None, 0, &C_LANG),
         Lang::Cpp => w.generic(root, None, 0, &CPP),
@@ -907,6 +934,79 @@ fn dirty_files(ws: &Path) -> HashSet<String> {
     set
 }
 
+/// Project and UI files that have no tree-sitter outline but orient a reader (`vx map` lists them
+/// below the code files).
+fn is_manifest_path(rel: &str) -> bool {
+    let name = rel.rsplit('/').next().unwrap_or(rel).to_lowercase();
+    if matches!(name.as_str(), "cargo.toml" | "package.json" | "pyproject.toml" | "go.mod") {
+        return true;
+    }
+    matches!(
+        name.rsplit_once('.').map(|(_, e)| e),
+        Some("csproj" | "fsproj" | "vbproj" | "props" | "targets" | "sln" | "slnx" | "xaml" | "axaml")
+    )
+}
+
+/// Cheap regex outline of a manifest/markup file: one symbol per notable line.
+fn manifest_syms(rel: &str, text: &str) -> Vec<Sym> {
+    let name = rel.rsplit('/').next().unwrap_or(rel).to_lowercase();
+    let ext = name.rsplit_once('.').map(|(_, e)| e).unwrap_or("");
+    let stem = |p: &str| {
+        let f = p.rsplit(['/', '\\']).next().unwrap_or(p);
+        f.rsplit_once('.').map_or(f, |(s, _)| s).to_string()
+    };
+    let msbuild_ref = lazy_re!(r#"<(PackageReference|PackageVersion|ProjectReference)\s[^>]*?(?:Include|Update)="([^"]+)""#);
+    let msbuild_prop = lazy_re!(r"<(TargetFrameworks?|OutputType|UseWPF|UseWinUI|UseMaui)>([^<]+)<");
+    let sln = lazy_re!(r#"Project\("[^"]*"\)\s*=\s*"([^"]+)"|<Project\s+Path="([^"]+)""#);
+    let xaml = lazy_re!(r#"x:Class="([^"]+)""#);
+    let single = lazy_re!(r#"(?m)^\s*(?:name\s*=\s*|"name"\s*:\s*|module\s+)"?([^"\s,]+)"?"#);
+    let mut out: Vec<Sym> = Vec::new();
+    let mk = |row: usize, label: &str, value: String| Sym {
+        name: value.clone(),
+        kind: "manifest".into(),
+        container: None,
+        start: row,
+        end: row,
+        sig: format!("{label} {value}"),
+        depth: 0,
+    };
+    for (row, line) in text.lines().enumerate() {
+        if out.len() >= 40 {
+            break;
+        }
+        match ext {
+            "csproj" | "fsproj" | "vbproj" | "props" | "targets" => {
+                for c in msbuild_ref.captures_iter(line) {
+                    let v = if &c[1] == "ProjectReference" { stem(&c[2]) } else { c[2].to_string() };
+                    out.push(mk(row, &c[1], v));
+                }
+                for c in msbuild_prop.captures_iter(line) {
+                    out.push(mk(row, &c[1], c[2].trim().to_string()));
+                }
+            }
+            "sln" | "slnx" => {
+                for c in sln.captures_iter(line) {
+                    out.push(mk(row, "Project", c.get(1).map_or_else(|| stem(&c[2]), |m| m.as_str().to_string())));
+                }
+            }
+            "xaml" | "axaml" => {
+                for c in xaml.captures_iter(line) {
+                    out.push(mk(row, "x:Class", c[1].rsplit('.').next().unwrap_or(&c[1]).to_string()));
+                }
+            }
+            _ => {
+                // `Cargo.toml`/`pyproject.toml` `name = "x"`, `package.json` `"name": "x"`, `go.mod` `module x`.
+                if out.is_empty() {
+                    if let Some(c) = single.captures(line) {
+                        out.push(mk(row, &name, c[1].to_string()));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<String, String> {
     let mut dir_note: Option<String> = None;
     let root = match dir.filter(|d| !d.trim().is_empty()) {
@@ -933,6 +1033,8 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
         syms: Vec<Sym>,
         /// Hashes of every identifier in the file (not the strings: keeps memory flat on big repos).
         idents: HashSet<u64>,
+        /// Project/UI manifest (`.csproj`, `.xaml`, `Cargo.toml`, ...): listed below the code files.
+        manifest: bool,
     }
     fn hash_ident(s: &str) -> u64 {
         use std::hash::{Hash, Hasher};
@@ -957,20 +1059,28 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
             continue;
         }
         let rel = rel_of(ws, e.path());
-        let Some(lang) = lang_for(&rel).filter(|l| *l != Lang::Json) else { continue };
+        let lang = lang_for(&rel).filter(|l| *l != Lang::Json);
+        if lang.is_none() && !is_manifest_path(&rel) {
+            continue;
+        }
         if e.metadata().map(|m| m.len() > 300_000).unwrap_or(true) {
             continue;
         }
         let Ok(text) = std::fs::read_to_string(e.path()) else { continue };
-        let syms = symbols(lang, &text);
-        let idents: HashSet<u64> = ident.find_iter(&text).map(|m| hash_ident(m.as_str())).collect();
-        entries.push(Entry { rel, nlines: text.lines().count(), syms, idents });
+        let (syms, idents, manifest) = match lang {
+            Some(lang) => (symbols(lang, &text), ident.find_iter(&text).map(|m| hash_ident(m.as_str())).collect(), false),
+            None => (manifest_syms(&rel, &text), HashSet::new(), true),
+        };
+        entries.push(Entry { rel, nlines: text.lines().count(), syms, idents, manifest });
         if entries.len() >= 2500 {
             break;
         }
     }
     if entries.is_empty() {
-        return Ok("No supported source files found (rs, ts, tsx, js, py, go, cs, java, c/cpp, rb, php, kt, sh).".into());
+        return Ok(format!(
+            "No supported source files found in {} (rs, ts, tsx, js, py, go, cs, java, c/cpp, rb, php, kt, sh).",
+            root.display()
+        ));
     }
     let tokens: Vec<String> = query
         .unwrap_or("")
@@ -992,6 +1102,9 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
     let rank: Vec<i64> = entries
         .iter()
         .map(|e| {
+            if e.manifest {
+                return -1;
+            }
             let mut scores: Vec<usize> = top_names(&e.syms)
                 .iter()
                 .filter(|n| n.len() >= 4)
@@ -1108,7 +1221,9 @@ pub fn repo_map(ws: &Path, query: Option<&str>, dir: Option<&str>) -> Result<Str
         if tokens.is_empty() {
             let names = top_names(&e.syms);
             let extra = names.len().saturating_sub(10);
-            block = format!("{} ({}){mark}: {}{}\n", e.rel, e.nlines, names.iter().take(10).copied().collect::<Vec<_>>().join(", "), if extra > 0 { format!(" +{extra}") } else { String::new() });
+            if !names.is_empty() {
+                block = format!("{} ({}){mark}: {}{}\n", e.rel, e.nlines, names.iter().take(10).copied().collect::<Vec<_>>().join(", "), if extra > 0 { format!(" +{extra}") } else { String::new() });
+            }
         } else {
             // Source lines are only needed for the few files actually shown: re-read them now.
             let text = std::fs::read_to_string(ws.join(&e.rel)).unwrap_or_default();

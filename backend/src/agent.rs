@@ -52,12 +52,13 @@ pub struct AgentChatReq {
 const SYSTEM_PROMPT: &str = r#"You are Vireo Agent, a concise, practical AI software engineer working directly inside the user's local repository.
 You have token-efficient tools to inspect and modify files and run commands:
 - repo_map(query?, dir?) ranked symbol map; outline(path) symbols with [start#hash..end#hash] ranges
-- read_file(path, start_line?, end_line?, symbol?) returns lines as `N#hash|code`
+- read_file(path, start_line?, end_line?, symbol?) returns lines as `N#hash|code`; read_file(specs: ["a.rs:10..30", "b.rs:Foo"]) reads several files at once
 - search_code(query) returns `file:line#hash| text`
 - edit_file(path, start, end?, new_text) replaces lines by their `N#hash` anchors (copy them from read_file/outline/search/verify output); no old text needed. Use op=insert_after/insert_before/delete for those cases.
 - symbol_edit(path, symbol, mode, new_code?) reads or changes a whole function/struct/class by name
 - ast(pattern, lang?, rewrite?) structural search / multi-file codemod (ast-grep)
 - verify(command?) runs build/tests and returns only deduplicated errors with anchors
+- apply_patch(patch) atomic multi-file/multi-hunk patch (anchors, `@@ symbol Name`, or context hunks); replace_text(old, new, path?, glob?, regex?, rules?) atomic replace across files; edit_file(edits: [...]) batches several edits (even across files) in one call. Prefer these over shell scripts for multi-file changes.
 - write_file(path, content) for new files; run_command(command) for anything else
 
 Guidelines:
@@ -118,9 +119,10 @@ fn openai_tools_schema() -> Value {
                         "path": { "type": "string" },
                         "start_line": { "type": "integer" },
                         "end_line": { "type": "integer" },
-                        "symbol": { "type": "string", "description": "Read just this function/class, e.g. `run_loop` or `Type::method`." }
+                        "symbol": { "type": "string", "description": "Read just this function/class, e.g. `run_loop` or `Type::method`." },
+                        "specs": { "type": "array", "description": "Batch: several files in one call, e.g. [\"a.rs:10..30\", \"b.rs:Foo\"] (path is then not needed).", "items": { "type": "string" } }
                     },
-                    "required": ["path"]
+                    "required": []
                 }
             }
         },
@@ -167,9 +169,10 @@ fn openai_tools_schema() -> Value {
                         "end": { "type": "string", "description": "Optional end anchor (inclusive); defaults to start." },
                         "new_text": { "type": "string", "description": "Replacement code without the N#hash| prefixes." },
                         "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"] },
-                        "old_text": { "type": "string", "description": "Fallback only." }
+                        "old_text": { "type": "string", "description": "Fallback only." },
+                        "edits": { "type": "array", "description": "Several edits in one atomic call (may span files). Each item: {path?, start?, end?, op?, new_text} or {path?, old_text, new_text} or {path?, symbol, op?, new_text}.", "items": { "type": "object" } }
                     },
-                    "required": ["path", "new_text"]
+                    "required": []
                 }
             }
         },
@@ -232,6 +235,42 @@ fn openai_tools_schema() -> Value {
                 }
             }
         }
+        ,
+        {
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Atomic multi-file patch. Format: `*** Update File: a.rs` then hunks `@@ 12#ab..15#cd` (replace those anchored lines with the `+` lines), `@@ after 12#ab`, `@@ delete 12#ab..15#cd`, `@@ symbol Foo::bar` (replace a whole symbol), `@@ after symbol Foo`, `@@ delete symbol Foo`, `@@ top|bottom|after imports`; also `*** Add File:` / `*** Delete File:`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch": { "type": "string" },
+                        "dry_run": { "type": "boolean" }
+                    },
+                    "required": ["patch"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "replace_text",
+                "description": "Atomic find-and-replace across a file, directory or glob (literal by default; regex=true uses $1 / ${1} for groups). Pass `rules: [{old, new, regex?}]` for several replacements in one pass. Use dry_run first for wide changes; `expected` guards the match count.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "old": { "type": "string" },
+                        "new": { "type": "string" },
+                        "rules": { "type": "array", "items": { "type": "object" } },
+                        "path": { "type": "string" },
+                        "glob": { "type": "string" },
+                        "regex": { "type": "boolean" },
+                        "expected": { "type": "integer" },
+                        "dry_run": { "type": "boolean" }
+                    }
+                }
+            }
+        }
     ])
 }
 
@@ -278,7 +317,8 @@ async fn exec_tool(
     args: &Value,
     turn: &mut TurnTracker,
 ) -> String {
-    let is_mutation = matches!(name, "write_file" | "edit_file" | "run_command" | "symbol_edit")
+    let is_mutation = matches!(name, "write_file" | "edit_file" | "run_command" | "symbol_edit" | "apply_patch")
+        || (name == "replace_text" && !args["dry_run"].as_bool().unwrap_or(false))
         || (name == "ast" && args.get("rewrite").and_then(|v| v.as_str()).map_or(false, |r| !r.is_empty()));
     if is_mutation {
         // Silent pre-turn snapshot; the checkpoint is only shown at the end if files changed.
@@ -327,7 +367,8 @@ async fn exec_tool(
             .await
             .unwrap_or_else(|_| "Failed to list files".to_string())
         }
-        "repo_map" | "outline" | "read_file" | "search_code" | "ast" | "verify" | "symbol_edit" | "edit_file"
+        "repo_map" | "outline" | "read_file" | "search_code" | "ast" | "verify" | "symbol_edit" | "edit_file" | "apply_patch"
+        | "replace_text"
             if name != "edit_file" || args.get("old_text").and_then(|v| v.as_str()).is_none() =>
         {
             let (op, a) = match name {
@@ -341,19 +382,25 @@ async fn exec_tool(
                     json!({ "path": args["path"], "symbol": args["symbol"], "mode": args["mode"], "new_code": args["new_code"] }),
                 ),
                 "edit_file" => ("edit", args.clone()),
+                "apply_patch" => ("apply", json!({ "patch": args["patch"], "dry_run": args["dry_run"] })),
+                "replace_text" => ("replace", args.clone()),
                 _ => {
-                    // read_file
-                    let target = if let Some(sym) = args.get("symbol").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
-                        Some(sym.to_string())
+                    // read_file: one file (range/symbol) or `specs: ["a.rs:10..30", "b.rs:Foo"]`
+                    if args.get("specs").and_then(|v| v.as_array()).is_some_and(|l| !l.is_empty()) {
+                        ("view", json!({ "specs": args["specs"] }))
                     } else {
-                        let st = args.get("start_line").and_then(|v| v.as_u64());
-                        let en = args.get("end_line").and_then(|v| v.as_u64());
-                        match (st, en) {
-                            (None, None) => None,
-                            (s, e) => Some(format!("{}..{}", s.unwrap_or(1), e.map(|e| e.to_string()).unwrap_or_default())),
-                        }
-                    };
-                    ("view", json!({ "path": args["path"], "target": target }))
+                        let target = if let Some(sym) = args.get("symbol").and_then(|v| v.as_str()).filter(|s| !s.is_empty()) {
+                            Some(sym.to_string())
+                        } else {
+                            let st = args.get("start_line").and_then(|v| v.as_u64());
+                            let en = args.get("end_line").and_then(|v| v.as_u64());
+                            match (st, en) {
+                                (None, None) => None,
+                                (s, e) => Some(format!("{}..{}", s.unwrap_or(1), e.map(|e| e.to_string()).unwrap_or_default())),
+                            }
+                        };
+                        ("view", json!({ "path": args["path"], "target": target }))
+                    }
                 }
             };
             let ws_owned = ws.to_path_buf();
@@ -361,7 +408,7 @@ async fn exec_tool(
             let res = tokio::task::spawn_blocking(move || crate::code_intel::run_op_string(&ws_owned, &op_owned, &a))
                 .await
                 .unwrap_or_else(|_| "Error: tool crashed".to_string());
-            if matches!(name, "edit_file" | "symbol_edit" | "ast") && !res.starts_with("Error") {
+            if matches!(name, "edit_file" | "symbol_edit" | "ast" | "apply_patch" | "replace_text") && !res.starts_with("Error") {
                 let touched = args.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 state.notify_fs_changed(vec![if touched.is_empty() { "ast".to_string() } else { touched }]);
             }

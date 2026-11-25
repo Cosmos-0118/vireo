@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use super::doc::{locate, parse_anchor_in_doc, read_doc, splice, syntax_note, Doc};
 use super::patch_parse::{parse_patch, AnchorKind, Edge, FileOp, Hunk};
-use super::symbols::{import_end_row, lang_for, syntax_errors};
+use super::symbols::{find_symbol, import_end_row, lang_for, symbols, syntax_errors};
 use super::util::{rel_of, resolve_existing, resolve_new_file};
 
 /// Fold typographic punctuation to ASCII (what models often type instead of the file's text).
@@ -313,6 +313,36 @@ fn plan_update(
                             end.0,
                             end.1
                         ));
+                        failed = true;
+                    }
+                    AnchorKind::Replace => edits.push((r0, r1 - r0 + 1, new.clone(), hi)),
+                    AnchorKind::Delete => edits.push((r0, r1 - r0 + 1, Vec::new(), hi)),
+                    AnchorKind::After | AnchorKind::Before if new.is_empty() => {
+                        errors.push(format!("{}: nothing to insert (no `+` lines)", tag(header)));
+                        failed = true;
+                    }
+                    AnchorKind::After => edits.push((r1 + 1, 0, new.clone(), hi)),
+                    AnchorKind::Before => edits.push((r0, 0, new.clone(), hi)),
+                }
+            }
+            Hunk::Symbol { kind, name, new, header } => {
+                let Some(l) = lang.filter(|l| *l != super::symbols::Lang::Json) else {
+                    errors.push(format!("{}: no symbol support for {rel}", tag(header)));
+                    failed = true;
+                    continue;
+                };
+                let syms = symbols(l, &doc.to_text());
+                let (r0, r1) = match find_symbol(&syms, name) {
+                    Ok(s) => (s.start, s.end),
+                    Err(e) => {
+                        errors.push(format!("{}: {e}", tag(header)));
+                        failed = true;
+                        continue;
+                    }
+                };
+                match kind {
+                    AnchorKind::Replace if new.is_empty() => {
+                        errors.push(format!("{}: no `+` lines. To remove the symbol say so: `@@ delete symbol {name}`", tag(header)));
                         failed = true;
                     }
                     AnchorKind::Replace => edits.push((r0, r1 - r0 + 1, new.clone(), hi)),

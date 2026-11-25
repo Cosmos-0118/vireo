@@ -74,6 +74,11 @@ fn resolve_target(
 }
 
 pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> Result<String, String> {
+    view_budget(ws, path, target, cwd, MAX_VIEW_LINES, MAX_VIEW_BYTES)
+}
+
+/// [`view`] with an explicit per-file line/byte budget (a batch splits one budget across files).
+fn view_budget(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>, max_lines: usize, max_bytes: usize) -> Result<String, String> {
     // `a.rs:Foo` / `a.rs:10..30` given as the path alone (MCP callers) behaves like the CLI spec.
     let target = target.map(str::trim).filter(|t| !t.is_empty());
     let (path, inline) = split_view_spec(path);
@@ -104,7 +109,7 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> 
         let mut shown = 0usize;
         for i in from..=to {
             let line = show_line(&doc, i);
-            if shown >= MAX_VIEW_LINES || (shown > 0 && out.len() + line.len() > MAX_VIEW_BYTES) {
+            if shown >= max_lines || (shown > 0 && out.len() + line.len() > max_bytes) {
                 out.push_str(&format!(
                     "…[{} more lines; continue with {}:{}..{}]\n",
                     to + 1 - i,
@@ -139,7 +144,7 @@ pub fn view(ws: &Path, path: &str, target: Option<&str>, cwd: Option<&Path>) -> 
         }
         for i in *from..=*to {
             let line = show_line(&doc, i);
-            if shown >= MAX_VIEW_LINES || (shown > 0 && out.len() + line.len() > MAX_VIEW_BYTES) {
+            if shown >= max_lines || (shown > 0 && out.len() + line.len() > max_bytes) {
                 let mut spec = format!("{}..{}", i + 1, to + 1);
                 for (f, t, _) in &sections[si + 1..] {
                     spec.push_str(&format!(",{}..{}", f + 1, t + 1));
@@ -170,19 +175,28 @@ pub fn split_view_spec(spec: &str) -> (&str, Option<&str>) {
     (&s[..idx], Some(after))
 }
 
-/// Batch view multiple `file[:target]` specs in one call (shared byte/line budget).
+/// Batch view multiple `file[:target]` specs in one call. One byte/line budget is shared fairly:
+/// each file gets an equal slice of what is left (unused slack flows to later files), so a long
+/// first file can't starve the rest. A file cut short ends with its own continuation spec.
 pub fn view_many(ws: &Path, specs: &[String], cwd: Option<&Path>) -> Result<String, String> {
     if specs.is_empty() {
         return Err("no files specified".into());
     }
     let mut out = String::new();
+    let mut lines_used = 0usize;
     for (idx, raw) in specs.iter().enumerate() {
-        if out.len() > MAX_VIEW_BYTES {
-            out.push_str(&format!("…[{} more file(s) omitted; view them individually]\n", specs.len() - idx));
+        let left = specs.len() - idx;
+        let bytes_left = MAX_VIEW_BYTES.saturating_sub(out.len());
+        if bytes_left < 600 {
+            let names: Vec<&str> = specs[idx..].iter().map(|s| split_view_spec(s).0).collect();
+            out.push_str(&format!("…[{} more file(s) omitted: {}; view them individually]\n", left, names.join(", ")));
             break;
         }
+        let max_bytes = (bytes_left / left).max(1_500).min(bytes_left);
+        let max_lines = (MAX_VIEW_LINES.saturating_sub(lines_used) / left).max(25);
         let (p, t) = split_view_spec(raw);
-        let chunk = view(ws, p, t, cwd)?;
+        let chunk = view_budget(ws, p, t, cwd, max_lines, max_bytes)?;
+        lines_used += chunk.lines().count();
         if idx > 0 && !out.ends_with('\n') {
             out.push('\n');
         }

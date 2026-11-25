@@ -50,7 +50,7 @@ pub use edit::{ast, create, edit_batch, hashline_edit};
 #[allow(unused_imports)]
 pub use patch::apply_patch;
 #[allow(unused_imports)]
-pub use replace::{replace_text, ReplaceOpts};
+pub use replace::{replace_rules, replace_text, ReplaceOpts};
 #[allow(unused_imports)]
 pub use search::{search, SearchOpts};
 #[allow(unused_imports)]
@@ -62,22 +62,15 @@ pub use view::{split_view_spec, view, view_many};
 
 /// Short usage hint injected into external agent CLIs (kept tiny on purpose: this is the whole
 /// per-turn "schema" cost of the vx tools).
-pub const AGENT_HINT: &str = "Vireo `vx` is available (as MCP tools `mcp__vx__*` (load via ToolSearch if deferred) and as `vx` on PATH): token-lean code tools.\n\
-Prefer `vx` over cat/rg/sed/Python patch scripts. For edits: use `vx apply` (atomic multi-file/multi-hunk patch) or `vx replace` (atomic literal/regex replace across files) instead of shell/Python scripts; use `vx edit` / `vx symbol` (or native Edit) for single-spot tweaks.\n\
-- map [query] [--dir D]         ranked repo symbol map\n\
-- outline <file>                symbols as [start#hash..end#hash] ranges\n\
-- view <file> [symbol|A..B,C..D]  lines as N#hash|code (supports multi-range & batch `a:10..30 b:20..40`)\n\
-- search <regex> [path] [-g G] [-C N] [-F] [-l]   anchored grep (smart path/glob resolution, context, literal, files-only)\n\
-- apply [--file F] [--dry-run]  atomic multi-file V4A patch (`*** Update File:` + `@@ 12#ab..15#cd`/`@@ after`/`@@ delete` with `+` lines, or classic `@@` context)\n\
-- replace <old> <new> [path] [-g G] [-r] [--dry-run] [--expected N]   atomic literal/regex replace across files\n\
-- edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]   (MCP: `start` may be a range `12#ab..15#cd`; `edits:[{start,end?,op?,new_text}]` batches several atomically; `symbol` instead of `start` edits a whole symbol; `old_text`+`new_text` replaces exact text with no anchors and returns fresh ones)\n\
-- Familiar names work: file_path/old_string/new_string/pattern/content/name. `search` retries as literal text when a regex finds nothing. `view a.rs:Foo` or `Foo:7` reads a symbol.\n\
-- symbol <file> <name> [--replace|--insert-after|--delete] [--text T|--file F]\n\
-- create <file> [--force] [--text T|--file F]\n\
-- ast '<pattern>' [-r '<rewrite>' [--dry-run]] [-l lang] [path]\n\
-- release [status|preflight|notes|bump|publish|verify] [patch|minor|major|X.Y.Z] [--dry-run]   release engine across Rust/Node/.NET/Python/Java/Go: version sync, notes, gates, tag/push/draft release (always `publish --dry-run` first)\n\
-- check [--raw] [--warnings] [--timeout S] [cmd ...]   build/test runner with anchored errors, rustc notes/labels, and failing test output (MCP: still running after 60s -> background job id; `check {job}` waits for it)\n\
-From a shell on Windows, prefer MCP or `--file F` over piping multi-line code. Edits print new anchors and syntax errors immediately; `vx help` has details.";
+pub const AGENT_HINT: &str = r##"Vireo `vx`: token-lean code tools (MCP `mcp__vx__*`, load via ToolSearch if deferred; or `vx` on PATH). Prefer them over cat/rg/sed/Python scripts.
+- map [query] [--dir D] · outline <file...> · view <file> [Symbol|A..B C..D] or `a.rs:10..30 b.rs:Foo` · search <regex> [path] [-g G] [-C N] [-F] [-l]
+- edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]: by anchor (MCP: `start` may be a range)
+- edit with no view (MCP): {path, old_text, new_text} | {path, symbol, new_text, op?} | {edits: [{path?, start|old_text|symbol, new_text, op?}]} = many edits across files, atomic
+- replace <old> <new> [path] [-g G] [-r] [--dry-run] [--expected N]: atomic across files; regex groups `$1`/`\1` (MCP: `rules: [{old, new, regex?}]` for several at once)
+- apply [--file F]: atomic multi-file patch. Hunks: `@@ 12#ab..15#cd` (+ lines replace), `@@ after 12#ab`, `@@ delete A#h..B#h`, `@@ symbol Foo::bar` (+ lines replace the symbol), `@@ after symbol Foo`, `@@ delete symbol Foo`, `@@ top|bottom|after imports`, or classic `@@` context
+- symbol <file> <name> [--replace|--insert-after|--delete] · create <file> [--force] · ast '<pat>' [-r '<rewrite>'] [-l lang]
+- check [cmd...]: build/test with anchored errors (MCP: long builds return a job id; call check {job}) · release [status|preflight|notes|bump|publish|verify]: `status` says what to do next; `publish --dry-run` first
+Anchors `N#hh` come from view/search/edit output and edits return fresh ones, so never re-read after editing. On Windows prefer MCP or `--file F` over piping multi-line code. `vx help` has details."##;
 
 fn s<'a>(args: &'a Value, k: &str) -> Option<&'a str> {
     args.get(k).and_then(|v| v.as_str())
@@ -107,7 +100,17 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
     let need = |k: &str| s(a, k).ok_or_else(|| format!("missing `{k}`"));
     let cwd = s(a, "cwd").map(PathBuf::from);
     match op {
-        "outline" => outline(ws, need("path")?, cwd.as_deref()),
+        "outline" => {
+            // `specs: [a.rs, b.rs]` outlines several files in one call.
+            if let Some(specs) = a.get("specs").and_then(|v| v.as_array()).filter(|l| !l.is_empty()) {
+                let mut parts = Vec::new();
+                for spec in specs.iter().filter_map(|v| v.as_str()) {
+                    parts.push(outline(ws, split_view_spec(spec).0, cwd.as_deref())?);
+                }
+                return Ok(parts.join("\n"));
+            }
+            outline(ws, need("path")?, cwd.as_deref())
+        }
         "view" => {
             if let Some(specs) = a.get("specs").and_then(|v| v.as_array()) {
                 let list: Vec<String> = specs
@@ -146,7 +149,7 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
         }
         "edit" => {
             if let Some(list) = a.get("edits").and_then(|v| v.as_array()) {
-                return edit_batch(ws, need("path")?, list, cwd.as_deref());
+                return edit_batch(ws, s(a, "path").unwrap_or(""), list, cwd.as_deref());
             }
             // A symbol name instead of anchors: edit the whole symbol.
             if let (None, Some(sym)) = (s(a, "start"), s(a, "symbol")) {
@@ -198,6 +201,17 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
                 expected: a["expected"].as_u64().map(|n| n as usize),
                 all_files: a["all_files"].as_bool().unwrap_or(false),
             };
+            // `rules: [{old, new, regex?}]`: several replacements in one atomic pass.
+            if let Some(list) = a.get("rules").and_then(|v| v.as_array()).filter(|l| !l.is_empty()) {
+                let mut rules = Vec::with_capacity(list.len());
+                for (i, r) in list.iter().enumerate() {
+                    let get = |ks: &[&str]| ks.iter().find_map(|k| r.get(*k).and_then(|v| v.as_str()));
+                    let old = get(&["old", "old_string", "old_text"]).ok_or_else(|| format!("rules[{}]: missing `old`", i + 1))?;
+                    let new = get(&["new", "new_string", "new_text"]).ok_or_else(|| format!("rules[{}]: missing `new`", i + 1))?;
+                    rules.push((old.to_string(), new.to_string(), r["regex"].as_bool().unwrap_or(opts.regex)));
+                }
+                return replace_rules(ws, &rules, &opts);
+            }
             replace_text(ws, need("old")?, need("new")?, &opts)
         }
         "symbol" => symbol_op(

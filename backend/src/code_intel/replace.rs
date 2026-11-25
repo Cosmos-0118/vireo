@@ -39,10 +39,93 @@ struct PlannedReplace {
 /// Eliminates the need for `sed -i` or ad-hoc Python scripts while keeping CRLF, syntax checks,
 /// dry-run previews, and rollback guarantees.
 pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Result<String, String> {
-    if old.is_empty() {
-        return Err("`old` pattern cannot be empty".into());
+    replace_rules(ws, &[(old.to_string(), new.to_string(), opts.regex)], opts)
+}
+
+/// A literal or regex `old` -> `new` pair.
+struct Rule {
+    re: Option<Regex>,
+    old_lf: String,
+    new_lf: String,
+}
+
+/// Regex replacement strings written the Python/sed/JS way work: `\1` and `$1_x` mean group 1
+/// (the `regex` crate would read `$1_x` as a group named `1_x` and insert nothing).
+fn normalize_repl(s: &str) -> String {
+    let cs: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 4);
+    let mut i = 0;
+    while i < cs.len() {
+        match cs[i] {
+            '\\' if cs.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
+                out.push_str(&format!("${{{}}}", cs[i + 1]));
+                i += 2;
+            }
+            '$' if cs.get(i + 1) == Some(&'$') => {
+                out.push_str("$$");
+                i += 2;
+            }
+            '$' if cs.get(i + 1).is_some_and(|c| c.is_ascii_digit()) => {
+                let mut j = i + 1;
+                while j < cs.len() && cs[j].is_ascii_digit() {
+                    j += 1;
+                }
+                out.push_str(&format!("${{{}}}", cs[i + 1..j].iter().collect::<String>()));
+                i = j;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
     }
-    if old == new && !opts.regex {
+    out
+}
+
+/// Apply one rule to `text`: (occurrences, new text). Fills `preview` with the first hits.
+fn apply_rule(rule: &Rule, text: &str, use_crlf: bool, rel: &str, preview: &mut Vec<String>) -> (usize, String) {
+    let mut note = |pos: usize| {
+        if preview.len() < 8 {
+            let ln = text[..pos].bytes().filter(|&b| b == b'\n').count() + 1;
+            let line_str = text.lines().nth(ln - 1).unwrap_or("");
+            preview.push(format!("  {rel}:{ln}#{}| {}", line_hash(line_str), line_str.trim()));
+        }
+    };
+    let eol = |s: &str| if use_crlf { s.replace('\n', "\r\n") } else { s.to_string() };
+    if let Some(rx) = &rule.re {
+        let mut count = 0usize;
+        for m in rx.find_iter(text) {
+            count += 1;
+            note(m.start());
+        }
+        if count == 0 {
+            return (0, text.to_string());
+        }
+        (count, rx.replace_all(text, eol(&rule.new_lf).as_str()).into_owned())
+    } else {
+        let needle = eol(&rule.old_lf);
+        let mut count = 0usize;
+        for (pos, _) in text.match_indices(&needle) {
+            count += 1;
+            note(pos);
+        }
+        if count == 0 {
+            return (0, text.to_string());
+        }
+        (count, text.replace(&needle, &eol(&rule.new_lf)))
+    }
+}
+
+/// Atomic multi-rule replace: every `(old, new, regex)` rule is applied in order to each file in
+/// memory, then all files are written together (rolled back on any write failure).
+pub fn replace_rules(ws: &Path, rules: &[(String, String, bool)], opts: &ReplaceOpts) -> Result<String, String> {
+    if rules.is_empty() {
+        return Err("`rules` is empty".into());
+    }
+    if let Some(i) = rules.iter().position(|r| r.0.is_empty()) {
+        return Err(if rules.len() == 1 { "`old` pattern cannot be empty".into() } else { format!("rules[{}]: `old` pattern cannot be empty", i + 1) });
+    }
+    if rules.iter().all(|(o, n, rx)| o == n && !rx) {
         return Ok("No change: `old` and `new` are identical.".into());
     }
     let has_path = opts.path.as_deref().map(|p| !p.trim().is_empty()).unwrap_or(false);
@@ -87,13 +170,16 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
         return Err(format!("no files matched the target scope{tip}"));
     }
 
-    let re = if opts.regex {
-        Some(Regex::new(old).map_err(|e| format!("invalid regex `{old}`: {e}"))?)
-    } else {
-        None
-    };
-    let old_lf = old.replace("\r\n", "\n");
-    let new_lf = new.replace("\r\n", "\n");
+    let mut compiled: Vec<Rule> = Vec::new();
+    for (old, new, rx) in rules {
+        if old == new && !rx {
+            continue;
+        }
+        // `(?m)`: `^`/`$` match at every line, which is what a multi-line file edit means.
+        let re = if *rx { Some(Regex::new(&format!("(?m){old}")).map_err(|e| format!("invalid regex `{old}`: {e}"))?) } else { None };
+        let new_lf = new.replace("\r\n", "\n");
+        compiled.push(Rule { re, old_lf: old.replace("\r\n", "\n"), new_lf: if *rx { normalize_repl(&new_lf) } else { new_lf } });
+    }
     let single_explicit = files.len() == 1 && has_path && files[0].0.is_file();
 
     let mut plans: Vec<PlannedReplace> = Vec::new();
@@ -118,68 +204,47 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
         let use_crlf = doc.eol == "\r\n";
         let mut loose = false;
 
-        let (count, replaced, preview_lines) = if let Some(ref rx) = re {
-            let mut count = 0usize;
-            let mut preview = Vec::new();
-            for m in rx.find_iter(&text) {
-                count += 1;
-                if preview.len() < 8 {
-                    let ln = text[..m.start()].bytes().filter(|&b| b == b'\n').count() + 1;
-                    let line_str = doc.lines.get(ln - 1).map(String::as_str).unwrap_or("");
-                    preview.push(format!("  {rel}:{ln}#{}| {}", line_hash(line_str), line_str.trim()));
-                }
-            }
-            if count == 0 {
+        let mut cur = text.clone();
+        let mut count = 0usize;
+        let mut preview: Vec<String> = Vec::new();
+        for rule in &compiled {
+            let (c, next) = apply_rule(rule, &cur, use_crlf, &rel, &mut preview);
+            count += c;
+            cur = next;
+        }
+        if count == 0 {
+            // One named file, one literal rule: tolerate indentation / trailing-whitespace drift
+            // (unique match only), else show the nearest real lines so the retry needs no extra read.
+            let single_rule = compiled.len() == 1 && compiled[0].re.is_none();
+            if !(single_explicit && single_rule) {
                 continue;
             }
-            let rep_str = if use_crlf { new_lf.replace('\n', "\r\n") } else { new_lf.clone() };
-            let out = rx.replace_all(&text, rep_str.as_str()).into_owned();
-            (count, out, preview)
-        } else {
-            let needle = if use_crlf { old_lf.replace('\n', "\r\n") } else { old_lf.clone() };
-            let repl = if use_crlf { new_lf.replace('\n', "\r\n") } else { new_lf.clone() };
-            let mut count = 0usize;
-            let mut preview = Vec::new();
-            for (pos, _) in text.match_indices(&needle) {
-                count += 1;
-                if preview.len() < 8 {
-                    let ln = text[..pos].bytes().filter(|&b| b == b'\n').count() + 1;
-                    let line_str = doc.lines.get(ln - 1).map(String::as_str).unwrap_or("");
-                    preview.push(format!("  {rel}:{ln}#{}| {}", line_hash(line_str), line_str.trim()));
+            let (old_lf, new_lf) = (&compiled[0].old_lf, &compiled[0].new_lf);
+            let old_lines: Vec<String> = old_lf.trim_end_matches('\n').split('\n').map(String::from).collect();
+            let new_lines: Vec<String> = new_lf.trim_end_matches('\n').split('\n').map(String::from).collect();
+            match seek_lines(&doc.lines, &old_lines, 0, false) {
+                Ok(Some((at, level, _))) if matches!(level, MatchLevel::Rstrip | MatchLevel::Trim) => {
+                    let shift = indent_shift(&old_lines[0], &doc.lines[at]);
+                    let shifted: Vec<String> = match &shift {
+                        Some(s) => new_lines.iter().map(|l| apply_shift(l, s)).collect(),
+                        None => new_lines,
+                    };
+                    let mut d = Doc::parse(&text);
+                    d.lines.splice(at..at + old_lines.len(), shifted);
+                    let line_str = doc.lines[at].as_str();
+                    preview.push(format!("  {rel}:{}#{}| {}", at + 1, line_hash(line_str), line_str.trim()));
+                    loose = true;
+                    count = 1;
+                    cur = d.to_text();
                 }
-            }
-            if count == 0 {
-                if !single_explicit {
+                _ => {
+                    miss_hint = closest_hint(&doc, &old_lines);
                     continue;
                 }
-                // One named file: tolerate indentation / trailing-whitespace drift (unique match
-                // only), else show the nearest real lines so the retry needs no extra read.
-                let old_lines: Vec<String> = old_lf.trim_end_matches('\n').split('\n').map(String::from).collect();
-                let new_lines: Vec<String> = new_lf.trim_end_matches('\n').split('\n').map(String::from).collect();
-                match seek_lines(&doc.lines, &old_lines, 0, false) {
-                    Ok(Some((at, level, _))) if matches!(level, MatchLevel::Rstrip | MatchLevel::Trim) => {
-                        let shift = indent_shift(&old_lines[0], &doc.lines[at]);
-                        let shifted: Vec<String> = match &shift {
-                            Some(s) => new_lines.iter().map(|l| apply_shift(l, s)).collect(),
-                            None => new_lines,
-                        };
-                        let mut d = Doc::parse(&text);
-                        d.lines.splice(at..at + old_lines.len(), shifted);
-                        let line_str = doc.lines[at].as_str();
-                        preview.push(format!("  {rel}:{}#{}| {}", at + 1, line_hash(line_str), line_str.trim()));
-                        loose = true;
-                        (1, d.to_text(), preview)
-                    }
-                    _ => {
-                        miss_hint = closest_hint(&doc, &old_lines);
-                        continue;
-                    }
-                }
-            } else {
-                let out = text.replace(&needle, &repl);
-                (count, out, preview)
             }
-        };
+        }
+        let replaced = cur;
+        let preview_lines = preview;
 
         if replaced == text {
             continue;
@@ -232,7 +297,8 @@ pub fn replace_text(ws: &Path, old: &str, new: &str, opts: &ReplaceOpts) -> Resu
         }
     }
     if plans.is_empty() {
-        return Err(format!("no matches found for `{}`{miss_hint}", clip(old, 60)));
+        let what = if compiled.len() == 1 { format!("`{}`", clip(&rules[0].0, 60)) } else { format!("any of the {} rules", compiled.len()) };
+        return Err(format!("no matches found for {what}{miss_hint}"));
     }
 
     if opts.dry_run {

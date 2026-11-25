@@ -30,9 +30,11 @@ pub(crate) fn vx_args(kind: CliKind, ws: &Path, mode: PermMode) -> Vec<String> {
                 args.push("--append-system-prompt".to_string());
                 args.push(crate::code_intel::AGENT_HINT.to_string());
                 args.push("--allowedTools".to_string());
+                // Claude Code's shell tool is `PowerShell` or `Bash` on Windows (depending on setup) and `Bash` elsewhere.
+                let shell = if cfg!(windows) { "Bash(vx:*),PowerShell(vx:*)" } else { "Bash(vx:*)" };
                 args.push(match mode {
-                    PermMode::Ask => "Bash(vx:*),mcp__vx__map,mcp__vx__view,mcp__vx__search".to_string(),
-                    PermMode::AutoEdit | PermMode::FullAccess => "Bash(vx:*),mcp__vx__*".to_string(),
+                    PermMode::Ask => format!("{shell},mcp__vx__map,mcp__vx__view,mcp__vx__search"),
+                    PermMode::AutoEdit | PermMode::FullAccess => format!("{shell},mcp__vx__*"),
                 });
             }
             CliKind::Codex => {

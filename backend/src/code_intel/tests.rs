@@ -1109,3 +1109,103 @@ fn old_text_edit_returns_fresh_anchors() {
     let r = run_op(&ws, "edit", &json!({"path": "a.rs", "old_text": "fn b() {}", "new_text": "fn b2() {}"})).unwrap();
     assert!(r.contains("New anchor: 2#") && r.contains("fn b2() {}"), "{r}");
 }
+
+#[test]
+fn csharp_top_level_program_and_manifests_show_in_map_and_outline() {
+    let ws = tmp("cs-toplevel");
+    std::fs::create_dir_all(ws.join("App")).unwrap();
+    std::fs::write(
+        ws.join("App/Program.cs"),
+        "var builder = WebApplication.CreateBuilder(args);\nvar app = builder.Build();\napp.Run();\n\nstatic void Helper() { }\n",
+    )
+    .unwrap();
+    std::fs::write(ws.join("App/Svc.cs"), "namespace Demo;\npublic class Svc { public event System.Action Changed; }\n").unwrap();
+    std::fs::write(
+        ws.join("App/App.csproj"),
+        "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>\n  <ItemGroup><PackageReference Include=\"Serilog\" Version=\"3\" /><ProjectReference Include=\"../Lib/Lib.csproj\" /></ItemGroup>\n</Project>\n",
+    )
+    .unwrap();
+    std::fs::write(ws.join("App/Main.xaml"), "<Window x:Class=\"Demo.MainWindow\"></Window>\n").unwrap();
+    let outline = run_op(&ws, "outline", &json!({"path": "App/Program.cs"})).unwrap();
+    assert!(outline.contains("<top-level statements>") && outline.contains("Helper"), "{outline}");
+    let out = run_op(&ws, "outline", &json!({"path": "App/Svc.cs"})).unwrap();
+    assert!(out.contains("Svc") && out.contains("Changed"), "{out}");
+    let map = run_op(&ws, "map", &json!({})).unwrap();
+    assert!(map.contains("Program.cs") && map.contains("<top-level>"), "{map}");
+    assert!(!map.lines().any(|l| l.trim_end().ends_with(':')), "dangling colon: {map}");
+    assert!(map.contains("App.csproj") && map.contains("Serilog") && map.contains("Lib"), "{map}");
+    assert!(map.contains("Main.xaml") && map.contains("MainWindow"), "{map}");
+}
+
+#[test]
+fn empty_map_names_the_scanned_root() {
+    let ws = tmp("empty-map");
+    let out = run_op(&ws, "map", &json!({})).unwrap();
+    assert!(out.contains("No supported source files found in") && out.contains("empty-map"), "{out}");
+}
+
+#[test]
+fn batched_view_and_outline_cover_every_file() {
+    let ws = tmp("view-many");
+    let big: String = (0..400).map(|i| format!("fn f{i}() {{ let _ = {i}; }}\n")).collect();
+    std::fs::write(ws.join("big.rs"), &big).unwrap();
+    std::fs::write(ws.join("b.rs"), "fn b() {}\n").unwrap();
+    std::fs::write(ws.join("c.rs"), "fn c() {}\n").unwrap();
+    let out = run_op(&ws, "view", &json!({"specs": ["big.rs", "b.rs", "c.rs"]})).unwrap();
+    assert!(out.contains("# b.rs") && out.contains("# c.rs") && out.contains("fn c() {}"), "{out}");
+    let o = run_op(&ws, "outline", &json!({"specs": ["b.rs", "c.rs"]})).unwrap();
+    assert!(o.contains("# b.rs") && o.contains("# c.rs"), "{o}");
+}
+
+#[test]
+fn edit_batch_mixes_selectors_across_files() {
+    let ws = tmp("edit-batch-mixed");
+    std::fs::write(ws.join("a.rs"), "fn one() {}\nfn two() {}\nfn three() {}\n").unwrap();
+    std::fs::write(ws.join("b.rs"), "fn keep() {}\nfn gone() {}\n").unwrap();
+    let r = run_op(
+        &ws,
+        "edit",
+        &json!({"edits": [
+            {"path": "a.rs", "old_text": "fn one() {}", "new_text": "fn uno() {}"},
+            {"path": "a.rs", "symbol": "three", "new_text": "fn tres() {}"},
+            {"path": "b.rs", "symbol": "gone", "op": "delete"},
+        ]}),
+    )
+    .unwrap();
+    assert!(!r.starts_with("Error"), "{r}");
+    assert_eq!(std::fs::read_to_string(ws.join("a.rs")).unwrap().replace("\r\n", "\n"), "fn uno() {}\nfn two() {}\nfn tres() {}\n");
+    assert_eq!(std::fs::read_to_string(ws.join("b.rs")).unwrap().replace("\r\n", "\n"), "fn keep() {}\n");
+    let dup = run_op(&ws, "edit", &json!({"path": "a.rs", "edits": [{"old_text": "fn", "new_text": "x"}]}));
+    assert!(dup.unwrap_err().contains("occurs"), "ambiguous old_text must be refused");
+}
+
+#[test]
+fn apply_symbol_hunks_replace_insert_and_delete_by_name() {
+    let ws = tmp("apply-symbol");
+    std::fs::write(ws.join("a.rs"), "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+    let patch = "*** Begin Patch\n*** Update File: a.rs\n@@ symbol a\n+fn a2() {}\n@@ after symbol b\n+fn b_next() {}\n@@ delete symbol c\n*** End Patch\n";
+    let r = run_op(&ws, "apply", &json!({"patch": patch})).unwrap();
+    assert!(!r.starts_with("Error"), "{r}");
+    assert_eq!(std::fs::read_to_string(ws.join("a.rs")).unwrap().replace("\r\n", "\n"), "fn a2() {}\nfn b() {}\nfn b_next() {}\n");
+}
+
+#[test]
+fn replace_rules_apply_in_one_pass_and_normalize_backrefs() {
+    let ws = tmp("replace-rules");
+    std::fs::write(ws.join("a.txt"), "alpha one\nbeta two\n").unwrap();
+    std::fs::write(ws.join("b.txt"), "alpha again\n").unwrap();
+    let r = run_op(
+        &ws,
+        "replace",
+        &json!({"path": ".", "rules": [
+            {"old": "alpha", "new": "ALPHA"},
+            {"old": "^([A-Za-z]+) ([A-Za-z]+)$", "new": "\\2_$1_x", "regex": true},
+        ]}),
+    );
+    let r = r.unwrap();
+    assert!(r.contains("Replaced"), "{r}");
+    let a = std::fs::read_to_string(ws.join("a.txt")).unwrap().replace("\r\n", "\n");
+    assert_eq!(a, "one_ALPHA_x\ntwo_beta_x\n");
+    let b = std::fs::read_to_string(ws.join("b.txt")).unwrap().replace("\r\n", "\n");
+    assert_eq!(b, "again_ALPHA_x\n");
+}

@@ -2,23 +2,25 @@
 
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::sync::Arc;
-use std::path::Path;
+use std::sync::{Arc, RwLock};
+use std::path::{Path, PathBuf};
 
 use super::code_intel;
 
 /// Sent in the MCP `initialize` reply: exact argument shapes, so a host that lazy-loads tool
 /// schemas needs no extra round trip to learn them.
-const MCP_INSTRUCTIONS: &str = "vx tool arguments (JSON):\n\
-- view {path, target?: \"10..50\" | \"10..30,80..100\" | \"Symbol\", outline?: true} or {specs: [\"a.rs:10..50\", \"b.rs:Foo\"]}\n\
-- search {query, path?, glob?, literal?, ignore_case?, context?, files_only?}\n\
-- edit {path, start: \"12#ab..15#cd\" | \"top\" | \"bottom\" | \"imports\", new_text, op?: replace|insert_after|insert_before|delete}; \
-or {path, symbol, new_text}; or {path, old_text, new_text} (no anchors needed, returns fresh ones); or {path, edits: [{start, end?, op?, new_text}]}\n\
-- apply {patch: \"*** Update File: a.rs\\n@@ 12#ab..15#cd\\n+new line\"}\n\
-- replace {old, new, path?, glob?, regex?, expected?, dry_run?}\n\
-- check {cmd?, dir?, warnings?}: a build still running after 60s continues in the background and returns a job id; call check {job} to wait for it.\n\
-- release {action?: status|preflight|notes|bump|publish|verify|activity, version?: patch|minor|major|prerelease|X.Y.Z, dry_run?, skip_tests?, write?, changelog?, notes_file?, publish?, no_push?, assets?, only?}: polyglot release engine. Flow: status -> notes {write:true} (then edit the draft) -> publish {dry_run:true} (show the plan) -> publish. Every step appears live on the user's Releases page.\n\
-Anchors `N#hh` come from view/search/edit output; edits return fresh anchors, so no re-view is needed.";
+const MCP_INSTRUCTIONS: &str = r##"vx tool arguments (JSON). Anchors `N#hh` come from view/search/edit output; edits return fresh ones, so never re-view after editing.
+- map {query?, dir?} · search {query, path?, glob?, literal?, ignore_case?, context?, files_only?}
+- view {path, target?: "10..50" | "10..30,80..100" | "Symbol", outline?: true} or {specs: ["a.rs:10..50", "b.rs:Foo"], outline?: true}
+Edit, pick one:
+- by anchor: edit {path, start: "12#ab..15#cd" | "top" | "bottom" | "imports", new_text, op?: replace|insert_after|insert_before|delete}
+- by exact text (no view): edit {path, old_text, new_text}
+- by symbol (no view): edit {path, symbol: "Foo::bar", new_text, op?: replace|insert_after|insert_before|delete}
+- many at once: edit {edits: [{path?, start | old_text | symbol, new_text?, op?}]} (any mix, any files, atomic) · replace {rules: [{old, new, regex?}], path?, glob?} · apply {patch}
+- replace {old, new, path?, glob?, regex?, expected?, dry_run?}: literal by default; regex replacement uses $1 / ${1}
+- apply {patch: "*** Update File: a.rs\n@@ 12#ab..15#cd\n+new line"}; other hunks: @@ symbol Foo::bar (+lines replace it) · @@ after symbol Foo · @@ delete symbol Foo · @@ top|bottom|after imports
+- check {cmd?, dir?, warnings?}: a build still running after 60s returns a job id; call check {job} to wait.
+- release {action?: status|preflight|notes|bump|publish|verify|activity, version?, dry_run?, ...}: `status` (default) says what to do next; always publish {dry_run:true} first."##;
 
 pub fn mcp_tools(read_only: bool) -> Value {
     let mut tools = vec![
@@ -36,7 +38,7 @@ pub fn mcp_tools(read_only: bool) -> Value {
         }),
         json!({
             "name": "view",
-            "description": "Read files with N#hash|code anchors: single file (full, range A..B, comma-separated multi-range A..B,C..D, symbol, or outline=true) OR batch multiple files via `specs` (e.g. [\"a.ts:10..30\", \"b.ts:foo\"]). Auto-resolves unique workspace paths.",
+                "description": "Read files as N#hash|code: one file (full, range A..B, ranges A..B,C..D, or Symbol) or several via `specs` (e.g. [\"a.ts:10..30\", \"b.ts:foo\"]); the output budget is shared fairly, so every file gets shown. `outline: true` (with `path` or `specs`) lists symbols with [start#h..end#h] ranges. Unique path suffixes auto-resolve.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -73,7 +75,7 @@ pub fn mcp_tools(read_only: bool) -> Value {
         tools.extend([
             json!({
                 "name": "apply",
-                "description": "Apply a multi-file/multi-hunk V4A patch atomically (`*** Update File:` / `*** Add File:` / `*** Delete File:`, optionally wrapped in `*** Begin Patch` / `*** End Patch`). Supports hashline-anchored hunks (`@@ 12#ab..15#cd`, `@@ after 12#ab`, `@@ before 12#ab`, `@@ delete 12#ab..15#cd`; write ONLY `+` lines there: the anchors already name the replaced lines, so no `-`/context lines (a stray `-old` echo is ignored)), anchor-free `@@ top` / `@@ bottom` / `@@ after imports` (inserts after the file's import block and skips imports already present; no view needed), and classic `@@` context hunks (` `, `-`, `+`). All anchors refer to pre-patch lines. Paths auto-resolve unique suffixes (`components/X.tsx` -> `frontend/src/components/X.tsx`); new files go next to an existing matching folder.",
+                "description": "Apply a multi-file V4A patch atomically (`*** Update File:` / `*** Add File:` / `*** Delete File:`). Hunks: anchored `@@ 12#ab..15#cd`, `@@ after 12#ab`, `@@ before 12#ab`, `@@ delete 12#ab..15#cd` (write ONLY `+` lines; the anchors name the replaced lines); by symbol `@@ symbol Foo::bar` (+lines replace it), `@@ after symbol Foo`, `@@ before symbol Foo`, `@@ delete symbol Foo`; anchor-free `@@ top`, `@@ bottom`, `@@ after imports` (skips imports already present); classic `@@` context hunks (` `, `-`, `+`). Anchors refer to pre-patch lines. Paths auto-resolve unique suffixes.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -86,10 +88,11 @@ pub fn mcp_tools(read_only: bool) -> Value {
             }),
             json!({
                 "name": "replace",
-                "description": "Atomic literal (default) or regex find-and-replace across one file, a directory, or a glob. Preserves CRLF, runs syntax checks, supports dry_run and expected occurrence count guard.",
+                "description": "Atomic find-and-replace across a file, directory or glob: literal by default, regex=true for patterns (replacement groups $1 / ${1}; \\1 also works; ^/$ match per line). `rules: [{old, new, regex?}]` batches several. Preserves CRLF, checks syntax, supports dry_run and expected count.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
+                        "rules": { "type": "array", "description": "Several replacements in ONE atomic pass (applied in order to each file): [{old, new, regex?}]. Use instead of `old`/`new`", "items": { "type": "object" } },
                         "old": { "type": "string", "description": "Exact text (or regex if regex=true) to replace" },
                         "new": { "type": "string", "description": "Replacement text" },
                         "path": { "type": "string", "description": "Target file or directory" },
@@ -100,13 +103,13 @@ pub fn mcp_tools(read_only: bool) -> Value {
                         "expected": { "type": "integer", "description": "Abort if total occurrences != expected" },
                         "all_files": { "type": "boolean", "description": "Allow replacing across entire workspace with no path/glob" }
                     },
-                    "required": ["old", "new"]
+                    "required": []
                 },
                 "annotations": { "readOnlyHint": false }
             }),
             json!({
                 "name": "edit",
-                "description": "Edit lines by N#hash anchor (no old text needed). For several edits to one file, pass them together in `edits: [{start, end?, op?, new_text}]` so every anchor resolves against the current file at once. Accepts the same paths as view (unique suffixes auto-resolve). Returns fresh anchors around the edit and syntax errors with the offending lines.",
+                "description": "Edit by anchor (`start`), exact text (`old_text`) or symbol name (`symbol`); batch many in `edits` (any mix, any files). Returns fresh anchors and any new syntax errors with the offending lines. Paths auto-resolve unique suffixes.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -116,10 +119,10 @@ pub fn mcp_tools(read_only: bool) -> Value {
                         "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"], "description": "Default replace (needs new_text); use delete to remove lines" },
                         "new_text": { "type": "string", "description": "Replacement / inserted text" },
                         "old_text": { "type": "string", "description": "No anchors yet (e.g. you read the file another way)? Pass the exact text to replace instead of `start`; it must occur once. Returns fresh N#hash anchors for follow-up edits" },
-                        "edits": { "type": "array", "description": "Several edits to this file in ONE atomic call; anchors all refer to the file as it is now. Each: {start, end?, op?, new_text?}", "items": { "type": "object" } },
+                        "edits": { "type": "array", "description": "Several edits in ONE atomic call; anchors refer to the files as they are now. Each: {path?, start?, end?, op?, new_text?} or {path?, old_text, new_text} or {path?, symbol, op?, new_text?}; a per-edit `path` makes one call span files (the top-level `path` is the default)", "items": { "type": "object" } },
                         "symbol": { "type": "string", "description": "Instead of anchors: edit a whole symbol by name (op replace / insert_after / delete)" }
                     },
-                    "required": ["path"]
+                    "required": []
                 },
                 "annotations": { "readOnlyHint": false }
             }),
@@ -157,7 +160,7 @@ pub fn mcp_tools(read_only: bool) -> Value {
             }),
             json!({
                 "name": "release",
-                "description": "Release engineering across Rust/Node/Tauri/.NET/Python/Java/Go/installers. `status` (default): stacks, version files + drift, commits since last tag (flags non-conventional repos), suggested bump, CI mode & workflow notes wiring. `preflight`: clean tree, branch, remote sync, free tag, version order, CI tag/notes wiring, gh auth, build gate. `notes`: release notes draft (Conventional Commits + heuristic fallback for non-conventional commits, diffstat/commit-body context in tool output, warns & scopes to prev..tag when tag already exists; `write` saves clean markdown draft, `changelog` prepends CHANGELOG.md). `bump`: atomic lossless version sync of every manifest + lockfile (`dry_run` previews). `publish`: preflight -> bump -> commit -> tag -> push (CI tag workflows) or draft GitHub release (`publish: true` makes it public); ALWAYS call with dry_run first and show the plan to the user. `verify`: remote tag, release state, CI run. `activity`: recent release actions by the user, agents and the CLI. Every action you take shows live on the user's Releases page, so write notes with `notes {write:true}`, polish that file, then `publish {dry_run:true}` before `publish`.",
+                "description": "Release engine (Rust/Node/Tauri/.NET/Python/Java/Go). `status` (default) shows stacks, version drift, commits since the last tag and the exact next command. Others: preflight, notes (write:true saves an editable draft), bump, publish, verify, activity. Always publish {dry_run:true} first and show the plan; every action shows live on the user's Releases page.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -304,9 +307,97 @@ fn send(line: &Value) -> bool {
     out.write_all(s.as_bytes()).is_ok() && out.flush().is_ok()
 }
 
-pub fn run_mcp(ws: &Path, read_only: bool) {
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `file:///c%3A/Users/me/repo` -> `c:/Users/me/repo`; `file:///home/me/repo` -> `/home/me/repo`.
+fn uri_to_path(uri: &str) -> Option<PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let dec = percent_decode(rest);
+    let b = dec.as_bytes();
+    // `/c:/x` (Windows drive) -> `c:/x`.
+    let p = if b.len() >= 3 && b[0] == b'/' && b[2] == b':' && b[1].is_ascii_alphabetic() { &dec[1..] } else { &dec[..] };
+    (!p.is_empty()).then(|| PathBuf::from(p))
+}
+
+/// The folder a client says it is working in: `workspaceFolders[0]`, `rootUri`, or `rootPath`.
+fn init_workspace(params: &Value) -> Option<PathBuf> {
+    let from_uri = params["workspaceFolders"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|f| f["uri"].as_str())
+        .or_else(|| params["rootUri"].as_str())
+        .and_then(uri_to_path);
+    from_uri
+        .or_else(|| params["rootPath"].as_str().map(PathBuf::from))
+        .filter(|p| p.is_absolute() && p.is_dir())
+}
+
+/// Nearest enclosing git root of `p` (a file or folder), else the folder itself.
+fn repo_root_of(p: &Path) -> Option<PathBuf> {
+    let dir = if p.is_dir() { p } else { p.parent()? };
+    if !dir.is_dir() {
+        return None;
+    }
+    Some(dir.ancestors().find(|d| d.join(".git").exists()).unwrap_or(dir).to_path_buf())
+}
+
+/// The first absolute `path`/`dir`/`cwd`/`specs[0]` of a tool call, if any.
+fn absolute_target(args: &Value) -> Option<PathBuf> {
+    let spec0 = args["specs"].as_array().and_then(|a| a.first()).and_then(|s| s.as_str()).map(|s| code_intel::split_view_spec(s).0.to_string());
+    ["path", "dir", "cwd"]
+        .iter()
+        .find_map(|k| args[*k].as_str().map(str::to_string))
+        .or(spec0)
+        .map(|s| PathBuf::from(s.trim().trim_matches('"')))
+        .filter(|p| p.is_absolute())
+}
+
+/// Follow the client's root on `initialize`, and (while the launch folder isn't a git repo) the
+/// repo of the first absolute path a tool call names, so an IDE-spawned server isn't stuck in its
+/// install folder.
+fn adopt_workspace(ws: &RwLock<PathBuf>, req: &Value) {
+    let target = match req["method"].as_str() {
+        Some("initialize") => init_workspace(&req["params"]),
+        Some("tools/call") => {
+            let cur = ws.read().map(|w| w.clone()).unwrap_or_default();
+            if cur.join(".git").exists() {
+                return;
+            }
+            absolute_target(&req["params"]["arguments"])
+                .filter(|p| !code_intel::resolve(&cur, &p.to_string_lossy()).is_ok())
+                .and_then(|p| repo_root_of(&p))
+        }
+        _ => None,
+    };
+    if let (Some(t), Ok(mut w)) = (target, ws.write()) {
+        *w = t;
+    }
+}
+
+/// `locked`: the workspace came from `--workspace`/`VIREO_WORKSPACE`, so the client's roots and
+/// absolute paths never move it. Otherwise it follows the client's `initialize` root, and a
+/// launch directory that isn't a git repo (an IDE's install folder) rebinds to the repo that
+/// the first absolute path in a tool call lives in.
+pub fn run_mcp(ws: &Path, read_only: bool, locked: bool) {
     let stdin = std::io::stdin();
-    let ws: Arc<std::path::PathBuf> = Arc::new(ws.to_path_buf());
+    let ws: Arc<RwLock<PathBuf>> = Arc::new(RwLock::new(ws.to_path_buf()));
     let mut workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for line in BufReader::new(stdin.lock()).lines() {
         let Ok(line) = line else { break };
@@ -314,18 +405,22 @@ pub fn run_mcp(ws: &Path, read_only: bool) {
         if t.is_empty() {
             continue;
         }
-        match serde_json::from_str::<Value>(t) {
+        let parsed = serde_json::from_str::<Value>(t);
+        if let (Ok(req), false) = (&parsed, locked) {
+            adopt_workspace(&ws, req);
+        }
+        let cur: PathBuf = ws.read().map(|w| w.clone()).unwrap_or_default();
+        match parsed {
             Ok(req) if runs_concurrently(&req) => {
                 workers.retain(|h| !h.is_finished());
-                let ws = Arc::clone(&ws);
                 workers.push(std::thread::spawn(move || {
-                    if let Some(r) = handle_mcp_request(&ws, read_only, &req) {
+                    if let Some(r) = handle_mcp_request(&cur, read_only, &req) {
                         send(&r);
                     }
                 }));
             }
             Ok(req) => {
-                if let Some(r) = handle_mcp_request(&ws, read_only, &req) {
+                if let Some(r) = handle_mcp_request(&cur, read_only, &req) {
                     if !send(&r) {
                         break;
                     }
@@ -346,5 +441,48 @@ pub fn run_mcp(ws: &Path, read_only: bool) {
     // stdin closed: let in-flight replies finish (piped/scripted use) before the process exits.
     for w in workers {
         let _ = w.join();
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::*;
+
+    #[test]
+    fn file_uris_decode_to_paths() {
+        assert_eq!(uri_to_path("file:///c%3A/Users/me/my%20repo"), Some(PathBuf::from("c:/Users/me/my repo")));
+        assert_eq!(uri_to_path("file:///C:/x"), Some(PathBuf::from("C:/x")));
+        assert_eq!(uri_to_path("file:///home/me/repo"), Some(PathBuf::from("/home/me/repo")));
+        assert_eq!(uri_to_path("https://example.com"), None);
+    }
+
+    #[test]
+    fn unlocked_server_follows_the_client_root_and_absolute_paths() {
+        let base = std::env::temp_dir().join(format!("vx-mcp-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let launch = base.join("ide-install");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/a.rs"), "fn a() {}\n").unwrap();
+        std::fs::create_dir_all(&launch).unwrap();
+
+        // `initialize` with a root URI moves the workspace.
+        let ws = RwLock::new(launch.clone());
+        let uri = format!("file:///{}", repo.to_string_lossy().replace('\\', "/").trim_start_matches('/'));
+        adopt_workspace(&ws, &json!({"method": "initialize", "params": {"rootUri": uri}}));
+        assert_eq!(ws.read().unwrap().to_string_lossy().replace('\\', "/").to_lowercase(), repo.to_string_lossy().replace('\\', "/").to_lowercase());
+
+        // Without a root, the first absolute path in a tool call selects the enclosing git repo.
+        let ws = RwLock::new(launch.clone());
+        let file = repo.join("src/a.rs");
+        adopt_workspace(&ws, &json!({"method": "tools/call", "params": {"name": "view", "arguments": {"path": file.to_string_lossy()}}}));
+        assert_eq!(*ws.read().unwrap(), repo);
+
+        // A workspace that is already a git repo never moves.
+        let ws = RwLock::new(repo.clone());
+        adopt_workspace(&ws, &json!({"method": "tools/call", "params": {"name": "map", "arguments": {"dir": launch.to_string_lossy()}}}));
+        assert_eq!(*ws.read().unwrap(), repo);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

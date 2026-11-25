@@ -140,6 +140,18 @@ export function describeTool(t: ToolCallTrace): ToolView {
         edits: rw,
       };
     }
+    case 'apply_patch':
+      return { Icon: SquarePen, kind: 'edit', verb: 'Patched', active: 'Patching', subject: 'multi-file patch', meta: 'apply', edits: true };
+    case 'replace_text':
+      return {
+        Icon: SquarePen,
+        kind: 'edit',
+        verb: 'Replaced',
+        active: 'Replacing',
+        subject: str('path') || str('glob') || 'workspace',
+        meta: 'replace',
+        edits: true,
+      };
     case 'verify':
       return {
         Icon: TerminalIcon,

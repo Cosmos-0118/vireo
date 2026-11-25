@@ -402,6 +402,9 @@ impl TurnTracker {
                 }
                 _ => self.opaque = true,
             },
+            // Multi-file by nature: the touched paths aren't known up front.
+            "apply_patch" => self.opaque = true,
+            "replace_text" if !args.get("dry_run").and_then(|v| v.as_bool()).unwrap_or(false) => self.opaque = true,
             "run_command" => {
                 let cmd = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
                 if !is_read_only_command(cmd) {
