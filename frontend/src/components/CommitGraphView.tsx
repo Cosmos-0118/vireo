@@ -64,6 +64,12 @@ const INSPECTOR_MIN = { w: 320, h: 170 };
 const SIDE_DOCK_MIN_WIDTH = 880;
 const LIST_MIN_WIDTH = 360;
 
+// Shared column geometry so the sticky header and every row line up exactly.
+const COL_AUTHOR = 'w-40 shrink-0 px-3 truncate hidden @[620px]:block';
+const COL_DATE = 'w-32 shrink-0 px-3 truncate tabular-nums hidden @[460px]:block';
+const COL_SHA = 'w-[84px] shrink-0 pl-3 pr-1';
+const COL_ACTIONS = 'w-7 shrink-0 flex items-center justify-center';
+
 function loadInspectorSize() {
   try {
     const raw = JSON.parse(localStorage.getItem(INSPECTOR_KEY) || 'null');
@@ -832,20 +838,10 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
 
       <div className={`flex-1 min-h-0 min-w-0 flex ${dockSide ? 'flex-row' : 'flex-col'}`}>
       <div className="@container flex-1 min-w-0 min-h-0 flex flex-col">
-      {/* Column Headers */}
-      <div className="flex items-center h-7 px-3 border-b border-[var(--border)] bg-[var(--bg-sidebar)]/60 text-[10.5px] font-semibold uppercase tracking-wider text-[var(--text-dim)] shrink-0">
-        <div style={{ width: graphColWidth }} className="shrink-0">
-          Graph
-        </div>
-        <div className="flex-1 min-w-0 px-2">Description</div>
-        <div className="w-36 shrink-0 px-2 hidden @[620px]:block">Author</div>
-        <div className="w-28 shrink-0 px-2 hidden @[460px]:block">Date</div>
-        <div className="w-24 shrink-0 px-2 text-right">Commit</div>
-      </div>
-
-      {/* Commit Rows */}
+      {/* Commit Rows (column header is sticky inside the scroller so the
+          scrollbar never shifts rows out of line with their headings) */}
       <div
-        className="flex-1 overflow-y-auto min-h-0 py-0.5 outline-none"
+        className="flex-1 overflow-y-auto min-h-0 outline-none scroll-pt-8"
         tabIndex={0}
         onKeyDown={(e) => {
           if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
@@ -860,6 +856,16 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
           }
         }}
       >
+        <div className="sticky top-0 z-[2] flex items-center h-8 px-3 border-b border-[var(--border)] bg-[var(--bg-sidebar)] text-[10.5px] font-semibold uppercase tracking-[0.08em] text-[var(--text-dim)]">
+          <div style={{ width: graphColWidth }} className="shrink-0">
+            Graph
+          </div>
+          <div className="flex-1 min-w-0 px-2">Description</div>
+          <div className={`${COL_AUTHOR} shadow-[inset_1px_0_0_var(--border)]`}>Author</div>
+          <div className={`${COL_DATE} shadow-[inset_1px_0_0_var(--border)]`}>Date</div>
+          <div className={`${COL_SHA} shadow-[inset_1px_0_0_var(--border)]`}>Commit</div>
+          <div className={COL_ACTIONS} />
+        </div>
         {layout.rows.map((row) => {
           const c = row.commit;
 
@@ -896,13 +902,10 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
                     −{gitStatus?.total_deletions ?? 0}
                   </span>
                 </div>
-                <div className="w-36 shrink-0 px-2 text-xs text-[var(--text-dim)] hidden @[620px]:block">
-                  Working Tree
-                </div>
-                <div className="w-28 shrink-0 px-2 text-xs text-[var(--text-dim)] hidden @[460px]:block">
-                  Now
-                </div>
-                <div className="w-24 shrink-0 px-2" />
+                <div className={`${COL_AUTHOR} text-xs text-[var(--text-dim)]`}>Working Tree</div>
+                <div className={`${COL_DATE} text-xs text-[var(--text-dim)]`}>Now</div>
+                <div className={COL_SHA} />
+                <div className={COL_ACTIONS} />
               </div>
             );
           }
@@ -959,32 +962,34 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
                 </span>
               </div>
 
-              <div className="w-36 shrink-0 px-2 text-xs text-[var(--text-muted)] truncate hidden @[620px]:block">
+              <div className={`${COL_AUTHOR} text-xs text-[var(--text-muted)]`} title={c.author}>
                 {c.author}
               </div>
 
-              <div className="w-28 shrink-0 px-2 text-[11.5px] text-[var(--text-dim)] truncate hidden @[460px]:block">
+              <div className={`${COL_DATE} text-xs text-[var(--text-dim)]`} title={c.date}>
                 {c.date}
               </div>
 
-              <div className="w-24 shrink-0 px-2 flex items-center justify-end gap-0.5">
+              <div className={`${COL_SHA} flex items-center`}>
                 <button
                   onClick={(e) => {
                     e.stopPropagation();
                     copyText(c.hash, `SHA (${c.short_hash})`, c.hash);
                   }}
-                  className="font-mono text-[11px] px-1 h-5 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-elevated)] flex items-center gap-1 cursor-pointer"
+                  className="-ml-1 font-mono text-[11px] tabular-nums px-1 h-5 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-elevated)] flex items-center gap-1 cursor-pointer"
                   aria-label="Copy full commit SHA"
                 >
                   {copiedHash === c.hash && <Check size={10} className="text-[var(--added-fg)]" />}
                   {c.short_hash}
                 </button>
+              </div>
+              <div className={COL_ACTIONS}>
                 <button
                   onClick={(e) => {
                     hover.hide();
                     openCommitContextMenu(e, c);
                   }}
-                  className="p-0.5 rounded opacity-0 group-hover:opacity-100 hover:bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+                  className="p-0.5 rounded opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-[var(--bg-elevated)] text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
                   aria-label="Commit actions"
                 >
                   <MoreHorizontal size={13} />
