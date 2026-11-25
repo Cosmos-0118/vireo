@@ -9,6 +9,9 @@ import { removePref, setPref } from './prefs';
 
 export type ActionId =
   | 'quickOpen'
+  | 'openFolder'
+  | 'newTerminal'
+  | 'reopenTab'
   | 'openSettings'
   | 'openShortcuts'
   | 'saveFile'
@@ -29,7 +32,7 @@ export type ActionId =
   | 'zoomOut'
   | 'zoomReset';
 
-export type ShortcutGroup = 'General' | 'View' | 'Sidebar' | 'Tabs' | 'Zoom';
+export type ShortcutGroup = 'File' | 'General' | 'View' | 'Sidebar' | 'Tabs' | 'Zoom';
 
 export interface ActionDef {
   id: ActionId;
@@ -41,18 +44,21 @@ export interface ActionDef {
   alts?: string[];
 }
 
-export const GROUP_ORDER: ShortcutGroup[] = ['General', 'View', 'Sidebar', 'Tabs', 'Zoom'];
+export const GROUP_ORDER: ShortcutGroup[] = ['File', 'General', 'View', 'Sidebar', 'Tabs', 'Zoom'];
 
 export const ACTIONS: ActionDef[] = [
+  // File
+  { id: 'quickOpen', label: 'Open File (Quick Open: files, themes, tasks)', group: 'File', default: 'Mod+P' },
+  { id: 'openFolder', label: 'Open Folder…', group: 'File', default: 'Mod+O' },
+  { id: 'saveFile', label: 'Save File', group: 'File', default: 'Mod+S', alts: ['Mod+Shift+S'] },
   // General
-  { id: 'quickOpen', label: 'Quick Open (files, themes, tasks)', group: 'General', default: 'Mod+P' },
   { id: 'openSettings', label: 'Open Settings', group: 'General', default: 'Mod+,' },
   { id: 'openShortcuts', label: 'Open Keyboard Shortcuts', group: 'General', default: 'Mod+Shift+/' },
-  { id: 'saveFile', label: 'Save File', group: 'General', default: 'Mod+S', alts: ['Mod+Shift+S'] },
   { id: 'runPrimary', label: 'Run primary task (restarts if running)', group: 'General', default: 'F5' },
   // View
   { id: 'toggleSidebar', label: 'Toggle Sidebar', group: 'View', default: 'Mod+B' },
   { id: 'toggleTerminal', label: 'Toggle Terminal', group: 'View', default: 'Mod+`' },
+  { id: 'newTerminal', label: 'New Terminal', group: 'View', default: 'Mod+Shift+`' },
   { id: 'toggleAgent', label: 'Toggle Agent Panel', group: 'View', default: 'Mod+Shift+A' },
   // Sidebar views
   { id: 'showExplorer', label: 'Show File Explorer', group: 'Sidebar', default: 'Mod+Shift+E' },
@@ -63,6 +69,7 @@ export const ACTIONS: ActionDef[] = [
   // Tabs
   { id: 'closeTab', label: 'Close Active Tab', group: 'Tabs', default: 'Mod+W' },
   { id: 'closeAllTabs', label: 'Close All Tabs', group: 'Tabs', default: 'Mod+Shift+W' },
+  { id: 'reopenTab', label: 'Reopen Closed Tab', group: 'Tabs', default: 'Mod+Shift+T' },
   { id: 'nextTab', label: 'Next Tab', group: 'Tabs', default: 'Mod+Tab', alts: ['Mod+PageDown'] },
   { id: 'prevTab', label: 'Previous Tab', group: 'Tabs', default: 'Mod+Shift+Tab', alts: ['Mod+PageUp'] },
   // Zoom
@@ -83,6 +90,14 @@ export const FIXED_SHORTCUTS: { group: string; items: FixedShortcut[] }[] = [
   {
     group: 'Editor',
     items: [
+      { keys: 'Mod+F', label: 'Find' },
+      { keys: 'Mod+H', label: 'Find and replace' },
+      { keys: 'F3', label: 'Find next' },
+      { keys: 'Shift+F3', label: 'Find previous' },
+      { keys: 'Mod+G', label: 'Go to line' },
+      { keys: 'Mod+D', label: 'Select next occurrence' },
+      { keys: 'Tab', label: 'Indent selection' },
+      { keys: 'Shift+Tab', label: 'Outdent selection' },
       { keys: 'Alt+[', label: 'Navigate back' },
       { keys: 'Alt+]', label: 'Navigate forward' },
       { keys: 'Mod+Z', label: 'Undo' },
@@ -100,6 +115,13 @@ export const FIXED_SHORTCUTS: { group: string; items: FixedShortcut[] }[] = [
       { keys: 'Mod+]', label: 'Indent' },
       { keys: 'Mod+[', label: 'Outdent' },
       { keys: 'Mod+Shift+\\', label: 'Jump to matching bracket' },
+    ],
+  },
+  {
+    group: 'Tabs',
+    items: [
+      { keys: 'Alt+1…8', label: 'Go to tab 1–8' },
+      { keys: 'Alt+9', label: 'Go to last tab' },
     ],
   },
   {
@@ -353,6 +375,13 @@ export function findAction(e: KeyboardEvent): ActionDef | undefined {
   const b = eventToBinding(e);
   if (!b) return undefined;
   return ACTIONS.find((a) => getBinding(a.id) === b || a.alts?.includes(b));
+}
+
+/** Alt+1…9 -> tab slot 0…8 (8 = last tab); null for anything else or while a shortcut is being recorded. */
+export function tabSlotFromEvent(e: KeyboardEvent): number | null {
+  if (recording > 0 || e.isComposing || !e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return null;
+  const m = /^Digit([1-9])$/.exec(e.code || '');
+  return m ? Number(m[1]) - 1 : null;
 }
 
 export function matchesAction(e: KeyboardEvent, id: ActionId): boolean {

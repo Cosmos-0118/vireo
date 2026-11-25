@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Lock, RotateCcw, Search, X } from 'lucide-react';
 import {
   ACTIONS,
@@ -28,7 +28,7 @@ const Keys: React.FC<{ binding: string; dim?: boolean }> = ({ binding, dim }) =>
       {keys.map((k, i) => (
         <kbd
           key={i}
-          className={`inline-flex items-center justify-center min-w-[22px] h-[22px] px-1.5 rounded-[4px] border border-[var(--border)] bg-[var(--bg-elevated)] shadow-[inset_0_-1px_0_var(--border)] font-mono text-[11px] leading-none ${
+          className={`inline-flex items-center justify-center min-w-[24px] h-[24px] px-1.5 rounded-[5px] border border-[var(--border)] bg-[var(--bg-base)] shadow-[0_1px_0_var(--border)] font-mono text-[11.5px] font-medium leading-none ${
             dim ? 'text-[var(--text-muted)]' : 'text-[var(--text-primary)]'
           }`}
         >
@@ -81,6 +81,19 @@ export const ShortcutsPage: React.FC = () => {
   const [recording, setRecording] = useState<ActionId | null>(null);
   const [hint, setHint] = useState<string | null>(null);
   const [pending, setPending] = useState<{ id: ActionId; binding: string; conflicts: ActionDef[] } | null>(null);
+
+  // Scale the whole page up on large screens, like the Releases page (fixed px sizes otherwise look tiny).
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scale, setScale] = useState(1);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const update = () => setScale(Math.min(2, Math.max(1, el.clientWidth / 1000)));
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // Capture the next key combo for the action being edited. Global shortcuts are suspended meanwhile.
   useEffect(() => {
@@ -252,36 +265,51 @@ export const ShortcutsPage: React.FC = () => {
     );
   };
 
-  // Group headings only when browsing (not while a search ranks results across groups).
-  const body: React.ReactNode[] = [];
-  let last = '';
-  for (const r of visible) {
-    const gKey = `${r.kind}:${r.group}`;
-    if (!q && gKey !== last) {
-      last = gKey;
-      body.push(
-        <h3 key={`h:${gKey}`} className="px-3 pt-5 pb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--text-dim)] first:pt-1">
-          {r.group}
-          {r.kind === 'fixed' && <span className="ml-1.5 normal-case tracking-normal font-normal">· built-in</span>}
-        </h3>
-      );
+  // Browsing: one card per group. Searching: a single ranked card across groups.
+  type Section = { key: string; title: string; builtin: boolean; rows: Row[] };
+  const sections: Section[] = [];
+  if (q) {
+    if (visible.length > 0) sections.push({ key: 'results', title: `${visible.length} result${visible.length === 1 ? '' : 's'}`, builtin: false, rows: visible });
+  } else {
+    for (const r of visible) {
+      const key = `${r.kind}:${r.group}`;
+      const cur = sections[sections.length - 1];
+      if (cur && cur.key === key) cur.rows.push(r);
+      else sections.push({ key, title: r.group, builtin: r.kind === 'fixed', rows: [r] });
     }
-    body.push(renderRow(r, !!q));
   }
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto bg-[var(--bg-base)]">
+    <div ref={scrollRef} className="@container flex-1 min-h-0 overflow-y-auto bg-[var(--bg-base)] select-none">
       <div className="sticky top-0 z-[2] bg-[var(--bg-base)]/95 backdrop-blur-sm border-b border-[var(--border)]">
-        <div className="mx-auto w-full max-w-[920px] px-6 py-3 flex items-center gap-2">
-          <div className="relative flex-1">
+        <div className="mx-auto w-full max-w-[1400px] px-6 @[1100px]:px-10 pt-5 pb-3" style={{ zoom: scale }}>
+          <div className="flex items-end justify-between gap-4 pb-3">
+            <div className="min-w-0">
+              <h1 className="text-[20px] font-semibold tracking-tight text-[var(--text-primary)]">Keyboard Shortcuts</h1>
+              <p className="mt-0.5 text-[12.5px] text-[var(--text-muted)]">
+                Click a shortcut to rebind it. Press <kbd className="font-mono text-[11.5px] text-[var(--text-primary)]">Esc</kbd> to cancel.
+              </p>
+            </div>
+            {customCount > 0 && (
+              <button
+                type="button"
+                onClick={resetAllBindings}
+                className="shrink-0 inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-[var(--border)] text-[12px] text-[var(--text-muted)] cursor-pointer hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              >
+                <RotateCcw size={12} />
+                Reset all ({customCount})
+              </button>
+            )}
+          </div>
+          <div className="relative">
             <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-dim)]" />
             <input
               autoFocus
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search shortcuts…"
+              placeholder="Search by action, group or key…"
               spellCheck={false}
-              className="w-full h-9 pl-9 pr-8 rounded-md bg-[var(--bg-input)] border border-[var(--border)] text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none focus:border-[var(--accent)]"
+              className="w-full h-9 pl-9 pr-8 rounded-md bg-[var(--bg-input)] border border-[var(--border)] text-[13px] text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none focus:border-[var(--accent)] select-text"
             />
             {query && (
               <button
@@ -294,23 +322,31 @@ export const ShortcutsPage: React.FC = () => {
               </button>
             )}
           </div>
-          {customCount > 0 && (
-            <button
-              type="button"
-              onClick={resetAllBindings}
-              className="shrink-0 inline-flex items-center gap-1.5 h-9 px-3 rounded-md border border-[var(--border)] text-[12px] text-[var(--text-muted)] cursor-pointer hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-            >
-              <RotateCcw size={12} />
-              Reset all ({customCount})
-            </button>
-          )}
         </div>
       </div>
 
-      <div className="mx-auto w-full max-w-[920px] px-6 py-4 pb-10">
-        {body}
+      <div className="mx-auto w-full max-w-[1400px] px-6 @[1100px]:px-10 py-5 pb-12" style={{ zoom: scale }}>
+        <div className={q ? '' : '@[1100px]:columns-2 @[1100px]:gap-x-5'}>
+          {sections.map((s) => (
+            <section key={s.key} className="break-inside-avoid mb-5 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)]/40 overflow-hidden">
+              <h3 className="flex items-center gap-2 h-9 px-3 border-b border-[var(--border)] text-[11px] font-semibold uppercase tracking-[0.08em] text-[var(--text-dim)]">
+                {s.title}
+                {s.builtin && (
+                  <span className="inline-flex items-center gap-1 normal-case tracking-normal font-normal">
+                    <Lock size={10} /> built-in
+                  </span>
+                )}
+                {!q && <span className="ml-auto normal-case tracking-normal font-normal tabular-nums">{s.rows.length}</span>}
+              </h3>
+              <div className="divide-y divide-[var(--border)]/60">{s.rows.map((r) => renderRow(r, !!q))}</div>
+            </section>
+          ))}
+        </div>
         {visible.length === 0 && (
-          <div className="py-16 text-center text-[12.5px] text-[var(--text-dim)]">No shortcuts match “{query}”.</div>
+          <div className="py-20 text-center">
+            <Search size={22} className="mx-auto mb-2 text-[var(--text-dim)]" />
+            <div className="text-[13px] text-[var(--text-muted)]">No shortcuts match “{query}”.</div>
+          </div>
         )}
       </div>
     </div>

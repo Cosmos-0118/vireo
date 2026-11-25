@@ -305,6 +305,8 @@ interface TerminalPanelProps {
   onTaskTabsChange?: (taskIds: string[]) => void;
   /** Increment to open the "Launch CLI agent" menu (e.g. from the Agent Chat header). */
   launcherSignal?: number;
+  /** Increment to open a new shell tab (the initial value is ignored). */
+  newShellSignal?: number;
   maximized?: boolean;
   onToggleMaximize?: () => void;
   onSendOutputToAgent: (output: string) => void;
@@ -319,6 +321,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   pendingCommand,
   onTaskTabsChange,
   launcherSignal = 0,
+  newShellSignal = 0,
   maximized = false,
   onToggleMaximize,
   onSendOutputToAgent,
@@ -410,6 +413,14 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     setTabs((prev) => [...prev, { id, title: `Shell ${prev.length + 1}`, kind: 'shell' }]);
     setActiveId(id);
   };
+
+  const handledShellRef = useRef(newShellSignal);
+  useEffect(() => {
+    if (newShellSignal === handledShellRef.current) return;
+    handledShellRef.current = newShellSignal;
+    addShell();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [newShellSignal]);
 
   const launchAgent = (label: string, cmd: string) => {
     const id = `agent-${Date.now()}`;

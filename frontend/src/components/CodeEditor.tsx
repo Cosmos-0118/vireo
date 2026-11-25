@@ -24,7 +24,17 @@ import {
   highlightActiveLineGutter,
 } from '@codemirror/view';
 import { diffLines, diffWordsWithSpace } from 'diff';
-import { defaultKeymap, history, historyKeymap } from '@codemirror/commands';
+import { defaultKeymap, history, historyKeymap, indentWithTab } from '@codemirror/commands';
+import {
+  closeSearchPanel,
+  findNext,
+  findPrevious,
+  gotoLine,
+  highlightSelectionMatches,
+  openSearchPanel,
+  search,
+  selectNextOccurrence,
+} from '@codemirror/search';
 import { syntaxHighlighting } from '@codemirror/language';
 import {
   Check,
@@ -644,9 +654,19 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
         highlightActiveLine(),
         highlightActiveLineGutter(),
         history(),
+        search({ top: true }),
+        highlightSelectionMatches(),
         keymap.of([
           { key: 'Alt-]', run: () => navRef.current(1) },
           { key: 'Alt-[', run: () => navRef.current(-1) },
+          // Mod-Alt-g (CodeMirror's default Go to line) is the global Git Graph shortcut, so Go to line is Mod-g.
+          { key: 'Mod-f', run: openSearchPanel, scope: 'editor search-panel' },
+          { key: 'Mod-h', run: openSearchPanel, scope: 'editor search-panel' },
+          { key: 'F3', run: findNext, shift: findPrevious, scope: 'editor search-panel' },
+          { key: 'Mod-g', run: gotoLine },
+          { key: 'Mod-d', run: selectNextOccurrence, preventDefault: true },
+          { key: 'Escape', run: closeSearchPanel },
+          indentWithTab,
           ...defaultKeymap,
           ...historyKeymap,
         ]),

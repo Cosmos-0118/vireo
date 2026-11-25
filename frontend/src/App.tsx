@@ -35,7 +35,7 @@ import {
 } from 'lucide-react';
 import { diffLines } from 'diff';
 import { AgentSettingsProvider } from './agentSettings';
-import { findAction, shortcutLabel, withShortcut, useKeybindings, type ActionId } from './keybindings';
+import { findAction, shortcutLabel, tabSlotFromEvent, withShortcut, useKeybindings, type ActionId } from './keybindings';
 import { api, wsUrl } from './api';
 import { gitWriteActive } from './utils/gitWrites';
 import {
@@ -271,6 +271,7 @@ export function App() {
   const [terminalHeight, setTerminalHeight] = useState(storedLayout.terminalHeight);
   const [terminalMaximized, setTerminalMaximized] = useState(false);
   const [launcherSignal, setLauncherSignal] = useState(0);
+  const [newShellSignal, setNewShellSignal] = useState(0);
   const [panelPriority, setPanelPriority] = useState<PanelSide>('sidebar');
   const [workbenchSize, setWorkbenchSize] = useState({ w: 0, h: 0 });
   const workbenchRef = useRef<HTMLDivElement>(null);
@@ -375,6 +376,8 @@ export function App() {
   const seededRef = useRef<Map<string, number>>(new Map());
   const pillTimerRef = useRef<number | undefined>(undefined);
   const tabsRef = useRef<OpenTab[]>([]);
+  /** Recently closed tabs (newest last) for "Reopen Closed Tab". */
+  const closedTabsRef = useRef<OpenTab[]>([]);
   const actionsRef = useRef<Partial<Record<ActionId, () => void>>>({});
   useKeybindings(); // re-render so tooltips follow rebinding
   const gitStatusRef = useRef<GitStatusRes | null>(null);
@@ -881,6 +884,7 @@ export function App() {
             followSwitchRef.current.path = null;
             setPillVisible(false);
             setTabs([]);
+      closedTabsRef.current = [];
             setActiveTabId(null);
             loadWorkspaceData();
           } else if (data.type === 'checkpoint_created') {
@@ -962,6 +966,15 @@ export function App() {
   // Global keyboard shortcuts (bindings come from ./keybindings; handlers are in `actionsRef`).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      const slot = tabSlotFromEvent(e);
+      if (slot !== null) {
+        const list = tabsRef.current;
+        if (list.length === 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setActiveTabId(list[slot === 8 ? list.length - 1 : Math.min(slot, list.length - 1)].id);
+        return;
+      }
       const def = findAction(e);
       if (!def) return;
       // Like VS Code, app shortcuts also work while the terminal has focus.
@@ -1561,7 +1574,24 @@ export function App() {
     setActiveTabId(id);
   }, []);
 
+  const rememberClosed = (closed: OpenTab[]) => {
+    const ids = new Set(closed.map((t) => t.id));
+    closedTabsRef.current = [...closedTabsRef.current.filter((t) => !ids.has(t.id)), ...closed].slice(-25);
+  };
+
+  const reopenClosedTab = () => {
+    const stack = closedTabsRef.current;
+    while (stack.length > 0) {
+      const t = stack.pop()!;
+      if (tabsRef.current.some((x) => x.id === t.id)) continue;
+      setTabs((prev) => (prev.some((x) => x.id === t.id) ? prev : [...prev, t]));
+      setActiveTabId(t.id);
+      return;
+    }
+  };
+
   const closeTab = (id: string) => {
+    rememberClosed(tabsRef.current.filter((t) => t.id === id));
     contentCacheRef.current.delete(id);
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
@@ -1576,6 +1606,7 @@ export function App() {
   // otherwise fall back to the last remaining tab.
   const closeTabsWhere = (shouldClose: (t: OpenTab, index: number) => boolean) => {
     const next = tabs.filter((t, i) => !shouldClose(t, i));
+    rememberClosed(tabs.filter((t) => !next.includes(t)));
     for (const t of tabs) if (!next.includes(t)) contentCacheRef.current.delete(t.id);
     setTabs(next);
     if (!next.some((t) => t.id === activeTabId)) {
@@ -1749,6 +1780,7 @@ export function App() {
       setWorkspace(info);
       setEditingWs(false);
       setTabs([]);
+      closedTabsRef.current = [];
       setActiveTabId(null);
       await loadWorkspaceData();
       showToast(`Opened workspace: ${info.name}`);
@@ -1765,6 +1797,7 @@ export function App() {
       setWsDraft(info.path);
       setEditingWs(false);
       setTabs([]);
+      closedTabsRef.current = [];
       setActiveTabId(null);
       await loadWorkspaceData();
       showToast(`Opened workspace: ${info.name}`);
@@ -1885,6 +1918,12 @@ export function App() {
   // Re-assigned every render so the global key handler always sees fresh closures.
   actionsRef.current = {
     quickOpen: () => setQuickOpenVisible((v) => !v),
+    openFolder: () => void handlePickWorkspace(),
+    newTerminal: () => {
+      setShowTerminal(true);
+      setNewShellSignal((n) => n + 1);
+    },
+    reopenTab: reopenClosedTab,
     openSettings: openSettingsTab,
     openShortcuts: openShortcutsTab,
     saveFile: () => window.dispatchEvent(new CustomEvent('vireo:save-file')),
@@ -2777,6 +2816,7 @@ export function App() {
                     pendingCommand={pendingCmd}
                     onTaskTabsChange={handleTaskTabsChange}
                     launcherSignal={launcherSignal}
+                    newShellSignal={newShellSignal}
                     maximized={terminalMaximized}
                     onToggleMaximize={() => setTerminalMaximized((v) => !v)}
                     onSendOutputToAgent={handleAskAgent}
