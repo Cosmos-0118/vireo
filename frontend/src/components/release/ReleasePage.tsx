@@ -105,6 +105,18 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
   const [, setNow] = useState(0); // re-render relative times
   const mountedAt = useRef(Date.now());
   const lastSeen = useRef<string>('');
+  // Scale the whole page up on large screens (fixed px sizes otherwise look tiny).
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scale, setScale] = useState(1);
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const update = () => setScale(Math.min(2, Math.max(1, el.clientWidth / 1000)));
+    update();
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   // ---- Data -------------------------------------------------------------------------------
 
@@ -376,8 +388,8 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
   );
 
   return (
-    <div className="flex-1 min-h-0 overflow-y-auto bg-[var(--bg-base)] select-text">
-      <div className="mx-auto w-full max-w-[860px] px-8 py-8">
+    <div ref={scrollRef} className="flex-1 min-h-0 overflow-y-auto bg-[var(--bg-base)] select-text">
+      <div className="mx-auto w-full max-w-[860px] px-8 py-8" style={{ zoom: scale }}>
         {/* Header */}
         <header className="flex items-center gap-3 pb-4 border-b border-[var(--border)]">
           <div className="min-w-0 flex-1">
@@ -512,7 +524,7 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
                       ))}
                   </div>
                 )}
-                <div className="max-h-[320px] overflow-y-auto px-5 py-4">
+                <div className="overflow-y-auto px-5 py-4" style={{ maxHeight: `max(320px, ${55 / scale}vh)` }}>
                   {!notes ? (
                     <span className="flex items-center gap-2 text-[12px] text-[var(--text-muted)]">
                       {targetValid ? (
@@ -634,6 +646,7 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
 
       {dialog && (
         <ReviewDialog
+          scale={scale}
           plan={dialog.plan}
           outcome={dialog.outcome}
           verify={dialog.verify}

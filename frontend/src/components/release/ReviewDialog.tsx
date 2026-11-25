@@ -18,7 +18,9 @@ export function ReviewDialog({
   onVerify,
   onOpenUrl,
   onClose,
+  scale = 1,
 }: {
+  scale?: number;
   plan: ReleaseOutcome | null;
   outcome: ReleaseOutcome | null;
   verify: ReleaseReport | null;
@@ -81,7 +83,8 @@ export function ReviewDialog({
         role="dialog"
         aria-modal="true"
         aria-label={title}
-        className="w-full max-w-[560px] max-h-[86vh] flex flex-col rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl overflow-hidden"
+        className="w-full max-w-[560px] flex flex-col rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] shadow-2xl overflow-hidden"
+                style={{ zoom: scale, maxHeight: `${86 / scale}vh` }}
       >
         <header
           className="px-5 pt-5 pb-4 border-b border-[var(--border)]"
