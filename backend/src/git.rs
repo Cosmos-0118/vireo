@@ -1646,6 +1646,130 @@ pub async fn fetch_changes(
     Ok(Json(CommandRes { ok, stdout, stderr }))
 }
 
+static AUTO_FETCH_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+struct AutoFetchGuard;
+impl Drop for AutoFetchGuard {
+    fn drop(&mut self) {
+        AUTO_FETCH_BUSY.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[derive(Serialize)]
+pub struct AutoFetchRes {
+    pub ok: bool,
+    /// Remote branch heads differed from our remote-tracking refs (so a fetch ran).
+    pub changed: bool,
+    pub stderr: String,
+}
+
+/// Runs `git args` non-interactively with a hard timeout (process is killed on expiry).
+async fn run_git_bounded(ws: &Path, args: &[&str], secs: u64) -> Result<(bool, String, String), String> {
+    let mut cmd = git_command(ws, args)?;
+    cmd.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "never")
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), cmd.output()).await {
+        Ok(Ok(o)) => Ok((
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).to_string(),
+            String::from_utf8_lossy(&o.stderr).to_string(),
+        )),
+        Ok(Err(e)) => Err(format!("Failed to run git: {e}")),
+        Err(_) => Err(format!("git {} timed out", args.first().copied().unwrap_or(""))),
+    }
+}
+
+/// Quiet background sync check driven by the UI so remote updates show up without a manual
+/// Fetch. Cheap first: `git ls-remote --heads` per remote is compared with the local
+/// `refs/remotes/<remote>/*`, and a full fetch only runs for remotes whose heads differ.
+/// Single-flight (overlapping calls are skipped), never prompts for credentials, never runs
+/// `gc`, every git call is time-bounded. Offline/auth failures return `ok: false`. The file
+/// watcher sees the resulting ref changes, so the UI refreshes on its own.
+pub async fn auto_fetch(State(state): State<AppState>) -> Json<AutoFetchRes> {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
+    let res = |ok: bool, changed: bool, stderr: &str| {
+        Json(AutoFetchRes { ok, changed, stderr: stderr.to_string() })
+    };
+    if AUTO_FETCH_BUSY.swap(true, Ordering::AcqRel) {
+        return res(true, false, "busy");
+    }
+    let _guard = AutoFetchGuard;
+    let ws = state.workspace_path().await;
+    let remotes: Vec<String> =
+        get_remotes(&ws).await.into_iter().filter(|r| !r.starts_with('-')).collect();
+    if remotes.is_empty() {
+        return res(true, false, "no remotes");
+    }
+
+    let mut stale: Vec<String> = Vec::new();
+    for remote in &remotes {
+        let (ok, out, err) = match run_git_bounded(&ws, &["ls-remote", "--heads", remote], 20).await {
+            Ok(r) => r,
+            Err(e) => return res(false, false, &e),
+        };
+        if !ok {
+            return res(false, false, &err);
+        }
+        let remote_heads: BTreeMap<String, String> = out
+            .lines()
+            .filter_map(|l| {
+                let (sha, name) = l.split_once('\t')?;
+                Some((name.strip_prefix("refs/heads/")?.to_string(), sha.to_string()))
+            })
+            .collect();
+        let prefix = format!("refs/remotes/{remote}/");
+        let local = run_git_bounded(
+            &ws,
+            &["for-each-ref", "--format=%(objectname)%09%(refname)", &prefix],
+            10,
+        )
+        .await
+        .map(|(_, o, _)| o)
+        .unwrap_or_default();
+        let local_heads: BTreeMap<String, String> = local
+            .lines()
+            .filter_map(|l| {
+                let (sha, name) = l.split_once('\t')?;
+                let name = name.strip_prefix(&prefix)?;
+                (name != "HEAD").then(|| (name.to_string(), sha.to_string()))
+            })
+            .collect();
+        if remote_heads != local_heads {
+            stale.push(remote.clone());
+        }
+    }
+    if stale.is_empty() {
+        return res(true, false, "");
+    }
+
+    let mut errors = String::new();
+    let mut all_ok = true;
+    for remote in &stale {
+        match run_git_bounded(
+            &ws,
+            &["-c", "gc.auto=0", "-c", "maintenance.auto=false", "fetch", "--prune", "--quiet", remote],
+            60,
+        )
+        .await
+        {
+            Ok((ok, _, err)) => {
+                if !ok {
+                    all_ok = false;
+                    errors.push_str(&err);
+                }
+            }
+            Err(e) => {
+                all_ok = false;
+                errors.push_str(&e);
+            }
+        }
+    }
+    res(all_ok, true, &errors)
+}
+
 pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
     let ws = state.workspace_path().await;
     let ws_meta = ws.clone();

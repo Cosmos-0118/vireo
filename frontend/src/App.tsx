@@ -894,6 +894,62 @@ export function App() {
     };
   }, [refreshGit, loadWorkspaceData]);
 
+  // Background remote sync check: a cheap `ls-remote` compare (full fetch only when remote
+  // heads differ). Polls fast (20 s) for 5 min after focus or a detected change, else 90 s;
+  // hidden windows don't poll and a refocus checks immediately.
+  useEffect(() => {
+    const FAST = 20_000;
+    const SLOW = 90_000;
+    const ACTIVE_FOR = 5 * 60_000;
+    let lastActive = Date.now();
+    let lastRun = 0;
+    let running = false;
+    let timer = 0;
+    let closed = false;
+    const run = async () => {
+      const s = gitStatusRef.current;
+      if (running || document.hidden || !s?.is_repo || !s.remote_url || gitWriteActive()) return;
+      if (Date.now() - lastRun < 10_000) return;
+      running = true;
+      lastRun = Date.now();
+      try {
+        const r = await api.gitAutoFetch();
+        if (r.changed) {
+          lastActive = Date.now();
+          void refreshGit();
+        }
+      } catch {
+        // offline / backend busy: try again next tick
+      } finally {
+        running = false;
+      }
+    };
+    const schedule = () => {
+      if (closed) return;
+      const delay = Date.now() - lastActive < ACTIVE_FOR ? FAST : SLOW;
+      timer = window.setTimeout(async () => {
+        await run();
+        schedule();
+      }, delay);
+    };
+    const wake = () => {
+      if (document.hidden) return;
+      lastActive = Date.now();
+      void run();
+    };
+    document.addEventListener('visibilitychange', wake);
+    window.addEventListener('focus', wake);
+    const first = window.setTimeout(() => void run(), 3_000);
+    schedule();
+    return () => {
+      closed = true;
+      window.clearTimeout(timer);
+      window.clearTimeout(first);
+      document.removeEventListener('visibilitychange', wake);
+      window.removeEventListener('focus', wake);
+    };
+  }, [refreshGit]);
+
   // Global keyboard shortcuts (bindings come from ./keybindings; handlers are in `actionsRef`).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {

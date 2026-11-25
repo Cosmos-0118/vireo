@@ -349,6 +349,7 @@ fn build_router(
         .route("/api/git/push", post(git::push_changes))
         .route("/api/git/pull", post(git::pull_changes))
         .route("/api/git/fetch", post(git::fetch_changes))
+        .route("/api/git/auto-fetch", post(git::auto_fetch))
         .route("/api/git/branches", get(git::get_branches))
         .route("/api/git/checkout", post(git::checkout_branch))
         .route("/api/git/branch-delete", post(git::delete_branch))

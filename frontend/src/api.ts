@@ -142,6 +142,10 @@ export const api = {
   releaseActivity: () => releaseRun<{ items: ReleaseActivity[] }>('activity'),
 
   gitStatus: () => jsonFetch<GitStatusRes>('/api/git/status'),
+  gitAutoFetch: () =>
+    jsonFetch<{ ok: boolean; changed: boolean; stderr: string }>('/api/git/auto-fetch', {
+      method: 'POST',
+    }),
   gitDiff: (path: string, staged = false) =>
     jsonFetch<GitDiffRes>(
       `/api/git/diff?path=${encodeURIComponent(path)}&staged=${staged ? 'true' : 'false'}`
