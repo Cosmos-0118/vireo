@@ -7,6 +7,7 @@ mod cli_agent;
 mod code_intel;
 mod files;
 mod git;
+mod prefs;
 mod pty;
 mod release;
 mod secrets;
@@ -54,6 +55,19 @@ async fn serve_embedded(uri: Uri) -> Response {
         raw_path
     };
 
+    if path == "index.html" {
+        if let Some(index) = FrontendAssets::get("index.html") {
+            let html = String::from_utf8_lossy(&index.data);
+            let body = prefs::inject_into_html(&html);
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(Body::from(body))
+                .unwrap();
+        }
+    }
+
     if let Some(file) = FrontendAssets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
         // Vite emits content-hashed files under assets/: safe to cache forever. Everything else
@@ -73,11 +87,13 @@ async fn serve_embedded(uri: Uri) -> Response {
 
     // SPA fallback to index.html
     if let Some(index) = FrontendAssets::get("index.html") {
+        let html = String::from_utf8_lossy(&index.data);
+        let body = prefs::inject_into_html(&html);
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(embedded_body(index.data))
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Body::from(body))
             .unwrap();
     }
 
@@ -296,6 +312,8 @@ fn build_router(
 
     Router::new()
         .route("/api/health", get(health))
+        .route("/api/prefs", get(prefs::get_prefs).patch(prefs::patch_prefs))
+        .route("/api/prefs/bootstrap.js", get(prefs::bootstrap_js))
         .route("/api/window/zoom", post(set_window_zoom))
         .route("/api/window/control", post(window_control))
         .route(
@@ -440,11 +458,26 @@ fn main() {
         .build()
         .expect("Failed to initialize Tokio runtime");
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], cli.port));
+    // Desktop mode prefers a dedicated local port (4318, distinct from server-only/dev 4317)
+    // so origin-scoped browser storage stays stable for single-window launches, falling back to
+    // an ephemeral port when another instance is already running. Global preferences also persist
+    // on disk via `/api/prefs` so every window shares the same settings regardless of port.
     let (listener, bound_addr) = rt.block_on(async {
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .expect("Failed to bind local port");
+        let listener = if !cli.server_only && cli.port == 0 {
+            const DESKTOP_PORT: u16 = 4318;
+            match tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], DESKTOP_PORT)))
+                .await
+            {
+                Ok(l) => l,
+                Err(_) => tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+                    .await
+                    .expect("Failed to bind local port"),
+            }
+        } else {
+            tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], cli.port)))
+                .await
+                .expect("Failed to bind local port")
+        };
         let local = listener.local_addr().expect("Failed to read bound address");
         (listener, local)
     });
@@ -482,6 +515,7 @@ fn main() {
     let win_slot = main_window.clone();
     tauri::Builder::default()
         .setup(move |app| {
+            let (bg_r, bg_g, bg_b) = prefs::initial_window_bg();
             let win = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
@@ -496,7 +530,7 @@ fn main() {
             // Tauri's native file-drop handler swallows HTML5 drag events on Windows, which
             // breaks in-app drags (explorer -> agent/terminal) and OS file drops in the webview.
             .disable_drag_drop_handler()
-            .background_color(tauri::window::Color(27, 28, 31, 255))
+            .background_color(tauri::window::Color(bg_r, bg_g, bg_b, 255))
             .additional_browser_args(WEBVIEW2_ARGS)
             .center()
             .build()?;

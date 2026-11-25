@@ -106,14 +106,18 @@ impl AppState {
     }
 }
 
-fn last_workspace_file() -> Option<PathBuf> {
+pub fn state_dir() -> Option<PathBuf> {
     let base = std::env::var_os("LOCALAPPDATA")
         .or_else(|| std::env::var_os("XDG_STATE_HOME"))
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state"))
         })?;
-    Some(base.join("Vireo").join("last_workspace.txt"))
+    Some(base.join("Vireo"))
+}
+
+fn last_workspace_file() -> Option<PathBuf> {
+    Some(state_dir()?.join("last_workspace.txt"))
 }
 
 /// Remembers the open folder so the next launch reopens it. Best effort: failures are ignored.

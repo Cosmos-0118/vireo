@@ -8,6 +8,7 @@ import '@xterm/xterm/css/xterm.css';
 import { wsUrl } from '../api';
 import { isUsableDrag, readDrop, shellQuote, uploadDropped } from '../utils/dnd';
 import type { LiteTheme } from '../themes';
+import { setPref } from '../prefs';
 
 const PRIMARY_FONT = 'JetBrains Mono Variable';
 const FONT_FAMILY = `'${PRIMARY_FONT}', 'JetBrains Mono', 'Cascadia Code', Consolas, monospace`;
@@ -43,11 +44,7 @@ function readEngine(): TerminalEngine {
 }
 
 export function setTerminalEngine(engine: TerminalEngine): void {
-  try {
-    localStorage.setItem(ENGINE_KEY, engine);
-  } catch {
-    // storage unavailable: the choice just won't persist
-  }
+  setPref(ENGINE_KEY, engine);
   engineListeners.forEach((l) => l());
 }
 

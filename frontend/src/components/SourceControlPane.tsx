@@ -105,6 +105,7 @@ const GRAPH_MAX_LANES = 8;
 import { GitActionModal, type GitModalState } from './GitActionModal';
 import { FileIcon } from './FileIcon';
 import { PublishDialog, type PublishMode } from './PublishDialog';
+import { setPref } from '../prefs';
 
 interface SourceControlPaneProps {
   gitStatus: GitStatusRes | null;
@@ -215,12 +216,11 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
     [gitStatus?.remote_url]
   );
 
+  const lastSavedTreeViewRef = useRef(treeView);
   useEffect(() => {
-    try {
-      localStorage.setItem('vireo-scm-tree', String(treeView));
-    } catch {
-      // ignore
-    }
+    if (lastSavedTreeViewRef.current === treeView) return;
+    lastSavedTreeViewRef.current = treeView;
+    setPref('vireo-scm-tree', String(treeView));
   }, [treeView]);
 
   const fetchBranches = useCallback(() => {

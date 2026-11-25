@@ -26,6 +26,7 @@ import { FileIcon } from './FileIcon';
 import { fileStatusColor } from './GitBadges';
 import { FloatingContextMenu, type ContextMenuItem } from './CommitContextMenu';
 import { statusBadge } from './FileExplorer';
+import { setPref } from '../prefs';
 
 interface SearchPaneProps {
   active: boolean;
@@ -75,11 +76,7 @@ function loadRecent(): string[] {
 }
 
 function saveRecent(list: string[]) {
-  try {
-    localStorage.setItem(RECENT_KEY, JSON.stringify(list));
-  } catch {
-    /* storage unavailable */
-  }
+  setPref(RECENT_KEY, JSON.stringify(list));
 }
 
 const occurrences = (m: SearchMatch) => Math.max(1, m.ranges.length);

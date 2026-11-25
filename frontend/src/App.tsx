@@ -79,6 +79,7 @@ import {
   solveWidths,
   type PanelSide,
 } from './layout';
+import { flushPrefs, hasPersistedPref, setPref, setPrefs } from './prefs';
 
 /** Files whose changes can add, remove or rename Run tasks. */
 const TASK_SOURCE_RE =
@@ -156,10 +157,48 @@ export function App() {
   );
   const activeTheme = themes.find((t) => t.id === themeId) || BUILTIN_THEMES[0];
 
-  useEffect(() => {
+  const themeMetaJson = (theme: LiteTheme) =>
+    JSON.stringify({ type: theme.type, vars: theme.vars });
+
+  const selectTheme = useCallback(
+    (target: string | LiteTheme) => {
+      const next =
+        typeof target === 'string'
+          ? themes.find((t) => t.id === target) || BUILTIN_THEMES[0]
+          : target;
+      setThemeId(next.id);
+      setPrefs({
+        'vireo-theme': next.id,
+        'vireo-theme-meta': themeMetaJson(next),
+      });
+    },
+    [themes]
+  );
+
+  useLayoutEffect(() => {
     applyTheme(activeTheme);
-    localStorage.setItem('vireo-theme', activeTheme.id);
   }, [activeTheme]);
+
+  // One-time backfill for browser/dev sessions that saved a theme only in localStorage.
+  useEffect(() => {
+    try {
+      const storedTheme = localStorage.getItem('vireo-theme');
+      if (storedTheme && !hasPersistedPref('vireo-theme')) {
+        const entry: Record<string, string> = {
+          'vireo-theme': activeTheme.id,
+          'vireo-theme-meta': themeMetaJson(activeTheme),
+        };
+        const storedCustom = localStorage.getItem('vireo-custom-themes');
+        if (storedCustom && !hasPersistedPref('vireo-custom-themes')) {
+          entry['vireo-custom-themes'] = storedCustom;
+        }
+        setPrefs(entry);
+      }
+    } catch {
+      // ignore
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Workspace & Git state
   const [workspace, setWorkspace] = useState<WorkspaceInfo>({ path: '', name: 'Vireo' });
@@ -180,6 +219,7 @@ export function App() {
   const [nativeWindow, setNativeWindow] = useState<{ maximized: boolean } | null>(null);
   const windowAction = useCallback(
     (action: 'state' | 'minimize' | 'toggle_maximize' | 'close' | 'drag') => {
+      if (action === 'close') flushPrefs();
       api
         .windowControl(action)
         .then((res) => setNativeWindow(res.native ? { maximized: res.maximized } : null))
@@ -571,12 +611,12 @@ export function App() {
   }, [reloadActiveContent]);
 
   // Apply zoom to native Tauri WebView2 (or fallback to CSS zoom in browser mode)
+  const lastSavedZoomRef = useRef(zoom);
   useEffect(() => {
     let cancelled = false;
-    try {
-      localStorage.setItem('vireo-zoom', String(zoom));
-    } catch {
-      // ignore
+    if (lastSavedZoomRef.current !== zoom) {
+      lastSavedZoomRef.current = zoom;
+      setPref('vireo-zoom', String(zoom));
     }
     api
       .setWindowZoom(zoom)
@@ -1078,15 +1118,9 @@ export function App() {
   }, [pausedJump, activeTab]);
 
   const toggleFollow = () => {
-    setFollowEdits((v) => {
-      const next = !v;
-      try {
-        localStorage.setItem('vireo-follow-edits', next ? '1' : '0');
-      } catch {
-        // ignore
-      }
-      return next;
-    });
+    const next = !followEdits;
+    setFollowEdits(next);
+    setPref('vireo-follow-edits', next ? '1' : '0');
     setPausedJump(null);
   };
 
@@ -1556,15 +1590,17 @@ export function App() {
     try {
       const text = await file.text();
       const parsed = parseVsCodeThemeJson(text, file.name.replace(/\.json$/i, ''));
-      setThemes((prev) => {
-        const next = [...prev.filter((t) => t.id !== parsed.id), parsed];
-        const customOnly = next.filter(
-          (t) => !BUILTIN_THEMES.some((b) => b.id === t.id)
-        );
-        localStorage.setItem('vireo-custom-themes', JSON.stringify(customOnly));
-        return next;
-      });
+      const next = [...themes.filter((t) => t.id !== parsed.id), parsed];
+      const customOnly = next.filter(
+        (t) => !BUILTIN_THEMES.some((b) => b.id === t.id)
+      );
+      setThemes(next);
       setThemeId(parsed.id);
+      setPrefs({
+        'vireo-custom-themes': JSON.stringify(customOnly),
+        'vireo-theme': parsed.id,
+        'vireo-theme-meta': themeMetaJson(parsed),
+      });
       setShowThemeMenu(false);
       showToast(`Imported theme: ${parsed.name}`);
     } catch {
@@ -1590,8 +1626,17 @@ export function App() {
   }, []);
 
   // Persist preferred sizes
+  const lastSavedLayoutRef = useRef({ sidebarWidth, agentWidth, terminalHeight });
   useEffect(() => {
-    saveLayout({ sidebarWidth, agentWidth, terminalHeight });
+    const prev = lastSavedLayoutRef.current;
+    if (
+      prev.sidebarWidth !== sidebarWidth ||
+      prev.agentWidth !== agentWidth ||
+      prev.terminalHeight !== terminalHeight
+    ) {
+      lastSavedLayoutRef.current = { sidebarWidth, agentWidth, terminalHeight };
+      saveLayout({ sidebarWidth, agentWidth, terminalHeight });
+    }
   }, [sidebarWidth, agentWidth, terminalHeight]);
 
   // The panel the user most recently opened wins when both side panels cannot fit.
@@ -1865,7 +1910,7 @@ export function App() {
                     <button
                       key={th.id}
                       onClick={() => {
-                        setThemeId(th.id);
+                        selectTheme(th);
                         setShowThemeMenu(false);
                       }}
                       className={`w-full text-left px-3 py-2 text-[13px] flex items-center justify-between cursor-pointer ${
@@ -2689,7 +2734,7 @@ export function App() {
             tasks={rankedTasks}
             onClose={() => setQuickOpenVisible(false)}
             onSelectFile={(p) => openFile(p)}
-            onSelectTheme={(id) => setThemeId(id)}
+            onSelectTheme={(id) => selectTheme(id)}
             onRunTask={handleRunTask}
           />
         </Suspense>

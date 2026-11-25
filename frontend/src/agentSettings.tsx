@@ -2,6 +2,7 @@ import React, { createContext, useCallback, useContext, useEffect, useMemo, useR
 import { Lock, ShieldAlert, ShieldCheck } from 'lucide-react';
 import { api } from './api';
 import type { AgentConfig, CliToolStatus, LocalModelsInfo, PermissionMode } from './types';
+import { setPref } from './prefs';
 
 export type Provider = AgentConfig['provider'];
 
@@ -152,11 +153,7 @@ export const AgentSettingsProvider: React.FC<{
   });
   const setShowQuickActions = useCallback((v: boolean) => {
     setShowQuickActionsState(v);
-    try {
-      localStorage.setItem(QUICK_ACTIONS_KEY, v ? '1' : '0');
-    } catch {
-      // ignore
-    }
+    setPref(QUICK_ACTIONS_KEY, v ? '1' : '0');
   }, []);
 
   const [cliTools, setCliTools] = useState<CliToolStatus[]>([]);
@@ -241,12 +238,12 @@ export const AgentSettingsProvider: React.FC<{
   }, [apiModelsCurrent, config.model]);
 
   // Persist everything except the API key, which goes to the OS credential store instead.
+  const lastSavedConfigRef = useRef(JSON.stringify({ ...config, apiKey: '' }));
   useEffect(() => {
-    try {
-      localStorage.setItem(CONFIG_KEY, JSON.stringify({ ...config, apiKey: '' }));
-    } catch {
-      // ignore
-    }
+    const serialized = JSON.stringify({ ...config, apiKey: '' });
+    if (lastSavedConfigRef.current === serialized) return;
+    lastSavedConfigRef.current = serialized;
+    setPref(CONFIG_KEY, serialized);
   }, [config]);
 
   useEffect(() => {

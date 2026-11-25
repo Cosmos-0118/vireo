@@ -55,6 +55,7 @@ const FULL_LANE_W = 14;
 const FULL_MAX_LANES = 16;
 import { GitActionModal, type GitModalState } from './GitActionModal';
 import ResizeHandle from './ResizeHandle';
+import { setPref } from '../prefs';
 
 const INSPECTOR_KEY = 'vireo-graph-inspector-v1';
 const INSPECTOR_DEFAULT = { w: 460, h: 320 };
@@ -216,12 +217,12 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
     return () => ro.disconnect();
   }, [rootEl]);
 
+  const lastSavedInspectorRef = useRef(inspectorSize);
   useEffect(() => {
-    try {
-      localStorage.setItem(INSPECTOR_KEY, JSON.stringify(inspectorSize));
-    } catch {
-      // ignore
-    }
+    const prev = lastSavedInspectorRef.current;
+    if (prev.w === inspectorSize.w && prev.h === inspectorSize.h) return;
+    lastSavedInspectorRef.current = inspectorSize;
+    setPref(INSPECTOR_KEY, JSON.stringify(inspectorSize), { debounceMs: 150 });
   }, [inspectorSize]);
 
   const uncommittedCount = gitStatus?.files.length ?? 0;

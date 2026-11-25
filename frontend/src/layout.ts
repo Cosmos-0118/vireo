@@ -1,3 +1,4 @@
+import { setPref } from './prefs';
 // Workbench layout constraints & solver.
 //
 // Panel widths the user picks ("preferred") are stored untouched; what is rendered ("effective")
@@ -127,9 +128,5 @@ export function loadLayout(): StoredLayout {
 }
 
 export function saveLayout(layout: StoredLayout) {
-  try {
-    localStorage.setItem(KEY, JSON.stringify(layout));
-  } catch {
-    // ignore
-  }
+  setPref(KEY, JSON.stringify(layout), { debounceMs: 150 });
 }

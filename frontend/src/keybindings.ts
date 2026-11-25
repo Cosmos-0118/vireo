@@ -5,6 +5,7 @@
 // An empty string means "unbound".
 
 import { useSyncExternalStore } from 'react';
+import { removePref, setPref } from './prefs';
 
 export type ActionId =
   | 'quickOpen'
@@ -266,12 +267,8 @@ const listeners = new Set<() => void>();
 
 function commit(next: Overrides) {
   overrides = next;
-  try {
-    if (Object.keys(next).length === 0) localStorage.removeItem(STORAGE_KEY);
-    else localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
-  } catch {
-    // ignore (private mode / quota)
-  }
+  if (Object.keys(next).length === 0) removePref(STORAGE_KEY);
+  else setPref(STORAGE_KEY, JSON.stringify(next));
   listeners.forEach((l) => l());
 }
 
