@@ -2849,9 +2849,13 @@ pub async fn open_external(
     let url = parsed.as_str();
 
     #[cfg(target_os = "windows")]
-    let res = background_command("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
-        .spawn();
+    let res = {
+        // The user's browser must outlive Vireo, so it leaves the kill-on-close job.
+        let mut c = background_command("rundll32");
+        c.args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(0x0800_0000 | crate::jobobject::CREATE_BREAKAWAY_FROM_JOB);
+        c.spawn()
+    };
     #[cfg(target_os = "macos")]
     let res = background_command("open").arg(url).spawn();
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]

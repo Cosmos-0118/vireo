@@ -7,6 +7,7 @@ mod cli_agent;
 mod code_intel;
 mod files;
 mod git;
+mod jobobject;
 mod prefs;
 mod pty;
 mod release;
@@ -439,6 +440,9 @@ async fn require_workspace(
 const WEBVIEW2_ARGS: &str = "--disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --metrics-recording-only --disable-default-apps --no-first-run --disable-speech-api --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,Translate,OptimizationHints,MediaRouter";
 
 fn main() {
+    // First thing, before any child process exists: children must inherit the kill-on-close job
+    // so no shell/dev server/agent can outlive the app and keep the workspace folder locked.
+    jobobject::init();
     // Bundled git/rg/gh (installer `tools/` folder) for machines that lack them. Must run before
     // any thread is spawned, since it edits this process's environment.
     code_intel::use_bundled_tools();
