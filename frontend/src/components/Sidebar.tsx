@@ -161,8 +161,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
       {/* Sidebar Pane Content */}
       {!railOnly && (
       <div className="flex-1 min-w-0 flex flex-col overflow-hidden">
-        {activeTab === 'changes' && (
+        <div className={activeTab === 'changes' ? 'flex-1 flex flex-col min-h-0' : 'hidden'}>
           <SourceControlPane
+            active={activeTab === 'changes'}
             gitStatus={gitStatus}
             selectedPath={selectedPath}
             selectedCommitKey={selectedTabId}
@@ -176,7 +177,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onToast={onToast}
             recentPaths={recentPaths}
           />
-        )}
+        </div>
 
         {/* Loaded on first visit, then kept mounted (hidden) so their state survives tab switches. */}
         {seen.current.explorer && (

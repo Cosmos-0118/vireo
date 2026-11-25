@@ -13,6 +13,11 @@ import { groupRefs, RefLabel } from './GitBadges';
 const detailCache = new Map<string, CommitDetailRes>();
 const inflight = new Map<string, Promise<CommitDetailRes | null>>();
 
+export function clearCommitDetailCache() {
+  detailCache.clear();
+  inflight.clear();
+}
+
 function loadDetailSilently(hash: string): Promise<CommitDetailRes | null> {
   const cached = detailCache.get(hash);
   if (cached) return Promise.resolve(cached);

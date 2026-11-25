@@ -61,7 +61,7 @@ import {
   type ContextMenuItem,
 } from './CommitContextMenu';
 import { CommitGraphSvg, GraphRails, graphWidth } from './CommitGraphSvg';
-import { useCommitHover } from './CommitHoverCard';
+import { clearCommitDetailCache, useCommitHover } from './CommitHoverCard';
 import { BranchBar } from './BranchBar';
 import { isPushRejected, pullThenPush } from '../utils/gitSync';
 import { fileStatusColor, RefBadges, SyncMark } from './GitBadges';
@@ -108,6 +108,8 @@ import { PublishDialog, type PublishMode } from './PublishDialog';
 import { setPref } from '../prefs';
 
 interface SourceControlPaneProps {
+  /** Whether the Source Control sidebar tab is currently visible (stays mounted when hidden). */
+  active?: boolean;
   gitStatus: GitStatusRes | null;
   selectedPath: string | null;
   selectedCommitKey: string | null;
@@ -132,6 +134,7 @@ interface SourceControlPaneProps {
 }
 
 export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
+  active = true,
   gitStatus,
   selectedPath,
   selectedCommitKey,
@@ -223,20 +226,40 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
     setPref('vireo-scm-tree', String(treeView));
   }, [treeView]);
 
+  // Reset workspace-scoped caches and expansion state when switching folders.
+  useEffect(() => {
+    lastBranchesKeyRef.current = '';
+    lastLogKeyRef.current = '';
+    setCommitDetails({});
+    setExpandedCommitHash(null);
+    setCompareDrawer(null);
+    clearCommitDetailCache();
+  }, [workspacePath]);
+
+  const branchesSeqRef = useRef(0);
   const fetchBranches = useCallback(() => {
+    const seq = ++branchesSeqRef.current;
     api
       .gitBranches()
-      .then(setBranchInfo)
-      .catch(() => setBranchInfo({ current: '', branches: [], remote_branches: [] }));
+      .then((res) => {
+        if (seq === branchesSeqRef.current) setBranchInfo(res);
+      })
+      .catch(() => {
+        if (seq === branchesSeqRef.current) {
+          setBranchInfo({ current: '', branches: [], remote_branches: [] });
+        }
+      });
   }, []);
 
   const appendInFlight = useRef(false);
+  const logSeqRef = useRef(0);
   const fetchLog = useCallback(
     async (opts?: { append?: boolean; skip?: number }) => {
       if (opts?.append) {
         if (appendInFlight.current) return;
         appendInFlight.current = true;
       }
+      const seq = ++logSeqRef.current;
       setGraphLoading(true);
       try {
         const res = await api.gitLog({
@@ -245,28 +268,50 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
           all: allBranches,
           search: graphSearch.trim() || undefined,
         });
+        if (seq !== logSeqRef.current) return;
         setCommits((prev) => (opts?.append ? appendUniqueCommits(prev, res.commits) : res.commits));
         setHasMore(res.has_more);
       } catch {
         // ignore transient error
       } finally {
         if (opts?.append) appendInFlight.current = false;
-        setGraphLoading(false);
+        if (seq === logSeqRef.current) setGraphLoading(false);
       }
     },
     [allBranches, graphSearch]
   );
 
-  useEffect(() => {
-    fetchBranches();
-  }, [fetchBranches, workspacePath, gitStatus?.branch, gitStatus?.head_hash, gitStatus?.ahead, gitStatus?.behind]);
+  // Changes on any ref-mutating git op (push, tag, merge, fetch, branch, commit, rebase, reset,
+  // stash, remote/upstream), and stays stable across ordinary working-tree edits and staging.
+  const gitRev =
+    gitStatus?.refs_fingerprint ??
+    `${gitStatus?.branch ?? ''}|${gitStatus?.head_hash ?? ''}|${gitStatus?.ahead ?? 0}|${gitStatus?.behind ?? 0}`;
 
+  const lastBranchesKeyRef = useRef('');
   useEffect(() => {
+    if (!active || !gitStatus?.is_repo) return;
+    const key = `${workspacePath}|${gitRev}`;
+    if (lastBranchesKeyRef.current === key) return;
+    lastBranchesKeyRef.current = key;
+    fetchBranches();
+  }, [active, fetchBranches, workspacePath, gitStatus?.is_repo, gitRev]);
+
+  const lastLogKeyRef = useRef('');
+  useEffect(() => {
+    if (!active || !gitStatus?.is_repo) return;
+    const key = `${workspacePath}|${gitRev}|${allBranches ? 1 : 0}|${graphSearch}`;
+    if (lastLogKeyRef.current === key) return;
+    if (!graphSearch) {
+      lastLogKeyRef.current = key;
+      void fetchLog({ append: false, skip: 0 });
+      return;
+    }
     const t = window.setTimeout(() => {
-      fetchLog({ append: false, skip: 0 });
-    }, graphSearch ? 200 : 0);
+      lastLogKeyRef.current = key;
+      void fetchLog({ append: false, skip: 0 });
+    }, 180);
     return () => window.clearTimeout(t);
-  }, [fetchLog, workspacePath, gitStatus?.branch, gitStatus?.head_hash, graphSearch]);
+  }, [active, fetchLog, workspacePath, gitStatus?.is_repo, gitRev, allBranches, graphSearch]);
 
   const runAction = useCallback(
     async (fn: () => Promise<void>) => {
@@ -274,16 +319,17 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       try {
         await fn();
         setModal(null);
+        // `onRefreshGit()` returns an updated `refs_fingerprint` for ref-mutating actions,
+        // automatically driving `fetchBranches` and `fetchLog` once without redundant fetches
+        // on stage/unstage/discard.
         await onRefreshGit();
-        fetchBranches();
-        fetchLog({ append: false, skip: 0 });
       } catch (e: unknown) {
         onToast(e instanceof Error ? e.message : String(e), true);
       } finally {
         setBusy(false);
       }
     },
-    [onRefreshGit, fetchBranches, fetchLog, onToast]
+    [onRefreshGit, onToast]
   );
 
   const copyText = useCallback(
@@ -308,7 +354,14 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       setLoadingDetailHash(hash);
       try {
         const d = await api.gitCommitDetail(hash);
-        setCommitDetails((prev) => ({ ...prev, [hash]: d }));
+        setCommitDetails((prev) => {
+          const next: Record<string, CommitDetailRes> = { ...prev, [hash]: d };
+          const keys = Object.keys(next);
+          if (keys.length > 30) {
+            delete next[keys[0]];
+          }
+          return next;
+        });
         return d;
       } catch (e: unknown) {
         onToast(e instanceof Error ? e.message : 'Failed to load commit details', true);
@@ -412,14 +465,15 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
     });
 
   const graphFiltered = graphSearch.trim().length > 0;
+  const hasWorkingTree = totalChanged > 0 && !graphFiltered;
   const graphLayout = useMemo(
     () =>
       computeGitGraphLayout(commits, {
-        workingTree: totalChanged > 0 && !graphFiltered,
+        workingTree: hasWorkingTree,
         currentBranch: gitStatus?.branch,
         flat: graphFiltered,
       }),
-    [commits, totalChanged, graphFiltered, gitStatus?.branch]
+    [commits, hasWorkingTree, graphFiltered, gitStatus?.branch]
   );
   const upstreamName = useMemo(() => {
     const up = commits.find((c) => c.hash === graphLayout.upstreamHash);

@@ -60,6 +60,8 @@ pub struct AppState {
     pub sessions: Arc<crate::agent_session::SessionManager>,
     /// Currently running chat turns (CLI sessions and direct API loops), keyed by `thread_id`.
     pub active_turns: Arc<crate::agent_session::ActiveTurnRegistry>,
+    /// Per-workspace git metadata cache (branches, log, stashes, remote URL) keyed by ref fingerprints.
+    pub git_cache: Arc<crate::git::GitCache>,
 }
 
 /// The user's answers to an in-chat question card, keyed by question id.
@@ -94,6 +96,7 @@ impl AppState {
             pending_questions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             sessions: Arc::new(crate::agent_session::SessionManager::default()),
             active_turns: Arc::new(crate::agent_session::ActiveTurnRegistry::default()),
+            git_cache: Arc::new(crate::git::GitCache::default()),
         }
     }
 

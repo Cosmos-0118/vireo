@@ -5,10 +5,384 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 use tokio::io::AsyncWriteExt;
+
+/// Resolved `.git` directories for a workspace (handles regular repos, linked worktrees,
+/// submodules, and subdirectories inside a repository).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitDirs {
+    /// Per-worktree git dir (`HEAD`, `index`, `MERGE_HEAD`, `FETCH_HEAD`, `rebase-*`).
+    pub git_dir: PathBuf,
+    /// Shared git dir (`refs/`, `packed-refs`, `config`, `logs/refs/stash`, `reftable/`).
+    pub common_dir: PathBuf,
+}
+
+/// Pure-Rust git directory discovery (~0.05 ms, zero `git.exe` spawns).
+pub fn resolve_git_dirs(ws: &Path) -> Option<GitDirs> {
+    if ws.as_os_str().is_empty() {
+        return None;
+    }
+    let mut cur: Option<&Path> = Some(ws);
+    while let Some(dir) = cur {
+        let dot_git = dir.join(".git");
+        let git_dir = if dot_git.is_dir() {
+            dot_git
+        } else if dot_git.is_file() {
+            let content = std::fs::read_to_string(&dot_git).ok()?;
+            let first = content.lines().next()?.trim();
+            let raw = first.strip_prefix("gitdir:")?.trim();
+            let p = PathBuf::from(raw);
+            if p.is_absolute() {
+                p
+            } else {
+                dir.join(p)
+            }
+        } else {
+            cur = dir.parent();
+            continue;
+        };
+
+        let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(|rel| {
+                let p = PathBuf::from(&rel);
+                if p.is_absolute() {
+                    p
+                } else {
+                    git_dir.join(p)
+                }
+            })
+            .unwrap_or_else(|| git_dir.clone());
+
+        return Some(GitDirs { git_dir, common_dir });
+    }
+    None
+}
+
+fn hash_file_or_meta(h: &mut Sha256, label: &str, path: &Path, max_read: u64) {
+    h.update(label.as_bytes());
+    h.update([0u8]);
+    match std::fs::metadata(path) {
+        Ok(md) => {
+            h.update([1u8]);
+            h.update(md.len().to_le_bytes());
+            if let Ok(mtime) = md.modified() {
+                if let Ok(dur) = mtime.duration_since(UNIX_EPOCH) {
+                    h.update(dur.as_secs().to_le_bytes());
+                    h.update(dur.subsec_nanos().to_le_bytes());
+                }
+            }
+            if md.is_file() && md.len() <= max_read {
+                if let Ok(bytes) = std::fs::read(path) {
+                    h.update(&bytes);
+                }
+            }
+        }
+        Err(_) => {
+            h.update([0u8]);
+        }
+    }
+}
+
+fn hex_prefix8(digest: &[u8]) -> String {
+    let mut out = String::with_capacity(16);
+    for &b in digest.iter().take(8) {
+        use std::fmt::Write;
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
+/// Fast pure-Rust fingerprint of all git refs, HEAD, remotes/tracking config, fetch state,
+/// stashes, and in-progress operations. Changes on every ref-mutating git command (`push`,
+/// `pull`, `fetch`, `tag`, `merge`, `rebase`, `commit`, `branch`, `checkout`, `reset`,
+/// `stash`, `remote`) and stays stable across ordinary working-tree edits and staging.
+pub fn compute_refs_fingerprint(dirs: &GitDirs) -> String {
+    let mut h = Sha256::new();
+    hash_file_or_meta(&mut h, "HEAD", &dirs.git_dir.join("HEAD"), 512);
+    hash_file_or_meta(&mut h, "packed-refs", &dirs.common_dir.join("packed-refs"), 64 * 1024);
+    hash_file_or_meta(&mut h, "config", &dirs.common_dir.join("config"), 32 * 1024);
+    hash_file_or_meta(&mut h, "FETCH_HEAD", &dirs.git_dir.join("FETCH_HEAD"), 4096);
+    hash_file_or_meta(
+        &mut h,
+        "stash-log",
+        &dirs.common_dir.join("logs").join("refs").join("stash"),
+        16 * 1024,
+    );
+    hash_file_or_meta(
+        &mut h,
+        "reftable",
+        &dirs.common_dir.join("reftable").join("tables.list"),
+        16 * 1024,
+    );
+    for sentinel in ["CHERRY_PICK_HEAD", "MERGE_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply"] {
+        hash_file_or_meta(&mut h, sentinel, &dirs.git_dir.join(sentinel), 0);
+    }
+
+    // Walk loose refs deterministically (skipping transient `*.lock` files).
+    let refs_root = dirs.common_dir.join("refs");
+    if refs_root.is_dir() {
+        let mut entries: Vec<(String, PathBuf)> = Vec::new();
+        let mut stack: Vec<(String, PathBuf)> = vec![(String::new(), refs_root)];
+        const MAX_LOOSE_REFS: usize = 2000;
+        while let Some((prefix, dir)) = stack.pop() {
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            for entry in rd.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.ends_with(".lock") {
+                    continue;
+                }
+                let rel = if prefix.is_empty() {
+                    name.into_owned()
+                } else {
+                    format!("{prefix}/{name}")
+                };
+                let p = entry.path();
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    stack.push((rel, p));
+                } else {
+                    entries.push((rel, p));
+                    if entries.len() >= MAX_LOOSE_REFS {
+                        break;
+                    }
+                }
+            }
+            if entries.len() >= MAX_LOOSE_REFS {
+                break;
+            }
+        }
+        entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        for (rel, p) in entries {
+            hash_file_or_meta(&mut h, &rel, &p, 256);
+        }
+    }
+
+    hex_prefix8(&h.finalize())
+}
+
+fn config_stamp(dirs: &GitDirs) -> String {
+    let mut h = Sha256::new();
+    hash_file_or_meta(&mut h, "config", &dirs.common_dir.join("config"), 32 * 1024);
+    hex_prefix8(&h.finalize())
+}
+
+fn stash_stamp(dirs: &GitDirs) -> Option<String> {
+    let ref_p = dirs.common_dir.join("refs").join("stash");
+    let log_p = dirs.common_dir.join("logs").join("refs").join("stash");
+    let packed_p = dirs.common_dir.join("packed-refs");
+    let has_loose = ref_p.exists() || log_p.exists();
+    let has_packed = !has_loose
+        && std::fs::read_to_string(&packed_p)
+            .map(|s| s.lines().any(|l| l.ends_with(" refs/stash")))
+            .unwrap_or(false);
+    if !has_loose && !has_packed {
+        return None;
+    }
+    let mut h = Sha256::new();
+    hash_file_or_meta(&mut h, "refs/stash", &ref_p, 256);
+    hash_file_or_meta(&mut h, "logs/refs/stash", &log_p, 16 * 1024);
+    if has_packed {
+        hash_file_or_meta(&mut h, "packed-refs", &packed_p, 0);
+    }
+    Some(hex_prefix8(&h.finalize()))
+}
+
+fn detect_git_state(dirs: &GitDirs) -> Option<String> {
+    if dirs.git_dir.join("CHERRY_PICK_HEAD").exists() {
+        Some("cherry-pick".to_string())
+    } else if dirs.git_dir.join("MERGE_HEAD").exists() {
+        Some("merge".to_string())
+    } else if dirs.git_dir.join("REVERT_HEAD").exists() {
+        Some("revert".to_string())
+    } else if dirs.git_dir.join("rebase-merge").exists() || dirs.git_dir.join("rebase-apply").exists() {
+        Some("rebase".to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolves a ref (e.g. `refs/heads/main`) to its commit SHA in pure Rust via loose refs or `packed-refs`.
+fn resolve_ref_sha(dirs: &GitDirs, ref_name: &str) -> Option<String> {
+    let mut loose = dirs.common_dir.clone();
+    for part in ref_name.split('/') {
+        loose.push(part);
+    }
+    if let Ok(raw) = std::fs::read_to_string(&loose) {
+        let t = raw.trim();
+        if let Some(target) = t.strip_prefix("ref:") {
+            return resolve_ref_sha(dirs, target.trim());
+        }
+        if !t.is_empty() && t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Some(t.to_string());
+        }
+    }
+    if let Ok(packed) = std::fs::read_to_string(dirs.common_dir.join("packed-refs")) {
+        for line in packed.lines() {
+            if line.starts_with('#') || line.starts_with('^') {
+                continue;
+            }
+            if let Some((sha, name)) = line.split_once(' ') {
+                if name.trim() == ref_name {
+                    return Some(sha.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Reads `(branch_name_or_HEAD, Option<full_head_sha>)` directly from `.git/HEAD` (~0.05 ms).
+fn read_head_state(dirs: &GitDirs) -> Option<(String, Option<String>)> {
+    let raw = std::fs::read_to_string(dirs.git_dir.join("HEAD")).ok()?;
+    let trimmed = raw.trim();
+    if let Some(target) = trimmed.strip_prefix("ref:") {
+        let ref_name = target.trim();
+        let branch = ref_name
+            .strip_prefix("refs/heads/")
+            .unwrap_or(ref_name)
+            .to_string();
+        let sha = resolve_ref_sha(dirs, ref_name);
+        Some((branch, sha))
+    } else if !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(("HEAD".to_string(), Some(trimmed.to_string())))
+    } else {
+        None
+    }
+}
+
+/// Reads `refs/remotes/origin/HEAD` directly in pure Rust (e.g. `ref: refs/remotes/origin/main` -> `"main"`).
+fn read_default_branch_symref(dirs: &GitDirs) -> Option<String> {
+    let p = dirs.common_dir.join("refs").join("remotes").join("origin").join("HEAD");
+    let raw = std::fs::read_to_string(p).ok()?;
+    let target = raw.trim().strip_prefix("ref:")?.trim();
+    let short = target.strip_prefix("refs/remotes/origin/")?;
+    (!short.is_empty()).then(|| short.to_string())
+}
+
+#[derive(Default)]
+struct GitCacheInner {
+    workspace: PathBuf,
+    remote_url: Option<(String, String)>,
+    stashes: Option<(String, Vec<StashItem>)>,
+    branches: Option<(String, BranchesRes)>,
+    logs_fp: String,
+    logs: Vec<((usize, bool, Option<String>), CommitLogRes)>,
+    last_dirty: (bool, bool),
+}
+
+#[derive(Default)]
+pub struct GitCache {
+    inner: Mutex<GitCacheInner>,
+}
+
+impl GitCache {
+    fn lock_ws(&self, ws: &Path) -> std::sync::MutexGuard<'_, GitCacheInner> {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if g.workspace != ws {
+            *g = GitCacheInner {
+                workspace: ws.to_path_buf(),
+                ..Default::default()
+            };
+        }
+        g
+    }
+
+    fn get_remote_url(&self, ws: &Path, stamp: &str) -> Option<String> {
+        let g = self.lock_ws(ws);
+        g.remote_url
+            .as_ref()
+            .filter(|(s, _)| s == stamp)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn set_remote_url(&self, ws: &Path, stamp: String, url: String) {
+        self.lock_ws(ws).remote_url = Some((stamp, url));
+    }
+
+    fn get_stashes(&self, ws: &Path, stamp: &str) -> Option<Vec<StashItem>> {
+        let g = self.lock_ws(ws);
+        g.stashes
+            .as_ref()
+            .filter(|(s, _)| s == stamp)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn set_stashes(&self, ws: &Path, stamp: String, items: Vec<StashItem>) {
+        self.lock_ws(ws).stashes = Some((stamp, items));
+    }
+
+    fn get_branches(&self, ws: &Path, fp: &str) -> Option<BranchesRes> {
+        let g = self.lock_ws(ws);
+        g.branches
+            .as_ref()
+            .filter(|(f, _)| f == fp)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn set_branches(&self, ws: &Path, fp: String, res: BranchesRes) {
+        self.lock_ws(ws).branches = Some((fp, res));
+    }
+
+    fn get_log(
+        &self,
+        ws: &Path,
+        fp: &str,
+        limit: usize,
+        all: bool,
+        branch: &Option<String>,
+    ) -> Option<CommitLogRes> {
+        let g = self.lock_ws(ws);
+        if g.logs_fp != fp {
+            return None;
+        }
+        g.logs
+            .iter()
+            .find(|((l, a, b), _)| *l == limit && *a == all && b == branch)
+            .map(|(_, v)| v.clone())
+    }
+
+    fn set_log(
+        &self,
+        ws: &Path,
+        fp: String,
+        limit: usize,
+        all: bool,
+        branch: Option<String>,
+        res: CommitLogRes,
+    ) {
+        let mut g = self.lock_ws(ws);
+        if g.logs_fp != fp {
+            g.logs.clear();
+            g.logs_fp = fp;
+        }
+        let key = (limit, all, branch);
+        if let Some(existing) = g.logs.iter_mut().find(|(k, _)| *k == key) {
+            existing.1 = res;
+        } else {
+            if g.logs.len() >= 6 {
+                g.logs.remove(0);
+            }
+            g.logs.push((key, res));
+        }
+    }
+
+    fn last_dirty(&self, ws: &Path) -> (bool, bool) {
+        self.lock_ws(ws).last_dirty
+    }
+
+    fn set_last_dirty(&self, ws: &Path, unstaged_tracked: bool, staged: bool) {
+        self.lock_ws(ws).last_dirty = (unstaged_tracked, staged);
+    }
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct GitFileStatus {
@@ -43,6 +417,8 @@ pub struct GitStatusRes {
     pub total_deletions: usize,
     pub checkpoints: Vec<Checkpoint>,
     pub stashes: Vec<StashItem>,
+    /// Fingerprint of all git refs, HEAD, config, fetch state, stashes, and merge/rebase state.
+    pub refs_fingerprint: String,
 }
 
 #[derive(Deserialize)]
@@ -97,7 +473,7 @@ pub struct CommandRes {
     pub stderr: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct BranchesRes {
     pub current: String,
     pub branches: Vec<String>,
@@ -232,7 +608,7 @@ pub struct LogQuery {
     pub branch: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct CommitLogRes {
     pub commits: Vec<CommitLogItem>,
     pub has_more: bool,
@@ -467,8 +843,10 @@ fn parse_refs(raw: &str, remotes: &[String]) -> (Vec<GitRef>, bool) {
         }
         if let Some(branch) = tok.strip_prefix("HEAD -> ") {
             is_head = true;
+            let b = branch.trim();
+            let name = b.strip_prefix("refs/heads/").unwrap_or(b);
             refs.push(GitRef {
-                name: branch.trim().to_string(),
+                name: name.to_string(),
                 kind: "local".to_string(),
                 is_current: true,
             });
@@ -480,13 +858,36 @@ fn parse_refs(raw: &str, remotes: &[String]) -> (Vec<GitRef>, bool) {
                 is_current: true,
             });
         } else if let Some(tag) = tok.strip_prefix("tag: ") {
+            let t = tag.trim();
+            let name = t.strip_prefix("refs/tags/").unwrap_or(t);
             refs.push(GitRef {
-                name: tag.trim().to_string(),
+                name: name.to_string(),
                 kind: "tag".to_string(),
                 is_current: false,
             });
-        } else if tok.ends_with("/HEAD") || tok.contains(" -> ") {
-            // Skip symbolic remote HEAD pointers like origin/HEAD
+        } else if tok.ends_with("/HEAD") || tok.contains(" -> ") || tok == "refs/stash" {
+            // Skip symbolic remote HEAD pointers (origin/HEAD) and stash ref.
+            continue;
+        } else if let Some(local) = tok.strip_prefix("refs/heads/") {
+            refs.push(GitRef {
+                name: local.to_string(),
+                kind: "local".to_string(),
+                is_current: false,
+            });
+        } else if let Some(remote) = tok.strip_prefix("refs/remotes/") {
+            refs.push(GitRef {
+                name: remote.to_string(),
+                kind: "remote".to_string(),
+                is_current: false,
+            });
+        } else if let Some(tag) = tok.strip_prefix("refs/tags/") {
+            refs.push(GitRef {
+                name: tag.to_string(),
+                kind: "tag".to_string(),
+                is_current: false,
+            });
+        } else if tok.starts_with("refs/") {
+            // Ignore non-branch/non-tag refs such as refs/notes/* or refs/replace/*.
             continue;
         } else {
             let is_remote = remotes
@@ -729,73 +1130,119 @@ fn count_untracked_lines(ws: &Path, paths: Vec<String>) -> HashMap<String, usize
     m
 }
 
-pub async fn get_status(State(state): State<AppState>) -> Json<GitStatusRes> {
+pub async fn get_status(
+    State(state): State<AppState>,
+) -> Result<Json<GitStatusRes>, (StatusCode, String)> {
     let ws = state.workspace_path().await;
     let checkpoints = state.checkpoints.read().await.clone();
 
-    // One porcelain-v2 call replaces work-tree check, branch, HEAD, ahead/behind and file status;
-    // the remaining independent queries run concurrently.
-    let (status, unstaged_stat, staged_stat, stash, remote, git_dir) = tokio::join!(
+    let ws_meta = ws.clone();
+    let meta = tokio::task::spawn_blocking(move || {
+        let dirs = resolve_git_dirs(&ws_meta)?;
+        let cfg_st = config_stamp(&dirs);
+        let st_st = stash_stamp(&dirs);
+        Some((dirs, cfg_st, st_st))
+    })
+    .await
+    .unwrap_or(None);
+
+    let Some((dirs, cfg_stamp, stash_st)) = meta else {
+        return Ok(Json(GitStatusRes {
+            is_repo: false,
+            branch: String::new(),
+            head_hash: String::new(),
+            ahead: 0,
+            behind: 0,
+            remote_url: String::new(),
+            state: None,
+            files: Vec::new(),
+            total_additions: 0,
+            total_deletions: 0,
+            checkpoints,
+            stashes: Vec::new(),
+            refs_fingerprint: String::new(),
+        }));
+    };
+
+    let cached_remote = state.git_cache.get_remote_url(&ws, &cfg_stamp);
+    let cached_stashes = match &stash_st {
+        None => Some(Vec::new()),
+        Some(st) => state.git_cache.get_stashes(&ws, st),
+    };
+    let (hint_unstaged, hint_staged) = state.git_cache.last_dirty(&ws);
+
+    // Run `git status` alongside only the queries that are uncached or hinted dirty.
+    let (status, mut unstaged_stat, mut staged_stat, remote_res, stash_res) = tokio::join!(
         run_git_bytes(&ws, &["status", "--porcelain=v2", "--branch", "-z", "-uall"]),
-        run_git(&ws, &["diff", "--numstat"]),
-        run_git(&ws, &["diff", "--cached", "--numstat"]),
-        run_git(&ws, &["stash", "list", "--format=%gd%x1f%gs%x1f%ar"]),
-        run_git(&ws, &["remote", "get-url", "origin"]),
-        run_git(&ws, &["rev-parse", "--git-dir"]),
+        async {
+            if hint_unstaged {
+                Some(run_git(&ws, &["diff", "--numstat"]).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if hint_staged {
+                Some(run_git(&ws, &["diff", "--cached", "--numstat"]).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if cached_remote.is_none() {
+                Some(run_git(&ws, &["remote", "get-url", "origin"]).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if cached_stashes.is_none() {
+                Some(run_git(&ws, &["stash", "list", "--format=%gd%x1f%gs%x1f%ar"]).await)
+            } else {
+                None
+            }
+        },
     );
 
+    // If `.git` exists on disk, a non-zero `git status` is usually a transient lock/merge race:
+    // retry once before returning 503 so the UI retries instead of flashing "No Git Repository".
     let status_bytes = match status {
         Ok((true, out, _)) => out,
         _ => {
-            return Json(GitStatusRes {
-                is_repo: false,
-                branch: String::new(),
-                head_hash: String::new(),
-                ahead: 0,
-                behind: 0,
-                remote_url: String::new(),
-                state: None,
-                files: Vec::new(),
-                total_additions: 0,
-                total_deletions: 0,
-                checkpoints,
-                stashes: Vec::new(),
-            });
+            tokio::time::sleep(std::time::Duration::from_millis(90)).await;
+            match run_git_bytes(&ws, &["status", "--porcelain=v2", "--branch", "-z", "-uall"]).await {
+                Ok((true, out, _)) => out,
+                _ => {
+                    if resolve_git_dirs(&ws).is_none() {
+                        return Ok(Json(GitStatusRes {
+                            is_repo: false,
+                            branch: String::new(),
+                            head_hash: String::new(),
+                            ahead: 0,
+                            behind: 0,
+                            remote_url: String::new(),
+                            state: None,
+                            files: Vec::new(),
+                            total_additions: 0,
+                            total_deletions: 0,
+                            checkpoints,
+                            stashes: Vec::new(),
+                            refs_fingerprint: String::new(),
+                        }));
+                    }
+                    return Err((
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "Git status temporarily busy".to_string(),
+                    ));
+                }
+            }
         }
     };
     let parsed = parse_status_v2(&status_bytes);
 
-    let remote_url = remote.map(|(_, o, _)| o.trim().to_string()).unwrap_or_default();
-
-    let git_state = match git_dir {
-        Ok((true, out, _)) => {
-            let raw = out.trim();
-            let dir = if Path::new(raw).is_absolute() {
-                std::path::PathBuf::from(raw)
-            } else {
-                ws.join(raw)
-            };
-            if dir.join("CHERRY_PICK_HEAD").exists() {
-                Some("cherry-pick".to_string())
-            } else if dir.join("MERGE_HEAD").exists() {
-                Some("merge".to_string())
-            } else if dir.join("REVERT_HEAD").exists() {
-                Some("revert".to_string())
-            } else if dir.join("rebase-merge").exists() || dir.join("rebase-apply").exists() {
-                Some("rebase".to_string())
-            } else {
-                None
-            }
-        }
-        _ => None,
-    };
-
-    let mut stats = parse_numstat(&unstaged_stat.map(|r| r.1).unwrap_or_default());
-    for (k, (a, d)) in parse_numstat(&staged_stat.map(|r| r.1).unwrap_or_default()) {
-        let e = stats.entry(k).or_insert((0, 0));
-        e.0 += a;
-        e.1 += d;
-    }
+    let has_unstaged_tracked = parsed.entries.iter().any(|(x, y, _)| !(*x == '?' && *y == '?') && *y != ' ');
+    let has_staged = parsed.entries.iter().any(|(x, y, _)| !(*x == '?' && *y == '?') && *x != ' ');
+    state.git_cache.set_last_dirty(&ws, has_unstaged_tracked, has_staged);
 
     let untracked_paths: Vec<String> = parsed
         .entries
@@ -803,14 +1250,95 @@ pub async fn get_status(State(state): State<AppState>) -> Json<GitStatusRes> {
         .filter(|(x, y, _)| *x == '?' && *y == '?')
         .map(|(_, _, p)| p.clone())
         .collect();
-    let untracked_lines = if untracked_paths.is_empty() {
-        HashMap::new()
-    } else {
-        let ws2 = ws.clone();
-        tokio::task::spawn_blocking(move || count_untracked_lines(&ws2, untracked_paths))
+
+    // Compute any missing numstats + untracked line counts + post-status refs_fingerprint in parallel.
+    let need_unstaged = has_unstaged_tracked && unstaged_stat.is_none();
+    let need_staged = has_staged && staged_stat.is_none();
+    let ws2 = ws.clone();
+    let dirs_post = dirs.clone();
+    let (extra_unstaged, extra_staged, (untracked_lines, git_state, refs_fingerprint)) = tokio::join!(
+        async {
+            if need_unstaged {
+                Some(run_git(&ws, &["diff", "--numstat"]).await)
+            } else {
+                None
+            }
+        },
+        async {
+            if need_staged {
+                Some(run_git(&ws, &["diff", "--cached", "--numstat"]).await)
+            } else {
+                None
+            }
+        },
+        async {
+            tokio::task::spawn_blocking(move || {
+                let ul = if untracked_paths.is_empty() {
+                    HashMap::new()
+                } else {
+                    count_untracked_lines(&ws2, untracked_paths)
+                };
+                let gs = detect_git_state(&dirs_post);
+                let fp = compute_refs_fingerprint(&dirs_post);
+                (ul, gs, fp)
+            })
             .await
             .unwrap_or_default()
+        },
+    );
+    if extra_unstaged.is_some() {
+        unstaged_stat = extra_unstaged;
+    }
+    if extra_staged.is_some() {
+        staged_stat = extra_staged;
+    }
+
+    let remote_url = if let Some(u) = cached_remote {
+        u
+    } else {
+        let u = remote_res
+            .and_then(|r| r.ok())
+            .filter(|(ok, _, _)| *ok)
+            .map(|(_, o, _)| o.trim().to_string())
+            .unwrap_or_default();
+        state.git_cache.set_remote_url(&ws, cfg_stamp, u.clone());
+        u
     };
+
+    let stashes = if let Some(s) = cached_stashes {
+        s
+    } else {
+        let mut list = Vec::new();
+        if let Some(Ok((true, st_out, _))) = stash_res {
+            for line in st_out.lines() {
+                let p: Vec<&str> = line.split('\x1f').collect();
+                if p.len() >= 3 {
+                    list.push(StashItem {
+                        index: p[0].to_string(),
+                        message: p[1].to_string(),
+                        date: p[2].to_string(),
+                    });
+                }
+            }
+        }
+        if let Some(st) = stash_st {
+            state.git_cache.set_stashes(&ws, st, list.clone());
+        }
+        list
+    };
+
+    let mut stats = if has_unstaged_tracked {
+        parse_numstat(&unstaged_stat.and_then(|r| r.ok()).map(|r| r.1).unwrap_or_default())
+    } else {
+        HashMap::new()
+    };
+    if has_staged {
+        for (k, (a, d)) in parse_numstat(&staged_stat.and_then(|r| r.ok()).map(|r| r.1).unwrap_or_default()) {
+            let e = stats.entry(k).or_insert((0, 0));
+            e.0 += a;
+            e.1 += d;
+        }
+    }
 
     let mut files = Vec::with_capacity(parsed.entries.len());
     let mut total_additions = 0usize;
@@ -838,21 +1366,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<GitStatusRes> {
         });
     }
 
-    let mut stashes = Vec::new();
-    if let Ok((true, st_out, _)) = stash {
-        for line in st_out.lines() {
-            let p: Vec<&str> = line.split('\x1f').collect();
-            if p.len() >= 3 {
-                stashes.push(StashItem {
-                    index: p[0].to_string(),
-                    message: p[1].to_string(),
-                    date: p[2].to_string(),
-                });
-            }
-        }
-    }
-
-    Json(GitStatusRes {
+    Ok(Json(GitStatusRes {
         is_repo: true,
         branch: parsed.branch,
         head_hash: parsed.head_hash,
@@ -865,7 +1379,8 @@ pub async fn get_status(State(state): State<AppState>) -> Json<GitStatusRes> {
         total_deletions,
         checkpoints,
         stashes,
-    })
+        refs_fingerprint,
+    }))
 }
 
 pub async fn get_diff(
@@ -877,12 +1392,18 @@ pub async fn get_diff(
     let staged = q.staged.unwrap_or(false);
 
     let (original, modified, patch) = if staged {
-        let (ok_orig, orig_bytes, _) = run_git_bytes(&ws, &["show", &format!("HEAD:{}", rel)])
-            .await
-            .unwrap_or((false, Vec::new(), String::new()));
-        let (ok_mod, mod_bytes, _) = run_git_bytes(&ws, &["show", &format!(":{}", rel)])
-            .await
-            .unwrap_or((false, Vec::new(), String::new()));
+        let head_spec = format!("HEAD:{}", rel);
+        let idx_spec = format!(":{}", rel);
+        let head_args = ["show", head_spec.as_str()];
+        let idx_args = ["show", idx_spec.as_str()];
+        let patch_args = ["diff", "--cached", "--", rel.as_str()];
+        let (orig_res, mod_res, patch_res) = tokio::join!(
+            run_git_bytes(&ws, &head_args),
+            run_git_bytes(&ws, &idx_args),
+            run_git(&ws, &patch_args),
+        );
+        let (ok_orig, orig_bytes, _) = orig_res.unwrap_or((false, Vec::new(), String::new()));
+        let (ok_mod, mod_bytes, _) = mod_res.unwrap_or((false, Vec::new(), String::new()));
         if (ok_orig && is_binary_bytes(&orig_bytes)) || (ok_mod && is_binary_bytes(&mod_bytes)) {
             return Ok(Json(GitDiffRes {
                 path: rel,
@@ -893,9 +1414,7 @@ pub async fn get_diff(
                 binary: true,
             }));
         }
-        let (_, patch_out, _) = run_git(&ws, &["diff", "--cached", "--", &rel])
-            .await
-            .unwrap_or((false, String::new(), String::new()));
+        let (_, patch_out, _) = patch_res.unwrap_or((false, String::new(), String::new()));
         (
             if ok_orig {
                 String::from_utf8_lossy(&orig_bytes).to_string()
@@ -910,20 +1429,34 @@ pub async fn get_diff(
             patch_out,
         )
     } else {
-        // Compare index (if file is staged too, VS Code compares index vs working tree) or HEAD vs working tree
-        let (ok_idx, idx_bytes, _) = run_git_bytes(&ws, &["show", &format!(":{}", rel)])
-            .await
-            .unwrap_or((false, Vec::new(), String::new()));
+        // Compare index (if file is staged too, VS Code compares index vs working tree) or HEAD vs working tree.
+        let idx_spec = format!(":{}", rel);
+        let idx_args = ["show", idx_spec.as_str()];
+        let patch_args = ["diff", "--", rel.as_str()];
+        let safe_full = resolve_safe_path(&ws, &rel).ok();
+        let (idx_res, wt_bytes, patch_res) = tokio::join!(
+            run_git_bytes(&ws, &idx_args),
+            async {
+                match safe_full {
+                    Some(full) => tokio::fs::read(&full).await.ok(),
+                    None => None,
+                }
+            },
+            run_git(&ws, &patch_args),
+        );
+        let (ok_idx, idx_bytes, _) = idx_res.unwrap_or((false, Vec::new(), String::new()));
         let (orig_ok, orig_bytes) = if ok_idx {
             (true, idx_bytes)
         } else {
-            let (ok_head, head_bytes, _) =
-                run_git_bytes(&ws, &["show", &format!("HEAD:{}", rel)])
-                    .await
-                    .unwrap_or((false, Vec::new(), String::new()));
+            let head_spec = format!("HEAD:{}", rel);
+            let (ok_head, head_bytes, _) = run_git_bytes(&ws, &["show", &head_spec])
+                .await
+                .unwrap_or((false, Vec::new(), String::new()));
             (ok_head, head_bytes)
         };
-        if orig_ok && is_binary_bytes(&orig_bytes) {
+        if (orig_ok && is_binary_bytes(&orig_bytes))
+            || wt_bytes.as_deref().map(is_binary_bytes).unwrap_or(false)
+        {
             return Ok(Json(GitDiffRes {
                 path: rel,
                 staged,
@@ -938,30 +1471,10 @@ pub async fn get_diff(
         } else {
             String::new()
         };
-
-        let modified_text = match resolve_safe_path(&ws, &rel) {
-            Ok(full) => match tokio::fs::read(&full).await {
-                Ok(bytes) => {
-                    if is_binary_bytes(&bytes) {
-                        return Ok(Json(GitDiffRes {
-                            path: rel,
-                            staged,
-                            original: String::new(),
-                            modified: String::new(),
-                            patch: String::new(),
-                            binary: true,
-                        }));
-                    }
-                    String::from_utf8_lossy(&bytes).to_string()
-                }
-                Err(_) => String::new(),
-            },
-            Err(_) => String::new(),
-        };
-
-        let (_, patch_out, _) = run_git(&ws, &["diff", "--", &rel])
-            .await
-            .unwrap_or((false, String::new(), String::new()));
+        let modified_text = wt_bytes
+            .map(|b| String::from_utf8_lossy(&b).to_string())
+            .unwrap_or_default();
+        let (_, patch_out, _) = patch_res.unwrap_or((false, String::new(), String::new()));
         (original_text, modified_text, patch_out)
     };
 
@@ -1135,47 +1648,91 @@ pub async fn fetch_changes(
 
 pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
     let ws = state.workspace_path().await;
-    // All of these are independent: run them concurrently instead of one git.exe at a time.
+    let ws_meta = ws.clone();
+    let meta = tokio::task::spawn_blocking(move || {
+        let dirs = resolve_git_dirs(&ws_meta)?;
+        let fp = compute_refs_fingerprint(&dirs);
+        let head = read_head_state(&dirs);
+        let default_sym = read_default_branch_symref(&dirs);
+        let last_fetched = std::fs::metadata(dirs.git_dir.join("FETCH_HEAD"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64);
+        Some((fp, head, default_sym, last_fetched))
+    })
+    .await
+    .unwrap_or(None);
+
+    let Some((refs_fp, head_state, default_sym, last_fetched)) = meta else {
+        return Json(BranchesRes {
+            current: String::new(),
+            branches: Vec::new(),
+            remote_branches: Vec::new(),
+            details: Vec::new(),
+            upstream: String::new(),
+            upstream_gone: false,
+            detached: false,
+            head_short: String::new(),
+            default_branch: String::new(),
+            remotes: Vec::new(),
+            last_fetched: None,
+        });
+    };
+
+    if let Some(cached) = state.git_cache.get_branches(&ws, &refs_fp) {
+        return Json(cached);
+    }
+
+    // Only 2 concurrent git commands replace the previous 8-9 spawns:
+    // `for-each-ref` provides all local+remote branch details, and `remote` lists remotes.
     let none = || (false, String::new(), String::new());
-    let (cur, list, rlist, refs_out, head_short, remotes_out, dh, fh) = tokio::join!(
-        current_branch(&ws),
-        run_git(&ws, &["branch", "--format=%(refname:short)"]),
-        run_git(&ws, &["branch", "-r", "--format=%(refname:short)"]),
+    let (refs_out, remotes_out) = tokio::join!(
         run_git(
             &ws,
             &["for-each-ref", "--sort=-committerdate", BRANCH_REF_FORMAT, "refs/heads", "refs/remotes"],
         ),
-        run_git(&ws, &["rev-parse", "--short", "HEAD"]),
         run_git(&ws, &["remote"]),
-        run_git(&ws, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]),
-        run_git(&ws, &["rev-parse", "--git-path", "FETCH_HEAD"]),
     );
-    let (_, list, _) = list.unwrap_or_else(|_| none());
-    let branches = list
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let (_, rlist, _) = rlist.unwrap_or_else(|_| none());
-    let remote_branches = rlist
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty() && !s.ends_with("/HEAD"))
-        .collect();
 
     let (_, refs_out, _) = refs_out.unwrap_or_else(|_| none());
     let details = parse_branch_refs(&refs_out);
 
-    let current = cur;
+    let mut branches: Vec<String> = details
+        .iter()
+        .filter(|b| b.kind == "local")
+        .map(|b| b.name.clone())
+        .collect();
+    branches.sort();
+
+    let mut remote_branches: Vec<String> = details
+        .iter()
+        .filter(|b| b.kind == "remote")
+        .map(|b| b.name.clone())
+        .collect();
+    remote_branches.sort();
+
+    let (current, head_sha) = match head_state {
+        Some((cur, sha)) => (cur, sha),
+        None => (current_branch(&ws).await, None),
+    };
     let detached = current == "HEAD";
+    let head_short = match head_sha {
+        Some(sha) => sha.chars().take(7).collect(),
+        None if !details.is_empty() => run_git(&ws, &["rev-parse", "--short", "HEAD"])
+            .await
+            .ok()
+            .filter(|(ok, _, _)| *ok)
+            .map(|(_, o, _)| o.trim().to_string())
+            .unwrap_or_default(),
+        None => String::new(),
+    };
+
     let (upstream, upstream_gone) = details
         .iter()
         .find(|b| b.kind == "local" && b.is_current)
         .map(|b| (b.upstream.clone(), b.upstream_gone))
         .unwrap_or_default();
-
-    let (_, head_short, _) = head_short.unwrap_or_else(|_| none());
 
     let (_, remotes_out, _) = remotes_out.unwrap_or_else(|_| none());
     let remotes: Vec<String> = remotes_out
@@ -1184,9 +1741,8 @@ pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    let (dh_ok, dh_out, _) = dh.unwrap_or_else(|_| none());
-    let default_branch = if dh_ok && !dh_out.trim().is_empty() {
-        dh_out.trim().trim_start_matches("origin/").to_string()
+    let default_branch = if let Some(sym) = default_sym {
+        sym
     } else if details.iter().any(|b| b.kind == "local" && b.name == "main") {
         "main".to_string()
     } else if details.iter().any(|b| b.kind == "local" && b.name == "master") {
@@ -1195,20 +1751,7 @@ pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
         String::new()
     };
 
-    let (fh_ok, fh_out, _) = fh.unwrap_or_else(|_| none());
-    let last_fetched = if fh_ok {
-        let p = std::path::PathBuf::from(fh_out.trim());
-        let p = if p.is_absolute() { p } else { ws.join(p) };
-        std::fs::metadata(&p)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-    } else {
-        None
-    };
-
-    Json(BranchesRes {
+    let res = BranchesRes {
         current,
         branches,
         remote_branches,
@@ -1216,11 +1759,13 @@ pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
         upstream,
         upstream_gone,
         detached,
-        head_short: head_short.trim().to_string(),
+        head_short,
         default_branch,
         remotes,
         last_fetched,
-    })
+    };
+    state.git_cache.set_branches(&ws, refs_fp, res.clone());
+    Json(res)
 }
 
 pub async fn checkout_branch(
@@ -1266,50 +1811,67 @@ pub async fn get_log(
     let limit = q.limit.unwrap_or(80).clamp(1, 500);
     let skip = q.skip.unwrap_or(0);
     let all = q.all.unwrap_or(true);
-
-    let (head_ok, head_out, _) = run_git(&ws, &["rev-parse", "HEAD"])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
-    let head_hash = if head_ok {
-        head_out.trim().to_string()
-    } else {
-        String::new()
-    };
-
-    let remotes = get_remotes(&ws).await;
-
-    // Fetch limit + 1 to accurately compute `has_more`
-    let fetch_n = (limit + 1).to_string();
-    let skip_str = skip.to_string();
-
-    let mut args: Vec<String> = vec![
-        "log".to_string(),
-        "--topo-order".to_string(),
-        "--decorate=short".to_string(),
-        format!("-n{}", fetch_n),
-        format!("--skip={}", skip_str),
-        "--format=%H%x1f%h%x1f%P%x1f%D%x1f%s%x1f%an%x1f%ae%x1f%ar%x1f%aI%x1f%at".to_string(),
-    ];
-
-    if let Some(ref b) = q.branch {
-        let b_trim = b.trim();
-        if !b_trim.is_empty() && !b_trim.starts_with('-') {
-            args.push(b_trim.to_string());
-        } else if all {
-            // Stashes are not history; keep them out of the graph.
-            args.push("--exclude=refs/stash".to_string());
-            args.push("--all".to_string());
-        }
-    } else if all {
-        args.push("--exclude=refs/stash".to_string());
-        args.push("--all".to_string());
-    }
-
+    let branch_key = q
+        .branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        .map(str::to_string);
     let search_lower = q
         .search
         .as_deref()
         .map(|s| s.trim().to_lowercase())
         .filter(|s| !s.is_empty());
+
+    let ws_meta = ws.clone();
+    let meta = tokio::task::spawn_blocking(move || {
+        let dirs = resolve_git_dirs(&ws_meta)?;
+        let fp = compute_refs_fingerprint(&dirs);
+        let head_sha = read_head_state(&dirs).and_then(|(_, sha)| sha);
+        Some((fp, head_sha))
+    })
+    .await
+    .unwrap_or(None);
+
+    let Some((refs_fp, head_sha)) = meta else {
+        return Json(CommitLogRes {
+            commits: Vec::new(),
+            has_more: false,
+            head_hash: String::new(),
+        });
+    };
+
+    let cacheable = skip == 0 && search_lower.is_none();
+    if cacheable {
+        if let Some(cached) = state.git_cache.get_log(&ws, &refs_fp, limit, all, &branch_key) {
+            return Json(cached);
+        }
+    }
+
+    let mut head_hash = head_sha.unwrap_or_default();
+
+    // Fetch limit + 1 to accurately compute `has_more`
+    let fetch_n = (limit + 1).to_string();
+    let skip_str = skip.to_string();
+
+    // `--decorate=full` tags refs unambiguously with `refs/heads/`, `refs/remotes/`, `refs/tags/`,
+    // eliminating the extra `git remote` and `rev-parse HEAD` spawns (1 git.exe instead of 3).
+    let mut args: Vec<String> = vec![
+        "log".to_string(),
+        "--topo-order".to_string(),
+        "--decorate=full".to_string(),
+        format!("-n{}", fetch_n),
+        format!("--skip={}", skip_str),
+        "--format=%H%x1f%h%x1f%P%x1f%D%x1f%s%x1f%an%x1f%ae%x1f%ar%x1f%aI%x1f%at".to_string(),
+    ];
+
+    if let Some(ref b) = branch_key {
+        args.push(b.clone());
+    } else if all {
+        // Stashes are not history; keep them out of the graph.
+        args.push("--exclude=refs/stash".to_string());
+        args.push("--all".to_string());
+    }
 
     // When searching, fetch a larger window and filter across hash, message, author, and refs
     if search_lower.is_some() {
@@ -1340,7 +1902,10 @@ pub async fn get_log(
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            let (refs, ref_is_head) = parse_refs(p[3], &remotes);
+            let (refs, ref_is_head) = parse_refs(p[3], &[]);
+            if ref_is_head && head_hash.is_empty() {
+                head_hash = hash.clone();
+            }
             let is_head = ref_is_head || (!head_hash.is_empty() && hash == head_hash);
             let message = p[4].to_string();
             let author = p[5].to_string();
@@ -1385,11 +1950,17 @@ pub async fn get_log(
         false
     };
 
-    Json(CommitLogRes {
+    let res = CommitLogRes {
         commits: items,
         has_more,
         head_hash,
-    })
+    };
+    if cacheable {
+        state
+            .git_cache
+            .set_log(&ws, refs_fp, limit, all, branch_key, res.clone());
+    }
+    Json(res)
 }
 
 pub async fn get_commit_detail(
@@ -1398,21 +1969,46 @@ pub async fn get_commit_detail(
 ) -> Result<Json<CommitDetailRes>, (StatusCode, String)> {
     let ws = state.workspace_path().await;
     let hash = validate_git_ref_arg(&q.hash)?;
-    let remotes = get_remotes(&ws).await;
 
-    let (ok, meta_out, meta_err) = run_git(
-        &ws,
-        &[
-            "show",
-            "-s",
-            "--decorate=short",
-            "--format=%H%x1f%h%x1f%P%x1f%D%x1f%s%x1f%an%x1f%ae%x1f%ar%x1f%aI%x1f%b",
-            hash,
-        ],
-    )
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Run metadata + name-status + numstat concurrently (1 wave instead of 4 sequential spawns).
+    let meta_args = [
+        "show",
+        "-s",
+        "--decorate=full",
+        "--format=%H%x1f%h%x1f%P%x1f%D%x1f%s%x1f%an%x1f%ae%x1f%ar%x1f%aI%x1f%b",
+        hash,
+    ];
+    let st_args = [
+        "diff-tree",
+        "--no-commit-id",
+        "-r",
+        "--root",
+        "-m",
+        "--first-parent",
+        "-M",
+        "-z",
+        "--name-status",
+        hash,
+    ];
+    let ns_args = [
+        "diff-tree",
+        "--no-commit-id",
+        "-r",
+        "--root",
+        "-m",
+        "--first-parent",
+        "-M",
+        "-z",
+        "--numstat",
+        hash,
+    ];
+    let (meta_res, st_res, ns_res) = tokio::join!(
+        run_git(&ws, &meta_args),
+        run_git_bytes(&ws, &st_args),
+        run_git_bytes(&ws, &ns_args),
+    );
 
+    let (ok, meta_out, meta_err) = meta_res.map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
     if !ok {
         return Err((
             StatusCode::NOT_FOUND,
@@ -1439,7 +2035,7 @@ pub async fn get_commit_detail(
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .collect();
-    let (refs, _) = parse_refs(parts[3], &remotes);
+    let (refs, _) = parse_refs(parts[3], &[]);
     let subject = parts[4].to_string();
     let author = parts[5].to_string();
     let author_email = parts[6].to_string();
@@ -1447,34 +2043,8 @@ pub async fn get_commit_detail(
     let iso_date = parts[8].to_string();
     let body = parts[9].trim().to_string();
 
-    let diff_args_base: Vec<&str> = if parents.is_empty() {
-        vec!["diff-tree", "--no-commit-id", "-r", "--root", "-M", "-z"]
-    } else {
-        vec![
-            "diff-tree",
-            "--no-commit-id",
-            "-r",
-            "-m",
-            "--first-parent",
-            "-M",
-            "-z",
-        ]
-    };
-
-    let mut st_args = diff_args_base.clone();
-    st_args.push("--name-status");
-    st_args.push(&full_hash);
-    let (_, st_bytes, _) = run_git_bytes(&ws, &st_args)
-        .await
-        .unwrap_or((false, Vec::new(), String::new()));
-
-    let mut ns_args = diff_args_base;
-    ns_args.push("--numstat");
-    ns_args.push(&full_hash);
-    let (_, ns_bytes, _) = run_git_bytes(&ws, &ns_args)
-        .await
-        .unwrap_or((false, Vec::new(), String::new()));
-
+    let (_, st_bytes, _) = st_res.unwrap_or((false, Vec::new(), String::new()));
+    let (_, ns_bytes, _) = ns_res.unwrap_or((false, Vec::new(), String::new()));
     let files = parse_z_diff_files(&st_bytes, &ns_bytes);
     let total_additions = files.iter().map(|f| f.additions).sum();
     let total_deletions = files.iter().map(|f| f.deletions).sum();
@@ -1510,22 +2080,26 @@ pub async fn get_commit_diff(
         .unwrap_or_else(|| rel.clone());
 
     let parent_ref = format!("{}^1", hash);
-    let (has_parent, _, _) = run_git(&ws, &["rev-parse", "--verify", &parent_ref])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
+    let orig_spec = format!("{}:{}", parent_ref, old_rel);
+    let mod_spec = format!("{}:{}", hash, rel);
+    let orig_args = ["show", orig_spec.as_str()];
+    let mod_args = ["show", mod_spec.as_str()];
 
-    let (ok_orig, orig_bytes) = if has_parent {
-        let (ok, bytes, _) = run_git_bytes(&ws, &["show", &format!("{}:{}", parent_ref, old_rel)])
-            .await
-            .unwrap_or((false, Vec::new(), String::new()));
-        (ok, bytes)
-    } else {
-        (false, Vec::new())
-    };
+    // Run parent blob, commit blob, and diff concurrently (1 wave instead of 4 sequential spawns).
+    let (orig_res, mod_res, diff_res) = tokio::join!(
+        run_git_bytes(&ws, &orig_args),
+        run_git_bytes(&ws, &mod_args),
+        async {
+            if old_rel != rel {
+                run_git(&ws, &["diff", &parent_ref, hash, "--", &old_rel, &rel]).await
+            } else {
+                run_git(&ws, &["diff", &parent_ref, hash, "--", &rel]).await
+            }
+        },
+    );
 
-    let (ok_mod, mod_bytes, _) = run_git_bytes(&ws, &["show", &format!("{}:{}", hash, rel)])
-        .await
-        .unwrap_or((false, Vec::new(), String::new()));
+    let (ok_orig, orig_bytes, _) = orig_res.unwrap_or((false, Vec::new(), String::new()));
+    let (ok_mod, mod_bytes, _) = mod_res.unwrap_or((false, Vec::new(), String::new()));
 
     if (ok_orig && is_binary_bytes(&orig_bytes)) || (ok_mod && is_binary_bytes(&mod_bytes)) {
         return Ok(Json(GitDiffRes {
@@ -1538,20 +2112,15 @@ pub async fn get_commit_diff(
         }));
     }
 
-    let (_, patch_out, _) = if has_parent {
-        if old_rel != rel {
-            run_git(&ws, &["diff", &parent_ref, hash, "--", &old_rel, &rel])
+    let patch_out = match diff_res {
+        Ok((true, out, _)) => out,
+        _ => {
+            // Root commit (no `^1` parent): fall back to `git show --format=`.
+            run_git(&ws, &["show", "--format=", hash, "--", &rel])
                 .await
-                .unwrap_or((false, String::new(), String::new()))
-        } else {
-            run_git(&ws, &["diff", &parent_ref, hash, "--", &rel])
-                .await
-                .unwrap_or((false, String::new(), String::new()))
+                .map(|(_, o, _)| o)
+                .unwrap_or_default()
         }
-    } else {
-        run_git(&ws, &["show", "--format=", hash, "--", &rel])
-            .await
-            .unwrap_or((false, String::new(), String::new()))
     };
 
     Ok(Json(GitDiffRes {
@@ -2269,6 +2838,104 @@ mod tests {
         assert_eq!(files[2].path, "assets/logo.png");
         assert_eq!(files[2].status, "A");
         assert!(files[2].binary);
+    }
+
+    #[test]
+    fn test_parse_refs_full_decoration_without_remotes() {
+        let (refs, is_head) = parse_refs(
+            "HEAD -> refs/heads/feat/fast, refs/remotes/origin/feat/fast, refs/remotes/origin/HEAD, tag: refs/tags/v1.2.3, refs/heads/origin/local-branch, refs/stash, refs/notes/commits",
+            &[],
+        );
+        assert!(is_head);
+        assert_eq!(refs.len(), 4);
+        assert_eq!((refs[0].name.as_str(), refs[0].kind.as_str(), refs[0].is_current), ("feat/fast", "local", true));
+        assert_eq!((refs[1].name.as_str(), refs[1].kind.as_str(), refs[1].is_current), ("origin/feat/fast", "remote", false));
+        assert_eq!((refs[2].name.as_str(), refs[2].kind.as_str(), refs[2].is_current), ("v1.2.3", "tag", false));
+        // Even a local branch prefixed with `origin/` is unambiguously classified as local!
+        assert_eq!((refs[3].name.as_str(), refs[3].kind.as_str(), refs[3].is_current), ("origin/local-branch", "local", false));
+    }
+
+    #[test]
+    fn test_refs_fingerprint_reacts_to_git_ops_and_ignores_worktree_edits() {
+        let base = std::env::temp_dir().join(format!("vireo-git-fp-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base).unwrap();
+        let git_ok = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base)
+                .output()
+                .expect("git should be installed");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
+        git_ok(&["init", "-b", "main"]);
+        git_ok(&["config", "user.email", "test@vireo.dev"]);
+        git_ok(&["config", "user.name", "Vireo Test"]);
+        std::fs::write(base.join("a.txt"), "hello\n").unwrap();
+        git_ok(&["add", "a.txt"]);
+        git_ok(&["commit", "-m", "init"]);
+
+        let dirs = resolve_git_dirs(&base).expect("resolve_git_dirs should find .git");
+        let (br, sha) = read_head_state(&dirs).expect("read_head_state");
+        assert_eq!(br, "main");
+        assert!(sha.as_deref().map(|s| s.len() >= 40).unwrap_or(false));
+
+        // Subdirectory resolution works too.
+        let sub = base.join("nested").join("dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(resolve_git_dirs(&sub), Some(dirs.clone()));
+
+        let fp0 = compute_refs_fingerprint(&dirs);
+
+        // Ordinary working-tree edit + staging MUST NOT change refs_fingerprint.
+        std::fs::write(base.join("a.txt"), "hello world\n").unwrap();
+        git_ok(&["add", "a.txt"]);
+        assert_eq!(compute_refs_fingerprint(&dirs), fp0, "worktree/index edits must keep refs_fingerprint stable");
+
+        // Tag creation MUST change refs_fingerprint.
+        git_ok(&["tag", "v0.1.0"]);
+        let fp_tag = compute_refs_fingerprint(&dirs);
+        assert_ne!(fp_tag, fp0, "git tag must change refs_fingerprint");
+
+        // Tag deletion MUST change refs_fingerprint.
+        git_ok(&["tag", "-d", "v0.1.0"]);
+        let fp_untag = compute_refs_fingerprint(&dirs);
+        assert_ne!(fp_untag, fp_tag, "git tag -d must change refs_fingerprint");
+
+        // Simulating a push updating a remote-tracking ref MUST change refs_fingerprint.
+        let head_sha = sha.unwrap();
+        git_ok(&["update-ref", "refs/remotes/origin/main", &head_sha]);
+        let fp_push = compute_refs_fingerprint(&dirs);
+        assert_ne!(fp_push, fp_untag, "remote ref update (push) must change refs_fingerprint");
+
+        // Creating a branch MUST change refs_fingerprint.
+        git_ok(&["branch", "feature/x"]);
+        let fp_branch = compute_refs_fingerprint(&dirs);
+        assert_ne!(fp_branch, fp_push, "branch creation must change refs_fingerprint");
+
+        // Adding a remote (updating .git/config) MUST change refs_fingerprint.
+        git_ok(&["remote", "add", "origin", "https://example.com/org/repo.git"]);
+        let fp_remote = compute_refs_fingerprint(&dirs);
+        assert_ne!(fp_remote, fp_branch, "remote add must change refs_fingerprint");
+
+        // Worktree `.git` file resolution (gitdir + commondir).
+        let wt = std::env::temp_dir().join(format!("vireo-git-wt-test-{}", uuid::Uuid::new_v4()));
+        let wt_str = wt.to_string_lossy().to_string();
+        git_ok(&["worktree", "add", &wt_str, "feature/x"]);
+        let wt_dirs = resolve_git_dirs(&wt).expect("worktree resolve_git_dirs");
+        assert_ne!(wt_dirs.git_dir, wt_dirs.common_dir);
+        assert_eq!(
+            wt_dirs.common_dir.canonicalize().unwrap(),
+            dirs.common_dir.canonicalize().unwrap()
+        );
+
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

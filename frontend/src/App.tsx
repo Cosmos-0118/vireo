@@ -370,10 +370,25 @@ export function App() {
   useKeybindings(); // re-render so tooltips follow rebinding
   const gitStatusRef = useRef<GitStatusRes | null>(null);
   /**
-   * `git status` requests resolve out of order. `seq` numbers requests, `applied` is the newest one
-   * shown, and `startedAt` is when that one began (it reflects disk state from that moment on).
+   * Single-flight `git status` coordinator with trailing-edge rerun:
+   * at most one `/api/git/status` request is in flight at a time, and any refresh requested
+   * while one is active triggers one follow-up fetch immediately after so no update is ever lost.
    */
-  const gitFetchRef = useRef({ seq: 0, applied: 0, startedAt: 0 });
+  const gitFetchRef = useRef<{
+    seq: number;
+    applied: number;
+    startedAt: number;
+    inFlight: Promise<void> | null;
+    rerunNeeded: boolean;
+    nextWaiters: Array<() => void>;
+  }>({
+    seq: 0,
+    applied: 0,
+    startedAt: 0,
+    inFlight: null,
+    rerunNeeded: false,
+    nextWaiters: [],
+  });
   /** When the watcher last reported each path changed (normalized); see the prune effect below. */
   const editedAtRef = useRef<Map<string, number>>(new Map());
   const followRef = useRef(followEdits);
@@ -403,29 +418,110 @@ export function App() {
     setToast({ id: ++toastSeq.current, msg, isError, action });
   }, []);
 
-  const refreshGit = useCallback(async () => {
-    const attempt = async (retries: number): Promise<void> => {
-      const f = gitFetchRef.current;
+  const sameGitStatus = (a: GitStatusRes | null, b: GitStatusRes): boolean => {
+    if (!a) return false;
+    if (
+      a.is_repo !== b.is_repo ||
+      a.branch !== b.branch ||
+      a.head_hash !== b.head_hash ||
+      a.ahead !== b.ahead ||
+      a.behind !== b.behind ||
+      a.remote_url !== b.remote_url ||
+      a.state !== b.state ||
+      a.total_additions !== b.total_additions ||
+      a.total_deletions !== b.total_deletions ||
+      a.refs_fingerprint !== b.refs_fingerprint ||
+      a.files.length !== b.files.length ||
+      a.stashes.length !== b.stashes.length ||
+      a.checkpoints.length !== b.checkpoints.length
+    ) {
+      return false;
+    }
+    for (let i = 0; i < a.files.length; i++) {
+      const af = a.files[i];
+      const bf = b.files[i];
+      if (
+        af.path !== bf.path ||
+        af.index_status !== bf.index_status ||
+        af.worktree_status !== bf.worktree_status ||
+        af.staged !== bf.staged ||
+        af.unstaged !== bf.unstaged ||
+        af.untracked !== bf.untracked ||
+        af.additions !== bf.additions ||
+        af.deletions !== bf.deletions
+      ) {
+        return false;
+      }
+    }
+    for (let i = 0; i < a.stashes.length; i++) {
+      if (
+        a.stashes[i].index !== b.stashes[i].index ||
+        a.stashes[i].message !== b.stashes[i].message ||
+        a.stashes[i].date !== b.stashes[i].date
+      ) {
+        return false;
+      }
+    }
+    for (let i = 0; i < a.checkpoints.length; i++) {
+      if (
+        a.checkpoints[i].id !== b.checkpoints[i].id ||
+        a.checkpoints[i].redo_files !== b.checkpoints[i].redo_files
+      ) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  const refreshGit = useCallback((): Promise<void> => {
+    const f = gitFetchRef.current;
+
+    const runOne = async (retries: number): Promise<void> => {
       const seq = ++f.seq;
       const startedAt = Date.now();
       try {
         const status = await api.gitStatus();
-        // A slower, older request must not overwrite a newer answer (it can predate an agent edit).
         if (seq < f.applied) return;
         f.applied = seq;
         f.startedAt = startedAt;
-        setGitStatus(status);
+        setGitStatus((prev) => (sameGitStatus(prev, status) ? prev : status));
       } catch {
-        // A failed fetch (git busy, backend restarting) must not leave the sidebar stale until the
-        // user hits refresh: retry unless a newer request has been issued meanwhile.
-        if (retries > 0) {
-          window.setTimeout(() => {
-            if (f.seq === seq) void attempt(retries - 1);
-          }, 400);
+        // Transient lock (503) or backend busy: retry shortly unless a newer request is queued.
+        if (retries > 0 && !f.rerunNeeded) {
+          await new Promise<void>((r) => window.setTimeout(r, 250));
+          if (f.seq === seq && !f.rerunNeeded) {
+            await runOne(retries - 1);
+          }
         }
       }
     };
-    await attempt(2);
+
+    if (f.inFlight) {
+      f.rerunNeeded = true;
+      return new Promise<void>((resolve) => {
+        f.nextWaiters.push(resolve);
+      });
+    }
+
+    const drain = async () => {
+      try {
+        await runOne(3);
+        while (f.rerunNeeded) {
+          f.rerunNeeded = false;
+          const batchWaiters = f.nextWaiters.splice(0, f.nextWaiters.length);
+          await runOne(3);
+          for (const resolve of batchWaiters) resolve();
+        }
+      } finally {
+        f.inFlight = null;
+        const leftover = f.nextWaiters.splice(0, f.nextWaiters.length);
+        for (const resolve of leftover) resolve();
+      }
+    };
+
+    const p = drain();
+    f.inFlight = p;
+    return p;
   }, []);
 
   const loadWorkspaceData = useCallback(async () => {
@@ -686,13 +782,41 @@ export function App() {
       const paths = coarse ? [] : Array.from(pendingPaths);
       pendingPaths.clear();
       coarse = false;
-      fsChangedRef.current(paths, new Set(gitStatusRef.current?.files.map((f) => f.path) ?? []));
-      if (paths.length === 0 || paths.some((p) => TASK_SOURCE_RE.test(p))) {
-        refreshTasksRef.current();
+
+      const isGitMetaOnly =
+        paths.length > 0 &&
+        paths.every((p) => p.startsWith('.git/') || p.startsWith('git:'));
+      const affectsOpenContent =
+        !isGitMetaOnly ||
+        paths.some(
+          (p) =>
+            p === '.git/index' ||
+            p === '.git/HEAD' ||
+            p === 'git:stage' ||
+            p === 'git:unstage' ||
+            p === 'git:commit' ||
+            p === 'git:checkout' ||
+            p === 'git:merge' ||
+            p === 'git:reset' ||
+            p === 'git:pull' ||
+            p === 'git:stash' ||
+            p === 'git:cherry-pick' ||
+            p === 'git:revert' ||
+            p === 'git:apply-patch' ||
+            p === 'git:discard-all'
+        );
+
+      if (!isGitMetaOnly) {
+        fsChangedRef.current(paths, new Set(gitStatusRef.current?.files.map((f) => f.path) ?? []));
+        if (paths.length === 0 || paths.some((p) => TASK_SOURCE_RE.test(p))) {
+          refreshTasksRef.current();
+        }
+        setFsVersion((v) => v + 1);
       }
-      setFsVersion((v) => v + 1);
-      refreshGit();
-      reloadActiveContentRef.current();
+      void refreshGit();
+      if (affectsOpenContent) {
+        reloadActiveContentRef.current();
+      }
     };
     const scheduleFlush = () => {
       const now = Date.now();
@@ -2217,6 +2341,7 @@ export function App() {
                   <ReleasePage
                     active={activeTab?.mode === 'release'}
                     fsVersion={fsVersion}
+                    refsFingerprint={gitStatus?.refs_fingerprint}
                     theme={activeTheme}
                     onOpenFile={(p) => openFile(p)}
                     onAskAgent={handleAskAgent}

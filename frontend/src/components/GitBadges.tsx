@@ -10,7 +10,7 @@ const SYNC_IN = 'color-mix(in srgb, #a78bfa 75%, var(--text-primary))';
  * A bare tinted arrow, like GitHub Desktop / Tower; no box, so it reads as a glyph
  * next to the message rather than another badge competing with ref labels.
  */
-export const SyncMark: React.FC<{ dir: 'outgoing' | 'incoming'; size?: number }> = ({ dir, size = 14 }) => {
+export const SyncMark: React.FC<{ dir: 'outgoing' | 'incoming'; size?: number }> = React.memo(({ dir, size = 14 }) => {
   const Icon = dir === 'outgoing' ? ArrowUp : ArrowDown;
   return (
     <span
@@ -22,7 +22,7 @@ export const SyncMark: React.FC<{ dir: 'outgoing' | 'incoming'; size?: number }>
       <Icon size={size - 1} strokeWidth={2.25} />
     </span>
   );
-};
+});
 
 /**
  * Ahead/behind counts ("↓2 ↑1").
@@ -204,7 +204,7 @@ export const RefBadges: React.FC<{
   maxWidth?: number;
   /** Native title tooltips; disable inside rows that already show a hover card */
   tooltips?: boolean;
-}> = ({ refs, color, labelled = 1, maxWidth, tooltips = true }) => {
+}> = React.memo(({ refs, color, labelled = 1, maxWidth, tooltips = true }) => {
   if (refs.length === 0) return null;
   const grouped = groupRefs(refs);
   const shown = grouped.slice(0, labelled);
@@ -237,7 +237,7 @@ export const RefBadges: React.FC<{
       ))}
     </span>
   );
-};
+});
 
 export function fileStatusColor(status: string): string {
   switch (status) {

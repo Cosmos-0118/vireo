@@ -20,7 +20,16 @@ pub(crate) async fn emit(state: &AppState, tx: &mpsc::Sender<Result<Event, Infal
             send_sse(tx, "tool_call", json!({ "id": id, "name": name, "args": args })).await
         }
         Out::ToolResult { id, name, result } => {
-            if matches!(name.as_str(), "write_file" | "edit_file" | "run_command") {
+            if matches!(
+                name.as_str(),
+                "write_file"
+                    | "edit_file"
+                    | "run_command"
+                    | "symbol_edit"
+                    | "ast_rewrite"
+                    | "mcp__vx__release"
+                    | "mcp__vx__create"
+            ) {
                 state.notify_fs_changed(vec!["cli".to_string()]);
             }
             let result: String = result.chars().take(MAX_RESULT_CHARS).collect();

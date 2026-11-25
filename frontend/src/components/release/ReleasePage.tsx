@@ -35,6 +35,7 @@ interface ReleasePageProps {
   /** The Release tab is the visible tab (the page stays mounted while other tabs are shown). */
   active: boolean;
   fsVersion: number;
+  refsFingerprint?: string;
   theme: LiteTheme;
   onOpenFile: (path: string) => void;
   onAskAgent: (text: string) => void;
@@ -78,6 +79,7 @@ type Dialog = { plan: ReleaseOutcome | null; outcome: ReleaseOutcome | null; ver
 export const ReleasePage: React.FC<ReleasePageProps> = ({
   active,
   fsVersion,
+  refsFingerprint,
   theme,
   onOpenFile,
   onAskAgent,
@@ -127,7 +129,7 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
     const t = setTimeout(load, status ? 600 : 0);
     return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active, fsVersion, load]);
+  }, [active, fsVersion, refsFingerprint, load]);
 
   const target = useMemo(() => {
     if (!status || !bump) return '';
@@ -178,7 +180,7 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
     if (!active) return;
     const t = setTimeout(loadNotes, 250);
     return () => clearTimeout(t);
-  }, [active, fsVersion, loadNotes]);
+  }, [active, fsVersion, refsFingerprint, loadNotes]);
 
   // Activity: poll while visible so release steps run by an agent show up live. Callbacks are
   // read through a ref so the poller never re-subscribes when a parent re-renders.

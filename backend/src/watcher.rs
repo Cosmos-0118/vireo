@@ -1,3 +1,4 @@
+use crate::git::{resolve_git_dirs, GitDirs};
 use crate::state::{is_ignored_dir_name, WorkspaceEvent};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::collections::HashMap;
@@ -7,52 +8,119 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
 /// Quiet period after the last event before a batch is flushed.
-const DEBOUNCE: Duration = Duration::from_millis(120);
+const DEBOUNCE: Duration = Duration::from_millis(80);
 /// A batch is flushed at the latest this long after its first event, so a continuous stream of
 /// writes (build output, `npm install`) cannot starve the UI of updates.
-const MAX_BATCH_AGE: Duration = Duration::from_millis(400);
+const MAX_BATCH_AGE: Duration = Duration::from_millis(280);
 /// Paths reported per event. Past this the batch is reported as "something changed" (empty list),
 /// which clients treat as a full refresh.
 const MAX_REPORTED_PATHS: usize = 200;
 /// Hard cap on the pending set so a huge burst cannot grow memory without bound.
 const MAX_PENDING: usize = 2000;
 
-/// `.git` entries whose change alters what source control shows (branch, staging, upstream
-/// counts, stashes, in-progress merge/rebase). Object storage, logs and `*.lock` files are noise.
-fn git_path_relevant(rel: &str) -> bool {
-    if rel.ends_with(".lock") {
-        return false;
-    }
-    matches!(
-        rel,
-        ".git/HEAD"
-            | ".git/index"
-            | ".git/packed-refs"
-            | ".git/MERGE_HEAD"
-            | ".git/CHERRY_PICK_HEAD"
-            | ".git/REVERT_HEAD"
-            | ".git/rebase-merge"
-            | ".git/rebase-apply"
-    ) || rel.starts_with(".git/refs/")
+/// Normalize a path to forward slashes without Windows `\\?\` UNC prefix.
+fn normalize_path_str(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    s.strip_prefix("//?/").unwrap_or(&s).trim_end_matches('/').to_string()
 }
 
-fn should_ignore_path(workspace: &Path, path: &Path) -> bool {
-    let rel = match path.strip_prefix(workspace) {
-        Ok(r) => r,
-        Err(_) => return false,
+/// Strip `base` from `path` in a platform-appropriate way (case-insensitive on Windows,
+/// ignoring `\\?\` UNC prefixes), returning a forward-slash relative string.
+fn strip_prefix_norm(base: &Path, path: &Path) -> Option<String> {
+    let b = normalize_path_str(base);
+    let p = normalize_path_str(path);
+    if b.is_empty() {
+        return None;
+    }
+    let matches_prefix = |a: &str, pref: &str| {
+        if cfg!(windows) {
+            a.eq_ignore_ascii_case(pref)
+        } else {
+            a == pref
+        }
     };
-    for comp in rel.components() {
-        if let Some(s) = comp.as_os_str().to_str() {
-            if s == ".git" {
-                let rel_str = rel.to_string_lossy().replace('\\', "/");
-                return !git_path_relevant(&rel_str);
-            }
-            if is_ignored_dir_name(s) {
-                return true;
+    if matches_prefix(&p, &b) {
+        return Some(String::new());
+    }
+    if p.len() > b.len() && p.as_bytes()[b.len()] == b'/' {
+        if let Some(head) = p.get(..b.len()) {
+            if matches_prefix(head, &b) {
+                return Some(p[b.len() + 1..].to_string());
             }
         }
     }
-    false
+    None
+}
+
+/// `.git` entries (relative to the git dir, without a leading `.git/`) whose change alters what
+/// source control shows: branch, staging, upstream/remotes, tags, fetch state, stashes, or
+/// in-progress merge/rebase. Object storage, reflogs (except stash), and `*.lock` files are noise.
+fn git_rel_relevant(rel_in_git: &str) -> bool {
+    if rel_in_git.is_empty() || rel_in_git.ends_with(".lock") {
+        return false;
+    }
+    matches!(
+        rel_in_git,
+        "HEAD"
+            | "index"
+            | "packed-refs"
+            | "config"
+            | "FETCH_HEAD"
+            | "ORIG_HEAD"
+            | "MERGE_HEAD"
+            | "CHERRY_PICK_HEAD"
+            | "REVERT_HEAD"
+            | "rebase-merge"
+            | "rebase-apply"
+            | "logs/refs/stash"
+            | "reftable/tables.list"
+    ) || rel_in_git.starts_with("refs/")
+        || rel_in_git.starts_with("rebase-merge/")
+        || rel_in_git.starts_with("rebase-apply/")
+}
+
+/// Classify a filesystem event path against the workspace and resolved git dirs.
+/// Returns `Some(normalized_rel)` to report (with git metadata normalized to `.git/...`),
+/// or `None` if the event should be ignored.
+fn classify_event_path(
+    workspace: &Path,
+    git_dirs: Option<&GitDirs>,
+    path: &Path,
+) -> Option<String> {
+    if let Some(gd) = git_dirs {
+        if let Some(rel) = strip_prefix_norm(&gd.git_dir, path) {
+            return git_rel_relevant(&rel).then(|| format!(".git/{rel}"));
+        }
+        if gd.common_dir != gd.git_dir {
+            if let Some(rel) = strip_prefix_norm(&gd.common_dir, path) {
+                return git_rel_relevant(&rel).then(|| format!(".git/{rel}"));
+            }
+        }
+    }
+
+    if let Some(rel) = strip_prefix_norm(workspace, path) {
+        if rel.is_empty() {
+            return None;
+        }
+        for comp in rel.split('/') {
+            if comp == ".git" {
+                let in_git = rel.strip_prefix(".git/").unwrap_or("");
+                return git_rel_relevant(in_git).then(|| rel);
+            }
+            if is_ignored_dir_name(comp) {
+                return None;
+            }
+        }
+        return Some(rel);
+    }
+
+    // Outside workspace and outside known git dirs: ignore.
+    None
+}
+
+#[cfg(test)]
+fn should_ignore_path(workspace: &Path, path: &Path) -> bool {
+    classify_event_path(workspace, None, path).is_none()
 }
 
 enum Msg {
@@ -60,10 +128,50 @@ enum Msg {
     Retarget(PathBuf),
 }
 
+#[derive(Default)]
+struct GitWatchState {
+    dirs: Option<GitDirs>,
+    watched: Vec<PathBuf>,
+}
+
+impl GitWatchState {
+    fn watch_path(&mut self, w: &mut RecommendedWatcher, p: PathBuf, mode: RecursiveMode) {
+        if self.watched.iter().any(|x| x == &p) {
+            return;
+        }
+        if p.exists() && w.watch(&p, mode).is_ok() {
+            self.watched.push(p);
+        }
+    }
+
+    fn attach(&mut self, w: &mut RecommendedWatcher, ws: &Path) {
+        let Some(dirs) = resolve_git_dirs(ws) else {
+            return;
+        };
+        let git_dir = dirs.git_dir.clone();
+        let common_dir = dirs.common_dir.clone();
+        self.dirs = Some(dirs);
+        self.watch_path(w, git_dir.clone(), RecursiveMode::NonRecursive);
+        if common_dir != git_dir {
+            self.watch_path(w, common_dir.clone(), RecursiveMode::NonRecursive);
+        }
+        self.watch_path(w, common_dir.join("refs"), RecursiveMode::Recursive);
+        self.watch_path(w, common_dir.join("logs").join("refs"), RecursiveMode::NonRecursive);
+        self.watch_path(w, common_dir.join("reftable"), RecursiveMode::NonRecursive);
+    }
+
+    fn unwatch(&mut self, w: &mut RecommendedWatcher) {
+        for p in self.watched.drain(..) {
+            let _ = w.unwatch(&p);
+        }
+        self.dirs = None;
+    }
+}
+
 /// Watch the workspace without descending into dependency / build / VCS-object directories:
 /// the root non-recursively, every non-ignored top-level directory recursively, and only the
-/// `.git` files that matter (HEAD, index, refs/heads).
-fn watch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
+/// `.git` files/directories that alter source control state.
+fn watch_workspace(w: &mut RecommendedWatcher, ws: &Path, git_watch: &mut GitWatchState) {
     if ws.as_os_str().is_empty() {
         return;
     }
@@ -82,12 +190,10 @@ fn watch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
             let _ = w.watch(&entry.path(), RecursiveMode::Recursive);
         }
     }
-    let git = ws.join(".git");
-    let _ = w.watch(&git, RecursiveMode::NonRecursive);
-    let _ = w.watch(&git.join("refs"), RecursiveMode::Recursive);
+    git_watch.attach(w, ws);
 }
 
-fn unwatch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
+fn unwatch_workspace(w: &mut RecommendedWatcher, ws: &Path, git_watch: &mut GitWatchState) {
     if ws.as_os_str().is_empty() {
         return;
     }
@@ -99,9 +205,7 @@ fn unwatch_workspace(w: &mut RecommendedWatcher, ws: &Path) {
             }
         }
     }
-    let git = ws.join(".git");
-    let _ = w.unwatch(&git);
-    let _ = w.unwatch(&git.join("refs"));
+    git_watch.unwatch(w);
 }
 
 pub fn spawn_watcher(
@@ -126,6 +230,7 @@ pub fn spawn_watcher(
 
     std::thread::spawn(move || {
         let mut current_ws = initial_workspace;
+        let mut git_watch = GitWatchState::default();
 
         let mut watcher: Option<RecommendedWatcher> = notify::recommended_watcher({
             let tx = tx.clone();
@@ -136,7 +241,7 @@ pub fn spawn_watcher(
         .ok();
 
         if let Some(w) = watcher.as_mut() {
-            watch_workspace(w, &current_ws);
+            watch_workspace(w, &current_ws, &mut git_watch);
         }
 
         // path -> sequence number of its latest event, so a batch is reported oldest-first and
@@ -167,8 +272,8 @@ pub fn spawn_watcher(
             match msg {
                 Some(Msg::Retarget(new_ws)) => {
                     if let Some(w) = watcher.as_mut() {
-                        unwatch_workspace(w, &current_ws);
-                        watch_workspace(w, &new_ws);
+                        unwatch_workspace(w, &current_ws, &mut git_watch);
+                        watch_workspace(w, &new_ws, &mut git_watch);
                     }
                     current_ws = new_ws;
                     pending.clear();
@@ -177,23 +282,46 @@ pub fn spawn_watcher(
                     last_event = None;
                 }
                 Some(Msg::Fs(Ok(event))) => {
-                    // A new top-level directory appeared: start watching it too.
+                    if matches!(event.kind, EventKind::Access(_)) {
+                        continue;
+                    }
+                    // Dynamically watch newly created top-level directories AND `.git` (e.g. `git init`).
                     if matches!(event.kind, EventKind::Create(_)) {
                         if let Some(w) = watcher.as_mut() {
                             for p in &event.paths {
+                                let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                                if name == ".git"
+                                    && strip_prefix_norm(&current_ws, p).as_deref() == Some(".git")
+                                {
+                                    git_watch.attach(w, &current_ws);
+                                    let now = Instant::now();
+                                    first_event.get_or_insert(now);
+                                    last_event = Some(now);
+                                    seq += 1;
+                                    pending.insert(".git/HEAD".to_string(), seq);
+                                    continue;
+                                }
                                 if p.parent() == Some(current_ws.as_path()) && p.is_dir() {
-                                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                                     if name != ".git" && !is_ignored_dir_name(name) {
                                         let _ = w.watch(p, RecursiveMode::Recursive);
+                                    }
+                                }
+                                // If `.git/logs/refs` or `.git/reftable` appeared lazily (e.g. first stash),
+                                // re-attach git watches so future updates are caught.
+                                if let Some(gd) = git_watch.dirs.clone() {
+                                    if p.starts_with(&gd.common_dir)
+                                        && matches!(name, "refs" | "logs" | "reftable")
+                                    {
+                                        git_watch.attach(w, &current_ws);
                                     }
                                 }
                             }
                         }
                     }
                     for p in event.paths {
-                        if should_ignore_path(&current_ws, &p) {
+                        let Some(rel) = classify_event_path(&current_ws, git_watch.dirs.as_ref(), &p) else {
                             continue;
-                        }
+                        };
                         let now = Instant::now();
                         first_event.get_or_insert(now);
                         last_event = Some(now);
@@ -202,10 +330,6 @@ pub fn spawn_watcher(
                             continue;
                         }
                         seq += 1;
-                        let rel = p
-                            .strip_prefix(&current_ws)
-                            .map(|r| r.to_string_lossy().replace('\\', "/"))
-                            .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"));
                         pending.insert(rel, seq);
                     }
                 }
@@ -254,17 +378,51 @@ mod tests {
             ".git/HEAD",
             ".git/index",
             ".git/packed-refs",
+            ".git/config",
+            ".git/FETCH_HEAD",
+            ".git/ORIG_HEAD",
             ".git/MERGE_HEAD",
             ".git/refs/heads/main",
             ".git/refs/remotes/origin/main",
+            ".git/refs/tags/v1.0.0",
             ".git/refs/stash",
+            ".git/logs/refs/stash",
+            ".git/reftable/tables.list",
             ".git/rebase-merge",
         ] {
             assert!(!ign(ok), "{ok} must be watched");
         }
-        for noisy in [".git/index.lock", ".git/objects/ab/cd", ".git/logs/HEAD", ".git/FETCH_HEAD", ".git/refs/heads/x.lock"] {
+        for noisy in [
+            ".git/index.lock",
+            ".git/objects/ab/cd",
+            ".git/logs/HEAD",
+            ".git/refs/heads/x.lock",
+            ".git/refs/tags/v1.0.0.lock",
+            ".git/COMMIT_EDITMSG",
+        ] {
             assert!(ign(noisy), "{noisy} must be ignored");
         }
         assert!(!ign("src/main.rs"));
+    }
+
+    #[test]
+    fn worktree_external_git_dir_normalizes_to_dot_git() {
+        let ws = Path::new("/worktrees/feat");
+        let dirs = GitDirs {
+            git_dir: PathBuf::from("/main/.git/worktrees/feat"),
+            common_dir: PathBuf::from("/main/.git"),
+        };
+        assert_eq!(
+            classify_event_path(ws, Some(&dirs), Path::new("/main/.git/refs/tags/v2.0.0")),
+            Some(".git/refs/tags/v2.0.0".to_string())
+        );
+        assert_eq!(
+            classify_event_path(ws, Some(&dirs), Path::new("/main/.git/worktrees/feat/HEAD")),
+            Some(".git/HEAD".to_string())
+        );
+        assert_eq!(
+            classify_event_path(ws, Some(&dirs), Path::new("/main/.git/objects/aa/bb")),
+            None
+        );
     }
 }

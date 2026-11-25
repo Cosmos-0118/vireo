@@ -68,7 +68,7 @@ const DASH = '2.5 2.5';
  * straight rails, quarter-arc merges/forks at the row midline, and short
  * S-bends when a lane shifts left after another lane ends.
  */
-export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
+export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = React.memo(({
   row,
   maxLanes,
   laneWidth: laneW = 12,
@@ -201,7 +201,7 @@ export const CommitGraphSvg: React.FC<CommitGraphSvgProps> = ({
       {node}
     </svg>
   );
-};
+});
 
 /**
  * Continues a row's outgoing rails down through content rendered under the row
@@ -213,7 +213,7 @@ export const GraphRails: React.FC<{
   maxLanes: number;
   laneWidth?: number;
   maxVisibleLanes?: number;
-}> = ({ lanes, maxLanes, laneWidth = 12, maxVisibleLanes = 8 }) => {
+}> = React.memo(({ lanes, maxLanes, laneWidth = 12, maxVisibleLanes = 8 }) => {
   const W = graphLaneSpacing(maxLanes, laneWidth, maxVisibleLanes);
   return (
     <div className="absolute inset-y-0 left-0 pointer-events-none" aria-hidden="true">
@@ -232,4 +232,4 @@ export const GraphRails: React.FC<{
       ))}
     </div>
   );
-};
+});

@@ -137,6 +137,8 @@ export interface GitStatusRes {
   total_deletions: number;
   checkpoints: Checkpoint[];
   stashes: StashItem[];
+  /** Fingerprint of git refs, HEAD, config, fetch state, stashes, and merge/rebase state. */
+  refs_fingerprint?: string;
 }
 
 export interface GenerateMessageRes {

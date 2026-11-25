@@ -141,12 +141,14 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
   );
 
   const appendInFlight = useRef(false);
+  const logSeqRef = useRef(0);
   const fetchCommits = useCallback(
     async (opts?: { append?: boolean; skip?: number }) => {
       if (opts?.append) {
         if (appendInFlight.current) return;
         appendInFlight.current = true;
       }
+      const seq = ++logSeqRef.current;
       setLoading(true);
       try {
         const res = await api.gitLog({
@@ -155,24 +157,35 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
           all: allBranches,
           search: search.trim() || undefined,
         });
+        if (seq !== logSeqRef.current) return;
         setCommits((prev) => (opts?.append ? appendUniqueCommits(prev, res.commits) : res.commits));
         setHasMore(res.has_more);
       } catch (e: unknown) {
-        onToast(e instanceof Error ? e.message : 'Failed to load commit history', true);
+        if (seq === logSeqRef.current) {
+          onToast(e instanceof Error ? e.message : 'Failed to load commit history', true);
+        }
       } finally {
         if (opts?.append) appendInFlight.current = false;
-        setLoading(false);
+        if (seq === logSeqRef.current) setLoading(false);
       }
     },
     [allBranches, search, onToast]
   );
 
+  const gitRev =
+    gitStatus?.refs_fingerprint ??
+    `${gitStatus?.branch ?? ''}|${gitStatus?.head_hash ?? ''}|${gitStatus?.ahead ?? 0}|${gitStatus?.behind ?? 0}`;
+
   useEffect(() => {
+    if (!search) {
+      void fetchCommits({ append: false, skip: 0 });
+      return;
+    }
     const t = window.setTimeout(() => {
-      fetchCommits({ append: false, skip: 0 });
-    }, search ? 200 : 0);
+      void fetchCommits({ append: false, skip: 0 });
+    }, 180);
     return () => window.clearTimeout(t);
-  }, [fetchCommits, workspacePath, gitStatus?.head_hash, gitStatus?.branch, search]);
+  }, [fetchCommits, workspacePath, gitRev, search]);
 
   useEffect(() => {
     if (initialSelectedHash) {
@@ -227,14 +240,15 @@ export const CommitGraphView: React.FC<CommitGraphViewProps> = ({
 
   const uncommittedCount = gitStatus?.files.length ?? 0;
   const filtered = search.trim().length > 0;
+  const hasWorkingTree = uncommittedCount > 0 && !filtered;
   const layout = useMemo(
     () =>
       computeGitGraphLayout(commits, {
-        workingTree: uncommittedCount > 0 && !filtered,
+        workingTree: hasWorkingTree,
         currentBranch: gitStatus?.branch,
         flat: filtered,
       }),
-    [commits, uncommittedCount, filtered, gitStatus?.branch]
+    [commits, hasWorkingTree, filtered, gitStatus?.branch]
   );
   const upstreamName = useMemo(() => {
     const up = commits.find((c) => c.hash === layout.upstreamHash);
