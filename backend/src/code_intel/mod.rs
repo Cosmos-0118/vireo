@@ -34,6 +34,8 @@ mod view;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod bench;
 
 use patch_parse::parse_edge;
 use serde_json::{json, Value};

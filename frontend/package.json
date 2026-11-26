@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "bench": "rolldown bench/perf.bench.ts -f esm --platform node -d .bench-out && node .bench-out/perf.bench.js"
   },
   "dependencies": {
     "@codemirror/commands": "^6.8.1",

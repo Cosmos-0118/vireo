@@ -1,7 +1,8 @@
 import { Binary, Equals, GitDiff } from '@phosphor-icons/react';
 import { EmptyState, EmptyStateButton } from './ui/EmptyState';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { diffLines, diffWordsWithSpace } from 'diff';
+import { diffLines } from 'diff';
+import { computeChangedRanges, type CharRange } from '../utils/wordDiff';
 import {
   ArrowLeft,
   ArrowRight,
@@ -151,7 +152,19 @@ function assignClusters(changed: boolean[]): { ids: number[]; count: number } {
 }
 
 /** Nearest enclosing scope header: closest preceding line with less indentation than the fold's resume line. */
+const scopeCache = new WeakMap<string[], Map<number, string>>();
 function findScopeLabel(texts: string[], foldEnd: number): string {
+  // Called from every fold row on every render (hover, virtual-scroll tick): memoize per file.
+  let byEnd = scopeCache.get(texts);
+  if (!byEnd) scopeCache.set(texts, (byEnd = new Map()));
+  const hit = byEnd.get(foldEnd);
+  if (hit !== undefined) return hit;
+  const label = scanScopeLabel(texts, foldEnd);
+  byEnd.set(foldEnd, label);
+  return label;
+}
+
+function scanScopeLabel(texts: string[], foldEnd: number): string {
   const indentOf = (s: string) => {
     let w = 0;
     for (const ch of s) {
@@ -188,41 +201,6 @@ function splitLinesPreserve(val: string): string[] {
     lines.pop();
   }
   return lines;
-}
-
-interface CharRange {
-  from: number;
-  to: number;
-}
-
-function computeChangedRanges(
-  oldText: string,
-  newText: string,
-  side: 'left' | 'right'
-): CharRange[] {
-  if (oldText.length > 1200 || newText.length > 1200) return [];
-  const parts = diffWordsWithSpace(oldText, newText);
-  const ranges: CharRange[] = [];
-  let pos = 0;
-
-  for (const p of parts) {
-    if (side === 'left') {
-      if (p.added) continue;
-      const len = p.value.length;
-      if (p.removed && len > 0) {
-        ranges.push({ from: pos, to: pos + len });
-      }
-      pos += len;
-    } else {
-      if (p.removed) continue;
-      const len = p.value.length;
-      if (p.added && len > 0) {
-        ranges.push({ from: pos, to: pos + len });
-      }
-      pos += len;
-    }
-  }
-  return ranges;
 }
 
 function renderSyntaxSpans(

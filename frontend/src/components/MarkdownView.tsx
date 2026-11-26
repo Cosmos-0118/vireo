@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkBreaks from 'remark-breaks';
@@ -7,6 +7,12 @@ import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
 import { Check, Copy } from 'lucide-react';
 import type { TokenSpan } from '../syntax';
 import type { LiteTheme } from '../themes';
+
+// Stable plugin arrays: fresh literals each render change <ReactMarkdown>'s props every time.
+type MdPlugins = React.ComponentProps<typeof ReactMarkdown>['remarkPlugins'];
+const DOC_REMARK: MdPlugins = [remarkGfm];
+const CHAT_REMARK: MdPlugins = [remarkGfm, remarkBreaks];
+const NO_REHYPE: MdPlugins = [];
 
 const FencedCodeBlock: React.FC<{
   lang: string;
@@ -29,22 +35,31 @@ const FencedCodeBlock: React.FC<{
   const isDiff = normalizedLang === 'diff';
   // The Lezer grammars are heavy; load them on first code block instead of at app start.
   const [highlighted, setHighlighted] = useState<TokenSpan[][] | null>(null);
+  const lastHighlightRef = useRef(0);
   useEffect(() => {
     if (!normalizedLang) {
       setHighlighted(null);
       return;
     }
     let cancelled = false;
-    import('../syntax')
-      .then((m) => {
-        if (!cancelled) setHighlighted(m.highlightLinesByName(code, normalizedLang, theme));
-      })
-      .catch(() => {});
+    // While a block streams, `code` changes every frame; a full Lezer parse each time is O(T^2)
+    // overall. Cap re-highlighting at ~8/s (the first run is immediate).
+    const wait = Math.max(0, lastHighlightRef.current + 120 - Date.now());
+    const timer = setTimeout(() => {
+      lastHighlightRef.current = Date.now();
+      import('../syntax')
+        .then((m) => {
+          if (!cancelled) setHighlighted(m.highlightLinesByName(code, normalizedLang, theme));
+        })
+        .catch(() => {});
+    }, wait);
     return () => {
       cancelled = true;
+      clearTimeout(timer);
     };
   }, [code, normalizedLang, theme]);
-  const rawLines = code.split(/\r?\n/);
+  // Only the unhighlighted diff fallback reads this.
+  const rawLines = useMemo(() => (isDiff ? code.split(/\r?\n/) : []), [isDiff, code]);
 
   return (
     <div className="my-2 rounded-md border border-[var(--border)] bg-[var(--bg-panel)] overflow-hidden">
@@ -143,6 +158,7 @@ const sanitizeSchema = {
     th: [...(defaultSchema.attributes?.th ?? []), 'align'],
   },
 };
+const DOC_REHYPE: MdPlugins = [rehypeRaw, [rehypeSanitize, sanitizeSchema]];
 
 const slugify = (text: string) =>
   text
@@ -379,8 +395,8 @@ export const MarkdownMessage: React.FC<{
       className={`${doc ? 'text-[14.5px] leading-[1.7]' : 'text-[13.5px] leading-[1.65]'} text-[var(--text-primary)] break-words`}
     >
       <ReactMarkdown
-        remarkPlugins={doc ? [remarkGfm] : [remarkGfm, remarkBreaks]}
-        rehypePlugins={doc ? [rehypeRaw, [rehypeSanitize, sanitizeSchema]] : []}
+        remarkPlugins={doc ? DOC_REMARK : CHAT_REMARK}
+        rehypePlugins={doc ? DOC_REHYPE : NO_REHYPE}
         components={components}
       >
         {content}

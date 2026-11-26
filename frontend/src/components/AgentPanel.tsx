@@ -724,7 +724,38 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
+    // Token deltas arrive at 50-200+ Hz; each one used to clone the message list and re-render the
+    // whole panel. Buffer them and apply once per animation frame. Every other event flushes first
+    // (via `patchCurrent`) so ordering relative to tool calls / done is unchanged.
+    let pendingDelta = '';
+    let pendingDeltaId: string | null = null;
+    let deltaRaf = 0;
+    const applyDelta = () => {
+      deltaRaf = 0;
+      const delta = pendingDelta;
+      const id = pendingDeltaId;
+      pendingDelta = '';
+      pendingDeltaId = null;
+      if (!delta || !id) return;
+      patchAssistant(id, (m) => {
+        const parts = [...(m.parts ?? [])];
+        const last = parts[parts.length - 1];
+        if (last?.kind === 'text') parts[parts.length - 1] = { kind: 'text', text: last.text + delta };
+        else parts.push({ kind: 'text', text: delta.replace(/^\n+/, '') });
+        return {
+          ...m,
+          content: m.content + (m.content ? delta : delta.replace(/^\n+/, '')),
+          parts,
+          firstOutputAt: m.firstOutputAt ?? Date.now(),
+        };
+      });
+    };
+    const flushDelta = () => {
+      if (deltaRaf) cancelAnimationFrame(deltaRaf);
+      applyDelta();
+    };
     const patchCurrent = (fn: (m: UiChatMessage) => UiChatMessage) => {
+      flushDelta();
       const id = activeAssistantIdRef.current;
       if (id) patchAssistant(id, fn);
     };
@@ -740,6 +771,7 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
           },
           onSteerApplied: (ev) => {
             if (runSeqRef.current !== runId) return;
+            flushDelta(); // buffered tokens belong to the turn that is ending, not the next one
             const meta = queuedSteersRef.current.find((s) => s.steerId === ev.steer_id);
             updateQueuedSteers((prev) => prev.filter((s) => s.steerId !== ev.steer_id));
 
@@ -806,18 +838,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
           // Token-level streaming: fragments extend the current paragraph.
           onTextDelta: (delta) => {
             if (runSeqRef.current !== runId) return;
-            patchCurrent((m) => {
-              const parts = [...(m.parts ?? [])];
-              const last = parts[parts.length - 1];
-              if (last?.kind === 'text') parts[parts.length - 1] = { kind: 'text', text: last.text + delta };
-              else parts.push({ kind: 'text', text: delta.replace(/^\n+/, '') });
-              return {
-                ...m,
-                content: m.content + (m.content ? delta : delta.replace(/^\n+/, '')),
-                parts,
-                firstOutputAt: m.firstOutputAt ?? Date.now(),
-              };
-            });
+            if (pendingDeltaId && pendingDeltaId !== activeAssistantIdRef.current) flushDelta();
+            pendingDelta += delta;
+            pendingDeltaId ??= activeAssistantIdRef.current;
+            if (!deltaRaf) deltaRaf = requestAnimationFrame(applyDelta);
           },
           onSession: (sess) => {
             if (runSeqRef.current !== runId) return;
@@ -924,6 +948,10 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
       setPermRequests([]);
       setQuestions([]);
       clearActiveTurnState();
+    } finally {
+      // Never leave a frame callback behind after the run ends (Stop / error / done): apply what
+      // was already received so the visible message keeps it.
+      flushDelta();
     }
   };
 
@@ -1150,10 +1178,19 @@ export const AgentPanel: React.FC<AgentPanelProps> = ({
     external: true,
   });
 
+  // Only needed while the picker is open (it used to scan up to 4000 files on every token and
+  // keystroke), and `extraFiles` membership is a Set lookup instead of an O(|E|) includes().
   const filteredFiles = (() => {
+    if (!pickerOpen) return [];
     const q = pickerQuery.trim().toLowerCase();
-    const pool = allFiles.filter((f) => !extraFiles.includes(f));
-    return (q ? pool.filter((f) => f.toLowerCase().includes(q)) : pool).slice(0, 40);
+    const taken = new Set(extraFiles);
+    const out: string[] = [];
+    for (const f of allFiles) {
+      if (taken.has(f) || (q && !f.toLowerCase().includes(q))) continue;
+      out.push(f);
+      if (out.length >= 40) break;
+    }
+    return out;
   })();
 
   const addContextFile = (f: string) => {

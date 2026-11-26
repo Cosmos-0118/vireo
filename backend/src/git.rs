@@ -1031,6 +1031,10 @@ fn validate_git_ref_arg(s: &str) -> Result<&str, (StatusCode, String)> {
 
 /// Untracked files above this size are not read just to count their lines.
 const MAX_UNTRACKED_COUNT_BYTES: u64 = 1024 * 1024;
+/// At most this many untracked files are line-counted per status refresh...
+const MAX_UNTRACKED_COUNT_FILES: usize = 500;
+/// ...and at most this many bytes read in total.
+const MAX_UNTRACKED_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Default)]
 struct StatusV2 {
@@ -1117,15 +1121,27 @@ fn parse_status_v2(bytes: &[u8]) -> StatusV2 {
 /// Line counts for untracked files (skips large / binary / non-UTF-8 files).
 fn count_untracked_lines(ws: &Path, paths: Vec<String>) -> HashMap<String, usize> {
     let mut m = HashMap::new();
-    for p in paths {
+    // Bound the work per status refresh: a tree of thousands of untracked files (build output,
+    // datasets) must not make every refresh read hundreds of MB.
+    let mut budget = MAX_UNTRACKED_TOTAL_BYTES;
+    for p in paths.into_iter().take(MAX_UNTRACKED_COUNT_FILES) {
         let Ok(full) = resolve_safe_path(ws, &p) else { continue };
-        match std::fs::metadata(&full) {
-            Ok(md) if md.is_file() && md.len() <= MAX_UNTRACKED_COUNT_BYTES => {}
+        let len = match std::fs::metadata(&full) {
+            Ok(md) if md.is_file() && md.len() <= MAX_UNTRACKED_COUNT_BYTES => md.len(),
             _ => continue,
+        };
+        if len > budget {
+            continue; // too big for what is left; smaller files after it may still fit
         }
-        if let Ok(content) = std::fs::read_to_string(&full) {
-            m.insert(p, content.lines().count());
+        // Count newline bytes directly: no UTF-8 validation / String allocation. A NUL in the
+        // first block marks a binary file (not counted).
+        let Ok(bytes) = std::fs::read(&full) else { continue };
+        budget -= len.min(budget);
+        if bytes[..bytes.len().min(8192)].contains(&0) {
+            continue;
         }
+        let nl = bytes.iter().filter(|&&b| b == b'\n').count();
+        m.insert(p, nl + usize::from(bytes.last().is_some_and(|&b| b != b'\n')));
     }
     m
 }
@@ -3353,4 +3369,31 @@ pub async fn generate_commit_message(
         code: String::new(),
         error: String::new(),
     }))
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn bench_count_untracked() {
+        let ws = std::env::temp_dir().join(format!("vireo-bench-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        let body: String = (0..5000).map(|i| format!("log line {i} some output text here\n")).collect();
+        let mut paths = Vec::new();
+        for i in 0..1500 {
+            std::fs::write(ws.join(format!("f{i}.log")), &body).unwrap();
+            paths.push(format!("f{i}.log"));
+        }
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            std::hint::black_box(count_untracked_lines(&ws, paths.clone()));
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("BENCH count_untracked_lines(1500 files x 175KB) {best:.2} ms");
+        let _ = std::fs::remove_dir_all(&ws);
+    }
 }

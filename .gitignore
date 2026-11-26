@@ -6,6 +6,7 @@ backend/target/
 frontend/node_modules/
 frontend/dist/
 frontend/dist-ssr/
+frontend/.bench-out/
 *.tsbuildinfo
 
 # Release, staging & installer outputs

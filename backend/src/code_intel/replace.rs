@@ -82,8 +82,20 @@ fn normalize_repl(s: &str) -> String {
     out
 }
 
+/// Same verdict as `Doc::parse(text).eol == "\r\n"` without splitting the file into lines.
+fn detect_crlf(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if !bytes.contains(&b'\r') {
+        return false; // LF-only (the common case): one cheap scan, no counting
+    }
+    let lf_total = bytes.iter().filter(|&&b| b == b'\n').count();
+    let crlf = bytes.windows(2).filter(|w| w == b"\r\n").count();
+    crlf > lf_total - crlf
+}
+
 /// Apply one rule to `text`: (occurrences, new text). Fills `preview` with the first hits.
-fn apply_rule(rule: &Rule, text: &str, use_crlf: bool, rel: &str, preview: &mut Vec<String>) -> (usize, String) {
+/// The text is `None` when nothing matched (no copy of an untouched file).
+fn apply_rule(rule: &Rule, text: &str, use_crlf: bool, rel: &str, preview: &mut Vec<String>) -> (usize, Option<String>) {
     let mut note = |pos: usize| {
         if preview.len() < 8 {
             let ln = text[..pos].bytes().filter(|&b| b == b'\n').count() + 1;
@@ -99,9 +111,9 @@ fn apply_rule(rule: &Rule, text: &str, use_crlf: bool, rel: &str, preview: &mut 
             note(m.start());
         }
         if count == 0 {
-            return (0, text.to_string());
+            return (0, None);
         }
-        (count, rx.replace_all(text, eol(&rule.new_lf).as_str()).into_owned())
+        (count, Some(rx.replace_all(text, eol(&rule.new_lf).as_str()).into_owned()))
     } else {
         let needle = eol(&rule.old_lf);
         let mut count = 0usize;
@@ -110,9 +122,9 @@ fn apply_rule(rule: &Rule, text: &str, use_crlf: bool, rel: &str, preview: &mut 
             note(pos);
         }
         if count == 0 {
-            return (0, text.to_string());
+            return (0, None);
         }
-        (count, text.replace(&needle, &eol(&rule.new_lf)))
+        (count, Some(text.replace(&needle, &eol(&rule.new_lf))))
     }
 }
 
@@ -195,22 +207,24 @@ pub fn replace_rules(ws: &Path, rules: &[(String, String, bool)], opts: &Replace
             Err(e) if single_explicit => return Err(format!("cannot read {rel}: {e}")),
             Err(_) => continue,
         };
-        let text = match String::from_utf8(bytes.clone()) {
+        let text: &str = match std::str::from_utf8(&bytes) {
             Ok(t) => t,
             Err(_) if single_explicit => return Err(format!("{rel} is not UTF-8 text")),
             Err(_) => continue,
         };
-        let doc = Doc::parse(&text);
-        let use_crlf = doc.eol == "\r\n";
+        // Line splitting is deferred until something matched (most files never do).
+        let use_crlf = detect_crlf(text);
         let mut loose = false;
 
-        let mut cur = text.clone();
+        let mut cur: std::borrow::Cow<str> = std::borrow::Cow::Borrowed(text);
         let mut count = 0usize;
         let mut preview: Vec<String> = Vec::new();
         for rule in &compiled {
             let (c, next) = apply_rule(rule, &cur, use_crlf, &rel, &mut preview);
             count += c;
-            cur = next;
+            if let Some(n) = next {
+                cur = std::borrow::Cow::Owned(n);
+            }
         }
         if count == 0 {
             // One named file, one literal rule: tolerate indentation / trailing-whitespace drift
@@ -219,6 +233,7 @@ pub fn replace_rules(ws: &Path, rules: &[(String, String, bool)], opts: &Replace
             if !(single_explicit && single_rule) {
                 continue;
             }
+            let doc = Doc::parse(text);
             let (old_lf, new_lf) = (&compiled[0].old_lf, &compiled[0].new_lf);
             let old_lines: Vec<String> = old_lf.trim_end_matches('\n').split('\n').map(String::from).collect();
             let new_lines: Vec<String> = new_lf.trim_end_matches('\n').split('\n').map(String::from).collect();
@@ -229,13 +244,13 @@ pub fn replace_rules(ws: &Path, rules: &[(String, String, bool)], opts: &Replace
                         Some(s) => new_lines.iter().map(|l| apply_shift(l, s)).collect(),
                         None => new_lines,
                     };
-                    let mut d = Doc::parse(&text);
+                    let mut d = Doc::parse(text);
                     d.lines.splice(at..at + old_lines.len(), shifted);
                     let line_str = doc.lines[at].as_str();
                     preview.push(format!("  {rel}:{}#{}| {}", at + 1, line_hash(line_str), line_str.trim()));
                     loose = true;
                     count = 1;
-                    cur = d.to_text();
+                    cur = std::borrow::Cow::Owned(d.to_text());
                 }
                 _ => {
                     miss_hint = closest_hint(&doc, &old_lines);
@@ -243,12 +258,13 @@ pub fn replace_rules(ws: &Path, rules: &[(String, String, bool)], opts: &Replace
                 }
             }
         }
-        let replaced = cur;
+        let replaced = cur.into_owned();
         let preview_lines = preview;
 
         if replaced == text {
             continue;
         }
+        let doc = Doc::parse(text);
         let new_doc = Doc::parse(&replaced);
         let mut anchors = Vec::new();
         for (i, line) in new_doc.lines.iter().enumerate() {
@@ -260,7 +276,7 @@ pub fn replace_rules(ws: &Path, rules: &[(String, String, bool)], opts: &Replace
             }
         }
         let lang = lang_for(&rel);
-        let before_errs = syntax_errors(lang, &text);
+        let before_errs = syntax_errors(lang, text);
         let mut syntax_note = None;
         if let (Some(before), Some(after)) = (before_errs, syntax_errors(lang, &replaced)) {
             if after.len() > before.len() {

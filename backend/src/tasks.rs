@@ -13,6 +13,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
+/// Compile a static regex once per process (these helpers run per directory, per request).
+macro_rules! lazy_re {
+    ($p:expr) => {{
+        static R: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+        R.get_or_init(|| Regex::new($p).unwrap())
+    }};
+}
+
 const MAX_DIRS: usize = 300;
 const MAX_DEPTH: usize = 2;
 const MAX_PER_SOURCE: usize = 25;
@@ -330,7 +338,7 @@ fn extract_deno(dir: &Dir, out: &mut Vec<TaskItem>) {
 
 /// Keys declared under a TOML `[header]` section (flat key = value lines only).
 fn toml_section_keys(raw: &str, header: &str) -> Vec<String> {
-    let key_re = Regex::new(r#"^\s*([A-Za-z0-9_.-]+|"[^"]+")\s*="#).unwrap();
+    let key_re = lazy_re!(r#"^\s*([A-Za-z0-9_.-]+|"[^"]+")\s*="#);
     let mut inside = false;
     let mut keys = Vec::new();
     for line in raw.lines() {
@@ -388,7 +396,7 @@ fn extract_cargo(dir: &Dir, out: &mut Vec<TaskItem>) {
     if has_package {
         let pkg_name = toml_string_in_section(&raw, "package", "name");
         let mut in_bin = false;
-        let name_re = Regex::new(r#"^\s*name\s*=\s*"([^"]*)""#).unwrap();
+        let name_re = lazy_re!(r#"^\s*name\s*=\s*"([^"]*)""#);
         for line in raw.lines() {
             let t = line.trim();
             if t.starts_with('[') {
@@ -563,8 +571,8 @@ fn extract_go(dir: &Dir, out: &mut Vec<TaskItem>) {
 
 fn extract_make_like(dir: &Dir, out: &mut Vec<TaskItem>) {
     let label = dir.label("make");
-    let name_re_make = Regex::new(r"(?m)^([A-Za-z0-9][A-Za-z0-9_-]*)\s*:([^=]|$)").unwrap();
-    let name_re_just = Regex::new(r"(?m)^([A-Za-z_][A-Za-z0-9_-]*)\s*:([^=]|$)").unwrap();
+    let name_re_make = lazy_re!(r"(?m)^([A-Za-z0-9][A-Za-z0-9_-]*)\s*:([^=]|$)");
+    let name_re_just = lazy_re!(r"(?m)^([A-Za-z_][A-Za-z0-9_-]*)\s*:([^=]|$)");
     for (file, tool, re) in [
         ("Makefile", "make", &name_re_make),
         ("makefile", "make", &name_re_make),
@@ -594,7 +602,7 @@ fn extract_make_like(dir: &Dir, out: &mut Vec<TaskItem>) {
     }
     for file in ["Taskfile.yml", "Taskfile.yaml"] {
         if let Some(raw) = read(&dir.abs.join(file)) {
-            let key_re = Regex::new(r"^  ([A-Za-z0-9_:-]+):").unwrap();
+            let key_re = lazy_re!(r"^  ([A-Za-z0-9_:-]+):");
             let mut inside = false;
             let mut count = 0;
             for line in raw.lines() {
@@ -665,7 +673,7 @@ fn extract_launchers(ws: &Path, dir: &Dir, out: &mut Vec<TaskItem>) {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
-    let re = Regex::new(r"^(run|dev|start|serve|launch|build-and-run)([-_.][\w.-]*)?\.(ps1|sh|bat|cmd)$").unwrap();
+    let re = lazy_re!(r"^(run|dev|start|serve|launch|build-and-run)([-_.][\w.-]*)?\.(ps1|sh|bat|cmd)$");
     let Ok(rd) = std::fs::read_dir(&dir.abs) else {
         return;
     };
@@ -737,7 +745,7 @@ fn strip_jsonc(src: &str) -> String {
         }
         i += 1;
     }
-    Regex::new(r",(\s*[}\]])").unwrap().replace_all(&out, "$1").into_owned()
+    lazy_re!(r",(\s*[}\]])").replace_all(&out, "$1").into_owned()
 }
 
 fn extract_vscode(ws: &Path, out: &mut Vec<TaskItem>) {
@@ -750,7 +758,7 @@ fn extract_vscode(ws: &Path, out: &mut Vec<TaskItem>) {
     let Some(tasks) = json.get("tasks").and_then(|t| t.as_array()) else {
         return;
     };
-    let skip_re = Regex::new(r"\$\{(input|command|config|env):").unwrap();
+    let skip_re = lazy_re!(r"\$\{(input|command|config|env):");
     for t in tasks.iter().take(MAX_PER_SOURCE) {
         let (Some(label), Some(cmd)) = (
             t.get("label").and_then(|v| v.as_str()),
@@ -1146,6 +1154,31 @@ mod tests {
         assert_eq!(a.cwd, "sub");
         let b = res.tasks.iter().find(|t| t.id == "custom:b").unwrap();
         assert_eq!(b.depends_on, vec!["custom:a".to_string()]);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn bench_discover() {
+        let ws = std::env::temp_dir().join(format!("vireo-bench-tasks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        for i in 0..250 {
+            let d = ws.join(format!("pkg/p{i}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("Cargo.toml"), "[package]\nname = \"p\"\n[[bin]]\nname = \"b\"\n").unwrap();
+        }
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            std::hint::black_box(discover(&ws));
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("BENCH tasks::discover(250 dirs) {best:.2} ms");
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

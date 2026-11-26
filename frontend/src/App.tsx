@@ -1176,10 +1176,15 @@ export function App() {
           const base = reviewRef.current[path] ?? (trusted ? prev : null);
           let total: { adds: number; dels: number } | null = null;
           if (base !== null) {
-            total = { adds: 0, dels: 0 };
-            for (const part of diffLines(lf(base), lf(cur))) {
-              if (part.added) total.adds += part.count ?? 0;
-              else if (part.removed) total.dels += part.count ?? 0;
+            if (base === prev) {
+              // First edit of the file: same diff as above, don't run Myers over it twice.
+              total = { adds, dels };
+            } else {
+              total = { adds: 0, dels: 0 };
+              for (const part of diffLines(lf(base), lf(cur))) {
+                if (part.added) total.adds += part.count ?? 0;
+                else if (part.removed) total.dels += part.count ?? 0;
+              }
             }
           }
           results.push({ path, adds, dels, ranges, anchor, textLf: curLf, baseline: trusted ? eolMatched : null, total });

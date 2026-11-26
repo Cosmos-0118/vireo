@@ -29,6 +29,7 @@ import { FileIcon } from '../FileIcon';
 import { MarkdownMessage } from '../MarkdownView';
 import { activityTitle } from './ActivityFeed';
 import { ReviewDialog } from './ReviewDialog';
+import { visibleInterval } from '../../utils/visibleInterval';
 import { CheckList, Panel, Spinner, TONE, Toggle, btnGhost, btnPrimary, btnQuiet, isLock, splitPath, tint } from './ui';
 
 interface ReleasePageProps {
@@ -225,11 +226,11 @@ export const ReleasePage: React.FC<ReleasePageProps> = ({
   useEffect(() => {
     if (!active) return;
     void pollActivity();
-    const t = setInterval(() => {
+    // Pauses while the window is hidden/minimized.
+    return visibleInterval(() => {
       void pollActivity();
       setNow((n) => n + 1);
     }, POLL_MS);
-    return () => clearInterval(t);
   }, [active, pollActivity]);
 
   // ---- Actions ----------------------------------------------------------------------------

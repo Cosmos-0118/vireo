@@ -249,11 +249,21 @@ fn scan_file(
         return Some((found, None, 0));
     }
     edits.sort_by_key(|e| e.position);
-    let mut bytes = src.as_bytes().to_vec();
+    // Single forward pass over the sorted, non-overlapping edits: O(S + E), not a memmove of the
+    // file tail per edit.
+    let src_bytes = src.as_bytes();
     let n = edits.len();
-    for e in edits.into_iter().rev() {
-        bytes.splice(e.position..e.position + e.deleted_length, e.inserted_text);
+    let mut bytes = Vec::with_capacity(src_bytes.len() + src_bytes.len() / 8);
+    let mut last = 0usize;
+    for e in edits {
+        if e.position < last || e.position + e.deleted_length > src_bytes.len() {
+            continue; // overlapping edit (ast-grep never emits these)
+        }
+        bytes.extend_from_slice(&src_bytes[last..e.position]);
+        bytes.extend_from_slice(&e.inserted_text);
+        last = e.position + e.deleted_length;
     }
+    bytes.extend_from_slice(&src_bytes[last..]);
     let mut new_src = String::from_utf8(bytes).ok()?;
     if src.contains("\r\n") {
         // Keep CRLF files CRLF: rewrites are templated with bare `\n`.

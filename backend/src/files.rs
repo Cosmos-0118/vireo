@@ -459,13 +459,70 @@ fn split_globs(raw: &str) -> Vec<String> {
         .collect()
 }
 
-/// Converts a byte offset within `text` into UTF-16 code units.
 fn utf16_offset(text: &str, byte_idx: usize) -> usize {
     let idx = byte_idx.min(text.len());
     text.char_indices()
         .take_while(|(i, _)| *i < idx)
         .map(|(_, c)| c.len_utf16())
         .sum()
+}
+
+/// Subset of rg's `--json` message we read (unknown fields are ignored).
+#[derive(Deserialize)]
+struct RgMsg {
+    #[serde(rename = "type")]
+    kind: String,
+    data: Option<RgData>,
+}
+#[derive(Deserialize)]
+struct RgData {
+    path: Option<RgText>,
+    lines: Option<RgText>,
+    line_number: Option<u64>,
+    submatches: Option<Vec<RgSub>>,
+}
+#[derive(Deserialize)]
+struct RgText {
+    text: Option<String>,
+}
+#[derive(Deserialize)]
+struct RgSub {
+    start: u64,
+    end: u64,
+}
+
+/// `cap_units`: once a submatch starts at or past this many UTF-16 units (the displayed text is
+/// truncated there) later ones are dropped without walking further, so a huge minified line costs
+/// O(min(L, cap)) for the tail. The first submatch is always kept (it supplies the column).
+fn utf16_ranges(full: &str, subs: &[(usize, usize)], cap_units: usize) -> Vec<(usize, usize)> {
+    // One forward cursor over `full` (rg reports submatches in order), so the whole line is
+    // walked once: O(L + K) instead of O(K * L). Out-of-order offsets rewind the cursor.
+    let (mut bpos, mut upos, mut last_start) = (0usize, 0usize, 0usize);
+    let mut at = |byte_idx: usize| -> usize {
+        let idx = byte_idx.min(full.len());
+        if bpos > 0 && idx <= last_start {
+            (bpos, upos, last_start) = (0, 0, 0);
+        }
+        // Counts chars that start before `idx` (a mid-char `idx` includes that char).
+        while bpos < idx {
+            let Some(c) = full[bpos..].chars().next() else { break };
+            last_start = bpos;
+            upos += c.len_utf16();
+            bpos += c.len_utf8();
+        }
+        upos
+    };
+    // Sorted input (what rg emits): everything after a past-the-cap start starts later still.
+    let sorted = subs.windows(2).all(|w| w[0].0 <= w[1].0);
+    let mut out = Vec::with_capacity(subs.len().min(64));
+    for &(s, e) in subs {
+        let start = at(s);
+        if sorted && !out.is_empty() && start >= cap_units {
+            break;
+        }
+        out.push((start, at(e)));
+    }
+    out
 }
 
 fn truncate_utf16(text: &str, max_units: usize) -> String {
@@ -573,12 +630,104 @@ pub async fn search_files(
         }
     }
 
-    let rg_out = cmd.current_dir(&ws).output().await;
+    cmd.current_dir(&ws)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
 
-    if let Ok(output) = rg_out {
+    if let Ok(mut child) = cmd.spawn() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+        // Drain stderr concurrently so a chatty rg can never block on a full pipe.
+        let stderr_task = child.stderr.take().map(|mut s| {
+            tokio::spawn(async move {
+                let mut b = Vec::new();
+                let _ = s.read_to_end(&mut b).await;
+                b
+            })
+        });
+
+        let mut matches: Vec<SearchMatch> = Vec::new();
+        let mut truncated = false;
+        let mut killed = false;
+        let mut saw_output = false;
+        let mut per_file: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        // Stream rg's JSON and stop it as soon as the result cap is hit, instead of letting it
+        // scan the whole repo and buffering every match in memory.
+        if let Some(out) = child.stdout.take() {
+            let mut reader = tokio::io::BufReader::with_capacity(64 * 1024, out);
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+                saw_output = true;
+                let Ok(msg) = serde_json::from_slice::<RgMsg>(&buf) else {
+                    continue;
+                };
+                if msg.kind != "match" {
+                    continue;
+                }
+                let Some(data) = msg.data else { continue };
+                let Some(raw_text) = data.lines.and_then(|l| l.text) else {
+                    continue; // non-UTF8 line
+                };
+                if matches.len() >= SEARCH_MAX_TOTAL {
+                    truncated = true;
+                    killed = true;
+                    break;
+                }
+                let path = data
+                    .path
+                    .and_then(|p| p.text)
+                    .unwrap_or_default()
+                    .trim_start_matches("./")
+                    .replace('\\', "/");
+                let line_num = data.line_number.unwrap_or(1) as usize;
+                let full = raw_text.trim_end_matches(['\r', '\n']);
+                let raw: Vec<(usize, usize)> = data
+                    .submatches
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|m| (m.start as usize, m.end as usize))
+                    .collect();
+                let mut ranges = utf16_ranges(full, &raw, SEARCH_MAX_TEXT_UNITS);
+                let column = ranges.first().map(|r| r.0).unwrap_or(0) + 1;
+                let text = truncate_utf16(full, SEARCH_MAX_TEXT_UNITS);
+                let text_units: usize = text.chars().map(|c| c.len_utf16()).sum();
+                ranges.retain(|r| r.0 < text_units);
+                for r in ranges.iter_mut() {
+                    r.1 = r.1.min(text_units);
+                }
+                let count = per_file.entry(path.clone()).or_insert(0);
+                *count += 1;
+                if *count >= SEARCH_MAX_PER_FILE {
+                    truncated = true;
+                }
+                matches.push(SearchMatch {
+                    path,
+                    line: line_num,
+                    column,
+                    text,
+                    ranges,
+                });
+            }
+        }
+        if killed {
+            let _ = child.kill().await;
+        }
+        let status = child.wait().await.ok();
+        let stderr_bytes = match stderr_task {
+            Some(t) => t.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+
         // rg exits 0 on matches, 1 on none, 2 on error (it may still emit partial results).
-        if output.status.code() == Some(2) && output.stdout.is_empty() {
-            let err = String::from_utf8_lossy(&output.stderr);
+        if !killed && status.and_then(|s| s.code()) == Some(2) && !saw_output {
+            let err = String::from_utf8_lossy(&stderr_bytes);
             let detail = err
                 .lines()
                 .map(str::trim)
@@ -598,65 +747,6 @@ pub async fn search_files(
             return Err((StatusCode::BAD_REQUEST, msg));
         }
 
-        let mut matches: Vec<SearchMatch> = Vec::new();
-        let mut truncated = false;
-        let mut per_file: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let Ok(val) = serde_json::from_str::<serde_json::Value>(line) else {
-                continue;
-            };
-            if val.get("type").and_then(|t| t.as_str()) != Some("match") {
-                continue;
-            }
-            let data = &val["data"];
-            let Some(raw_text) = data["lines"]["text"].as_str() else {
-                continue; // non-UTF8 line
-            };
-            if matches.len() >= SEARCH_MAX_TOTAL {
-                truncated = true;
-                break;
-            }
-            let path = data["path"]["text"]
-                .as_str()
-                .unwrap_or("")
-                .trim_start_matches("./")
-                .replace('\\', "/");
-            let line_num = data["line_number"].as_u64().unwrap_or(1) as usize;
-            let full = raw_text.trim_end_matches(['\r', '\n']);
-            let mut ranges: Vec<(usize, usize)> = data["submatches"]
-                .as_array()
-                .map(|subs| {
-                    subs.iter()
-                        .filter_map(|m| {
-                            let s = m["start"].as_u64()? as usize;
-                            let e = m["end"].as_u64()? as usize;
-                            Some((utf16_offset(full, s), utf16_offset(full, e)))
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            let column = ranges.first().map(|r| r.0).unwrap_or(0) + 1;
-            let text = truncate_utf16(full, SEARCH_MAX_TEXT_UNITS);
-            let text_units: usize = text.chars().map(|c| c.len_utf16()).sum();
-            ranges.retain(|r| r.0 < text_units);
-            for r in ranges.iter_mut() {
-                r.1 = r.1.min(text_units);
-            }
-            let count = per_file.entry(path.clone()).or_insert(0);
-            *count += 1;
-            if *count >= SEARCH_MAX_PER_FILE {
-                truncated = true;
-            }
-            matches.push(SearchMatch {
-                path,
-                line: line_num,
-                column,
-                text,
-                ranges,
-            });
-        }
         // rg searches in parallel; keep file order stable (line order is preserved per file).
         matches.sort_by(|a, b| a.path.cmp(&b.path));
         let total_files = per_file.len();
@@ -706,15 +796,8 @@ pub async fn search_files(
                 .unwrap_or_default();
             let mut in_file = 0;
             for (idx, line_str) in content.lines().enumerate() {
-                let ranges: Vec<(usize, usize)> = matcher
-                    .find_iter(line_str)
-                    .map(|m| {
-                        (
-                            utf16_offset(line_str, m.start()),
-                            utf16_offset(line_str, m.end()),
-                        )
-                    })
-                    .collect();
+                let raw: Vec<(usize, usize)> = matcher.find_iter(line_str).map(|m| (m.start(), m.end())).collect();
+                let ranges = utf16_ranges(line_str, &raw, SEARCH_MAX_TEXT_UNITS);
                 if ranges.is_empty() {
                     continue;
                 }
@@ -832,4 +915,53 @@ pub async fn replace_in_files(
         replacements,
         skipped,
     }))
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+
+    #[test]
+    fn utf16_ranges_match_reference() {
+        let line = "aé😀b😀😀cd é x😀y;";
+        let n = line.len();
+        let mut subs = Vec::new();
+        for s in 0..=n {
+            for e in s..=n.min(s + 9) {
+                subs.push((s, e));
+            }
+        }
+        // Sorted, reversed and shuffled orders must all agree with the per-offset reference.
+        let mut shuffled = subs.clone();
+        shuffled.sort_by_key(|&(s, e)| (s * 7 + e * 13) % 31);
+        let mut reversed = subs.clone();
+        reversed.reverse();
+        for set in [&subs, &reversed, &shuffled] {
+            let want: Vec<_> = set.iter().map(|&(s, e)| (utf16_offset(line, s), utf16_offset(line, e))).collect();
+            assert_eq!(utf16_ranges(line, set, usize::MAX), want);
+        }
+        assert_eq!(utf16_ranges(line, &[(0, 0), (n + 50, n + 99)], usize::MAX), vec![(0, 0), (utf16_offset(line, n), utf16_offset(line, n))]);
+        // Cap: sorted submatches past it are dropped, the first one is always kept.
+        let sorted: Vec<_> = (0..n.saturating_sub(2)).step_by(3).map(|s| (s, s + 1)).filter(|&(s, e)| line.is_char_boundary(s) && line.is_char_boundary(e)).collect();
+        let capped = utf16_ranges(line, &sorted, 8);
+        assert!(capped.iter().skip(1).all(|r| r.0 < 8 + 2));
+        assert_eq!(capped.first(), sorted.first().map(|&(s, e)| (utf16_offset(line, s), utf16_offset(line, e))).as_ref());
+        let far = utf16_ranges(line, &[(n - 1, n)], 0);
+        assert_eq!(far.len(), 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn bench_utf16_ranges() {
+        // Minified-JS-like line: 200 KB with a match every 8 bytes, some multi-byte chars.
+        let line: String = (0..25_000).map(|i| if i % 50 == 0 { "é=ab;" } else { "a=b;;" }).collect::<String>().repeat(1);
+        let subs: Vec<(usize, usize)> = (0..line.len() / 8).map(|i| (i * 8, i * 8 + 2)).filter(|(_, e)| line.is_char_boundary(*e) && line.is_char_boundary(*e - 2)).collect();
+        let mut best = f64::MAX;
+        for _ in 0..3 {
+            let t = std::time::Instant::now();
+            std::hint::black_box(utf16_ranges(&line, &subs, usize::MAX));
+            best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        println!("BENCH utf16_ranges({} bytes line, {} submatches) {best:.2} ms", line.len(), subs.len());
+    }
 }

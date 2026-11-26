@@ -42,8 +42,8 @@ fn fold_punct(s: &str) -> String {
 
 /// Last-resort line equality: folded punctuation, and a `?` in the pattern may stand for one
 /// non-ASCII character (Windows PowerShell 5.1 pipes text to native programs as ASCII).
-fn fuzzy_eq(file: &str, pat: &str, wild: &mut bool) -> bool {
-    if fold_punct(file) == fold_punct(pat) {
+fn fuzzy_eq(file: &str, pat: &str, file_fold: &str, pat_fold: &str, wild: &mut bool) -> bool {
+    if file_fold == pat_fold {
         return true;
     }
     let (f, p) = (file.trim(), pat.trim());
@@ -83,6 +83,12 @@ pub(crate) fn seek_lines(
     let last = lines.len() - pat.len();
     let levels = [MatchLevel::Exact, MatchLevel::Rstrip, MatchLevel::Trim, MatchLevel::Fuzzy];
     for level in levels {
+        // Fold punctuation once per line / pattern line, not once per (line, pattern) comparison.
+        let (lines_fold, pat_fold): (Vec<String>, Vec<String>) = if level == MatchLevel::Fuzzy {
+            (lines.iter().map(|l| fold_punct(l)).collect(), pat.iter().map(|p| fold_punct(p)).collect())
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let at = |i: usize| -> Option<bool> {
             let mut wild = false;
             pat.iter()
@@ -93,7 +99,7 @@ pub(crate) fn seek_lines(
                         MatchLevel::Exact => a == p,
                         MatchLevel::Rstrip => a.trim_end() == p.trim_end(),
                         MatchLevel::Trim => a.trim() == p.trim(),
-                        MatchLevel::Fuzzy => fuzzy_eq(a, p, &mut wild),
+                        MatchLevel::Fuzzy => fuzzy_eq(a, p, &lines_fold[i + k], &pat_fold[k], &mut wild),
                     }
                 })
                 .then_some(wild)
@@ -170,12 +176,28 @@ pub(crate) fn closest_hint(doc: &Doc, old: &[String]) -> String {
     }
     let (mut best_i, mut best_score) = (0usize, 0usize);
     let win = old.len().max(1);
-    for i in 0..doc.lines.len() {
-        let end = (i + win).min(doc.lines.len());
-        let score = wanted
-            .iter()
-            .filter(|w| doc.lines[i..end].iter().any(|dl| dl.trim() == **w || dl.contains(**w)))
-            .count();
+    let n = doc.lines.len();
+    // `score[i]` = wanted lines found in `lines[i..i+win]`. One scan per wanted line marks the
+    // window starts that cover one of its hits (difference array): O(N*W) instead of O(N*W^2).
+    let mut diff = vec![0i32; n + 1];
+    for w in &wanted {
+        let mut covered = 0usize; // window starts below this are already counted for `w`
+        for (j, dl) in doc.lines.iter().enumerate() {
+            if !dl.contains(*w) {
+                continue;
+            }
+            let lo = (j + 1).saturating_sub(win).max(covered);
+            if lo <= j {
+                diff[lo] += 1;
+                diff[j + 1] -= 1;
+                covered = j + 1;
+            }
+        }
+    }
+    let mut run = 0i32;
+    for i in 0..n {
+        run += diff[i];
+        let score = run as usize;
         if score > best_score {
             best_score = score;
             best_i = i;
@@ -230,7 +252,6 @@ fn plan_update(
         }
     };
     let lang = lang_for(&rel);
-    let before_errs = syntax_errors(lang, &doc.to_text());
     let mut edits: Vec<(usize, usize, Vec<String>, usize)> = Vec::new();
     let mut notes: Vec<String> = resolved.into_iter().collect();
     let mut cursor = 0usize;
@@ -532,7 +553,9 @@ fn plan_update(
             }
         }
     }
-    if let (Some(before), Some(after)) = (before_errs, syntax_errors(lang_for(&target_rel), &text)) {
+    // Parse the original only now: failed hunks bail out above without paying for two parses.
+    let after_errs = syntax_errors(lang_for(&target_rel), &text);
+    if let (Some(before), Some(after)) = (after_errs.as_ref().and_then(|_| syntax_errors(lang, &doc.to_text())), after_errs) {
         if after.len() > before.len() {
             if let Some((row, m)) = after
                 .iter()

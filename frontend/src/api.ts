@@ -514,6 +514,7 @@ export async function streamAgentChat(
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let scanFrom = 0; // `\n\n` cannot start before this: never rescan the unterminated tail
   const currentEvent = 'message';
   let doneCalled = false;
   const emitDone = () => {
@@ -528,8 +529,14 @@ export async function streamAgentChat(
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
 
-    const parts = buffer.split('\n\n');
-    buffer = parts.pop() || '';
+    const parts: string[] = [];
+    let start = 0;
+    for (let idx = buffer.indexOf('\n\n', scanFrom); idx !== -1; idx = buffer.indexOf('\n\n', start)) {
+      parts.push(buffer.slice(start, idx));
+      start = idx + 2;
+    }
+    buffer = buffer.slice(start);
+    scanFrom = Math.max(0, buffer.length - 1); // a split `\n` | `\n` can straddle chunks
 
     for (const block of parts) {
       let evName = currentEvent;
