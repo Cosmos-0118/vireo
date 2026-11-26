@@ -9,14 +9,15 @@ use super::code_intel;
 
 /// Sent in the MCP `initialize` reply: exact argument shapes, so a host that lazy-loads tool
 /// schemas needs no extra round trip to learn them.
-const MCP_INSTRUCTIONS: &str = r##"vx tool arguments (JSON). Anchors `N#hh` come from view/search/edit output; edits return fresh ones, so never re-view after editing.
+const MCP_INSTRUCTIONS: &str = r##"vx tool arguments (JSON). Anchors `N#hh` come from view/search/edit output; edits return fresh ones, so never re-view after editing. Anchors elsewhere in the file auto-relocate when earlier edits shift lines, so keep using them. A plain line number (`57`, `57..60`) works wherever an anchor does (it must be current); `57|let x` also checks the line's text.
 - map {query?, dir?} · search {query, path?, glob?, literal?, ignore_case?, context?, files_only?}
 - view {path, target?: "10..50" | "10..30,80..100" | "Symbol", outline?: true} or {specs: ["a.rs:10..50", "b.rs:Foo"], outline?: true}
 Edit, pick one:
-- by anchor: edit {path, start: "12#ab..15#cd" | "top" | "bottom" | "imports", new_text, op?: replace|insert_after|insert_before|delete}
-- by exact text (no view): edit {path, old_text, new_text}
-- by symbol (no view): edit {path, symbol: "Foo::bar", new_text, op?: replace|insert_after|insert_before|delete}
-- many at once: edit {edits: [{path?, start | old_text | symbol, new_text?, op?}]} (any mix, any files, atomic) · replace {rules: [{old, new, regex?}], path?, glob?} · apply {patch}
+- by anchor: edit {path, at: "12#ab..15#cd" | "12..15" | "delete 12" | "after 12#ab" | "before 12" | "top" | "bottom" | "imports", new_text} (`at` = `start`; the inline word replaces `op`, which still works: replace|insert_after|insert_before|delete)
+- by exact text (no view): edit {path, old_text, new_text}: old_text may be part of a line; add `at` (a range) or `symbol` to search only there
+- by symbol (no view): edit {path, at: "symbol Foo::bar" | "after symbol Foo" | "delete symbol Foo", new_text}, or {path, symbol, new_text, op?}; a replace keeps the doc comment/attributes above it unless new_text starts with its own
+- many at once: edit {path?, edits: [{at | old_text | symbol, new_text?, path?}]} (any mix, any files, atomic; every entry refers to the file as it is now) · replace {rules: [{old, new, regex?}], path?, glob?} · apply {patch}
+- hunks only: edit {path, patch: "@@ delete 57\n@@ 60..62\nnew code, no + prefixes needed"}
 - replace {old, new, path?, glob?, regex?, expected?, dry_run?}: literal by default; regex replacement uses $1 / ${1}
 - apply {patch: "*** Update File: a.rs\n@@ 12#ab..15#cd\n+new line"}; other hunks: @@ symbol Foo::bar (+lines replace it) · @@ after symbol Foo · @@ delete symbol Foo · @@ top|bottom|after imports
 - check {cmd?, dir?, warnings?}: a build still running after 60s returns a job id; call check {job} to wait.
@@ -114,12 +115,22 @@ pub fn mcp_tools(read_only: bool) -> Value {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "start": { "type": "string", "description": "Anchor `12#ab`, a whole range `12#ab..15#cd` (as printed by view/outline), or `top` / `bottom` / `imports` to insert new_text there without viewing first (`imports` skips lines already present)" },
+                        "at": { "type": "string", "description": "Where to edit (alias of `start`): anchor `12#ab`, range `12#ab..15#cd` or plain lines `12..15`, `12|text` (checks the line holds `text`), with an optional leading word: `delete 12`, `after 12#ab`, `before 12`; `symbol Foo::bar` / `after symbol Foo` / `delete symbol Foo`; or `top` / `bottom` / `imports`" },
+                        "start": { "type": "string", "description": "Same as `at`: anchor `12#ab`, a whole range `12#ab..15#cd` (as printed by view/outline), or `top` / `bottom` / `imports` to insert new_text there without viewing first (`imports` skips lines already present)" },
+                        "patch": { "type": "string", "description": "Hunks only (no `*** Update File:` needed): `@@ 12..15` / `@@ delete 12` / `@@ after 12#ab` / `@@ symbol Foo` followed by the new code; `+` prefixes are optional when no line has one" },
                         "end": { "type": "string", "description": "Optional end anchor when `start` is a single anchor" },
                         "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"], "description": "Default replace (needs new_text); use delete to remove lines" },
                         "new_text": { "type": "string", "description": "Replacement / inserted text" },
-                        "old_text": { "type": "string", "description": "No anchors yet (e.g. you read the file another way)? Pass the exact text to replace instead of `start`; it must occur once. Returns fresh N#hash anchors for follow-up edits" },
-                        "edits": { "type": "array", "description": "Several edits in ONE atomic call; anchors refer to the files as they are now. Each: {path?, start?, end?, op?, new_text?} or {path?, old_text, new_text} or {path?, symbol, op?, new_text?}; a per-edit `path` makes one call span files (the top-level `path` is the default)", "items": { "type": "object" } },
+                        "old_text": { "type": "string", "description": "No anchors yet (e.g. you read the file another way)? Pass the exact text to replace instead of `at`; it must occur once (any part of a line is fine). With `at` (a range) or `symbol` it is searched only there. Returns fresh N#hash anchors for follow-up edits" },
+                        "edits": { "type": "array", "description": "Several edits in ONE atomic call; every entry refers to the files as they are now. Each entry: {at | old_text | symbol, new_text?} (plus optional path, op, end); a per-edit `path` makes one call span files (the top-level `path` is the default)", "items": { "type": "object", "properties": {
+                            "path": { "type": "string", "description": "File for this entry (default: the top-level path)" },
+                            "at": { "type": "string", "description": "Anchor `12#ab`, range `12#ab..15#cd` or `12..15`, optionally with a leading `delete` / `after` / `before`; `symbol Foo`; or `top` / `bottom` / `imports`" },
+                            "old_text": { "type": "string", "description": "Exact text to replace instead of `at` (may be part of a line; must occur once, or scope it with `at` / `symbol`)" },
+                            "symbol": { "type": "string", "description": "Edit this whole symbol (or, with old_text, only search inside it)" },
+                            "new_text": { "type": "string", "description": "Replacement / inserted text; omit with a delete" },
+                            "op": { "type": "string", "enum": ["replace", "insert_after", "insert_before", "delete"] },
+                            "end": { "type": "string" }
+                        } } },
                         "symbol": { "type": "string", "description": "Instead of anchors: edit a whole symbol by name (op replace / insert_after / delete)" }
                     },
                     "required": []

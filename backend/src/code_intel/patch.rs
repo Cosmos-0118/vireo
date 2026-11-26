@@ -21,9 +21,10 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use super::doc::{locate, parse_anchor_in_doc, read_doc, splice, syntax_note, Doc};
+use super::doc::{fill_plain, parse_anchor_in_doc, read_doc, splice, syntax_note, Doc};
+use super::journal::{self, locate_at, Splice};
 use super::patch_parse::{parse_patch, AnchorKind, Edge, FileOp, Hunk};
-use super::symbols::{find_symbol, import_end_row, lang_for, symbols, syntax_errors};
+use super::symbols::{find_symbol, import_end_row, keep_leading_docs, lang_for, symbols, syntax_errors};
 use super::util::{rel_of, resolve_existing, resolve_new_file};
 
 /// Fold typographic punctuation to ASCII (what models often type instead of the file's text).
@@ -138,10 +139,39 @@ fn leading_ws(s: &str) -> &str {
     &s[..n]
 }
 
+#[derive(Clone, PartialEq)]
 pub(crate) enum Shift {
     Add(String),
     Drop(String),
     Replace(String, String),
+    /// Only the first written line gets this indentation (the old text was copied from mid-line).
+    FirstLine(String),
+}
+
+/// The indentation fix for a hunk matched while ignoring indentation, or `None` when the lines
+/// already agree or the shift is not uniform. `old` is often copied from mid-line, so its first line
+/// lacks the leading whitespace the rest of it has: when only that line disagrees, trust the others
+/// (re-indenting every line by its offset would double the indentation).
+pub(crate) fn consistent_shift(old: &[String], file: &[String]) -> Option<Shift> {
+    let shifts: Vec<Option<Shift>> = old
+        .iter()
+        .zip(file)
+        .filter(|(o, _)| !o.trim().is_empty())
+        .map(|(o, f)| indent_shift(o, f))
+        .collect();
+    let uniform = |s: &[Option<Shift>]| s.windows(2).all(|w| w[0] == w[1]);
+    match shifts.len() {
+        0 => None,
+        _ if uniform(&shifts) => shifts.into_iter().next().flatten(),
+        n if n >= 2 && matches!(shifts[0], Some(Shift::Add(_))) && uniform(&shifts[1..]) => {
+            let rest = shifts[1].clone();
+            match (shifts.into_iter().next().flatten(), rest) {
+                (Some(Shift::Add(first)), None) => Some(Shift::FirstLine(first)),
+                (_, rest) => rest,
+            }
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn indent_shift(old_first: &str, file_first: &str) -> Option<Shift> {
@@ -158,11 +188,13 @@ pub(crate) fn indent_shift(old_first: &str, file_first: &str) -> Option<Shift> {
     }
 }
 
-pub(crate) fn apply_shift(l: &str, s: &Shift) -> String {
+pub(crate) fn apply_shift(l: &str, s: &Shift, first_done: &mut bool) -> String {
     if l.trim().is_empty() {
         return l.to_string();
     }
     match s {
+        Shift::FirstLine(e) if !std::mem::replace(first_done, true) => format!("{e}{l}"),
+        Shift::FirstLine(_) => l.to_string(),
         Shift::Add(e) => format!("{e}{l}"),
         Shift::Drop(d) => l.strip_prefix(d.as_str()).unwrap_or(l).to_string(),
         Shift::Replace(a, b) => l.strip_prefix(a.as_str()).map(|r| format!("{b}{r}")).unwrap_or_else(|| l.to_string()),
@@ -219,6 +251,8 @@ struct PlannedFile {
     remove_after: Option<PathBuf>,
     summary: String,
     notes: Vec<String>,
+    /// Exact row changes of an update (original coordinates), for the edit journal.
+    splices: Option<Vec<Splice>>,
 }
 
 /// Which file an `Update`/`Delete` names: exact path first, else a unique workspace match (noted).
@@ -316,7 +350,17 @@ fn plan_update(
                 edits.push((row, 0, lines, hi));
             }
             Hunk::Anchored { kind, start, end, new, header } => {
-                let (r0, r1) = match locate(&doc, &rel, start, end) {
+                // Plain line numbers (`@@ 12..15`) take the hash of the live line.
+                let (start, end) = match (fill_plain(&doc, &rel, start, None), fill_plain(&doc, &rel, end, None)) {
+                    (Ok(s), Ok(e)) => (s, e),
+                    (Err(e), _) | (_, Err(e)) => {
+                        errors.push(format!("{}: {e}", tag(header)));
+                        failed = true;
+                        continue;
+                    }
+                };
+                let (start, end) = (&start, &end);
+                let (r0, r1) = match locate_at(&full, &doc, &rel, start, end) {
                     Ok(r) => r,
                     Err(e) => {
                         errors.push(format!("{}: {e}", tag(header)));
@@ -366,7 +410,13 @@ fn plan_update(
                         errors.push(format!("{}: no `+` lines. To remove the symbol say so: `@@ delete symbol {name}`", tag(header)));
                         failed = true;
                     }
-                    AnchorKind::Replace => edits.push((r0, r1 - r0 + 1, new.clone(), hi)),
+                    AnchorKind::Replace => {
+                        let k = keep_leading_docs(&doc.lines, r0, r1, new);
+                        if k > 0 {
+                            notes.push(format!("{}: kept {k} leading doc/attribute line(s) your new text did not restate", tag(header)));
+                        }
+                        edits.push((r0 + k, r1 - r0 + 1 - k, new.clone(), hi))
+                    }
                     AnchorKind::Delete => edits.push((r0, r1 - r0 + 1, Vec::new(), hi)),
                     AnchorKind::After | AnchorKind::Before if new.is_empty() => {
                         errors.push(format!("{}: nothing to insert (no `+` lines)", tag(header)));
@@ -432,16 +482,14 @@ fn plan_update(
                     Ok(Some((idx, level, wild))) => {
                         let pat = &old[..pat_len];
                         let shift = if matches!(level, MatchLevel::Trim | MatchLevel::Fuzzy) {
-                            pat.iter()
-                                .enumerate()
-                                .find(|(_, l)| !l.trim().is_empty())
-                                .and_then(|(k, l)| indent_shift(l, &doc.lines[idx + k]))
+                            consistent_shift(pat, &doc.lines[idx..idx + pat_len])
                         } else {
                             None
                         };
                         let mut new_lines: Vec<String> = Vec::new();
                         let mut oi = 0usize;
                         let mut reindented = false;
+                        let mut first_done = false;
                         for (k, l) in body {
                             match *k {
                                 b' ' => {
@@ -457,7 +505,7 @@ fn plan_update(
                                 }
                                 b'+' => {
                                     if let Some(ref sh) = shift {
-                                        let shifted = apply_shift(l, sh);
+                                        let shifted = apply_shift(l, sh, &mut first_done);
                                         if shifted != *l {
                                             reindented = true;
                                         }
@@ -584,6 +632,7 @@ fn plan_update(
         remove_after,
         summary,
         notes,
+        splices: Some(edits.iter().map(|(s, r, n, _)| (*s, *r, n.len())).collect()),
     })
 }
 
@@ -639,6 +688,7 @@ pub fn apply_patch(
                         new_text: Some(text),
                         remove_after: None,
                         notes,
+                        splices: None,
                     });
                 }
                 Err(e) => errors.push(format!("{path}: {e}")),
@@ -654,6 +704,7 @@ pub fn apply_patch(
                         new_text: None,
                         remove_after: None,
                         notes: resolved.into_iter().collect(),
+                        splices: None,
                     });
                 }
                 Err(e) => errors.push(format!("{path}: {e}")),
@@ -716,6 +767,15 @@ pub fn apply_patch(
                 return Err(format!("failed writing {} ({e}); rolled back all changes", p.rel));
             }
             done.push(p);
+        }
+        // Remember how rows moved, so anchors printed before this patch still resolve exactly.
+        for p in &plans {
+            match (&p.new_text, &p.original, &p.remove_after) {
+                (Some(new), Some(orig), None) => journal::record(&p.full, &String::from_utf8_lossy(orig), new, p.splices.clone()),
+                (Some(_), _, Some(old)) => journal::forget(old),
+                (None, _, _) => journal::forget(&p.full),
+                _ => {}
+            }
         }
     }
     let mut out = if dry_run {

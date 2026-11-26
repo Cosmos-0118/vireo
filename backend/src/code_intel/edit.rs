@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use super::patch::apply_patch;
-use super::doc::{line_hash, locate, parse_anchor_in_doc, read_doc_smart, splice, syntax_note, text_to_lines, Doc};
-use super::symbols::{lang_for, syntax_errors, Lang};
+use super::patch::{apply_patch, closest_hint, seek_lines};
+use super::doc::{line_hash, parse_anchor_in_doc, read_doc_smart, splice, syntax_note, text_to_lines, Doc};
+use super::symbols::{find_symbol, lang_for, symbols, syntax_errors, Lang};
 use super::util::{command, rel_of, resolve_existing, resolve_new_file, run_capture, with_note};
 
 pub(crate) fn finish_edit(
@@ -20,7 +20,12 @@ pub(crate) fn finish_edit(
     summary: String,
 ) -> Result<String, String> {
     let text = doc.to_text();
+    let old_text = std::fs::read_to_string(full).ok();
     std::fs::write(full, text.as_bytes()).map_err(|e| format!("cannot write {rel}: {e}"))?;
+    if let Some(old) = old_text {
+        // Remember how rows moved, so anchors printed before this edit still resolve exactly.
+        super::journal::record(full, &old, &text, None);
+    }
     let mut msg = summary;
     if let Some((a, b)) = new_range {
         msg.push_str(&if a == b {
@@ -102,7 +107,7 @@ fn hashline_edit_doc(
         Some(e) if !e.trim().is_empty() => parse_anchor_in_doc(&doc, &rel, e)?,
         _ => s.clone(),
     };
-    let (r0, r1) = locate(&doc, &rel, &s, &e)?;
+    let (r0, r1) = super::journal::locate_at(&full, &doc, &rel, &s, &e)?;
     let new_lines = text_to_lines(new_text);
     match op {
         "replace" | "" => {
@@ -365,14 +370,159 @@ fn ast_cli(
     Ok(rewrite_report(ws, &per_file, matches.len()))
 }
 
+/// Selector shorthand shared by `edit` and every entry of `edits`: `at` is an alias of `start`, and
+/// `start` may carry the op and target kind inline, the same words `apply` headers use:
+/// `delete 12#ab..15#cd`, `after 12`, `before 12#ab`, `symbol Foo::bar`, `delete symbol Foo`.
+/// An explicit `op` always wins. Parameter aliases (`file_path`, `new_string`, ...) are applied too.
+pub(crate) fn canon_edit(v: &Value) -> Value {
+    let mut map = match super::with_aliases("edit", v) {
+        Value::Object(m) => m,
+        other => return other,
+    };
+    let at = map.remove("at");
+    if map.get("start").map_or(true, Value::is_null) {
+        if let Some(a) = at.filter(|a| !a.is_null()) {
+            map.insert("start".into(), a);
+        }
+    }
+    let Some(sel) = map.get("start").and_then(Value::as_str).map(|s| s.trim().to_string()) else {
+        return Value::Object(map);
+    };
+    if super::patch_parse::parse_edge(&sel).is_some() {
+        return Value::Object(map);
+    }
+    let re = lazy_re!(r"^(?i:(delete|after|before|replace|insert_after|insert_before)\s+)?(?i:(symbol)\s+)?(\S.*)$");
+    if let Some(c) = re.captures(&sel) {
+        let kw = c.get(1).map(|m| m.as_str().to_ascii_lowercase());
+        let is_symbol = c.get(2).is_some();
+        if kw.is_some() || is_symbol {
+            if let Some(kw) = kw {
+                let op = match kw.as_str() {
+                    "delete" => "delete",
+                    "after" | "insert_after" => "insert_after",
+                    "before" | "insert_before" => "insert_before",
+                    _ => "replace",
+                };
+                if map.get("op").map_or(true, Value::is_null) {
+                    map.insert("op".into(), Value::String(op.into()));
+                }
+            }
+            let rest = Value::String(c[3].trim().to_string());
+            if is_symbol {
+                map.remove("start");
+                map.insert("symbol".into(), rest);
+            } else {
+                map.insert("start".into(), rest);
+            }
+        }
+    }
+    Value::Object(map)
+}
+
+enum OldHit {
+    None,
+    /// 0-based rows where each occurrence starts.
+    Many(Vec<usize>),
+    /// The rows to replace and what they become (empty = delete them).
+    One { r0: usize, r1: usize, lines: Vec<String> },
+}
+
+/// Find the exact text `old` in rows `lo..=hi` of `doc` and work out the rows `new` replaces it in.
+/// Unlike a whole-line context match this also handles text from the middle of a line.
+fn resolve_old_text(doc: &Doc, old: &str, new: &str, lo: usize, hi: usize) -> OldHit {
+    let needle = old.replace("\r\n", "\n");
+    let new = new.replace("\r\n", "\n");
+    if needle.is_empty() || doc.lines.is_empty() || lo > hi || hi >= doc.lines.len() {
+        return OldHit::None;
+    }
+    let mut hay = String::new();
+    let mut starts = Vec::with_capacity(hi - lo + 2);
+    for r in lo..=hi {
+        starts.push(hay.len());
+        hay.push_str(&doc.lines[r]);
+        hay.push('\n');
+    }
+    starts.push(hay.len());
+    let row_of = |p: usize| starts.partition_point(|&s| s <= p) - 1;
+    let hits: Vec<usize> = hay.match_indices(needle.as_str()).map(|(i, _)| i).collect();
+    match hits.as_slice() {
+        [] => OldHit::None,
+        [p] => {
+            let end = p + needle.len();
+            let (i0, i1) = (row_of(*p), row_of(end - 1));
+            let text = format!("{}{}{}", &hay[starts[i0]..*p], new, &hay[end..starts[i1 + 1]]);
+            let lines = if new.trim().is_empty() && text.trim().is_empty() {
+                Vec::new()
+            } else {
+                text.strip_suffix('\n').unwrap_or(&text).split('\n').map(str::to_string).collect()
+            };
+            OldHit::One { r0: lo + i0, r1: lo + i1, lines }
+        }
+        many => OldHit::Many(many.iter().map(|p| lo + row_of(*p)).collect()),
+    }
+}
+
+fn push_plus(patch: &mut String, lines: impl IntoIterator<Item = impl AsRef<str>>) {
+    for l in lines {
+        patch.push('+');
+        patch.push_str(l.as_ref());
+        patch.push('\n');
+    }
+}
+
+/// `edit {old_text, new_text}` matched more than once: say where, so the retry can scope it.
+pub(crate) fn with_match_anchors(ws: &Path, path: &str, cwd: Option<&Path>, old: &str, err: String) -> String {
+    if !err.starts_with("expected 1 occurrence(s), found") {
+        return err;
+    }
+    let Ok((_, _, doc, _)) = read_doc_smart(ws, path, cwd) else { return err };
+    match resolve_old_text(&doc, old, "", 0, doc.lines.len().saturating_sub(1)) {
+        OldHit::Many(rows) => format!("{err}\n{}", many_hint(&doc, &rows)),
+        _ => err,
+    }
+}
+
+fn many_hint(doc: &Doc, rows: &[usize]) -> String {
+    let shown: Vec<String> = rows.iter().take(6).map(|r| doc.anchor(*r)).collect();
+    format!(
+        "old_text starts at {}{}. Add surrounding text, or scope it: pass `start` (a line range around the one you mean, e.g. \"{}..{}\") or `symbol` together with `old_text`.",
+        shown.join(", "),
+        if rows.len() > 6 { format!(" (+{} more)", rows.len() - 6) } else { String::new() },
+        shown[0],
+        doc.anchor((rows[0] + 3).min(doc.lines.len() - 1))
+    )
+}
+
+/// `edit {path, patch}`: a patch given without the `*** Update File:` envelope is wrapped for `path`.
+/// Hunks may use plain line numbers and need no `+` prefix (see `apply`).
+pub fn patch_edit(ws: &Path, path: &str, patch: &str, cwd: Option<&Path>) -> Result<String, String> {
+    let has_envelope = patch.lines().any(|l| {
+        let t = l.trim_start();
+        t.starts_with("*** Begin Patch")
+            || t.starts_with("*** Update File:")
+            || t.starts_with("*** Add File:")
+            || t.starts_with("*** Delete File:")
+    });
+    let full = if has_envelope {
+        patch.to_string()
+    } else if path.trim().is_empty() {
+        return Err("`patch` needs `path` (or `*** Update File: <path>` in the patch)".into());
+    } else {
+        format!("*** Begin Patch\n*** Update File: {}\n{}\n*** End Patch\n", path.trim(), patch.trim_end_matches('\n'))
+    };
+    apply_patch(ws, &full, cwd, false)
+}
+
 /// Several edits in a single atomic call, built on the `apply` patch path. Every anchor refers to
 /// the file as it is now (not after earlier entries). Each entry picks its target one of three ways
-/// (`start` anchors, `old_text` exact text, or `symbol` name) and may carry its own `path`, so one
-/// call can edit several files; `path` is the default for entries without one.
+/// (`start`/`at` anchors, `old_text` exact text, or `symbol` name) and may carry its own `path`, so
+/// one call can edit several files; `path` is the default for entries without one. `old_text` may be
+/// part of a line and may be scoped by a `start` range or a `symbol`.
 pub fn edit_batch(ws: &Path, path: &str, edits: &[serde_json::Value], cwd: Option<&Path>) -> Result<String, String> {
     if edits.is_empty() {
         return Err("`edits` is empty".into());
     }
+    let edits: Vec<Value> = edits.iter().map(canon_edit).collect();
     // Group entries per file (first-appearance order) so each file is one `Update File` section.
     let mut files: Vec<(String, Vec<(usize, &serde_json::Value)>)> = Vec::new();
     for (i, e) in edits.iter().enumerate() {
@@ -385,21 +535,98 @@ pub fn edit_batch(ws: &Path, path: &str, edits: &[serde_json::Value], cwd: Optio
             None => files.push((p.to_string(), vec![(i + 1, e)])),
         }
     }
+    const NEW_KEYS: [&str; 5] = ["new_text", "new_string", "newString", "content", "text"];
+    const OLD_KEYS: [&str; 4] = ["old_text", "old_string", "oldString", "old"];
     let mut patch = String::from("*** Begin Patch\n");
     for (file, list) in &files {
         patch.push_str(&format!("*** Update File: {file}\n"));
+        // The file as it is now, for `old_text` entries (unreadable: the patch engine says why).
+        let loaded = read_doc_smart(ws, file, cwd).ok();
+        let written: Vec<(usize, &str)> = list
+            .iter()
+            .filter_map(|(n, e)| NEW_KEYS.iter().find_map(|k| e.get(*k).and_then(|v| v.as_str())).map(|t| (*n, t)))
+            .collect();
         for (n, e) in list {
             let n = *n;
             let get = |ks: &[&str]| ks.iter().find_map(|k| e.get(*k).and_then(|v| v.as_str()));
-            let text = get(&["new_text", "new_string", "newString", "content", "text"]).unwrap_or("");
+            let text = get(&NEW_KEYS).unwrap_or("");
             let body = |patch: &mut String| {
-                for l in text.replace("\r\n", "\n").trim_end_matches('\n').split('\n') {
-                    patch.push('+');
+                push_plus(patch, text.replace("\r\n", "\n").trim_end_matches('\n').split('\n'));
+            };
+            let op = get(&["op"]).unwrap_or("replace");
+            // `old_text`: exact text replaced with `new_text`, no anchors; `start`/`symbol` beside it
+            // only narrow where it is searched.
+            if let Some(old) = get(&OLD_KEYS) {
+                if old.trim().is_empty() {
+                    return Err(format!("edits[{n}]: old_text is empty"));
+                }
+                if let Some((full, rel, doc)) = loaded.as_ref().map(|(full, rel, doc, _)| (full, rel, doc)).filter(|(_, _, d)| !d.lines.is_empty()) {
+                    let all = (0, doc.lines.len() - 1);
+                    let (lo, hi, scope) = if let Some(st) = get(&["start"]) {
+                        let (a, b) = split_range(st, get(&["end"]));
+                        let s = parse_anchor_in_doc(doc, rel, &a).map_err(|e| format!("edits[{n}]: {e}"))?;
+                        let en = match &b {
+                            Some(b) => parse_anchor_in_doc(doc, rel, b).map_err(|e| format!("edits[{n}]: {e}"))?,
+                            None => s.clone(),
+                        };
+                        let (r0, r1) = super::journal::locate_at(full, doc, rel, &s, &en).map_err(|e| format!("edits[{n}]: {e}"))?;
+                        (r0, r1, format!(" within lines {}..{}", r0 + 1, r1 + 1))
+                    } else if let Some(sym) = get(&["symbol"]) {
+                        let lang = lang_for(rel).filter(|l| *l != Lang::Json).ok_or_else(|| format!("edits[{n}]: no symbol support for {rel}"))?;
+                        let syms = symbols(lang, &doc.to_text());
+                        let s = find_symbol(&syms, sym).map_err(|e| format!("edits[{n}]: {e}"))?;
+                        (s.start, s.end, format!(" within symbol {}", sym.trim()))
+                    } else {
+                        (all.0, all.1, String::new())
+                    };
+                    match resolve_old_text(doc, old, text, lo, hi) {
+                        OldHit::One { r0, r1, lines } => {
+                            let range = if r0 == r1 { doc.anchor(r0) } else { format!("{}..{}", doc.anchor(r0), doc.anchor(r1)) };
+                            if lines.is_empty() {
+                                patch.push_str(&format!("@@ delete {range}\n"));
+                            } else {
+                                patch.push_str(&format!("@@ {range}\n"));
+                                push_plus(&mut patch, &lines);
+                            }
+                            continue;
+                        }
+                        OldHit::Many(rows) => {
+                            return Err(format!("edits[{n}]: old_text occurs {} times{scope} in {file}. {}", rows.len(), many_hint(doc, &rows)));
+                        }
+                        OldHit::None => {}
+                    }
+                    // No exact hit: a whole-line match that ignores indentation is still fine (the
+                    // patch engine re-indents `new_text`); otherwise fail here with a precise reason.
+                    let old_lines: Vec<String> = old.replace("\r\n", "\n").trim_end_matches('\n').split('\n').map(str::to_string).collect();
+                    let loose = if scope.is_empty() { seek_lines(&doc.lines, &old_lines, 0, false) } else { Ok(None) };
+                    match loose {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            let needle = old.trim();
+                            let overlap = written
+                                .iter()
+                                .find(|(j, t)| *j < n && t.contains(needle))
+                                .map(|(j, _)| format!(" That text is written by edits[{j}]: every entry refers to the file as it is now, so merge the two into one edit."))
+                                .unwrap_or_default();
+                            return Err(format!(
+                                "edits[{n}]: old_text not found{scope} in {file}.{overlap}{}",
+                                if scope.is_empty() { closest_hint(doc, &old_lines) } else { String::new() }
+                            ));
+                        }
+                        Err(e) => return Err(format!("edits[{n}]: old_text {e}")),
+                    }
+                }
+                patch.push_str("@@\n");
+                for l in old.replace("\r\n", "\n").trim_end_matches('\n').split('\n') {
+                    patch.push('-');
                     patch.push_str(l);
                     patch.push('\n');
                 }
-            };
-            let op = get(&["op"]).unwrap_or("replace");
+                if !text.is_empty() {
+                    body(&mut patch);
+                }
+                continue;
+            }
             // `symbol`: a whole declaration by name, no anchors.
             if get(&["start"]).is_none() {
                 if let Some(sym) = get(&["symbol"]) {
@@ -419,32 +646,8 @@ pub fn edit_batch(ws: &Path, path: &str, edits: &[serde_json::Value], cwd: Optio
                     }
                     continue;
                 }
-                // `old_text`: exact text (indentation-tolerant) replaced with `new_text`, no anchors.
-                if let Some(old) = get(&["old_text", "old_string", "oldString", "old"]) {
-                    if old.trim().is_empty() {
-                        return Err(format!("edits[{n}]: old_text is empty"));
-                    }
-                    if let Ok((_, _, doc, _)) = read_doc_smart(ws, file, cwd) {
-                        let hay = doc.to_text().replace("\r\n", "\n");
-                        let needle = old.replace("\r\n", "\n");
-                        let hits = hay.matches(needle.as_str()).count();
-                        if hits > 1 {
-                            return Err(format!("edits[{n}]: old_text occurs {hits} times in {file}; include more surrounding text so it is unique"));
-                        }
-                    }
-                    patch.push_str("@@\n");
-                    for l in old.replace("\r\n", "\n").trim_end_matches('\n').split('\n') {
-                        patch.push('-');
-                        patch.push_str(l);
-                        patch.push('\n');
-                    }
-                    if !text.is_empty() {
-                        body(&mut patch);
-                    }
-                    continue;
-                }
             }
-            let start = get(&["start"]).ok_or_else(|| format!("edits[{n}]: needs `start` (anchor), `old_text`, or `symbol`"))?;
+            let start = get(&["start"]).ok_or_else(|| format!("edits[{n}]: needs `start`/`at` (anchor), `old_text`, or `symbol`"))?;
             let (a, b) = split_range(start, get(&["end"]));
             let range = match &b {
                 Some(b) => format!("{a}..{b}"),
@@ -484,7 +687,22 @@ pub fn edit_batch(ws: &Path, path: &str, edits: &[serde_json::Value], cwd: Optio
         }
     }
     patch.push_str("*** End Patch\n");
-    apply_patch(ws, &patch, cwd, false).map_err(|e| format!("{e}\n(no edits were applied)"))
+    let single = files.len() == 1;
+    apply_patch(ws, &patch, cwd, false).map_err(|e| {
+        let e = if single { name_overlapping_edits(&e, &files[0].1) } else { e };
+        format!("{e}\n(no edits were applied)")
+    })
+}
+
+/// `hunks 2 and 3 touch the same lines` -> also say which `edits[..]` entries those are.
+fn name_overlapping_edits(err: &str, list: &[(usize, &Value)]) -> String {
+    let re = lazy_re!(r"hunks (\d+) and (\d+) touch the same lines");
+    let Some(c) = re.captures(err) else { return err.to_string() };
+    let entry = |h: &str| h.parse::<usize>().ok().and_then(|h| list.get(h.checked_sub(1)?)).map(|(n, _)| *n);
+    match (entry(&c[1]), entry(&c[2])) {
+        (Some(a), Some(b)) => format!("{err}\n(edits[{a}] and edits[{b}] overlap: merge them into one edit; all entries refer to the file as it is now)"),
+        _ => err.to_string(),
+    }
 }
 
 /// Fresh `N#hh` anchors for `new_text` after an anchor-free (`old_text`) replace, so a caller that

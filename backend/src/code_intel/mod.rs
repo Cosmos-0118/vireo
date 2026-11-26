@@ -23,6 +23,7 @@ mod astgrep;
 mod check;
 mod doc;
 mod edit;
+mod journal;
 mod patch;
 mod patch_parse;
 mod release;
@@ -48,7 +49,7 @@ pub use check::{check, check_failed, CheckOpts};
 #[allow(unused_imports)]
 pub use doc::line_hash;
 #[allow(unused_imports)]
-pub use edit::{ast, create, edit_batch, hashline_edit};
+pub use edit::{ast, create, edit_batch, hashline_edit, patch_edit};
 #[allow(unused_imports)]
 pub use patch::apply_patch;
 #[allow(unused_imports)]
@@ -66,13 +67,13 @@ pub use view::{split_view_spec, view, view_many};
 /// per-turn "schema" cost of the vx tools).
 pub const AGENT_HINT: &str = r##"Vireo `vx`: token-lean code tools (MCP `mcp__vx__*`, load via ToolSearch if deferred; or `vx` on PATH). Prefer them over cat/rg/sed/Python scripts.
 - map [query] [--dir D] · outline <file...> · view <file> [Symbol|A..B C..D] or `a.rs:10..30 b.rs:Foo` · search <regex> [path] [-g G] [-C N] [-F] [-l]
-- edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]: by anchor (MCP: `start` may be a range)
-- edit with no view (MCP): {path, old_text, new_text} | {path, symbol, new_text, op?} | {edits: [{path?, start|old_text|symbol, new_text, op?}]} = many edits across files, atomic
+- edit <file> A#h[..B#h] [--insert-after|--insert-before|--delete] [--text T|--file F]: by anchor (MCP: `at` may be a range, a plain line number `57..60`, or `delete 57` / `after 57#ab` / `symbol Foo`)
+- edit with no view (MCP): {path, old_text, new_text} (part of a line is fine; add `at`/`symbol` to scope it) | {path, symbol, new_text, op?} | {edits: [{path?, at|old_text|symbol, new_text, op?}]} = many edits across files, atomic | {path, patch: "@@ delete 57\n@@ 60..62\nnew code"}
 - replace <old> <new> [path] [-g G] [-r] [--dry-run] [--expected N]: atomic across files; regex groups `$1`/`\1` (MCP: `rules: [{old, new, regex?}]` for several at once)
 - apply [--file F]: atomic multi-file patch. Hunks: `@@ 12#ab..15#cd` (+ lines replace), `@@ after 12#ab`, `@@ delete A#h..B#h`, `@@ symbol Foo::bar` (+ lines replace the symbol), `@@ after symbol Foo`, `@@ delete symbol Foo`, `@@ top|bottom|after imports`, or classic `@@` context
 - symbol <file> <name> [--replace|--insert-after|--delete] · create <file> [--force] · ast '<pat>' [-r '<rewrite>'] [-l lang]
 - check [cmd...]: build/test with anchored errors (MCP: long builds return a job id; call check {job}) · release [status|preflight|notes|bump|draft|publish|verify]: `status` says what to do next; `publish --dry-run` first
-Anchors `N#hh` come from view/search/edit output and edits return fresh ones, so never re-read after editing. On Windows prefer MCP or `--file F` over piping multi-line code. `vx help` has details."##;
+Anchors `N#hh` come from view/search/edit output and edits return fresh ones, so never re-read after editing; anchors elsewhere in the file auto-relocate when lines shift, so keep using them. On Windows prefer MCP or `--file F` over piping multi-line code. `vx help` has details."##;
 
 fn s<'a>(args: &'a Value, k: &str) -> Option<&'a str> {
     args.get(k).and_then(|v| v.as_str())
@@ -97,7 +98,17 @@ fn globs_from(args: &Value) -> Vec<String> {
 
 /// Single entry point shared by the built-in agent, the `vx` CLI, and the `vx mcp` server.
 pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
-    let aliased = with_aliases(op, a);
+    let res = run_op_inner(ws, op, a);
+    // Whatever anchors this printed (result or error), the caller may now hold them.
+    match &res {
+        Ok(out) | Err(out) => journal::note_display(ws, a, out),
+    }
+    res
+}
+
+fn run_op_inner(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
+    // `edit` also expands the `at` / inline-op selector shorthand (see `edit::canon_edit`).
+    let aliased = if op == "edit" { edit::canon_edit(a) } else { with_aliases(op, a) };
     let a = &aliased;
     let need = |k: &str| s(a, k).ok_or_else(|| format!("missing `{k}`"));
     let cwd = s(a, "cwd").map(PathBuf::from);
@@ -153,6 +164,16 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
             if let Some(list) = a.get("edits").and_then(|v| v.as_array()) {
                 return edit_batch(ws, s(a, "path").unwrap_or(""), list, cwd.as_deref());
             }
+            // Hunks without the `*** Update File:` envelope, for the given `path`.
+            if let Some(p) = s(a, "patch").filter(|p| !p.trim().is_empty()) {
+                return patch_edit(ws, s(a, "path").unwrap_or(""), p, cwd.as_deref());
+            }
+            // `old_text` beside a `symbol` / `start` range only scopes where it is searched.
+            if s(a, "start").is_some_and(|x| parse_edge(x).is_none()) || s(a, "symbol").is_some() {
+                if ["old_string", "oldString", "old_text", "old"].iter().any(|k| s(a, k).is_some()) {
+                    return edit_batch(ws, need("path")?, std::slice::from_ref(a), cwd.as_deref());
+                }
+            }
             // A symbol name instead of anchors: edit the whole symbol.
             if let (None, Some(sym)) = (s(a, "start"), s(a, "symbol")) {
                 let mode = match s(a, "op").unwrap_or("replace") {
@@ -172,7 +193,8 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
                         expected: if a["replace_all"].as_bool().unwrap_or(false) { None } else { Some(1) },
                         ..Default::default()
                     };
-                    let msg = replace_text(ws, old, s(a, "new_text").unwrap_or(""), &opts)?;
+                    let msg = replace_text(ws, old, s(a, "new_text").unwrap_or(""), &opts)
+                        .map_err(|e| edit::with_match_anchors(ws, need("path").unwrap_or(""), cwd.as_deref(), old, e))?;
                     return Ok(match edit::anchors_after_replace(ws, need("path")?, cwd.as_deref(), s(a, "new_text").unwrap_or("")) {
                         Some(snip) => format!("{msg}\n{snip}"),
                         None => msg,

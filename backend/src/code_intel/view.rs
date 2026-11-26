@@ -7,7 +7,7 @@ use super::symbols::{find_symbol, lang_for, qualified, symbols, Lang};
 
 // Kept well under what MCP hosts inline from a tool result: past roughly 15-16 KB they
 // middle-truncate and spill the text to a side file, which destroys the very anchors we print.
-pub(crate) const MAX_VIEW_LINES: usize = 300;
+pub(crate) const MAX_VIEW_LINES: usize = 500;
 pub(crate) const MAX_VIEW_BYTES: usize = 14_000;
 /// One minified/generated line must not eat the whole budget (the hash stays that of the full line).
 const MAX_LINE_CHARS: usize = 2_000;

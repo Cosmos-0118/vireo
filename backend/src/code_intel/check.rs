@@ -597,12 +597,44 @@ fn start_job(ws: &Path, job: Job, timeout_secs: u64) -> Running {
     Running { rx, cap, job, started: Instant::now() }
 }
 
+#[cfg(test)]
+pub(crate) fn wants_output_for_test(cmd: &str) -> bool {
+    wants_output(cmd)
+}
+
+/// Commands whose point is the output they print even when they pass.
+fn wants_output(cmd: &str) -> bool {
+    lazy_re!(r"(?:^|\s)(?:--nocapture|--show-output|--no-capture|-rP|-s|bench|--bench|benchmark)(?:\s|$)").is_match(cmd)
+}
+
+/// Stdout of a passing run without build/test-harness boilerplate, capped, one block under the `✔` line.
+fn passing_output(stdout: &str) -> String {
+    const MAX: usize = 60;
+    let lines: Vec<String> = strip_ansi(stdout)
+        .lines()
+        .map(str::trim_end)
+        .filter(|t| !t.trim().is_empty() && !t.starts_with('{') && !progress_line(t) && !t.starts_with("test result:"))
+        .map(|t| clip(t, 200))
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    let mut out = String::new();
+    for l in lines.iter().take(MAX) {
+        out.push_str(&format!("  {l}\n"));
+    }
+    if lines.len() > MAX {
+        out.push_str(&format!("  …[{} more lines; --raw shows everything]\n", lines.len() - MAX));
+    }
+    out
+}
+
 /// Append the report for one finished job.
 fn render_job(
     ws: &Path,
     report: &mut String,
     out: RunOut,
-    (prefix, _, label): &Job,
+    (prefix, cmd_line, label): &Job,
     custom_cmd: bool,
     timeout_secs: u64,
     opts: &CheckOpts,
@@ -631,6 +663,10 @@ fn render_job(
         if opts.warnings && warns > 0 {
             let w: Vec<&Diag> = diags.iter().filter(|d| !d.error).collect();
             render_list(ws, report, &w, 15);
+        }
+        // The caller asked to see the program's own output (`--nocapture`, benches, ...): keep it.
+        if wants_output(cmd_line) {
+            report.push_str(&passing_output(&out.stdout));
         }
     } else if errors > 0 {
         report.push_str(&render_diags(ws, &diags, label, out.secs, opts.warnings));

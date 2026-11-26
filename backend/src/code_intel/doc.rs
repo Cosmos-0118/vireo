@@ -152,22 +152,82 @@ pub(crate) fn read_doc_smart(
 }
 
 pub(crate) fn parse_anchor(s: &str) -> Result<(usize, String), String> {
-    let bad = || format!("bad anchor `{s}` (expected like 189#a4, copied from view/search output)");
+    let bad = || format!("bad anchor `{s}` (expected like 189#a4, copied from view/search output, or a plain line number like 189)");
     // Accept anchors as printed by any vx tool: `12#a4`, `12#a4|code`, `110#5e-code` (search context),
     // `> 12#a4|` (diagnostics), `[12#a4` / `12#a4]` (outline), `path/file.rs:12#a4` (search).
-    let re = lazy_re!(r"^[>\[\s]*(?:[^\s:#]+:)?(\d+)#([0-9a-fA-F]{2})(?:$|[|\-\]\s.])");
+    // A bare line number (`12`, `12|code`) is accepted too: its hash is empty here and filled from the
+    // live file by `fill_plain` (a hash-free anchor is only as safe as the line number is current).
+    let re = lazy_re!(r"^[>\[\s]*(?:[^\s:#]+:)?(\d+)(?:#([0-9a-fA-F]{2})(?:$|[|\-\]\s.])|(?:$|[|\]\s]))");
     let c = re.captures(s.trim()).ok_or_else(bad)?;
     let n: usize = c[1].parse().map_err(|_| bad())?;
     if n == 0 {
         return Err(bad());
     }
-    Ok((n, c[2].to_lowercase()))
+    Ok((n, c.get(2).map(|m| m.as_str().to_lowercase()).unwrap_or_default()))
+}
+
+/// Give a hash-free anchor (plain line number) the hash of the live line, optionally checking a
+/// `|snippet` the caller typed: the line must contain it, else the nearest line within ±50 that does.
+pub(crate) fn fill_plain(
+    doc: &Doc,
+    rel: &str,
+    a: &(usize, String),
+    snippet: Option<&str>,
+) -> Result<(usize, String), String> {
+    if !a.1.is_empty() {
+        return Ok(a.clone());
+    }
+    let n = doc.lines.len();
+    if a.0 > n {
+        return Err(format!("line {} is past the end of {rel} ({n} lines)", a.0));
+    }
+    let want = snippet.map(str::trim).filter(|t| !t.is_empty());
+    let Some(want) = want else {
+        return Ok((a.0, line_hash(&doc.lines[a.0 - 1])));
+    };
+    let hit = |r: usize| doc.lines[r].contains(want);
+    let base = a.0 - 1;
+    if hit(base) {
+        return Ok((a.0, line_hash(&doc.lines[base])));
+    }
+    let mut found: Vec<usize> = Vec::new();
+    for d in 1..=50usize {
+        for r in [base.checked_sub(d), Some(base + d)].into_iter().flatten() {
+            if r < n && hit(r) {
+                found.push(r);
+            }
+        }
+        if !found.is_empty() {
+            break;
+        }
+    }
+    match found.as_slice() {
+        [r] => Ok((r + 1, line_hash(&doc.lines[*r]))),
+        [] => Err(format!(
+            "line {} of {rel} does not contain `{want}` (nor any line within 50). Current lines near {}:
+{}",
+            a.0,
+            a.0,
+            doc.snippet_near(a.0, 2)
+        )),
+        many => Err(format!(
+            "`{want}` appears at lines {} near {}; use a full anchor like {}",
+            many.iter().map(|r| (r + 1).to_string()).collect::<Vec<_>>().join(", "),
+            a.0,
+            doc.anchor(many[0])
+        )),
+    }
 }
 
 /// Parse an anchor, attaching live anchored lines near the typed line number if malformed so the
-/// agent can fix typos in zero extra read turns.
+/// agent can fix typos in zero extra read turns. Plain line numbers (`12`, `12|snippet`) are
+/// resolved against `doc`.
 pub(crate) fn parse_anchor_in_doc(doc: &Doc, rel: &str, raw: &str) -> Result<(usize, String), String> {
     match parse_anchor(raw) {
+        Ok(a) if a.1.is_empty() => {
+            let snippet = raw.split_once('|').map(|(_, t)| t);
+            fill_plain(doc, rel, &a, snippet)
+        }
         Ok(a) => Ok(a),
         Err(msg) => {
             let digits: String = lazy_re!(r"^[>\[\s]*(?:[^\s:#]+:)?(\d+)")
@@ -177,7 +237,8 @@ pub(crate) fn parse_anchor_in_doc(doc: &Doc, rel: &str, raw: &str) -> Result<(us
             if let Ok(line_no) = digits.parse::<usize>() {
                 if line_no >= 1 && !doc.lines.is_empty() {
                     return Err(format!(
-                        "{msg} in {rel}. Current lines near {line_no}:\n{}",
+                        "{msg} in {rel}. Current lines near {line_no}:
+{}",
                         doc.snippet_near(line_no, 2)
                     ));
                 }

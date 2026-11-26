@@ -793,6 +793,25 @@ pub fn outline(ws: &Path, path: &str, cwd: Option<&Path>) -> Result<String, Stri
     Ok(out)
 }
 
+/// How many leading doc-comment / attribute / decorator lines of the symbol range `r0..=r1` a
+/// replacement should leave alone: the symbol range starts at its `///` docs and `#[..]` attributes,
+/// so replacing it with just the signature and body would silently delete them. Zero when `new`
+/// itself starts with a comment or attribute (it restates them), or the range has none.
+pub(crate) fn keep_leading_docs(lines: &[String], r0: usize, r1: usize, new: &[String]) -> usize {
+    let leading = |l: &str| {
+        let t = l.trim_start();
+        t.starts_with("//") || t.starts_with("/*") || t.starts_with('*') || t.starts_with("#[") || t.starts_with("#!") || t.starts_with('@') || t.starts_with('#')
+    };
+    if new.iter().find(|l| !l.trim().is_empty()).is_some_and(|l| leading(l)) {
+        return 0;
+    }
+    let mut k = 0;
+    while r0 + k < r1 && lines.get(r0 + k).is_some_and(|l| leading(l)) {
+        k += 1;
+    }
+    k
+}
+
 /// Read or change a whole symbol (function, struct, class, ...) by name.
 pub fn symbol_op(
     ws: &Path,
@@ -842,9 +861,11 @@ fn symbol_op_doc(
             if new_lines.is_empty() {
                 return Err("new_code is empty (use mode delete to remove the symbol)".into());
             }
-            let (k, removed) = (new_lines.len(), r1 - r0 + 1);
-            splice(&mut doc, r0, removed, new_lines);
-            finish_edit(&full, &rel, &doc, Some(lang), before, Some((r0, r0 + k - 1)), format!("Replaced {} in {rel} (lines {}..{}, +{k} -{removed}).", qualified(&s), r0 + 1, r1 + 1))
+            let kept = keep_leading_docs(&doc.lines, r0, r1, &new_lines);
+            let (k, removed) = (new_lines.len(), r1 - r0 + 1 - kept);
+            splice(&mut doc, r0 + kept, removed, new_lines);
+            let note = if kept > 0 { format!(" Kept {kept} leading doc/attribute line(s) your new_code did not restate.") } else { String::new() };
+            finish_edit(&full, &rel, &doc, Some(lang), before, Some((r0 + kept, r0 + kept + k - 1)), format!("Replaced {} in {rel} (lines {}..{}, +{k} -{removed}).{note}", qualified(&s), r0 + kept + 1, r1 + 1))
         }
         "delete" => {
             let removed = r1 - r0 + 1;

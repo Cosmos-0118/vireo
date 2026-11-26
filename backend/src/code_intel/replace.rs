@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use super::check::clip;
 use super::doc::{line_hash, Doc};
-use super::patch::{apply_shift, closest_hint, indent_shift, seek_lines, MatchLevel};
+use super::patch::{apply_shift, closest_hint, consistent_shift, seek_lines, MatchLevel};
 use super::search::{collect_files, GlobMatcher};
 use super::symbols::{lang_for, syntax_errors};
 use super::util::{missing_path_err, rel_of, resolve_with_cwd, top_level_dirs};
@@ -239,9 +239,12 @@ pub fn replace_rules(ws: &Path, rules: &[(String, String, bool)], opts: &Replace
             let new_lines: Vec<String> = new_lf.trim_end_matches('\n').split('\n').map(String::from).collect();
             match seek_lines(&doc.lines, &old_lines, 0, false) {
                 Ok(Some((at, level, _))) if matches!(level, MatchLevel::Rstrip | MatchLevel::Trim) => {
-                    let shift = indent_shift(&old_lines[0], &doc.lines[at]);
+                    let shift = consistent_shift(&old_lines, &doc.lines[at..at + old_lines.len()]);
                     let shifted: Vec<String> = match &shift {
-                        Some(s) => new_lines.iter().map(|l| apply_shift(l, s)).collect(),
+                        Some(s) => {
+                            let mut first_done = false;
+                            new_lines.iter().map(|l| apply_shift(l, s, &mut first_done)).collect()
+                        }
                         None => new_lines,
                     };
                     let mut d = Doc::parse(text);
@@ -344,6 +347,9 @@ pub fn replace_rules(ws: &Path, rules: &[(String, String, bool)], opts: &Replace
             return Err(format!("failed writing {} ({e}); rolled back all changes", p.rel));
         }
         done.push(p);
+    }
+    for p in &plans {
+        super::journal::record(&p.full, &String::from_utf8_lossy(&p.original), &p.new_text, None);
     }
 
     let mut out = format!("Replaced {total_count} occurrence(s) in {} file(s):\n", plans.len());

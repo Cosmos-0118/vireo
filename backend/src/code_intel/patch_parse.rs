@@ -96,7 +96,7 @@ fn is_file_header(l: &str) -> bool {
 
 fn parse_anchored_header(h: &str) -> Option<(AnchorKind, (usize, String), (usize, String))> {
     let re = lazy_re!(
-        r"^(?i:(after|before|replace|delete)\s+)?\[?(\d+#[0-9A-Fa-f]{2})(?:\s*(?:\.\.|-)\s*(\d+#[0-9A-Fa-f]{2}))?\]?$"
+        r"^(?i:(after|before|replace|delete)\s+)?\[?(\d+(?:#[0-9A-Fa-f]{2})?)(?:\s*(?:\.\.|-)\s*(\d+(?:#[0-9A-Fa-f]{2})?))?\]?$"
     );
     let c = re.captures(h.trim())?;
     let kind = match c.get(1).map(|m| m.as_str().to_ascii_lowercase()).as_deref() {
@@ -134,6 +134,7 @@ fn looks_like_anchored_header(h: &str) -> bool {
     let low = t.to_ascii_lowercase();
     t.contains('#')
         || t.contains("..")
+        || t.bytes().all(|b| b.is_ascii_digit())
         || low.starts_with("after ")
         || low.starts_with("before ")
         || low.starts_with("replace ")
@@ -216,6 +217,9 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
             // `-` lines tolerated inside anchored hunks: (hunk index, patch line). The anchors already
             // name the replaced lines, so a diff-style `-old` line is redundant, never content.
             let mut echoed_minus: Vec<(usize, usize)> = Vec::new();
+            // Body lines that carry no `+` in anchored/symbol/edge hunks: (patch line, text) per hunk index.
+            // When a hunk has no `+` line at all they are the replacement verbatim (prefix-free form).
+            let mut raw: std::collections::BTreeMap<usize, Vec<(usize, String)>> = std::collections::BTreeMap::new();
             while i < lines.len() && !is_file_header(lines[i]) {
                 let b = lines[i];
                 let line_no = i + 1;
@@ -269,18 +273,16 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                 let Some(cur) = hunks.last_mut() else { continue };
                 match cur {
                     Hunk::BadAnchor { .. } => {}
-                    Hunk::Edge { new, header, .. } => {
+                    Hunk::Edge { new, .. } => {
                         if let Some(rest) = b.strip_prefix('+') {
                             new.extend(std::iter::repeat(String::new()).take(pending_blanks));
                             pending_blanks = 0;
                             new.push(strip_hashline_prefix(rest).to_string());
-                        } else if b.trim().is_empty() {
-                            pending_blanks += 1;
                         } else {
-                            return Err(format!(
-                                "patch line {line_no}: `{header}` takes only `+` lines (the lines to insert); got `{}`",
-                                clip(b, 60)
-                            ));
+                            if b.trim().is_empty() {
+                                pending_blanks += 1;
+                            }
+                            raw.entry(cur_idx).or_default().push((line_no, b.to_string()));
                         }
                     }
                     Hunk::Anchored { new, header, kind, .. } | Hunk::Symbol { new, header, kind, .. } => {
@@ -290,19 +292,19 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                             new.push(strip_hashline_prefix(rest).to_string());
                         } else if b.trim().is_empty() {
                             pending_blanks += 1;
+                            raw.entry(cur_idx).or_default().push((line_no, String::new()));
                         } else if b.starts_with('-') {
                             // diff-style echo of a line being replaced/deleted: harmless, skip it
+                            // (unless the whole hunk turns out to be prefix-free code, see `raw`)
                             echoed_minus.push((cur_idx, line_no));
-                        } else {
-                            let what = if *kind == AnchorKind::Delete {
-                                "takes no body lines"
-                            } else {
-                                "takes only `+` lines (every line to write must start with `+`; the anchors already say which lines change, so no `-` or context lines are needed)"
-                            };
+                            raw.entry(cur_idx).or_default().push((line_no, b.to_string()));
+                        } else if *kind == AnchorKind::Delete {
                             return Err(format!(
-                                "patch line {line_no}: anchored hunk `{header}` {what}; got `{}`",
+                                "patch line {line_no}: anchored hunk `{header}` takes no body lines; got `{}`",
                                 clip(b, 60)
                             ));
+                        } else {
+                            raw.entry(cur_idx).or_default().push((line_no, b.to_string()));
                         }
                     }
                     Hunk::Context { body, .. } => {
@@ -321,6 +323,38 @@ pub(crate) fn parse_patch(text: &str) -> Result<Vec<FileOp>, String> {
                             ));
                         }
                     }
+                }
+            }
+            // Prefix-free hunks: with no `+` line at all, the body is the code to write, verbatim.
+            // Mixing `+` lines with bare lines stays an error so a stray line is never silently kept.
+            for (idx, entries) in &raw {
+                let Some(h) = hunks.get_mut(*idx) else { continue };
+                let (is_anchored, new, header) = match h {
+                    Hunk::Anchored { new, header, .. } | Hunk::Symbol { new, header, .. } => (true, new, header.clone()),
+                    Hunk::Edge { new, header, .. } => (false, new, header.clone()),
+                    _ => continue,
+                };
+                let content: Vec<&(usize, String)> = entries.iter().filter(|(_, t)| !t.trim().is_empty()).collect();
+                if content.is_empty() {
+                    continue;
+                }
+                if new.is_empty() && !content.iter().all(|(_, t)| t.starts_with('-')) {
+                    let mut lines: Vec<String> = entries.iter().map(|(_, t)| strip_hashline_prefix(t).to_string()).collect();
+                    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+                        lines.pop();
+                    }
+                    while lines.first().is_some_and(|l| l.trim().is_empty()) {
+                        lines.remove(0);
+                    }
+                    *new = lines;
+                    echoed_minus.retain(|(i, _)| i != idx);
+                } else if let Some((line_no, t)) = content.iter().find(|(_, t)| !(is_anchored && t.starts_with('-'))) {
+                    let what = if is_anchored {
+                        "takes only `+` lines (every line to write must start with `+`, or none of them: then the body is taken verbatim; the anchors already say which lines change)"
+                    } else {
+                        "takes only `+` lines (the lines to insert), or none at all for verbatim text"
+                    };
+                    return Err(format!("patch line {line_no}: hunk `{header}` {what}; got `{}`", clip(t, 60)));
                 }
             }
             // A replace/insert hunk made only of `-` lines would silently become a deletion (or a

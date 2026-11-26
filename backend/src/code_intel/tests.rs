@@ -285,7 +285,7 @@ fn apply_patch_tolerates_diff_style_minus_lines_in_anchored_hunks() {
     // Context (space-prefixed) lines are still rejected, with a message that says what to do.
     let ctx = format!("*** Update File: a.rs\n@@ {b2}\n let a = 1;\n+let b = 5;\n");
     let err = apply_patch(&ws, &ctx, None, false).unwrap_err();
-    assert!(err.contains("no `-` or context lines are needed"), "{err}");
+    assert!(err.contains("takes only `+` lines") && err.contains("verbatim"), "{err}");
 }
 
 #[test]
@@ -953,14 +953,14 @@ fn search_lists_lockfile_hits_last() {
 #[test]
 fn view_continuation_hint_is_a_copyable_spec() {
     let ws = tmp("view-hint");
-    let body: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+    let body: String = (1..=800).map(|i| format!("line {i}\n")).collect();
     std::fs::write(ws.join("big.txt"), body).unwrap();
     let v = view(&ws, "big.txt", None, None).unwrap();
-    assert!(v.contains("continue with big.txt:301..500"), "{v}");
+    assert!(v.contains("continue with big.txt:501..800"), "{v}");
     assert!(!v.contains("vx view"), "hint must work for both CLI and MCP callers: {v}");
     // The hinted spec round-trips through the same entry point.
-    let next = view(&ws, "big.txt:301..500", None, None).unwrap();
-    assert!(next.contains("301#") && next.contains("500#"), "{next}");
+    let next = view(&ws, "big.txt:501..800", None, None).unwrap();
+    assert!(next.contains("501#") && next.contains("800#"), "{next}");
 }
 
 #[test]
@@ -1092,13 +1092,13 @@ fn long_checks_park_as_jobs_and_resume() {
 fn capped_whole_file_view_outlines_the_rest() {
     let ws = tmp("view-tail");
     let mut src = String::new();
-    for i in 0..400 {
-        src.push_str(&format!("fn f{i}() {{ let _ = {i}; }}\n"));
+    for i in 0..800 {
+        src.push_str(&format!("fn f{i}() {{}}\n"));
     }
     std::fs::write(ws.join("big.rs"), &src).unwrap();
     let out = view(&ws, "big.rs", None, None).unwrap();
     assert!(out.contains("more lines; continue with big.rs:"), "{out}");
-    assert!(out.contains("-- outline of the rest --") && out.contains("fn f300") && out.contains("more symbols"), "{out}");
+    assert!(out.contains("-- outline of the rest --") && out.contains("fn f500") && out.contains("more symbols"), "{out}");
     assert!(out.len() < 18_000, "{}", out.len());
 }
 
@@ -1208,4 +1208,424 @@ fn replace_rules_apply_in_one_pass_and_normalize_backrefs() {
     assert_eq!(a, "one_ALPHA_x\ntwo_beta_x\n");
     let b = std::fs::read_to_string(ws.join("b.txt")).unwrap().replace("\r\n", "\n");
     assert_eq!(b, "again_ALPHA_x\n");
+}
+
+fn read(ws: &std::path::Path, f: &str) -> String {
+    std::fs::read_to_string(ws.join(f)).unwrap().replace("\r\n", "\n")
+}
+
+#[test]
+fn edit_accepts_plain_line_numbers_and_inline_ops() {
+    let ws = tmp("edit-plain");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+    run_op(&ws, "edit", &json!({"path": "a.txt", "at": "2", "new_text": "TWO"})).unwrap();
+    assert_eq!(read(&ws, "a.txt"), "one\nTWO\nthree\nfour\n");
+    run_op(&ws, "edit", &json!({"path": "a.txt", "at": "after 1", "new_text": "1.5"})).unwrap();
+    assert_eq!(read(&ws, "a.txt"), "one\n1.5\nTWO\nthree\nfour\n");
+    run_op(&ws, "edit", &json!({"path": "a.txt", "at": "delete 2..3"})).unwrap();
+    assert_eq!(read(&ws, "a.txt"), "one\nthree\nfour\n");
+    // `N|text` checks the line (and finds it nearby when the number drifted).
+    run_op(&ws, "edit", &json!({"path": "a.txt", "at": "3|four", "new_text": "4"})).unwrap();
+    run_op(&ws, "edit", &json!({"path": "a.txt", "at": "1|three", "new_text": "3"})).unwrap();
+    assert_eq!(read(&ws, "a.txt"), "one\n3\n4\n");
+    let err = run_op(&ws, "edit", &json!({"path": "a.txt", "at": "2|nope", "new_text": "x"})).unwrap_err();
+    assert!(err.contains("does not contain `nope`"), "{err}");
+    assert!(run_op(&ws, "edit", &json!({"path": "a.txt", "at": "9", "new_text": "x"})).unwrap_err().contains("past the end"));
+}
+
+#[test]
+fn edits_array_takes_at_plain_numbers_and_aliases() {
+    let ws = tmp("edits-at");
+    std::fs::write(ws.join("a.txt"), "a\nb\nc\nd\ne\n").unwrap();
+    run_op(
+        &ws,
+        "edit",
+        &json!({"file_path": "a.txt", "edits": [
+            {"at": "delete 1"},
+            {"at": "3", "new_string": "C"},
+            {"at": "after 5", "new_text": "f"},
+        ]}),
+    )
+    .unwrap();
+    assert_eq!(read(&ws, "a.txt"), "b\nC\nd\ne\nf\n");
+}
+
+#[test]
+fn edits_old_text_may_be_part_of_a_line_and_scoped() {
+    let ws = tmp("edits-old");
+    let src = "fn a() {\n    let n = x + 1;\n}\n\nfn b() {\n    let n = x + 1;\n    drop(n);\n}\n";
+    std::fs::write(ws.join("a.rs"), src).unwrap();
+    // Sub-line text, twice in the file: ambiguous unless scoped to one symbol.
+    let amb = run_op(&ws, "edit", &json!({"path": "a.rs", "edits": [{"old_text": "x + 1", "new_text": "x + 2"}]})).unwrap_err();
+    assert!(amb.contains("occurs 2 times") && amb.contains("2#") && amb.contains("6#"), "{amb}");
+    run_op(&ws, "edit", &json!({"path": "a.rs", "edits": [{"symbol": "fn b", "old_text": "x + 1", "new_text": "x + 2"}]})).unwrap();
+    assert_eq!(read(&ws, "a.rs"), src.replacen("x + 1", "x + 2", 2).replacen("x + 2", "x + 1", 1));
+    // Same through the single-edit form: `symbol` + `old_text` narrows, it does not replace the symbol.
+    run_op(&ws, "edit", &json!({"path": "a.rs", "symbol": "fn a", "old_text": "x + 1", "new_text": "x - 1"})).unwrap();
+    assert!(read(&ws, "a.rs").starts_with("fn a() {\n    let n = x - 1;\n}\n"));
+    // A whole line with its newline and an empty replacement removes the line.
+    run_op(&ws, "edit", &json!({"path": "a.rs", "edits": [{"old_text": "    drop(n);\n", "new_text": ""}]})).unwrap();
+    assert!(!read(&ws, "a.rs").contains("drop(n)") && read(&ws, "a.rs").ends_with("x + 2;\n}\n"), "{}", read(&ws, "a.rs"));
+}
+
+#[test]
+fn edits_name_overlapping_and_dependent_entries() {
+    let ws = tmp("edits-overlap");
+    std::fs::write(ws.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+    let err = run_op(
+        &ws,
+        "edit",
+        &json!({"path": "a.txt", "edits": [{"old_text": "two", "new_text": "TWO"}, {"old_text": "TWO", "new_text": "2"}]}),
+    )
+    .unwrap_err();
+    assert!(err.contains("edits[2]") && err.contains("edits[1]"), "{err}");
+    let err = run_op(&ws, "edit", &json!({"path": "a.txt", "edits": [{"at": "1..2", "new_text": "x"}, {"at": "2..3", "new_text": "y"}]})).unwrap_err();
+    assert!(err.contains("edits[1] and edits[2] overlap"), "{err}");
+    assert_eq!(read(&ws, "a.txt"), "one\ntwo\nthree\n");
+}
+
+#[test]
+fn edit_patch_param_is_prefix_free_with_plain_lines() {
+    let ws = tmp("edit-patch");
+    std::fs::write(ws.join("a.rs"), "fn a() {\n    1\n}\nfn b() {\n    2\n}\nfn c() {}\n").unwrap();
+    run_op(&ws, "edit", &json!({"path": "a.rs", "patch": "@@ delete 7\n@@ 4..6\nfn b() {\n    20\n}\n@@ 2\n    10"})).unwrap();
+    assert_eq!(read(&ws, "a.rs"), "fn a() {\n    10\n}\nfn b() {\n    20\n}\n");
+    // Mixing `+` lines with bare lines is still refused.
+    let err = run_op(&ws, "edit", &json!({"path": "a.rs", "patch": "@@ 2\n+x\ny"})).unwrap_err();
+    assert!(err.contains("takes only `+` lines"), "{err}");
+}
+
+#[test]
+fn symbol_replace_keeps_doc_comment_unless_restated() {
+    let ws = tmp("sym-doc");
+    std::fs::write(ws.join("a.rs"), RS).unwrap();
+    let r = run_op(&ws, "edit", &json!({"path": "a.rs", "symbol": "fn foo", "new_text": "fn foo(x: i32) -> i32 {\n    x + 2\n}"})).unwrap();
+    assert!(r.contains("Kept 2 leading"), "{r}");
+    let t = read(&ws, "a.rs");
+    assert!(t.contains("/// Doc for foo\n#[inline]\nfn foo(x: i32) -> i32 {\n    x + 2\n}"), "{t}");
+    // Restating a doc comment replaces the old one.
+    run_op(&ws, "edit", &json!({"path": "a.rs", "symbol": "fn foo", "new_text": "/// New doc\nfn foo(x: i32) -> i32 {\n    x\n}"})).unwrap();
+    let t = read(&ws, "a.rs");
+    assert!(t.contains("/// New doc\nfn foo") && !t.contains("Doc for foo") && !t.contains("#[inline]"), "{t}");
+}
+
+#[test]
+fn indentation_tolerant_match_does_not_double_indent_a_mid_line_copy() {
+    let ws = tmp("indent-mid");
+    std::fs::write(ws.join("a.rs"), "fn f() {\n    let x = 1;\n    let y = 2;\n}\n").unwrap();
+    // `old` starts mid-line (no leading spaces on line 1) but the rest carries the real indentation.
+    let patch = "*** Update File: a.rs\n@@\n-let x = 1;\n-    let y = 2;\n+let x = 10;\n+    let y = 20;\n";
+    apply_patch(&ws, patch, None, false).unwrap();
+    assert_eq!(read(&ws, "a.rs"), "fn f() {\n    let x = 10;\n    let y = 20;\n}\n");
+}
+
+#[test]
+fn passing_check_shows_program_output_when_asked() {
+    assert!(super::check::wants_output_for_test("cargo test -- --nocapture"));
+    assert!(!super::check::wants_output_for_test("cargo test"));
+}
+
+/// Stale single-line anchors after K real edits: the edit journal against plain hash relocation.
+/// Run: cargo test measure_stale_anchor_resolution -- --ignored --nocapture
+#[test]
+#[ignore]
+fn measure_stale_anchor_resolution() {
+    use super::doc::{locate, Doc};
+    use super::journal::locate_at;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    let mut stack = vec![root];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(d).unwrap().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    let ws = tmp("measure");
+    // (method, K, kind) -> [correct, error, wrong]
+    let mut stats: std::collections::BTreeMap<(&str, usize, &str), [usize; 3]> = Default::default();
+    let mut seed = 12345u64;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (seed >> 33) as usize
+    };
+    let mut trial = 0;
+    let mut shown_wrong = 0;
+    for f in files.iter().filter(|f| std::fs::metadata(f).map(|m| m.len() < 60_000).unwrap_or(false)) {
+        for k_edits in [1usize, 3, 6, 12] {
+            trial += 1;
+            let name = format!("t{trial}.rs");
+            let text = std::fs::read_to_string(f).unwrap();
+            std::fs::write(ws.join(&name), &text).unwrap();
+            let doc0 = Doc::parse(&text);
+            let n0 = doc0.lines.len();
+            if n0 < 30 {
+                continue;
+            }
+            // The agent reads the whole file first (in chunks, as the view cap requires).
+            for s in (1..=n0).step_by(250) {
+                run_op(&ws, "view", &json!({"path": name, "target": format!("{s}..{}", (s + 249).min(n0))})).unwrap();
+            }
+            // Original row -> current row (None once an edit replaced or removed it).
+            let mut map: Vec<Option<usize>> = (0..n0).map(Some).collect();
+            // Every edit's (at, removed, added) and the anchors its output printed (version after it).
+            let mut applied: Vec<(usize, usize, usize)> = Vec::new();
+            let mut printed: Vec<Vec<(usize, String)>> = Vec::new();
+            for k in 0..k_edits {
+                let cur = Doc::parse(&std::fs::read_to_string(ws.join(&name)).unwrap());
+                let r = rnd() % cur.lines.len();
+                // An agent only holds anchors a tool printed: view the row first, as it would.
+                let shown = run_op(&ws, "view", &json!({"path": name, "target": format!("{}..{}", r + 1, r + 1)})).unwrap();
+                let anchor = lazy_re!(r"(\d+#[0-9a-f]{2})\|").captures(&shown).unwrap()[1].to_string();
+                let (op, body, at, removed, added) = match k % 3 {
+                    0 => ("insert_after", format!("// ins {trial} {k} a\n// ins {trial} {k} b\n// ins {trial} {k} c"), r + 1, 0, 3),
+                    1 => ("delete", String::new(), r, 1, 0),
+                    _ => ("replace", format!("// rep {trial} {k} a\n// rep {trial} {k} b"), r, 1, 2),
+                };
+                // Through `run_op`, as the MCP server does, so printed anchors are noted.
+                let Ok(out) = run_op(&ws, "edit", &json!({"path": name, "start": anchor, "op": op, "new_text": body})) else {
+                    continue;
+                };
+                applied.push((at, removed, added));
+                printed.push(
+                    lazy_re!(r"(?m)^(\d+)#([0-9a-f]{2})\|")
+                        .captures_iter(&out)
+                        .map(|c| (c[1].parse().unwrap(), c[2].to_string()))
+                        .collect(),
+                );
+                for m in map.iter_mut().flatten() {
+                    if *m >= at + removed {
+                        *m = *m + added - removed;
+                    } else if *m >= at && removed > 0 {
+                        *m = usize::MAX;
+                    }
+                }
+                for m in map.iter_mut() {
+                    if *m == Some(usize::MAX) {
+                        *m = None;
+                    }
+                }
+            }
+            let cur = Doc::parse(&std::fs::read_to_string(ws.join(&name)).unwrap());
+            let full = ws.join(&name);
+            // Anchors printed by edit j's own output, used after the edits that came later.
+            for (j, toks) in printed.iter().enumerate() {
+                for (n, h) in toks {
+                    let mut row = Some(n - 1);
+                    for &(at, removed, added) in &applied[j + 1..] {
+                        row = row.and_then(|p| {
+                            if p < at {
+                                Some(p)
+                            } else if p < at + removed {
+                                None
+                            } else {
+                                Some(p + added - removed)
+                            }
+                        });
+                    }
+                    let Some(want) = row else { continue };
+                    let a = (*n, h.clone());
+                    for (method, res) in [
+                        ("window", locate(&cur, &name, &a, &a)),
+                        ("journal", locate_at(&full, &cur, &name, &a, &a)),
+                    ] {
+                        let slot = stats.entry((method, k_edits, "printed")).or_default();
+                        match res {
+                            Ok((r, _)) if r == want => slot[0] += 1,
+                            Ok((r, _)) => {
+                                slot[2] += 1;
+                                if method == "journal" {
+                                    println!(
+                                        "WRONG(printed) {name} k={k_edits} printed by edit {j} as {n}#{h}: want row {} {:?} got row {} {:?}",
+                                        want + 1,
+                                        cur.lines[want],
+                                        r + 1,
+                                        cur.lines[r]
+                                    );
+                                }
+                            }
+                            Err(_) => slot[1] += 1,
+                        }
+                    }
+                }
+            }
+            for i in 0..n0 {
+                let Some(want) = map[i] else { continue };
+                if doc0.lines[i].trim().is_empty() {
+                    continue;
+                }
+                let kind = if doc0.lines[i].trim().len() <= 2 { "trivial" } else { "real" };
+                let a = (i + 1, line_hash(&doc0.lines[i]));
+                for (method, res) in [
+                    ("window", locate(&cur, &name, &a, &a)),
+                    ("journal", locate_at(&full, &cur, &name, &a, &a)),
+                ] {
+                    let slot = stats.entry((method, k_edits, kind)).or_default();
+                    match res {
+                        Ok((r, _)) if r == want => slot[0] += 1,
+                        Ok((r, _)) => {
+                            slot[2] += 1;
+                            if method == "journal" && shown_wrong < 8 {
+                                shown_wrong += 1;
+                                println!(
+                                    "WRONG {name} k={k_edits} orig row {} want {} got {r}\n  orig: {:?}\n  want: {:?}\n  got:  {:?}",
+                                    i + 1,
+                                    want + 1,
+                                    doc0.lines[i],
+                                    cur.lines[want],
+                                    cur.lines[r]
+                                );
+                            }
+                        }
+                        Err(_) => slot[1] += 1,
+                    }
+                }
+                // A 3-line range whose rows all survived: the usual shape of a real edit.
+                if i + 2 < n0 && map[i + 2] == Some(want + 2) && !doc0.lines[i + 2].trim().is_empty() {
+                    let e = (i + 3, line_hash(&doc0.lines[i + 2]));
+                    for (method, res) in [
+                        ("window", locate(&cur, &name, &a, &e)),
+                        ("journal", locate_at(&full, &cur, &name, &a, &e)),
+                    ] {
+                        let slot = stats.entry((method, k_edits, "range3")).or_default();
+                        match res {
+                            Ok((r, r2)) if r == want && r2 == want + 2 => slot[0] += 1,
+                            Ok(_) => slot[2] += 1,
+                            Err(_) => slot[1] += 1,
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for ((method, k, kind), [ok, err, wrong]) in &stats {
+        let t = (ok + err + wrong) as f64;
+        println!(
+            "{method:8} edits={k:<2} {kind:8} correct {:6.2}%  error {:6.2}%  WRONG {:6.2}%  (n={})",
+            *ok as f64 / t * 100.0,
+            *err as f64 / t * 100.0,
+            *wrong as f64 / t * 100.0,
+            t as usize
+        );
+    }
+}
+
+fn row_of(text: &str, needle: &str) -> usize {
+    text.lines().position(|l| l.contains(needle)).unwrap() + 1
+}
+
+#[test]
+fn stale_anchors_follow_earlier_edits_exactly() {
+    let ws = tmp("journal");
+    // Many identical closers: hash-only relocation cannot tell them apart.
+    let mut src = String::new();
+    for i in 0..12 {
+        src.push_str(&format!("fn f{i}() {{\n    if x {{\n        y({i});\n    }}\n}}\n"));
+    }
+    std::fs::write(ws.join("a.rs"), &src).unwrap();
+    // Anchors printed before any edit: the `}` closing f7's `if`, and f9's call line.
+    let v0 = view(&ws, "a.rs", None, None).unwrap();
+    let anchor = |needle_row: usize| {
+        let l = v0.lines().find(|l| l.starts_with(&format!("{needle_row}#"))).unwrap();
+        l.split('|').next().unwrap().to_string()
+    };
+    let (close7, call9) = (anchor(7 * 5 + 4), anchor(9 * 5 + 3));
+    // Two edits above shift both anchors by different amounts.
+    run_op(&ws, "edit", &json!({"path": "a.rs", "old_text": "fn f0() {", "new_text": "// a\n// b\n// c\nfn f0() {"})).unwrap();
+    run_op(&ws, "edit", &json!({"path": "a.rs", "old_text": "// c\n", "new_text": ""})).unwrap();
+    // Stale `}` anchor still lands on f7's closing brace, not on any of the other `    }` lines.
+    run_op(&ws, "edit", &json!({"path": "a.rs", "at": close7, "new_text": "    } // end-if-7"})).unwrap();
+    run_op(&ws, "edit", &json!({"path": "a.rs", "at": call9, "new_text": "        y(nine);"})).unwrap();
+    let t = read(&ws, "a.rs");
+    assert_eq!(t.matches("end-if-7").count(), 1);
+    assert_eq!(row_of(&t, "end-if-7"), row_of(&t, "fn f7() {") + 3, "{t}");
+    assert_eq!(row_of(&t, "y(nine)"), row_of(&t, "fn f9() {") + 2, "{t}");
+    assert!(!t.contains("y(9)"));
+}
+
+#[test]
+fn journal_is_dropped_when_the_file_changes_behind_its_back() {
+    let ws = tmp("journal-ext");
+    std::fs::write(ws.join("a.txt"), "a\nb\nc\nd\ne\nf\n").unwrap();
+    let v0 = view(&ws, "a.txt", None, None).unwrap();
+    let e5 = v0.lines().nth(5).unwrap().split('|').next().unwrap().to_string(); // header + a b c d e
+    run_op(&ws, "edit", &json!({"path": "a.txt", "old_text": "a\n", "new_text": "a\nA\n"})).unwrap();
+    // Someone else rewrites the file: the recorded shifts no longer describe it.
+    std::fs::write(ws.join("a.txt"), "x\ny\na\nA\nb\nc\nd\ne\nf\n").unwrap();
+    // Plain relocation still finds the (unique) `e` line.
+    run_op(&ws, "edit", &json!({"path": "a.txt", "at": e5, "new_text": "E"})).unwrap();
+    assert_eq!(read(&ws, "a.txt"), "x\ny\na\nA\nb\nc\nd\nE\nf\n");
+}
+
+#[test]
+fn diff_splices_track_far_apart_changes() {
+    use super::journal::diff_splices;
+    let old: Vec<String> = (0..2000).map(|i| format!("line {i}")).collect();
+    let mut new = old.clone();
+    new.insert(10, "added".into());
+    new.drain(1500..1502);
+    new[1700] = "changed".into();
+    let sp = diff_splices(&old, &new);
+    // Rows are those of the old text: 2 rows gone at old 1499..1501, old row 1701 rewritten.
+    assert_eq!(sp, vec![(10, 0, 1), (1499, 2, 0), (1701, 1, 1)]);
+}
+
+#[test]
+fn display_history_picks_between_versions_and_never_guesses() {
+    let ws = tmp("journal-display");
+    let mut src = String::new();
+    for i in 0..6 {
+        src.push_str(&format!("fn f{i}() {{\n    g({i});\n}}\n"));
+    }
+    std::fs::write(ws.join("a.rs"), &src).unwrap();
+    let anchor_of = |out: &str, row: usize| -> String {
+        out.lines().find(|l| l.starts_with(&format!("{row}#"))).unwrap().split('|').next().unwrap().to_string()
+    };
+    // f4's closing brace is row 15. Read the file, then add two lines at the top.
+    let v0 = run_op(&ws, "view", &json!({"path": "a.rs"})).unwrap();
+    let close_f4 = anchor_of(&v0, 15);
+    run_op(&ws, "edit", &json!({"path": "a.rs", "at": "top", "new_text": "// one\n// two"})).unwrap();
+    // The edit printed only rows near the top, so row 15 was shown at version 0 alone: unambiguous
+    // even though the unshifted row 15 (`}` of f4's body after the shift is row 17) also hashes alike.
+    run_op(&ws, "edit", &json!({"path": "a.rs", "at": close_f4, "new_text": "} // f4"})).unwrap();
+    let t = read(&ws, "a.rs");
+    assert_eq!(row_of(&t, "} // f4"), row_of(&t, "g(4);") + 1, "{t}");
+
+    // Show the whole file again after another shift: the same token now has two displayed meanings.
+    let v1 = run_op(&ws, "view", &json!({"path": "a.rs"})).unwrap();
+    let stale = anchor_of(&v1, 12);
+    run_op(&ws, "edit", &json!({"path": "a.rs", "at": "top", "new_text": "// three"})).unwrap();
+    run_op(&ws, "view", &json!({"path": "a.rs"})).unwrap();
+    let before = read(&ws, "a.rs");
+    match run_op(&ws, "edit", &json!({"path": "a.rs", "at": stale, "new_text": "}"})) {
+        // Either the one displayed meaning won, or it refused and listed the candidates: never a silent guess.
+        Ok(_) => assert_ne!(read(&ws, "a.rs"), before),
+        Err(e) => {
+            assert!(e.contains("which one did you mean"), "{e}");
+            assert_eq!(read(&ws, "a.rs"), before);
+        }
+    }
+}
+
+#[test]
+fn foreign_writes_are_diffed_into_the_journal() {
+    let ws = tmp("journal-foreign");
+    let mut src = String::new();
+    for i in 0..30 {
+        src.push_str(&format!("let v{i} = 1;\n}}\n"));
+    }
+    std::fs::write(ws.join("a.rs"), &src).unwrap();
+    let v0 = run_op(&ws, "view", &json!({"path": "a.rs"})).unwrap();
+    let a = |row: usize| v0.lines().find(|l| l.starts_with(&format!("{row}#"))).unwrap().split('|').next().unwrap().to_string();
+    let target = a(42); // the `}` after `let v20`
+    // An editor prepends 3 lines and the journal never sees it.
+    std::fs::write(ws.join("a.rs"), format!("// x\n// y\n// z\n{src}")).unwrap();
+    run_op(&ws, "edit", &json!({"path": "a.rs", "at": target, "new_text": "} // here"})).unwrap();
+    let t = read(&ws, "a.rs");
+    assert_eq!(row_of(&t, "} // here"), row_of(&t, "let v20 = 1;") + 1, "{t}");
 }
