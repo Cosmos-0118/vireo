@@ -209,6 +209,19 @@ impl SessionManager {
         }
     }
 
+    /// App exit: ends every session and waits (up to `timeout`) for the CLI process trees to
+    /// be gone, so none is left running or killed mid-write by the OS.
+    pub async fn shutdown_all(&self, timeout: Duration) {
+        let sessions: Vec<Arc<Session>> = self.map.lock().await.drain().map(|(_, e)| e.session).collect();
+        for s in &sessions {
+            s.shutdown();
+        }
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline && sessions.iter().any(|s| s.is_alive()) {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Starts the background sweep (once), which drops dead and idle sessions.
     fn ensure_reaper(&self) {
         self.reaper.call_once(|| {

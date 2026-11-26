@@ -721,6 +721,9 @@ fn build_unix_shell(
 // can rebuild its screen, and delivery is flow-controlled with client ACKs.
 // ---------------------------------------------------------------------------
 
+/// How long a shell gets to exit by itself after its PTY is closed, before it is terminated.
+const SHELL_EXIT_GRACE: Duration = Duration::from_millis(1200);
+
 enum PtyCmd {
     Input(Vec<u8>),
     Resize(u16, u16),
@@ -783,6 +786,8 @@ struct PtySession {
     /// Bumped (to the ring end) whenever output arrives or the process exits.
     updates: watch::Sender<u64>,
     exited: AtomicBool,
+    /// Set by the control thread once the shell is gone and the PTY is closed.
+    closed: Arc<AtomicBool>,
     /// Read cursor of every attached client (conn id -> absolute offset).
     cursors: Mutex<HashMap<u64, Arc<AtomicU64>>>,
     detached_since: Mutex<Option<Instant>>,
@@ -812,6 +817,22 @@ impl PtySession {
 fn sessions() -> &'static Mutex<HashMap<String, Arc<PtySession>>> {
     static SESSIONS: OnceLock<Mutex<HashMap<String, Arc<PtySession>>>> = OnceLock::new();
     SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// App exit: ends every shell and waits (up to `timeout`) for each to close cleanly, so the
+/// shells are not terminated mid-write when the process goes away.
+pub fn shutdown_all(timeout: Duration) {
+    let all: Vec<Arc<PtySession>> = match sessions().lock() {
+        Ok(mut map) => map.drain().map(|(_, s)| s).collect(),
+        Err(_) => return,
+    };
+    for s in &all {
+        s.kill();
+    }
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline && !all.iter().all(|s| s.closed.load(Ordering::Acquire)) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn remove_session(session: &Arc<PtySession>) {
@@ -937,6 +958,7 @@ fn spawn_session(
         }),
         updates,
         exited: AtomicBool::new(false),
+        closed: Arc::new(AtomicBool::new(false)),
         cursors: Mutex::new(HashMap::new()),
         detached_since: Mutex::new(Some(Instant::now())),
     });
@@ -975,15 +997,19 @@ fn spawn_session(
     // Control thread: input, resize, kill, and child-exit detection. ConPTY does not close
     // the output pipe when the child exits, so poll for it and then drop the master.
     let mut killer = child.clone_killer();
+    let child_done = Arc::new(AtomicBool::new(false));
     {
         // Block on the child's exit instead of polling `try_wait` every 400 ms.
         let exit_tx = session.cmd_tx.clone();
+        let done = child_done.clone();
         let mut child = child;
         std::thread::spawn(move || {
             let _ = child.wait();
+            done.store(true, Ordering::Release);
             let _ = exit_tx.send(PtyCmd::Exited);
         });
     }
+    let closed = session.closed.clone();
     std::thread::spawn(move || {
         let mut last_size = (cols, rows);
         loop {
@@ -1015,9 +1041,19 @@ fn spawn_session(
                 Ok(PtyCmd::Kill) | Err(_) => break,
             }
         }
-        let _ = killer.kill();
+        // Close the pseudoconsole first: ConPTY then sends the shell a close event and it exits
+        // on its own (history saved, no half-written output). Terminating a live shell is the
+        // fallback for one that ignores it.
         drop(writer);
         drop(master);
+        let deadline = Instant::now() + SHELL_EXIT_GRACE;
+        while !child_done.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !child_done.load(Ordering::Acquire) {
+            let _ = killer.kill();
+        }
+        closed.store(true, Ordering::Release);
     });
 
     Ok(session)

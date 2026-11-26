@@ -304,14 +304,15 @@ fn parse_args() -> CliArgs {
 fn build_router(
     initial_workspace: PathBuf,
     main_window: Arc<OnceLock<tauri::WebviewWindow>>,
-) -> Router {
+) -> (Router, Arc<agent_session::SessionManager>) {
     let (events_tx, _) = tokio::sync::broadcast::channel(128);
     let watcher_tx = watcher::spawn_watcher(initial_workspace.clone(), events_tx.clone());
     let mut app_state = AppState::new(initial_workspace, watcher_tx);
     app_state.events_tx = events_tx;
     app_state.main_window = main_window;
+    let sessions = app_state.sessions.clone();
 
-    Router::new()
+    let router = Router::new()
         .route("/api/health", get(health))
         .route("/api/prefs", get(prefs::get_prefs).patch(prefs::patch_prefs))
         .route("/api/prefs/bootstrap.js", get(prefs::bootstrap_js))
@@ -411,7 +412,8 @@ fn build_router(
                 }))
                 .allow_methods(Any)
                 .allow_headers(Any),
-        )
+        );
+    (router, sessions)
 }
 
 /// Routes that operate on the open folder are refused while no folder is open.
@@ -439,6 +441,44 @@ async fn require_workspace(
 /// covered window still throttles.
 const WEBVIEW2_ARGS: &str = "--disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --metrics-recording-only --disable-default-apps --no-first-run --disable-speech-api --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,Translate,OptimizationHints,MediaRouter";
 
+/// How long app exit waits for shells and agent CLIs to stop before the OS-level job object
+/// terminates whatever is left.
+const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_millis(2500);
+
+/// Stops every shell and agent CLI process, once. Safe to call again (later calls do nothing).
+fn shutdown(rt: &tokio::runtime::Runtime, sessions: &agent_session::SessionManager) {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if DONE.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    rt.block_on(async {
+        let shells = tokio::task::spawn_blocking(|| pty::shutdown_all(SHUTDOWN_GRACE));
+        let _ = tokio::join!(sessions.shutdown_all(SHUTDOWN_GRACE), shells);
+    });
+}
+
+/// Server-only mode: resolves on Ctrl+C / Ctrl+Break (and closing the console window on Windows).
+async fn shutdown_signal() {
+    #[cfg(windows)]
+    {
+        let close = async {
+            match tokio::signal::windows::ctrl_close() {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = close => {}
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
 fn main() {
     // First thing, before any child process exists: children must inherit the kill-on-close job
     // so no shell/dev server/agent can outlive the app and keep the workspace folder locked.
@@ -453,7 +493,7 @@ fn main() {
     });
     let cli = parse_args();
     let main_window: Arc<OnceLock<tauri::WebviewWindow>> = Arc::new(OnceLock::new());
-    let app_router = build_router(cli.workspace.clone(), main_window.clone());
+    let (app_router, sessions) = build_router(cli.workspace.clone(), main_window.clone());
 
     // A single-user local app: a handful of workers is plenty (blocking work has its own pool).
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 4);
@@ -494,11 +534,12 @@ fn main() {
         } else {
             println!("Workspace: {}", cli.workspace.display());
         }
-        rt.block_on(async move {
-            axum::serve(listener, app_router)
-                .await
-                .expect("Server error");
+        rt.block_on(async {
+            let _ = axum::serve(listener, app_router)
+                .with_graceful_shutdown(shutdown_signal())
+                .await;
         });
+        shutdown(&rt, &sessions);
         return;
     }
 
@@ -542,6 +583,13 @@ fn main() {
             let _ = win_slot.set(win);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("Error running Vireo desktop app");
+        .build(tauri::generate_context!())
+        .expect("Error building Vireo desktop app")
+        .run(move |_app, event| {
+            // The window is already gone here; stop shells and agent CLIs cleanly before the
+            // process ends instead of leaving them to be terminated by the OS.
+            if matches!(event, tauri::RunEvent::Exit) {
+                shutdown(&rt, &sessions);
+            }
+        });
 }
