@@ -355,6 +355,7 @@ fn build_router(
         .route("/api/git/branches", get(git::get_branches))
         .route("/api/git/checkout", post(git::checkout_branch))
         .route("/api/git/branch-delete", post(git::delete_branch))
+        .route("/api/git/remote-prune", post(git::prune_remote_branches))
         .route("/api/git/log", get(git::get_log))
         .route("/api/git/commit-detail", get(git::get_commit_detail))
         .route("/api/git/commit-diff", get(git::get_commit_diff))

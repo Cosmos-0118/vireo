@@ -222,6 +222,11 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ name, force }),
     }),
+  gitPruneRemoteBranches: () =>
+    jsonFetch<CommandRes>('/api/git/remote-prune', {
+      method: 'POST',
+      body: '{}',
+    }),
   gitLog: (opts?: {
     limit?: number;
     skip?: number;

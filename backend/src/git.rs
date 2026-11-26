@@ -1943,6 +1943,37 @@ pub async fn delete_branch(
     Ok(Json(CommandRes { ok, stdout, stderr }))
 }
 
+/// `git remote prune` for every remote: drops remote-tracking refs whose branch
+/// no longer exists on the remote. Local branches are never touched.
+pub async fn prune_remote_branches(
+    State(state): State<AppState>,
+) -> Result<Json<CommandRes>, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let (ok, remotes_out, stderr) = run_git(&ws, &["remote"])
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    if !ok {
+        return Ok(Json(CommandRes { ok, stdout: String::new(), stderr }));
+    }
+    let mut all_ok = true;
+    let mut stdout = String::new();
+    let mut errors = String::new();
+    for remote in remotes_out
+        .lines()
+        .map(str::trim)
+        .filter(|r| !r.is_empty() && !r.starts_with('-'))
+    {
+        let (ok, out, err) = run_git(&ws, &["remote", "prune", remote])
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        all_ok &= ok;
+        stdout.push_str(&out);
+        errors.push_str(&err);
+    }
+    state.notify_fs_changed(vec!["git:branch-delete".to_string()]);
+    Ok(Json(CommandRes { ok: all_ok, stdout, stderr: errors }))
+}
+
 pub async fn get_log(
     State(state): State<AppState>,
     Query(q): Query<LogQuery>,

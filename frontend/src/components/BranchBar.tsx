@@ -795,6 +795,14 @@ const BranchPicker: React.FC<BranchPickerProps> = ({
     });
   };
 
+  const pruneRemoteBranches = () => {
+    runAction(async () => {
+      const res = await api.gitPruneRemoteBranches();
+      if (!res.ok) throw new Error(res.stderr || 'Could not clean up remote branches');
+      const n = (res.stdout.match(/\[pruned\]/g) ?? []).length;
+      onToast(n > 0 ? `Removed ${plural(n, 'remote branch')} deleted on the remote` : 'No deleted remote branches found');
+    });
+  };
   const onKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === 'Escape') {
       e.preventDefault();
@@ -974,7 +982,22 @@ const BranchPicker: React.FC<BranchPickerProps> = ({
               <MoreHint n={matchedLocals.length - SECTION_LIMIT} />
             )}
 
-            {shownRemotes.length > 0 && <SectionLabel>Remote only</SectionLabel>}
+            {shownRemotes.length > 0 && (
+              <SectionLabel
+                action={
+                  <button
+                    onClick={pruneRemoteBranches}
+                    title="Remove branches that were deleted on the remote"
+                    aria-label="Remove branches deleted on the remote"
+                    className="flex items-center justify-center w-5 h-5 -my-1 rounded normal-case text-[var(--text-muted)] hover:text-[var(--removed-fg)] hover:bg-[var(--bg-hover)] cursor-pointer"
+                  >
+                    <CloudOff size={12} />
+                  </button>
+                }
+              >
+                Remote only
+              </SectionLabel>
+            )}
             {shownRemotes.map((b) => {
               idx++;
               const i = idx;
@@ -1009,9 +1032,10 @@ const BranchPicker: React.FC<BranchPickerProps> = ({
   );
 };
 
-const SectionLabel: React.FC<{ children: React.ReactNode }> = ({ children }) => (
-  <div className="px-2.5 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">
-    {children}
+const SectionLabel: React.FC<{ children: React.ReactNode; action?: React.ReactNode }> = ({ children, action }) => (
+  <div className="flex items-center justify-between px-2.5 pt-2 pb-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-dim)]">
+    <span>{children}</span>
+    {action}
   </div>
 );
 
