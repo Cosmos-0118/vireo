@@ -323,8 +323,9 @@ pub(crate) fn locate_at(
     rel: &str,
     s: &(usize, String),
     e: &(usize, String),
+    hint: Option<&str>,
 ) -> Result<(usize, usize), String> {
-    match journal_lookup(full, doc, s, e) {
+    match journal_lookup(full, doc, s, e, hint) {
         Lookup::Found(r) => Ok(r),
         Lookup::Ambiguous(pairs) => {
             // Show each candidate's first line, so one retry with the right anchor is enough.
@@ -347,7 +348,7 @@ enum Lookup {
     Unknown,
 }
 
-fn journal_lookup(full: &Path, doc: &Doc, s: &(usize, String), e: &(usize, String)) -> Lookup {
+fn journal_lookup(full: &Path, doc: &Doc, s: &(usize, String), e: &(usize, String), hint: Option<&str>) -> Lookup {
     if s.0 == 0 || e.0 < s.0 || doc.lines.is_empty() {
         return Lookup::Unknown;
     }
@@ -380,10 +381,16 @@ fn journal_lookup(full: &Path, doc: &Doc, s: &(usize, String), e: &(usize, Strin
         1 => Lookup::Found(cands[0].0),
         _ => {
             let seen: Vec<(usize, usize)> = cands.iter().filter(|c| c.1).map(|c| c.0).collect();
-            match seen.len() {
-                1 => Lookup::Found(seen[0]),
-                0 => Lookup::Ambiguous(sorted(cands.iter().map(|c| c.0).collect())),
-                _ => Lookup::Ambiguous(sorted(seen)),
+            let pool = if seen.is_empty() { cands.iter().map(|c| c.0).collect() } else { seen };
+            // The caller copied the printed line too (`12#ab|text`): it must be the line holding that text.
+            let by_text: Vec<(usize, usize)> = match hint {
+                Some(h) => pool.iter().copied().filter(|(a, _)| doc.lines[*a].contains(h)).collect(),
+                None => Vec::new(),
+            };
+            match (pool.len(), by_text.len()) {
+                (1, _) => Lookup::Found(pool[0]),
+                (_, 1) => Lookup::Found(by_text[0]),
+                _ => Lookup::Ambiguous(sorted(pool)),
             }
         }
     }

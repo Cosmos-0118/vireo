@@ -107,7 +107,8 @@ fn hashline_edit_doc(
         Some(e) if !e.trim().is_empty() => parse_anchor_in_doc(&doc, &rel, e)?,
         _ => s.clone(),
     };
-    let (r0, r1) = super::journal::locate_at(&full, &doc, &rel, &s, &e)?;
+    let hint = super::doc::anchor_snippet(start);
+    let (r0, r1) = super::journal::locate_at(&full, &doc, &rel, &s, &e, hint)?;
     let new_lines = text_to_lines(new_text);
     match op {
         "replace" | "" => {
@@ -569,7 +570,8 @@ pub fn edit_batch(ws: &Path, path: &str, edits: &[serde_json::Value], cwd: Optio
                             Some(b) => parse_anchor_in_doc(doc, rel, b).map_err(|e| format!("edits[{n}]: {e}"))?,
                             None => s.clone(),
                         };
-                        let (r0, r1) = super::journal::locate_at(full, doc, rel, &s, &en).map_err(|e| format!("edits[{n}]: {e}"))?;
+                        let (r0, r1) = super::journal::locate_at(full, doc, rel, &s, &en, super::doc::anchor_snippet(&a))
+                            .map_err(|e| format!("edits[{n}]: {e}"))?;
                         (r0, r1, format!(" within lines {}..{}", r0 + 1, r1 + 1))
                     } else if let Some(sym) = get(&["symbol"]) {
                         let lang = lang_for(rel).filter(|l| *l != Lang::Json).ok_or_else(|| format!("edits[{n}]: no symbol support for {rel}"))?;

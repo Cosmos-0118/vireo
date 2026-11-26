@@ -1432,7 +1432,7 @@ fn measure_stale_anchor_resolution() {
                     let a = (*n, h.clone());
                     for (method, res) in [
                         ("window", locate(&cur, &name, &a, &a)),
-                        ("journal", locate_at(&full, &cur, &name, &a, &a)),
+                        ("journal", locate_at(&full, &cur, &name, &a, &a, None)),
                     ] {
                         let slot = stats.entry((method, k_edits, "printed")).or_default();
                         match res {
@@ -1463,7 +1463,8 @@ fn measure_stale_anchor_resolution() {
                 let a = (i + 1, line_hash(&doc0.lines[i]));
                 for (method, res) in [
                     ("window", locate(&cur, &name, &a, &a)),
-                    ("journal", locate_at(&full, &cur, &name, &a, &a)),
+                    ("journal", locate_at(&full, &cur, &name, &a, &a, None)),
+                    ("journal+text", locate_at(&full, &cur, &name, &a, &a, Some(doc0.lines[i].trim()))),
                 ] {
                     let slot = stats.entry((method, k_edits, kind)).or_default();
                     match res {
@@ -1490,7 +1491,7 @@ fn measure_stale_anchor_resolution() {
                     let e = (i + 3, line_hash(&doc0.lines[i + 2]));
                     for (method, res) in [
                         ("window", locate(&cur, &name, &a, &e)),
-                        ("journal", locate_at(&full, &cur, &name, &a, &e)),
+                        ("journal", locate_at(&full, &cur, &name, &a, &e, None)),
                     ] {
                         let slot = stats.entry((method, k_edits, "range3")).or_default();
                         match res {
@@ -1628,4 +1629,14 @@ fn foreign_writes_are_diffed_into_the_journal() {
     run_op(&ws, "edit", &json!({"path": "a.rs", "at": target, "new_text": "} // here"})).unwrap();
     let t = read(&ws, "a.rs");
     assert_eq!(row_of(&t, "} // here"), row_of(&t, "let v20 = 1;") + 1, "{t}");
+}
+
+#[test]
+fn anchor_snippet_is_read_from_a_copied_view_line() {
+    use super::doc::anchor_snippet;
+    assert_eq!(anchor_snippet("12#ab|    let x = 1;"), Some("let x = 1;"));
+    assert_eq!(anchor_snippet("src/a.rs:12#ab|fn main() {"), Some("fn main() {"));
+    assert_eq!(anchor_snippet("12#ab"), None);
+    assert_eq!(anchor_snippet("12#ab|   "), None);
+    assert_eq!(anchor_snippet("12"), None);
 }

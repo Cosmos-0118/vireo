@@ -166,6 +166,15 @@ pub(crate) fn parse_anchor(s: &str) -> Result<(usize, String), String> {
     Ok((n, c.get(2).map(|m| m.as_str().to_lowercase()).unwrap_or_default()))
 }
 
+/// The text after `|` in an anchor copied whole from `view` output (`12#ab|    let x = 1;`): a
+/// free check of which line was meant when the hash alone fits several.
+pub(crate) fn anchor_snippet(raw: &str) -> Option<&str> {
+    let c = lazy_re!(r"^[>\[\s]*(?:[^\s:#]+:)?\d+#[0-9a-fA-F]{2}\|(.*)$").captures(raw.trim())?;
+    let m = c.get(1)?;
+    let t = raw.trim()[m.start()..].trim();
+    (!t.is_empty()).then_some(t)
+}
+
 /// Give a hash-free anchor (plain line number) the hash of the live line, optionally checking a
 /// `|snippet` the caller typed: the line must contain it, else the nearest line within ±50 that does.
 pub(crate) fn fill_plain(

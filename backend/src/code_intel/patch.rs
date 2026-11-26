@@ -360,7 +360,7 @@ fn plan_update(
                     }
                 };
                 let (start, end) = (&start, &end);
-                let (r0, r1) = match locate_at(&full, &doc, &rel, start, end) {
+                let (r0, r1) = match locate_at(&full, &doc, &rel, start, end, None) {
                     Ok(r) => r,
                     Err(e) => {
                         errors.push(format!("{}: {e}", tag(header)));
