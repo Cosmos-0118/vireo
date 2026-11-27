@@ -1651,18 +1651,32 @@ fn cli_run(ws: &Path, jf: &Path, full: &Path, op: &str, a: Value) -> Result<Stri
 
 #[test]
 fn stale_anchor_maps_through_edits_made_by_earlier_cli_runs() {
+    use super::doc::line_hash;
     let ws = tmp("journal-cli");
     let jf = ws.join("journal.json");
     let full = ws.join("a.rs");
-    std::fs::write(&full, "fn a() {\n}\nfn b() {\n}\nfn c() {\n}\n").unwrap();
-    // Run 1 prints `6#hh` for c's closing brace.
+    // A decoy with the target's 1-byte hash but different text: after the shift it sits at the
+    // target's old row, so a hash-only match there would edit the wrong line.
+    let target = "    c_body();";
+    let decoy = (0..10_000)
+        .map(|i| format!("    b_body_{i}();"))
+        .find(|s| line_hash(s) == line_hash(target))
+        .unwrap();
+    std::fs::write(&full, format!("fn a() {{\n}}\nfn b() {{\n{decoy}\n}}\n{target}\n")).unwrap();
+    // Run 1 prints `6#hh|    c_body();`.
     let v = cli_run(&ws, &jf, &full, "view", json!({"path": "a.rs"})).unwrap();
-    let c_close = v.lines().find(|l| l.starts_with("6#")).unwrap().split('|').next().unwrap().to_string();
-    // Run 2 adds two lines above it.
+    let anchor = v.lines().find(|l| l.starts_with("6#")).unwrap().to_string();
+    assert!(anchor.ends_with(target), "{anchor}");
+    // Run 2 adds two lines above it: row 6 now holds the decoy.
     cli_run(&ws, &jf, &full, "edit", json!({"path": "a.rs", "at": "top", "new_text": "// x\n// y"})).unwrap();
-    // Run 3 uses the stale anchor. Row 6 now holds b's `}` (same hash): it must still be c's.
-    cli_run(&ws, &jf, &full, "edit", json!({"path": "a.rs", "at": c_close, "new_text": "} // end c"})).unwrap();
-    assert_eq!(read(&ws, "a.rs"), "// x\n// y\nfn a() {\n}\nfn b() {\n}\nfn c() {\n} // end c\n");
+    // Run 3 uses the stale anchor as printed. The journal must map it to row 8. (Tests share one
+    // in-memory journal and every printed `N#hh` marks rows as shown, so the copied line text is
+    // what tells the candidates apart when other tests run in parallel.)
+    cli_run(&ws, &jf, &full, "edit", json!({"path": "a.rs", "at": anchor, "new_text": "    c_body(); // edited"})).unwrap();
+    assert_eq!(
+        read(&ws, "a.rs"),
+        format!("// x\n// y\nfn a() {{\n}}\nfn b() {{\n{decoy}\n}}\n    c_body(); // edited\n")
+    );
 }
 
 #[test]
