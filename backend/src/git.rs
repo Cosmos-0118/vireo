@@ -740,11 +740,16 @@ fn git_command(ws: &Path, args: &[&str]) -> Result<tokio::process::Command, Stri
             return Err("Invalid git argument".to_string());
         }
         let lower = a.to_ascii_lowercase();
-        if prev != "-m"
-            && ["--upload-pack", "--receive-pack", "--exec", "--config-env"]
-                .iter()
-                .any(|bad| lower.starts_with(bad))
-        {
+        // Options that run a program or write an arbitrary file. (`--output-indicator-*` are
+        // harmless diff options, so `--output` is matched exactly.)
+        let runs_or_writes = ["--upload-pack", "--receive-pack", "--exec", "--config-env", "--open-files-in-pager"]
+            .iter()
+            .any(|bad| lower.starts_with(bad))
+            || lower == "--output"
+            || lower.starts_with("--output=")
+            // `git grep -O<pager>` opens matches in a program (`-o` is --only-matching).
+            || (args.first() == Some(&"grep") && a.starts_with("-O"));
+        if prev != "-m" && runs_or_writes {
             return Err(format!("Refusing unsafe git argument: {a}"));
         }
         prev = a;
@@ -2935,12 +2940,20 @@ mod tests {
             vec!["push", "--receive-pack", "x", "origin"],
             vec!["log", "--config-env=core.pager=X"],
             vec!["show", "HEAD\0--exec"],
+            vec!["diff", "--output=/tmp/owned", "HEAD"],
+            vec!["log", "--output", "/tmp/owned"],
+            vec!["grep", "--open-files-in-pager=calc", "x"],
+            vec!["grep", "-Ocalc", "x"],
         ] {
             assert!(git_command(ws, &bad).is_err(), "{bad:?}");
         }
         // A commit/tag/stash message is data, even when it looks like an option.
         assert!(git_command(ws, &["commit", "-m", "--upload-pack is mentioned\nsecond line"]).is_ok());
         assert!(git_command(ws, &["checkout", "--", "src/--exec.rs"]).is_ok());
+        // Look-alikes that are harmless stay allowed.
+        assert!(git_command(ws, &["diff", "--output-indicator-new=+", "HEAD"]).is_ok());
+        assert!(git_command(ws, &["grep", "-o", "x"]).is_ok());
+        assert!(git_command(ws, &["log", "-O", "order.txt"]).is_ok());
     }
 
     #[test]
