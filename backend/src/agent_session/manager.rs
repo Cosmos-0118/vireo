@@ -99,10 +99,18 @@ pub struct Acquired {
 
 type Sessions = Arc<Mutex<HashMap<String, Entry>>>;
 
-#[derive(Default)]
 pub struct SessionManager {
     map: Sessions,
     reaper: std::sync::Once,
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        Self {
+            map: Sessions::default(),
+            reaper: std::sync::Once::new(),
+        }
+    }
 }
 
 impl SessionManager {
