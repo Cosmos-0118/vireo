@@ -11,7 +11,11 @@ import type { LiteTheme } from '../themes';
 import { setPref } from '../prefs';
 
 const PRIMARY_FONT = 'JetBrains Mono Variable';
-const FONT_FAMILY = `'${PRIMARY_FONT}', 'JetBrains Mono', 'Cascadia Code', Consolas, monospace`;
+// Nerd Font fallbacks render prompt icons (powerlevel10k, starship, oh-my-posh) that JetBrains
+// Mono lacks; text keeps the primary font because the browser falls back per glyph.
+const NERD_FALLBACKS =
+  "'Symbols Nerd Font Mono', 'JetBrainsMono Nerd Font Mono', 'MesloLGS NF', 'MesloLGLDZ Nerd Font Mono', 'MesloLGM Nerd Font Mono', 'Hack Nerd Font Mono', 'CaskaydiaCove Nerd Font Mono', 'FiraCode Nerd Font Mono'";
+const FONT_FAMILY = `'${PRIMARY_FONT}', 'JetBrains Mono', 'Cascadia Code', ${NERD_FALLBACKS}, Menlo, Consolas, monospace`;
 const IS_WINDOWS = typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent);
 
 /**

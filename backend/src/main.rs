@@ -392,6 +392,7 @@ fn build_router(
         .route("/api/agent/session/prepare", post(agent_session::prepare_session))
         .route("/api/agent/session/close", post(agent_session::close_session))
         .route("/api/agent/cli-tools", get(pty::list_cli_tools))
+        .route("/api/terminal/shell", get(pty::shell_info))
         .route("/api/agent/models", get(agent::list_models))
         .route("/api/agent/api-models", post(agent::list_api_models))
         .route("/api/secrets", get(secrets::get_secrets))

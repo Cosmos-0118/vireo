@@ -85,6 +85,8 @@ export const api = {
       body: JSON.stringify({ id, value }),
     });
   },
+  /** Name of the shell a new terminal tab runs ("zsh", "bash", "PowerShell"). */
+  shellInfo: () => jsonFetch<{ name: string }>('/api/terminal/shell'),
   getWorkspace: () => jsonFetch<WorkspaceInfo>('/api/workspace'),
   setWorkspace: (path: string) =>
     jsonFetch<WorkspaceInfo>('/api/workspace', {

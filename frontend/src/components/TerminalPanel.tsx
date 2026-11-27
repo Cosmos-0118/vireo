@@ -27,6 +27,10 @@ import {
   useTerminalEngine,
 } from './usePtyTerminal';
 
+/** Title of plain shell tabs; replaced by the backend's shell name once known. */
+let shellTitle = /Windows/i.test(navigator.userAgent) ? 'PowerShell' : 'Terminal';
+const IS_MAC = typeof navigator !== 'undefined' && /Macintosh|Mac OS X/i.test(navigator.userAgent);
+
 export interface TermTabSpec {
   id: string;
   title: string;
@@ -105,7 +109,8 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
     active,
     visible,
     theme,
-    fontSize: 14,
+    // macOS renders type larger than Windows at the same px; 12px matches the UI and VS Code on Mac.
+    fontSize: IS_MAC ? 12 : 14,
     scrollback: isAgent ? 3000 : 1500,
     exitMessage: isAgent ? '[Agent session ended]' : '[Process exited]',
     focusOnOpen: isAgent,
@@ -329,9 +334,25 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   visible = true,
 }) => {
   const [tabs, setTabs] = useState<TermTabSpec[]>([
-    { id: 'shell-1', title: 'PowerShell', kind: 'shell' },
+    { id: 'shell-1', title: shellTitle, kind: 'shell' },
   ]);
   const [activeId, setActiveId] = useState<string>('shell-1');
+  // Name plain shell tabs after the real shell (zsh/bash on macOS/Linux) once the backend says.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .shellInfo()
+      .then(({ name }) => {
+        if (cancelled || !name || name === shellTitle) return;
+        const prev = shellTitle;
+        shellTitle = name;
+        setTabs((ts) => ts.map((t) => (t.kind === 'shell' && t.title === prev ? { ...t, title: name } : t)));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
   const [engine, setEngine] = useTerminalEngine();
   const [cliTools, setCliTools] = useState<CliToolStatus[]>([]);
   const [menuAnchor, setMenuAnchor] = useState<DOMRect | null>(null);
@@ -442,7 +463,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== id);
       if (next.length === 0) {
-        const fresh: TermTabSpec = { id: `shell-${Date.now()}`, title: 'PowerShell', kind: 'shell' };
+        const fresh: TermTabSpec = { id: `shell-${Date.now()}`, title: shellTitle, kind: 'shell' };
         setActiveId(fresh.id);
         return [fresh];
       }
