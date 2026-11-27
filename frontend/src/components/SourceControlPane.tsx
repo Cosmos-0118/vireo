@@ -1,4 +1,4 @@
-import { CheckCircle, Equals, FileDashed, GitCommit } from '@phosphor-icons/react';
+import { Equals, FileDashed, GitCommit } from '@phosphor-icons/react';
 import { EmptyRow, EmptyState } from './ui/EmptyState';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
@@ -183,7 +183,6 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
   const [stashesOpen, setStashesOpen] = useState(false);
   const [checkpointsOpen, setCheckpointsOpen] = useState(false);
   const [changesRatio, setChangesRatio] = useState(0.46); // split ratio between Changes & Graph
-  const [cleanRatio, setCleanRatio] = useState(0.22); // same, when there is nothing to change
   const splitContainerRef = useRef<HTMLDivElement>(null);
 
   // Changes filter
@@ -623,8 +622,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
     const rect = container.getBoundingClientRect();
     const onMove = (ev: MouseEvent) => {
       const rel = (ev.clientY - rect.top) / Math.max(1, rect.height);
-      if (totalChanged > 0) setChangesRatio(Math.max(0.18, Math.min(0.82, rel)));
-      else setCleanRatio(Math.max(0.1, Math.min(0.82, rel)));
+      setChangesRatio(Math.max(0.18, Math.min(0.82, rel)));
     };
     const onUp = () => {
       window.removeEventListener('mousemove', onMove);
@@ -1151,7 +1149,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
           )}
 
           {/* Branch Bar + Commit Box */}
-          <div className="px-2.5 pt-2 pb-2.5 border-b border-[var(--border)] shrink-0">
+          <div className={`px-2.5 ${showCommitBox ? 'pt-2 pb-2.5' : 'py-2'} border-b border-[var(--border)] shrink-0`}>
             <BranchBar
               gitStatus={gitStatus}
               branchInfo={branchInfo}
@@ -1550,20 +1548,8 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
             </div>
             )}
 
-            {/* Clean tree: a quiet placeholder keeps the graph docked at the bottom and resizable */}
-            {totalChanged === 0 && (
-              <EmptyState
-                icon={CheckCircle}
-                tone="success"
-                title="Working tree clean"
-                description="New edits will appear here as they happen."
-                style={graphOpen ? { flex: `0 0 ${Math.round(cleanRatio * 100)}%` } : { flex: '1 1 auto' }}
-                className="!py-4"
-              />
-            )}
-
-            {/* Draggable Splitter between Changes/placeholder & Graph */}
-            {graphOpen && (totalChanged === 0 || changesOpen) && (
+            {/* Draggable Splitter between Changes & Graph */}
+            {graphOpen && totalChanged > 0 && changesOpen && (
               <div
                 onMouseDown={startSplitDrag}
                 className="h-[3px] cursor-row-resize bg-[var(--border)]/70 hover:bg-[var(--accent)] shrink-0 transition-colors"

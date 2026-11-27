@@ -8,7 +8,6 @@ import {
   ArrowUp,
   Check,
   ChevronDown,
-  CircleCheck,
   Cloud,
   CloudOff,
   CloudUpload,
@@ -361,18 +360,7 @@ export const BranchBar: React.FC<BranchBarProps> = ({
       statusText = `${sync.ahead} to push to ${upstreamLabel}`;
       break;
     default:
-      statusIcon = <CircleCheck size={12} strokeWidth={2.25} className="shrink-0 text-[var(--added-fg)]" />;
-      statusText = (
-        <>
-          <span className="text-[var(--text-muted)]">Up to date</span>
-          {sync.upstream && (
-            <span className="text-[var(--text-dim)]">
-              {' · '}
-              <span className="font-mono text-[10.5px]">{upstreamLabel}</span>
-            </span>
-          )}
-        </>
-      );
+      statusText = null;
   }
 
   return (
