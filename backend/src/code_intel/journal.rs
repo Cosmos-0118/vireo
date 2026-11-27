@@ -15,6 +15,7 @@
 //! Nothing here can pick a wrong line silently: a candidate must match the anchor's hash(es), and
 //! several distinct candidates that cannot be told apart are an error that lists them.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -33,6 +34,7 @@ const MAX_ROWS: usize = 200_000;
 /// How far apart (in rows) the two texts may drift before a diff gives up re-syncing.
 const RESYNC_WINDOW: usize = 300;
 
+#[derive(Clone, Serialize, Deserialize)]
 struct Journal {
     path: PathBuf,
     /// Fingerprint of the text the snapshot below describes.
@@ -233,6 +235,142 @@ pub(crate) fn record(full: &Path, old: &str, new: &str, splices: Option<Vec<Spli
 pub(crate) fn forget(full: &Path) {
     if let Ok(mut t) = table().lock() {
         t.remove(&key(full));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Persistence across one-shot processes (the `vx` CLI)
+// ---------------------------------------------------------------------------------------------
+//
+// The MCP server and the app are long-lived, so the in-memory table above sees every write and
+// display. Each `vx` CLI command is a fresh process: without this, anchors printed by one command
+// could not be mapped through the writes of the next, and a stale `N#hh` would either be refused
+// as ambiguous or, worse, land on whatever line now sits at row N with the same hash.
+//
+// Each run loads the workspace's journal file, runs, and merges back only the entries it changed,
+// so parallel runs on different files keep each other's history. A lost update (two runs on the
+// same file at once) only drops evidence: lookups still verify every candidate's hash and fall
+// back to `locate` or an error, never a silent guess.
+
+const PERSIST_VERSION: u32 = 1;
+/// Entries nobody touched for this long are dropped on load.
+const PERSIST_TTL_SECS: u64 = 24 * 3600;
+/// Bigger files are kept in memory only (one row hash each would bloat the file).
+const PERSIST_MAX_ROWS: usize = 50_000;
+
+#[derive(Serialize, Deserialize, Default)]
+struct Persisted {
+    version: u32,
+    /// key -> (unix seconds when last saved, journal)
+    entries: HashMap<String, (u64, Journal)>,
+}
+
+/// Per journal file: digest of each entry as loaded, to tell which ones this process changed.
+fn baselines() -> &'static Mutex<HashMap<PathBuf, HashMap<String, u64>>> {
+    static B: OnceLock<Mutex<HashMap<PathBuf, HashMap<String, u64>>>> = OnceLock::new();
+    B.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+fn digest(j: &Journal) -> u64 {
+    serde_json::to_vec(j).map_or(0, |b| ((b.len() as u64) << 32) | xxh32(&b, 0) as u64)
+}
+
+fn read_persisted(file: &Path) -> Persisted {
+    let Ok(bytes) = std::fs::read(file) else { return Persisted::default() };
+    match serde_json::from_slice::<Persisted>(&bytes) {
+        Ok(mut p) if p.version == PERSIST_VERSION => {
+            let cutoff = now_secs().saturating_sub(PERSIST_TTL_SECS);
+            p.entries.retain(|_, (at, _)| *at >= cutoff);
+            p
+        }
+        // Unknown version or a torn/corrupt file: start over (it is only a cache).
+        _ => Persisted::default(),
+    }
+}
+
+/// The journal file for `ws` in the user's cache folder, or `None` when disabled
+/// (`VX_NO_JOURNAL=1`) or no cache folder is known. `VX_JOURNAL_DIR` overrides the folder.
+pub(crate) fn persist_file(ws: &Path) -> Option<PathBuf> {
+    if std::env::var_os("VX_NO_JOURNAL").is_some_and(|v| v != "0") {
+        return None;
+    }
+    let dir = if let Some(d) = std::env::var_os("VX_JOURNAL_DIR") {
+        PathBuf::from(d)
+    } else if cfg!(windows) {
+        PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("vx").join("cache")
+    } else if cfg!(target_os = "macos") {
+        PathBuf::from(std::env::var_os("HOME")?).join("Library").join("Caches").join("vx")
+    } else {
+        std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?
+            .join("vx")
+    };
+    Some(dir.join(format!("journal-{:08x}.json", xxh32(key(ws).as_bytes(), 0))))
+}
+
+/// Adds the entries saved in `file` to the in-memory table (entries already there win).
+pub(crate) fn load_persisted(file: &Path) {
+    let p = read_persisted(file);
+    let mut base = HashMap::new();
+    if let Ok(mut t) = table().lock() {
+        for (k, (_, j)) in p.entries {
+            base.insert(k.clone(), digest(&j));
+            t.entry(k).or_insert(j);
+        }
+    }
+    if let Ok(mut b) = baselines().lock() {
+        b.insert(file.to_path_buf(), base);
+    }
+}
+
+/// Merges what this process changed since [`load_persisted`] into `file` (re-read first, so
+/// other processes' entries survive) and writes it atomically. Best effort: errors are ignored.
+pub(crate) fn save_persisted(file: &Path) {
+    let Some(base) = baselines().lock().ok().and_then(|mut b| b.remove(file)) else { return };
+    let mut disk = read_persisted(file);
+    let now = now_secs();
+    {
+        let Ok(t) = table().lock() else { return };
+        for (k, j) in t.iter() {
+            let d = digest(j);
+            if base.get(k) == Some(&d) {
+                continue; // untouched here: keep whatever is on disk now
+            }
+            if j.last.len() > PERSIST_MAX_ROWS {
+                disk.entries.remove(k);
+            } else {
+                disk.entries.insert(k.clone(), (now, j.clone()));
+            }
+        }
+        // Forgotten here (file deleted/moved): drop it, unless another process updated it since.
+        for (k, d0) in &base {
+            if !t.contains_key(k) && disk.entries.get(k).is_some_and(|(_, j)| digest(j) == *d0) {
+                disk.entries.remove(k);
+            }
+        }
+    }
+    if disk.entries.len() > MAX_FILES {
+        let mut by_age: Vec<(u64, String)> = disk.entries.iter().map(|(k, (at, _))| (*at, k.clone())).collect();
+        by_age.sort();
+        for (_, k) in by_age.into_iter().take(disk.entries.len() - MAX_FILES) {
+            disk.entries.remove(&k);
+        }
+    }
+    disk.version = PERSIST_VERSION;
+    let Some(dir) = file.parent() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let Ok(bytes) = serde_json::to_vec(&disk) else { return };
+    // Write-then-rename so a concurrent reader never sees a half-written file.
+    let tmp = dir.join(format!(".{}.{}.tmp", file.file_name().and_then(|n| n.to_str()).unwrap_or("journal"), std::process::id()));
+    if std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, file).is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 

@@ -554,7 +554,7 @@ fn main() {
         other => fail(&format!("unknown command `{other}`\n{USAGE}")),
     };
 
-    match code_intel::run_op(&ws, op, &payload) {
+    match code_intel::run_op_persistent(&ws, op, &payload) {
         Ok(out) => {
             print!("{}", if out.ends_with('\n') { out.as_str() } else { "" });
             if !out.ends_with('\n') {

@@ -106,6 +106,24 @@ pub fn run_op(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
     res
 }
 
+/// [`run_op`] for one-shot processes (the `vx` CLI): loads the workspace's edit journal from the
+/// user cache before the op and saves it after, so anchors printed by an earlier `vx` command
+/// still map through the edits made since (as they do inside one long-lived MCP server).
+#[allow(dead_code)] // only the `vx` binary calls it; the app shares this module
+pub fn run_op_persistent(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
+    match journal::persist_file(ws) {
+        Some(file) => run_op_persistent_at(ws, &file, op, a),
+        None => run_op(ws, op, a),
+    }
+}
+
+pub(crate) fn run_op_persistent_at(ws: &Path, file: &Path, op: &str, a: &Value) -> Result<String, String> {
+    journal::load_persisted(file);
+    let res = run_op(ws, op, a);
+    journal::save_persisted(file);
+    res
+}
+
 fn run_op_inner(ws: &Path, op: &str, a: &Value) -> Result<String, String> {
     // `edit` also expands the `at` / inline-op selector shorthand (see `edit::canon_edit`).
     let aliased = if op == "edit" { edit::canon_edit(a) } else { with_aliases(op, a) };

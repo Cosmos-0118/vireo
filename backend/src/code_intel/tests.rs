@@ -1640,3 +1640,63 @@ fn anchor_snippet_is_read_from_a_copied_view_line() {
     assert_eq!(anchor_snippet("12#ab|   "), None);
     assert_eq!(anchor_snippet("12"), None);
 }
+
+/// One `vx` CLI command: a fresh process that loads the journal file, runs, saves, and exits
+/// (its in-memory journal for `full` is gone afterwards).
+fn cli_run(ws: &Path, jf: &Path, full: &Path, op: &str, a: Value) -> Result<String, String> {
+    let r = super::run_op_persistent_at(ws, jf, op, &a);
+    super::journal::forget(full);
+    r
+}
+
+#[test]
+fn stale_anchor_maps_through_edits_made_by_earlier_cli_runs() {
+    let ws = tmp("journal-cli");
+    let jf = ws.join("journal.json");
+    let full = ws.join("a.rs");
+    std::fs::write(&full, "fn a() {\n}\nfn b() {\n}\nfn c() {\n}\n").unwrap();
+    // Run 1 prints `6#hh` for c's closing brace.
+    let v = cli_run(&ws, &jf, &full, "view", json!({"path": "a.rs"})).unwrap();
+    let c_close = v.lines().find(|l| l.starts_with("6#")).unwrap().split('|').next().unwrap().to_string();
+    // Run 2 adds two lines above it.
+    cli_run(&ws, &jf, &full, "edit", json!({"path": "a.rs", "at": "top", "new_text": "// x\n// y"})).unwrap();
+    // Run 3 uses the stale anchor. Row 6 now holds b's `}` (same hash): it must still be c's.
+    cli_run(&ws, &jf, &full, "edit", json!({"path": "a.rs", "at": c_close, "new_text": "} // end c"})).unwrap();
+    assert_eq!(read(&ws, "a.rs"), "// x\n// y\nfn a() {\n}\nfn b() {\n}\nfn c() {\n} // end c\n");
+}
+
+#[test]
+fn parallel_cli_runs_keep_each_others_journal_entries() {
+    let ws = tmp("journal-cli-merge");
+    let (x, y) = (ws.join("x.txt"), ws.join("y.txt"));
+    std::fs::write(&x, "1\n2\n3\n").unwrap();
+    std::fs::write(&y, "a\nb\nc\n").unwrap();
+    let (jf, jf_other) = (ws.join("journal.json"), ws.join("other.json"));
+    // Run A edits x and saves its journal (to a side file for now).
+    cli_run(&ws, &jf_other, &x, "edit", json!({"path": "x.txt", "old_text": "1\n", "new_text": "0\n1\n"})).unwrap();
+    // Run B starts before A finished: it loads an empty journal and edits y...
+    super::journal::load_persisted(&jf);
+    super::run_op(&ws, "edit", &json!({"path": "y.txt", "old_text": "a\n", "new_text": "_\na\n"})).unwrap();
+    // ...A's save lands meanwhile, then B saves.
+    std::fs::copy(&jf_other, &jf).unwrap();
+    super::journal::save_persisted(&jf);
+    super::journal::forget(&y);
+    let saved: Value = serde_json::from_slice(&std::fs::read(&jf).unwrap()).unwrap();
+    let keys: Vec<String> = saved["entries"].as_object().unwrap().keys().cloned().collect();
+    let has = |p: &Path| keys.iter().any(|k| k.ends_with(&p.file_name().unwrap().to_string_lossy().to_lowercase()[..]));
+    assert!(has(&x) && has(&y), "both runs' entries survive: {keys:?}");
+}
+
+#[test]
+fn corrupt_or_foreign_journal_file_is_ignored() {
+    let ws = tmp("journal-cli-corrupt");
+    let jf = ws.join("journal.json");
+    let full = ws.join("a.txt");
+    std::fs::write(&full, "a\nb\n").unwrap();
+    std::fs::write(&jf, b"{ not json").unwrap();
+    cli_run(&ws, &jf, &full, "edit", json!({"path": "a.txt", "old_text": "b", "new_text": "B"})).unwrap();
+    assert_eq!(read(&ws, "a.txt"), "a\nB\n");
+    // The broken file was replaced by a valid one.
+    let saved: Value = serde_json::from_slice(&std::fs::read(&jf).unwrap()).unwrap();
+    assert_eq!(saved["version"], 1);
+}
