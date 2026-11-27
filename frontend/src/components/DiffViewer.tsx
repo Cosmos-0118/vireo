@@ -1614,7 +1614,7 @@ ${hunk.excerpt.slice(0, 3500)}
             ref={scrollContainerRef}
             onMouseLeave={() => setHoverHunk(-1)}
             onScroll={virtual ? onScrollerScroll : undefined}
-            className="flex-1 overflow-auto font-mono text-[13px] leading-[20px]"
+            className="diff-scroll flex-1 overflow-auto font-mono text-[13px] leading-[20px]"
           >
             {(() => {
               const n = activeItems.length;

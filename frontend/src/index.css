@@ -722,3 +722,14 @@ input:not([type="checkbox"]):not([type="radio"]) {
 @media (prefers-reduced-motion: reduce) {
   .vx-empty { animation: none; }
 }
+
+/* macOS renders type larger than Windows at the same px, so code would tower over the 12-13px
+   UI there. Match VS Code's Mac sizes (the terminal does the same in TerminalPanel). Diff rows are
+   measured, not assumed, so the windowed diff list stays exact. */
+html.platform-mac .cm-editor {
+  font-size: 12.5px;
+}
+html.platform-mac .diff-scroll {
+  font-size: 12px;
+  line-height: 18px;
+}
