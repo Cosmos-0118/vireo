@@ -114,7 +114,7 @@ jobs:
           app=artifacts/Vireo.app
           codesign --verify --deep --strict "$app"
           port=4399
-          "$app/Contents/MacOS/vireo-bin" --server-only --port "$port" --dir "$GITHUB_WORKSPACE" &
+          "$app/Contents/MacOS/Vireo" --server-only --port "$port" --dir "$GITHUB_WORKSPACE" &
           pid=$!
           for _ in $(seq 1 30); do
             if curl -fsS "http://127.0.0.1:$port/api/health" >/dev/null \

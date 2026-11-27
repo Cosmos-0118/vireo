@@ -271,7 +271,16 @@ pub fn invalidate_path_caches() {
 
 fn compute_augmented_path_env() -> OsString {
     let existing_raw = std::env::var_os("PATH").unwrap_or_default();
-    let mut dirs: Vec<PathBuf> = std::env::split_paths(&existing_raw).collect();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    // Apps opened from Finder/Dock get launchd's bare PATH. Put the user's login-shell PATH
+    // first so git/rg/gh/agents resolve the same way they do in their terminal.
+    #[cfg(target_os = "macos")]
+    for d in login_shell_path() {
+        push_unique_dir(&mut dirs, d);
+    }
+    for d in std::env::split_paths(&existing_raw) {
+        push_unique_dir(&mut dirs, d);
+    }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     #[cfg(windows)]
@@ -353,6 +362,69 @@ fn compute_augmented_path_env() -> OsString {
     }
 
     std::env::join_paths(dirs).unwrap_or(existing_raw)
+}
+
+/// The PATH a login shell sets up (Homebrew, nvm, pyenv, ... from ~/.zprofile / ~/.zshrc), read
+/// once per launch. Runs on the startup PATH thread, never on the UI path; gives up after 3 s so a
+/// slow or interactive shell config cannot stall tool lookups.
+#[cfg(target_os = "macos")]
+fn login_shell_path() -> Vec<PathBuf> {
+    static CACHE: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            const MARK: &str = "__VIREO_PATH__";
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+            let Ok(mut child) = std::process::Command::new(&shell)
+                .args(["-ilc", &format!("printf '{MARK}%s{MARK}' \"$PATH\"")])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            else {
+                return Vec::new();
+            };
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(20))
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Vec::new();
+                    }
+                }
+            }
+            let mut out = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                let _ = stdout.read_to_string(&mut out);
+            }
+            out.split(MARK)
+                .nth(1)
+                .map(|p| std::env::split_paths(p).filter(|d| d.is_absolute()).collect())
+                .unwrap_or_default()
+        })
+        .clone()
+}
+
+#[derive(Serialize)]
+pub struct ShellInfo {
+    /// Display name for a plain terminal tab ("zsh", "bash", "PowerShell").
+    pub name: String,
+}
+
+/// `GET /api/terminal/shell`: what a new terminal tab runs, for its tab title.
+pub async fn shell_info() -> Json<ShellInfo> {
+    #[cfg(windows)]
+    let name = "PowerShell".to_string();
+    #[cfg(not(windows))]
+    let name = std::env::var("SHELL")
+        .ok()
+        .and_then(|s| Path::new(&s).file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| "bash".to_string());
+    Json(ShellInfo { name })
 }
 
 /// Directory holding the `vx` helper binary (next to this executable), if it was built.

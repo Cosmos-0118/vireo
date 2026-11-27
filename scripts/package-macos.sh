@@ -25,7 +25,8 @@ done
 }
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-icon_src="$repo_root/backend/icons/icon.png"
+# macOS-style tile (dark rounded square, 1024px); the plain logo is the Windows/window icon.
+icon_src="$repo_root/backend/icons/macos-icon.png"
 for f in "$bin_dir/vireo" "$bin_dir/vx" "$icon_src"; do
   [[ -f "$f" ]] || { echo "missing: $f" >&2; exit 1; }
 done
@@ -37,22 +38,13 @@ trap 'rm -rf "$work"' EXIT
 
 app="$work/Vireo.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$bin_dir/vireo" "$app/Contents/MacOS/vireo-bin"
+# The Rust binary is the bundle executable itself (no shell launcher), so macOS registers the
+# app with its own icon at launch. It imports the login-shell PATH on its own (pty.rs).
+cp "$bin_dir/vireo" "$app/Contents/MacOS/Vireo"
 cp "$bin_dir/vx" "$app/Contents/MacOS/vx"
+chmod +x "$app/Contents/MacOS/Vireo" "$app/Contents/MacOS/vx"
 
-# Finder launches apps with a bare PATH (/usr/bin:/bin:/usr/sbin:/sbin), which hides Homebrew,
-# rg, gh and the CLI agents. The launcher picks up the user's login-shell PATH first.
-cat > "$app/Contents/MacOS/Vireo" <<'EOF'
-#!/bin/bash
-here="$(cd "$(dirname "$0")" && pwd)"
-login_path="$("${SHELL:-/bin/zsh}" -ilc 'printf %s "$PATH"' 2>/dev/null </dev/null | tail -n 1)"
-[[ -n "$login_path" ]] && export PATH="$login_path"
-export PATH="$here:$PATH"
-exec "$here/vireo-bin" "$@"
-EOF
-chmod +x "$app/Contents/MacOS/Vireo" "$app/Contents/MacOS/vireo-bin" "$app/Contents/MacOS/vx"
-
-# App icon: build an .icns from the 512px+ PNG.
+# App icon: build an .icns from the 1024px tile.
 iconset="$work/Vireo.iconset"
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do

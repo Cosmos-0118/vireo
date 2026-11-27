@@ -16,7 +16,10 @@ path = "src/bin/vx/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `custom-protocol` = production mode. Without it Tauri treats every build as dev (e.g. on macOS
+# it swaps the Dock icon for the raw PNG right after launch). The UI is served by our own axum
+# server, so Tauri's protocol itself goes unused.
+tauri = { version = "2", features = ["custom-protocol"] }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "process", "fs", "sync", "time", "macros", "signal"] }
 tower-http = { version = "0.7", features = ["cors"] }
