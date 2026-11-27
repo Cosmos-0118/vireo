@@ -10,6 +10,9 @@ pub enum WorkspaceEvent {
     FsChanged { paths: Vec<String> },
     WorkspaceSwitched { path: String },
     CheckpointCreated { checkpoint: Checkpoint },
+    /// git/ssh needs a passphrase, password or confirmation (see `askpass`).
+    AskpassPrompt { id: String, prompt: String, secret: bool },
+    AskpassClosed { id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

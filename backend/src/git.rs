@@ -757,6 +757,9 @@ fn git_command(ws: &Path, args: &[&str]) -> Result<tokio::process::Command, Stri
     cmd.args(["-c", "protocol.ext.allow=never", "-c", "protocol.fd.allow=never"])
         .args(args)
         .current_dir(ws);
+    // SSH key passphrases (fetch/push, SSH commit signing) and HTTPS credentials are asked in
+    // an in-app dialog instead of failing for lack of a terminal.
+    crate::askpass::apply_env(&mut cmd);
     Ok(cmd)
 }
 
@@ -1682,6 +1685,8 @@ pub struct AutoFetchRes {
 /// Runs `git args` non-interactively with a hard timeout (process is killed on expiry).
 async fn run_git_bounded(ws: &Path, args: &[&str], secs: u64) -> Result<(bool, String, String), String> {
     let mut cmd = git_command(ws, args)?;
+    // Background calls (auto-fetch) must never pop up a credential dialog.
+    crate::askpass::disable_env(&mut cmd);
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env("GCM_INTERACTIVE", "never")
         .stdin(Stdio::null())

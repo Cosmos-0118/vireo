@@ -38,6 +38,13 @@ import type {
   WorkspaceInfo,
 } from './types';
 
+export interface AskpassPrompt {
+  id: string;
+  prompt: string;
+  /** Hide the typed text (passphrases, passwords). */
+  secret: boolean;
+}
+
 async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {
     headers: { 'Content-Type': 'application/json', ...(init?.headers || {}) },
@@ -64,10 +71,20 @@ export const api = {
       body: JSON.stringify({ factor }),
     }),
   windowControl: (action: 'state' | 'minimize' | 'toggle_maximize' | 'close' | 'drag') =>
-    jsonFetch<{ native: boolean; maximized: boolean }>('/api/window/control', {
+    jsonFetch<{ native: boolean; maximized: boolean; platform?: string }>('/api/window/control', {
       method: 'POST',
       body: JSON.stringify({ action }),
     }),
+  /** Credential prompts from git/ssh (SSH key passphrase, HTTPS password) still awaiting the user. */
+  askpassPending: () => jsonFetch<AskpassPrompt[]>('/api/askpass/pending'),
+  /** Answer a credential prompt; `null` cancels it. */
+  askpassAnswer: async (id: string, value: string | null) => {
+    await fetch('/api/askpass/answer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, value }),
+    });
+  },
   getWorkspace: () => jsonFetch<WorkspaceInfo>('/api/workspace'),
   setWorkspace: (path: string) =>
     jsonFetch<WorkspaceInfo>('/api/workspace', {
