@@ -2,6 +2,7 @@
 
 mod agent;
 mod agent_session;
+mod askpass;
 mod checkpoint;
 mod cli_agent;
 mod code_intel;
@@ -183,6 +184,8 @@ struct WindowControlReq {
 struct WindowControlRes {
     native: bool,
     maximized: bool,
+    /// `std::env::consts::OS` ("macos", "windows", ...): macOS uses the native traffic lights.
+    platform: &'static str,
 }
 
 /// Window controls for the custom (frameless) title bar. The page is served
@@ -197,6 +200,7 @@ async fn window_control(
         return Json(WindowControlRes {
             native: false,
             maximized: false,
+            platform: std::env::consts::OS,
         });
     };
     match req.action.as_str() {
@@ -221,6 +225,7 @@ async fn window_control(
     Json(WindowControlRes {
         native: true,
         maximized: win.is_maximized().unwrap_or(false),
+        platform: std::env::consts::OS,
     })
 }
 
@@ -394,6 +399,9 @@ fn build_router(
         .route("/ws/pty", get(pty::ws_pty))
         .route("/api/pty/kill", post(pty::kill_pty))
         .route("/ws/events", get(ws_events))
+        .route("/api/askpass", post(askpass::prompt))
+        .route("/api/askpass/pending", get(askpass::list_pending))
+        .route("/api/askpass/answer", post(askpass::answer))
         .layer(axum::middleware::from_fn_with_state(
             app_state.clone(),
             require_workspace,
@@ -481,6 +489,10 @@ async fn shutdown_signal() {
     }
 }
 fn main() {
+    // Started by git/ssh as GIT_ASKPASS / SSH_ASKPASS: relay the prompt to the running app.
+    if let Some(code) = askpass::helper_exit_code() {
+        std::process::exit(code);
+    }
     // First thing, before any child process exists: children must inherit the kill-on-close job
     // so no shell/dev server/agent can outlive the app and keep the workspace folder locked.
     jobobject::init();
@@ -527,6 +539,7 @@ fn main() {
         let local = listener.local_addr().expect("Failed to read bound address");
         (listener, local)
     });
+    askpass::init(bound_addr.port());
 
     if cli.server_only {
         println!("Vireo server running at http://{}", bound_addr);
@@ -563,15 +576,25 @@ fn main() {
     tauri::Builder::default()
         .setup(move |app| {
             let (bg_r, bg_g, bg_b) = prefs::initial_window_bg();
-            let win = tauri::WebviewWindowBuilder::new(
+            let builder = tauri::WebviewWindowBuilder::new(
                 app,
                 "main",
                 tauri::WebviewUrl::External(app_url),
             )
             .title(ws_title)
             .inner_size(1440.0, 900.0)
-            .min_inner_size(960.0, 620.0)
-            .decorations(false)
+            .min_inner_size(960.0, 620.0);
+            // macOS keeps its native traffic lights (close/minimize/zoom, full screen, window
+            // snapping) over the page's title bar; the page leaves room for them on the left.
+            #[cfg(target_os = "macos")]
+            let builder = builder
+                .decorations(true)
+                .title_bar_style(tauri::TitleBarStyle::Overlay)
+                .hidden_title(true)
+                .traffic_light_position(tauri::LogicalPosition::new(14.0, 19.0));
+            #[cfg(not(target_os = "macos"))]
+            let builder = builder.decorations(false);
+            let win = builder
             .shadow(true)
             .zoom_hotkeys_enabled(false)
             // Tauri's native file-drop handler swallows HTML5 drag events on Windows, which

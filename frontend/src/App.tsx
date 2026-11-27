@@ -37,6 +37,8 @@ import { diffLines } from 'diff';
 import { AgentSettingsProvider } from './agentSettings';
 import { findAction, shortcutLabel, tabSlotFromEvent, withShortcut, useKeybindings, type ActionId } from './keybindings';
 import { api, wsUrl } from './api';
+import type { AskpassPrompt } from './api';
+import { AskpassDialog } from './components/AskpassDialog';
 import { gitWriteActive } from './utils/gitWrites';
 import {
   applyTheme,
@@ -225,17 +227,27 @@ export function App() {
   const [liveConnected, setLiveConnected] = useState(false);
 
   // Native window state for the custom title bar (null = running in a browser)
-  const [nativeWindow, setNativeWindow] = useState<{ maximized: boolean } | null>(null);
+  // `mac`: macOS draws native traffic lights over the left of the title bar instead of our buttons.
+  const [nativeWindow, setNativeWindow] = useState<{ maximized: boolean; mac: boolean } | null>(null);
   const windowAction = useCallback(
     (action: 'state' | 'minimize' | 'toggle_maximize' | 'close' | 'drag') => {
       if (action === 'close') flushPrefs();
       api
         .windowControl(action)
-        .then((res) => setNativeWindow(res.native ? { maximized: res.maximized } : null))
+        .then((res) =>
+          setNativeWindow(res.native ? { maximized: res.maximized, mac: res.platform === 'macos' } : null)
+        )
         .catch(() => {});
     },
     []
   );
+
+  // git/ssh credential prompts (SSH key passphrase, HTTPS password), answered one at a time.
+  const [askpassQueue, setAskpassQueue] = useState<AskpassPrompt[]>([]);
+  const answerAskpass = useCallback((id: string, value: string | null) => {
+    setAskpassQueue((q) => q.filter((p) => p.id !== id));
+    api.askpassAnswer(id, value).catch(() => {});
+  }, []);
   useEffect(() => {
     windowAction('state');
     let timer: number | undefined;
@@ -852,6 +864,10 @@ export function App() {
         setLiveConnected(true);
         // Events sent while the socket was down are lost: resync.
         refreshGit();
+        api
+          .askpassPending()
+          .then(setAskpassQueue)
+          .catch(() => {});
         setFsVersion((v) => v + 1);
       };
       sock.onclose = () => {
@@ -889,6 +905,11 @@ export function App() {
             loadWorkspaceData();
           } else if (data.type === 'checkpoint_created') {
             refreshGit();
+          } else if (data.type === 'askpass_prompt') {
+            const prompt: AskpassPrompt = { id: data.id, prompt: data.prompt, secret: !!data.secret };
+            setAskpassQueue((q) => (q.some((p) => p.id === prompt.id) ? q : [...q, prompt]));
+          } else if (data.type === 'askpass_closed') {
+            setAskpassQueue((q) => q.filter((p) => p.id !== data.id));
           }
         } catch {
           // ignore
@@ -2043,7 +2064,7 @@ export function App() {
         className="h-[38px] grid grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-[var(--border)] bg-[var(--bg-activity)] shrink-0 select-none"
       >
         {/* Left: brand and workspace */}
-        <div className="flex items-center gap-1 min-w-0 pl-3">
+        <div className={`flex items-center gap-1 min-w-0 ${nativeWindow?.mac ? 'pl-[84px]' : 'pl-3'}`}>
           <VireoLogo size={18} className="shrink-0 mr-1.5" />
 
           {editingWs ? (
@@ -2221,8 +2242,8 @@ export function App() {
             ))}
           </div>
 
-          {/* Window Controls */}
-          {nativeWindow && (
+          {/* Window Controls (macOS uses its native traffic lights instead) */}
+          {nativeWindow && !nativeWindow.mac && (
             <div className="flex h-full shrink-0">
               <button
                 onClick={() => windowAction('minimize')}
@@ -2265,6 +2286,8 @@ export function App() {
           )}
         </div>
       </header>
+
+      <AskpassDialog prompt={askpassQueue[0] ?? null} onSubmit={answerAskpass} />
 
       {/* Main Workbench Area */}
       <div ref={workbenchRef} className="flex-1 flex min-h-0 min-w-0 overflow-hidden">

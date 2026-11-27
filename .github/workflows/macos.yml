@@ -1,0 +1,185 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to build and attach to its release (leave empty for a test build)
+        required: false
+        type: string
+
+# Every job states its own permissions; nothing is granted at the workflow level.
+permissions: {}
+
+concurrency:
+  group: macos-${{ github.event.pull_request.number || inputs.tag || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Actions are pinned to full commit SHAs with the version tag in the comment, matching ci.yml.
+jobs:
+  build:
+    name: Build & Package (macOS universal)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      TAG: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}
+      CARGO_PROFILE_DEV_DEBUG: 0
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || '' }}
+          persist-credentials: false
+
+      - name: Resolve version and build profile
+        id: version
+        run: |
+          if [[ -n "$TAG" ]]; then
+            if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+              echo "::error::Tag '$TAG' must match vX.Y.Z or vX.Y.Z-prerelease."; exit 1
+            fi
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "PROFILE=release" >> "$GITHUB_ENV"
+          else
+            echo "version=0.0.0" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            # `ci` profile = release without fat LTO; tags still ship full-LTO release builds.
+            echo "PROFILE=ci" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: backend
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run unit tests
+        run: cargo test --manifest-path backend/Cargo.toml --locked
+
+      - name: Build arm64 and x86_64 binaries
+        run: |
+          for target in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --profile "$PROFILE" --bins --target "$target" \
+              --manifest-path backend/Cargo.toml --locked
+          done
+
+      - name: Merge into universal binaries
+        run: |
+          mkdir -p artifacts/bin
+          for bin in vireo vx; do
+            lipo -create \
+              "backend/target/aarch64-apple-darwin/$PROFILE/$bin" \
+              "backend/target/x86_64-apple-darwin/$PROFILE/$bin" \
+              -output "artifacts/bin/$bin"
+            lipo -info "artifacts/bin/$bin"
+          done
+
+      - name: Package Vireo.app, zip and dmg
+        run: |
+          chmod +x scripts/package-macos.sh
+          scripts/package-macos.sh --version "${{ steps.version.outputs.version }}" \
+            --bin-dir artifacts/bin --arch universal --out artifacts
+          cd artifacts
+          shasum -a 256 Vireo-*-macos-universal.zip Vireo-*-macos-universal.dmg > SHA256SUMS-macos.txt
+          cat SHA256SUMS-macos.txt
+
+      - name: Smoke-test the bundled binary
+        run: |
+          app=artifacts/Vireo.app
+          codesign --verify --deep --strict "$app"
+          port=4399
+          "$app/Contents/MacOS/vireo-bin" --server-only --port "$port" --dir "$GITHUB_WORKSPACE" &
+          pid=$!
+          for _ in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:$port/api/health" >/dev/null \
+              && curl -fsS "http://127.0.0.1:$port/" | grep -qi '<html'; then
+              echo "Health check and embedded UI OK on port $port"; kill "$pid"; exit 0
+            fi
+            sleep 1
+          done
+          kill "$pid" 2>/dev/null || true
+          echo "::error::Vireo did not answer on port $port"; exit 1
+
+      - name: Upload macOS packages
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: vireo-macos
+          path: |
+            artifacts/Vireo-*-macos-universal.zip
+            artifacts/Vireo-*-macos-universal.dmg
+            artifacts/SHA256SUMS-macos.txt
+          retention-days: ${{ steps.version.outputs.publish == 'true' && 30 || 3 }}
+
+  publish:
+    name: Attach to GitHub Release
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write # attaches assets to (or creates) the tag's GitHub Release
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+          sparse-checkout: .github/release-notes
+
+      - name: Download macOS packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: vireo-macos
+          path: artifacts
+
+      # release.yml (Windows) may create the release first or second. Upload when it exists;
+      # otherwise create it and let release.yml add its assets and notes afterwards.
+      - name: Upload assets
+        run: |
+          files=(artifacts/Vireo-*-macos-universal.zip artifacts/Vireo-*-macos-universal.dmg artifacts/SHA256SUMS-macos.txt)
+          for attempt in 1 2 3 4 5; do
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" "${files[@]}" --clobber && exit 0
+            else
+              notes=".github/release-notes/$TAG.md"
+              if [[ -f "$notes" ]]; then
+                flags=(--title "Vireo $TAG" --notes-file "$notes" --verify-tag)
+              else
+                flags=(--title "Vireo $TAG" --generate-notes --verify-tag)
+              fi
+              [[ "$TAG" == *-* ]] && flags+=(--prerelease)
+              gh release create "$TAG" "${files[@]}" "${flags[@]}" && exit 0
+            fi
+            echo "Attempt $attempt failed; retrying in 20s"
+            sleep 20
+          done
+          echo "::error::Could not attach macOS assets to $TAG"; exit 1
