@@ -44,9 +44,6 @@ export const PROVIDER_LABEL: Record<Provider, string> = {
   'copilot-cli': 'GitHub Copilot',
 };
 
-/** Provider ids whose API keys are kept in the OS credential store. */
-export const SECRET_NAMES = Object.keys(PROVIDER_LABEL);
-
 /** Providers that run an installed CLI with its own login instead of an API key. */
 export const CLI_PROVIDER_TOOL: Partial<Record<Provider, string>> = {
   'claude-cli': 'claude',
@@ -56,6 +53,9 @@ export const CLI_PROVIDER_TOOL: Partial<Record<Provider, string>> = {
 
 export const CLI_PROVIDERS: Provider[] = ['claude-cli', 'codex-cli', 'copilot-cli'];
 export const API_PROVIDERS: Provider[] = ['anthropic', 'openai', 'gemini'];
+
+/** Provider ids whose API keys are kept in the OS credential store. */
+export const SECRET_NAMES: string[] = [...API_PROVIDERS];
 
 export const PERM_MODES: Record<
   PermissionMode,
@@ -163,14 +163,26 @@ export const AgentSettingsProvider: React.FC<{
 
   useEffect(() => {
     let cancelled = false;
-    api
-      .cliTools()
-      .then((t) => !cancelled && setCliTools(t))
-      .catch(() => {});
-    api
-      .agentModels(config.provider === 'ollama' ? config.baseUrl : undefined)
-      .then((m) => !cancelled && setLocalModels(m))
-      .catch(() => {});
+    const run = () => {
+      if (cancelled) return;
+      api
+        .cliTools()
+        .then((t) => !cancelled && setCliTools(t))
+        .catch(() => {});
+      const isOllama = config.provider === 'ollama';
+      api
+        .agentModels(isOllama ? config.baseUrl : undefined, isOllama || refreshTick > 0)
+        .then((m) => !cancelled && setLocalModels(m))
+        .catch(() => {});
+    };
+    if (refreshTick === 0) {
+      const timer = window.setTimeout(run, 800);
+      return () => {
+        cancelled = true;
+        window.clearTimeout(timer);
+      };
+    }
+    run();
     return () => {
       cancelled = true;
     };
@@ -253,10 +265,10 @@ export const AgentSettingsProvider: React.FC<{
   }, [config.provider, config.apiKey]);
 
   // Load keys from the OS credential store; keys a previous version left in localStorage are
-  // moved there once and then erased from the browser.
+  // moved there once and then erased from the browser. Deferred slightly so startup I/O stays free.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
+    const timer = window.setTimeout(async () => {
       let stored: Record<string, string> = {};
       try {
         stored = await api.getSecrets(SECRET_NAMES);
@@ -289,9 +301,10 @@ export const AgentSettingsProvider: React.FC<{
       setApiKeys(merged);
       setConfig((c) => (c.apiKey ? c : { ...c, apiKey: merged[c.provider] ?? '' }));
       setSecretsReady(true);
-    })();
+    }, 900);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);

@@ -81,14 +81,15 @@ import {
   solveWidths,
   type PanelSide,
 } from './layout';
-import { flushPrefs, hasPersistedPref, setPref, setPrefs } from './prefs';
+import { flushPrefs, getBootstrap, hasPersistedPref, setPref, setPrefs } from './prefs';
 
 /** Files whose changes can add, remove or rename Run tasks. */
 const TASK_SOURCE_RE =
   /(^|\/)(package\.json|Cargo\.toml|pyproject\.toml|go\.mod|[Mm]akefile|justfile|Taskfile\.ya?ml|(docker-)?compose\.ya?ml|deno\.jsonc?|tasks\.json|[^/]+\.(ps1|sh|bat|cmd))$/;
 
+const loadDiffViewer = () => import('./components/DiffViewer');
 const DiffViewer = lazy(() =>
-  import('./components/DiffViewer').then((m) => ({ default: m.DiffViewer }))
+  loadDiffViewer().then((m) => ({ default: m.DiffViewer }))
 );
 const SettingsPage = lazy(() =>
   import('./components/SettingsPage').then((m) => ({ default: m.SettingsPage }))
@@ -105,16 +106,19 @@ const CommitGraphView = lazy(() =>
 const CodeEditor = lazy(() =>
   import('./components/CodeEditor').then((m) => ({ default: m.CodeEditor }))
 );
+const loadTerminalPanel = () => import('./components/TerminalPanel');
 const TerminalPanel = lazy(() =>
-  import('./components/TerminalPanel').then((m) => ({ default: m.TerminalPanel }))
+  loadTerminalPanel().then((m) => ({ default: m.TerminalPanel }))
 );
 const AgentPanel = lazy(() =>
   import('./components/AgentPanel').then((m) => ({ default: m.AgentPanel }))
 );
 const loadQuickOpen = () => import('./components/QuickOpen');
 const QuickOpen = lazy(() => loadQuickOpen().then((m) => ({ default: m.QuickOpen })));
-// Fetch the chunk once the app is idle so the first Ctrl+P opens instantly instead of waiting on it.
+// Preload the default workbench panes right away and QuickOpen once idle.
 if (typeof window !== 'undefined') {
+  void loadTerminalPanel();
+  void loadDiffViewer();
   const warm = () => void loadQuickOpen();
   if ('requestIdleCallback' in window) window.requestIdleCallback(warm, { timeout: 3000 });
   else setTimeout(warm, 1500);
@@ -216,10 +220,12 @@ export function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Workspace & Git state
-  const [workspace, setWorkspace] = useState<WorkspaceInfo>({ path: '', name: 'Vireo' });
+  // Workspace & Git state (hydrated synchronously from inline bootstrap when available)
+  const [workspace, setWorkspace] = useState<WorkspaceInfo>(
+    () => getBootstrap()?.workspace ?? { path: '', name: 'Vireo' }
+  );
   const [editingWs, setEditingWs] = useState(false);
-  const [wsDraft, setWsDraft] = useState('');
+  const [wsDraft, setWsDraft] = useState(() => getBootstrap()?.workspace?.path ?? '');
   const [gitStatus, setGitStatus] = useState<GitStatusRes | null>(null);
   const [fsVersion, setFsVersion] = useState(0);
   const [allFiles, setAllFiles] = useState<string[]>([]);
@@ -233,7 +239,11 @@ export function App() {
 
   // Native window state for the custom title bar (null = running in a browser)
   // `mac`: macOS draws native traffic lights over the left of the title bar instead of our buttons.
-  const [nativeWindow, setNativeWindow] = useState<{ maximized: boolean; mac: boolean } | null>(null);
+  const [nativeWindow, setNativeWindow] = useState<{ maximized: boolean; mac: boolean } | null>(() => {
+    const w = getBootstrap()?.window;
+    if (!w) return null;
+    return w.native ? { maximized: w.maximized, mac: w.platform === 'macos' } : null;
+  });
   const windowAction = useCallback(
     (action: 'state' | 'minimize' | 'toggle_maximize' | 'close' | 'drag') => {
       if (action === 'close') flushPrefs();
@@ -254,7 +264,9 @@ export function App() {
     api.askpassAnswer(id, value).catch(() => {});
   }, []);
   useEffect(() => {
-    windowAction('state');
+    if (!getBootstrap()?.window) {
+      windowAction('state');
+    }
     let timer: number | undefined;
     const onResize = () => {
       window.clearTimeout(timer);
@@ -522,6 +534,8 @@ export function App() {
     return true;
   };
 
+  const needInitialAutoOpenRef = useRef(true);
+
   const refreshGit = useCallback((): Promise<void> => {
     const f = gitFetchRef.current;
 
@@ -534,6 +548,26 @@ export function App() {
         f.applied = seq;
         f.startedAt = startedAt;
         setGitStatus((prev) => (sameGitStatus(prev, status) ? prev : status));
+        if (needInitialAutoOpenRef.current) {
+          needInitialAutoOpenRef.current = false;
+          if (status.files.length > 0) {
+            setTabs((prev) => {
+              if (prev.length === 0) {
+                const first = status.files[0];
+                setActiveTabId(first.path);
+                return [
+                  {
+                    id: first.path,
+                    path: first.path,
+                    mode: 'diff',
+                    staged: first.staged && !first.unstaged,
+                  },
+                ];
+              }
+              return prev;
+            });
+          }
+        }
       } catch {
         // Transient lock (503) or backend busy: retry shortly unless a newer request is queued.
         if (retries > 0 && !f.rerunNeeded) {
@@ -573,55 +607,44 @@ export function App() {
     return p;
   }, []);
 
+  const initialBootUsedRef = useRef(false);
   const loadWorkspaceData = useCallback(async () => {
     try {
-      const current = await api.getWorkspace();
+      let current: WorkspaceInfo | undefined;
+      if (!initialBootUsedRef.current) {
+        initialBootUsedRef.current = true;
+        current = getBootstrap()?.workspace;
+      }
+      if (!current) {
+        current = await api.getWorkspace();
+      }
+      setWorkspace(current);
+      setWsDraft(current.path);
       if (!current.path) {
         // No folder is open yet: show the empty shell and wait for the user to open one.
-        setWorkspace(current);
-        setWsDraft('');
         return;
       }
-      const gf = gitFetchRef.current;
-      const gitSeq = ++gf.seq;
-      const gitStartedAt = Date.now();
-      const [ws, status, files, taskList] = await Promise.all([
-        Promise.resolve(current),
-        api.gitStatus(),
-        api.listFiles(),
-        api.getTasks(),
-      ]);
-      setWorkspace(ws);
-      setWsDraft(ws.path);
-      if (gitSeq >= gf.applied) {
-        gf.applied = gitSeq;
-        gf.startedAt = gitStartedAt;
-        setGitStatus(status);
-      }
-      setAllFiles(files);
-      setTasks(taskList.tasks);
-      setProjectDefaultTask(taskList.default_task);
+      needInitialAutoOpenRef.current = true;
+      // Load Git status immediately via the single-flight coordinator so the sidebar and first
+      // diff tab render without waiting for full-tree file listing or task discovery.
+      await refreshGit();
 
-      // Auto-open the first modified file's diff if nothing is open yet
-      setTabs((prev) => {
-        if (prev.length === 0 && status.files.length > 0) {
-          const first = status.files[0];
-          setActiveTabId(first.path);
-          return [
-            {
-              id: first.path,
-              path: first.path,
-              mode: 'diff',
-              staged: first.staged && !first.unstaged,
-            },
-          ];
-        }
-        return prev;
-      });
+      // Fetch file list (for Quick Open / @file) and tasks (for Run menu) without blocking main UI.
+      api
+        .listFiles()
+        .then(setAllFiles)
+        .catch(() => {});
+      api
+        .getTasks()
+        .then((taskList) => {
+          setTasks(taskList.tasks);
+          setProjectDefaultTask(taskList.default_task);
+        })
+        .catch(() => {});
     } catch (e: unknown) {
       showToast(e instanceof Error ? e.message : 'Failed to load workspace', true);
     }
-  }, [showToast]);
+  }, [refreshGit, showToast]);
 
   useEffect(() => {
     loadWorkspaceData();
@@ -757,7 +780,12 @@ export function App() {
 
   // Apply zoom to native Tauri WebView2 (or fallback to CSS zoom in browser mode)
   const lastSavedZoomRef = useRef(zoom);
+  const initialZoomMountRef = useRef(true);
   useEffect(() => {
+    if (initialZoomMountRef.current) {
+      initialZoomMountRef.current = false;
+      if (zoom === 1) return;
+    }
     let cancelled = false;
     if (lastSavedZoomRef.current !== zoom) {
       lastSavedZoomRef.current = zoom;
@@ -882,18 +910,22 @@ export function App() {
     const onFocus = () => refreshGit();
     window.addEventListener('focus', onFocus);
 
+    let connectedOnce = false;
     const connect = () => {
       if (closed) return;
       sock = new WebSocket(wsUrl('/ws/events'));
       sock.onopen = () => {
         setLiveConnected(true);
-        // Events sent while the socket was down are lost: resync.
-        refreshGit();
-        api
-          .askpassPending()
-          .then(setAskpassQueue)
-          .catch(() => {});
-        setFsVersion((v) => v + 1);
+        if (connectedOnce) {
+          // Events sent while the socket was down are lost: resync.
+          refreshGit();
+          api
+            .askpassPending()
+            .then(setAskpassQueue)
+            .catch(() => {});
+          setFsVersion((v) => v + 1);
+        }
+        connectedOnce = true;
       };
       sock.onclose = () => {
         setLiveConnected(false);
@@ -1408,9 +1440,10 @@ export function App() {
       .slice(0, Math.max(0, SEED_SNAPSHOT_LIMIT - seededRef.current.size));
     if (!todo.length) return;
     let cancelled = false;
-    (async () => {
+    const timer = window.setTimeout(async () => {
       for (const p of todo) {
         if (cancelled) return;
+        if (snapshotsRef.current.has(p) || inflightRef.current.has(p)) continue;
         seededRef.current.set(p, Date.now());
         try {
           const f = await api.readFile(p);
@@ -1427,9 +1460,10 @@ export function App() {
           // deleted / unreadable: nothing to snapshot
         }
       }
-    })();
+    }, 1000);
     return () => {
       cancelled = true;
+      window.clearTimeout(timer);
     };
   }, [gitStatus]);
 

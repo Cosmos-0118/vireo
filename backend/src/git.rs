@@ -2545,8 +2545,9 @@ pub async fn compare_diff(
 
     let orig_spec = format!("{}:{}", base, old_rel);
     let safe_full = resolve_safe_path(&ws, &rel).ok();
+    let show_args = ["show", orig_spec.as_str()];
     let (orig_res, wt_bytes) = tokio::join!(
-        run_git_bytes(&ws, &["show", &orig_spec]),
+        run_git_bytes(&ws, &show_args),
         async {
             match safe_full {
                 Some(full) => tokio::fs::read(&full).await.ok(),

@@ -26,9 +26,11 @@ import {
   usePtyTerminal,
   useTerminalEngine,
 } from './usePtyTerminal';
+import { getBootstrap } from '../prefs';
 
-/** Title of plain shell tabs; replaced by the backend's shell name once known. */
-let shellTitle = /Windows/i.test(navigator.userAgent) ? 'PowerShell' : 'Terminal';
+const IS_WINDOWS_UA = typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent);
+/** Title of plain shell tabs; hydrated from bootstrap or replaced by the backend's shell name. */
+let shellTitle = getBootstrap()?.shell || (IS_WINDOWS_UA ? 'PowerShell' : 'Terminal');
 const IS_MAC = typeof navigator !== 'undefined' && /Macintosh|Mac OS X/i.test(navigator.userAgent);
 
 export interface TermTabSpec {
@@ -342,6 +344,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   const [activeId, setActiveId] = useState<string>('shell-1');
   // Name plain shell tabs after the real shell (zsh/bash on macOS/Linux) once the backend says.
   useEffect(() => {
+    if (getBootstrap()?.shell || IS_WINDOWS_UA) return;
     let cancelled = false;
     api
       .shellInfo()

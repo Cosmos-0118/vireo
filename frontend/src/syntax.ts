@@ -1,25 +1,3 @@
-import { javascript } from '@codemirror/lang-javascript';
-import { rust } from '@codemirror/lang-rust';
-import { python } from '@codemirror/lang-python';
-import { json } from '@codemirror/lang-json';
-import { css } from '@codemirror/lang-css';
-import { html } from '@codemirror/lang-html';
-import { markdown, markdownLanguage } from '@codemirror/lang-markdown';
-import { yaml } from '@codemirror/lang-yaml';
-import { xml } from '@codemirror/lang-xml';
-import { sql } from '@codemirror/lang-sql';
-import { cpp } from '@codemirror/lang-cpp';
-import { java } from '@codemirror/lang-java';
-import { go } from '@codemirror/lang-go';
-import { toml } from '@codemirror/legacy-modes/mode/toml';
-import { shell } from '@codemirror/legacy-modes/mode/shell';
-import { powerShell } from '@codemirror/legacy-modes/mode/powershell';
-import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile';
-import { ruby } from '@codemirror/legacy-modes/mode/ruby';
-import { swift } from '@codemirror/legacy-modes/mode/swift';
-import { lua } from '@codemirror/legacy-modes/mode/lua';
-import { properties } from '@codemirror/legacy-modes/mode/properties';
-import { csharp, kotlin } from '@codemirror/legacy-modes/mode/clike';
 import {
   HighlightStyle,
   Language,
@@ -29,6 +7,7 @@ import {
   syntaxTree,
   type StreamParser,
 } from '@codemirror/language';
+
 import { Prec, RangeSetBuilder, type Extension } from '@codemirror/state';
 import { Decoration, ViewPlugin, type DecorationSet, type EditorView, type ViewUpdate } from '@codemirror/view';
 import type { SyntaxNodeRef, Tree } from '@lezer/common';
@@ -47,66 +26,100 @@ interface LangDef {
   exts: string[];
   /** Exact lower-cased base names (Dockerfile, Cargo.lock…). */
   files?: string[];
-  create: () => LanguageSupport;
+  /** Fetches the grammar chunk on first use; each language is its own lazy chunk. */
+  load: () => Promise<LanguageSupport>;
 }
 
-const stream = (parser: StreamParser<unknown>) => () => new LanguageSupport(StreamLanguage.define(parser));
+const stream =
+  (mode: () => Promise<StreamParser<unknown>>) => async () =>
+    new LanguageSupport(StreamLanguage.define(await mode()));
+
+const jsLang = () => import('@codemirror/lang-javascript');
+const clike = () => import('@codemirror/legacy-modes/mode/clike');
 
 const LANGS: LangDef[] = [
-  { id: 'typescript', aliases: ['ts', 'typescript'], exts: ['ts', 'mts', 'cts'], create: () => javascript({ typescript: true }) },
-  { id: 'tsx', aliases: ['tsx'], exts: ['tsx'], create: () => javascript({ typescript: true, jsx: true }) },
-  { id: 'javascript', aliases: ['js', 'javascript', 'mjs', 'cjs', 'node'], exts: ['js', 'mjs', 'cjs'], create: () => javascript() },
-  { id: 'jsx', aliases: ['jsx'], exts: ['jsx'], create: () => javascript({ jsx: true }) },
-  { id: 'rust', aliases: ['rs', 'rust'], exts: ['rs'], create: () => rust() },
-  { id: 'python', aliases: ['py', 'python', 'py3', 'python3'], exts: ['py', 'pyi', 'pyw'], create: () => python() },
+  { id: 'typescript', aliases: ['ts', 'typescript'], exts: ['ts', 'mts', 'cts'], load: async () => (await jsLang()).javascript({ typescript: true }) },
+  { id: 'tsx', aliases: ['tsx'], exts: ['tsx'], load: async () => (await jsLang()).javascript({ typescript: true, jsx: true }) },
+  { id: 'javascript', aliases: ['js', 'javascript', 'mjs', 'cjs', 'node'], exts: ['js', 'mjs', 'cjs'], load: async () => (await jsLang()).javascript() },
+  { id: 'jsx', aliases: ['jsx'], exts: ['jsx'], load: async () => (await jsLang()).javascript({ jsx: true }) },
+  { id: 'rust', aliases: ['rs', 'rust'], exts: ['rs'], load: async () => (await import('@codemirror/lang-rust')).rust() },
+  { id: 'python', aliases: ['py', 'python', 'py3', 'python3'], exts: ['py', 'pyi', 'pyw'], load: async () => (await import('@codemirror/lang-python')).python() },
   {
     id: 'json',
     aliases: ['json', 'jsonc', 'json5'],
     exts: ['json', 'jsonc', 'json5', 'webmanifest', 'map', 'tsbuildinfo'],
     files: ['.prettierrc', '.eslintrc', '.babelrc', '.swcrc', '.stylelintrc'],
-    create: () => json(),
+    load: async () => (await import('@codemirror/lang-json')).json(),
   },
-  { id: 'css', aliases: ['css', 'scss', 'sass', 'less'], exts: ['css', 'scss', 'sass', 'less'], create: () => css() },
-  { id: 'html', aliases: ['html', 'htm', 'xhtml', 'vue', 'svelte'], exts: ['html', 'htm', 'xhtml', 'vue', 'svelte'], create: () => html() },
-  { id: 'markdown', aliases: ['md', 'markdown', 'mdx'], exts: ['md', 'markdown', 'mdx'], create: () => markdownSupport() },
-  { id: 'yaml', aliases: ['yaml', 'yml'], exts: ['yaml', 'yml'], create: () => yaml() },
+  { id: 'css', aliases: ['css', 'scss', 'sass', 'less'], exts: ['css', 'scss', 'sass', 'less'], load: async () => (await import('@codemirror/lang-css')).css() },
+  {
+    id: 'html',
+    aliases: ['html', 'htm', 'xhtml', 'vue', 'svelte'],
+    exts: ['html', 'htm', 'xhtml', 'vue', 'svelte'],
+    load: async () => (await import('@codemirror/lang-html')).html(),
+  },
+  { id: 'markdown', aliases: ['md', 'markdown', 'mdx'], exts: ['md', 'markdown', 'mdx'], load: () => markdownSupport() },
+  { id: 'yaml', aliases: ['yaml', 'yml'], exts: ['yaml', 'yml'], load: async () => (await import('@codemirror/lang-yaml')).yaml() },
   {
     id: 'xml',
     aliases: ['xml', 'svg', 'plist', 'xsl'],
     exts: ['xml', 'svg', 'plist', 'csproj', 'vcxproj', 'xsl', 'xslt', 'xsd', 'xaml', 'props', 'targets', 'resx'],
-    create: () => xml(),
+    load: async () => (await import('@codemirror/lang-xml')).xml(),
   },
-  { id: 'sql', aliases: ['sql', 'mysql', 'pgsql', 'postgres', 'sqlite'], exts: ['sql'], create: () => sql() },
+  { id: 'sql', aliases: ['sql', 'mysql', 'pgsql', 'postgres', 'sqlite'], exts: ['sql'], load: async () => (await import('@codemirror/lang-sql')).sql() },
   {
     id: 'cpp',
     aliases: ['c', 'h', 'cpp', 'c++', 'cc', 'cxx', 'hpp'],
     exts: ['c', 'h', 'cpp', 'hpp', 'cc', 'cxx', 'hh', 'hxx', 'ino'],
-    create: () => cpp(),
+    load: async () => (await import('@codemirror/lang-cpp')).cpp(),
   },
-  { id: 'java', aliases: ['java'], exts: ['java'], create: () => java() },
-  { id: 'go', aliases: ['go', 'golang'], exts: ['go'], files: ['go.mod', 'go.sum'], create: () => go() },
-  { id: 'toml', aliases: ['toml'], exts: ['toml'], files: ['cargo.lock', 'poetry.lock'], create: stream(toml) },
+  { id: 'java', aliases: ['java'], exts: ['java'], load: async () => (await import('@codemirror/lang-java')).java() },
+  { id: 'go', aliases: ['go', 'golang'], exts: ['go'], files: ['go.mod', 'go.sum'], load: async () => (await import('@codemirror/lang-go')).go() },
+  {
+    id: 'toml',
+    aliases: ['toml'],
+    exts: ['toml'],
+    files: ['cargo.lock', 'poetry.lock'],
+    load: stream(async () => (await import('@codemirror/legacy-modes/mode/toml')).toml),
+  },
   {
     id: 'shell',
     aliases: ['sh', 'bash', 'zsh', 'shell', 'console', 'shellscript', 'env', 'dotenv', 'makefile', 'make'],
     exts: ['sh', 'bash', 'zsh', 'env', 'mk'],
     files: ['makefile', 'gnumakefile', '.gitignore', '.gitattributes', '.dockerignore', '.npmignore', '.bashrc', '.zshrc', '.profile'],
-    create: stream(shell),
+    load: stream(async () => (await import('@codemirror/legacy-modes/mode/shell')).shell),
   },
-  { id: 'powershell', aliases: ['ps1', 'powershell', 'pwsh', 'ps'], exts: ['ps1', 'psm1', 'psd1'], create: stream(powerShell) },
-  { id: 'dockerfile', aliases: ['dockerfile', 'docker'], exts: ['dockerfile'], files: ['dockerfile'], create: stream(dockerFile) },
+  {
+    id: 'powershell',
+    aliases: ['ps1', 'powershell', 'pwsh', 'ps'],
+    exts: ['ps1', 'psm1', 'psd1'],
+    load: stream(async () => (await import('@codemirror/legacy-modes/mode/powershell')).powerShell),
+  },
+  {
+    id: 'dockerfile',
+    aliases: ['dockerfile', 'docker'],
+    exts: ['dockerfile'],
+    files: ['dockerfile'],
+    load: stream(async () => (await import('@codemirror/legacy-modes/mode/dockerfile')).dockerFile),
+  },
   {
     id: 'ini',
     aliases: ['ini', 'conf', 'cfg', 'properties'],
     exts: ['ini', 'conf', 'cfg', 'properties', 'editorconfig'],
     files: ['.editorconfig'],
-    create: stream(properties),
+    load: stream(async () => (await import('@codemirror/legacy-modes/mode/properties')).properties),
   },
-  { id: 'ruby', aliases: ['rb', 'ruby'], exts: ['rb', 'rake', 'gemspec'], files: ['gemfile', 'rakefile'], create: stream(ruby) },
-  { id: 'csharp', aliases: ['cs', 'csharp', 'c#'], exts: ['cs'], create: stream(csharp) },
-  { id: 'kotlin', aliases: ['kt', 'kotlin', 'kts'], exts: ['kt', 'kts'], create: stream(kotlin) },
-  { id: 'swift', aliases: ['swift'], exts: ['swift'], create: stream(swift) },
-  { id: 'lua', aliases: ['lua'], exts: ['lua'], create: stream(lua) },
+  {
+    id: 'ruby',
+    aliases: ['rb', 'ruby'],
+    exts: ['rb', 'rake', 'gemspec'],
+    files: ['gemfile', 'rakefile'],
+    load: stream(async () => (await import('@codemirror/legacy-modes/mode/ruby')).ruby),
+  },
+  { id: 'csharp', aliases: ['cs', 'csharp', 'c#'], exts: ['cs'], load: stream(async () => (await clike()).csharp) },
+  { id: 'kotlin', aliases: ['kt', 'kotlin', 'kts'], exts: ['kt', 'kts'], load: stream(async () => (await clike()).kotlin) },
+  { id: 'swift', aliases: ['swift'], exts: ['swift'], load: stream(async () => (await import('@codemirror/legacy-modes/mode/swift')).swift) },
+  { id: 'lua', aliases: ['lua'], exts: ['lua'], load: stream(async () => (await import('@codemirror/legacy-modes/mode/lua')).lua) },
 ];
 
 const BY_EXT = new Map<string, LangDef>();
@@ -118,30 +131,55 @@ for (const def of LANGS) {
   for (const a of [def.id, ...def.aliases]) BY_NAME.set(a.toLowerCase(), def);
 }
 
+/** Grammars that have finished loading. Sync consumers read this; they get null until `loadSupport` resolves. */
 const supportCache = new Map<string, LanguageSupport>();
-function supportFor(def: LangDef): LanguageSupport {
-  let s = supportCache.get(def.id);
-  if (!s) {
-    s = def.create();
-    supportCache.set(def.id, s);
+const pendingSupport = new Map<string, Promise<LanguageSupport | null>>();
+
+function supportFor(def: LangDef): LanguageSupport | null {
+  return supportCache.get(def.id) ?? null;
+}
+
+function loadSupport(def: LangDef): Promise<LanguageSupport | null> {
+  const cached = supportCache.get(def.id);
+  if (cached) return Promise.resolve(cached);
+  let p = pendingSupport.get(def.id);
+  if (!p) {
+    p = def
+      .load()
+      .then((s) => {
+        supportCache.set(def.id, s);
+        return s;
+      })
+      .catch(() => null)
+      .finally(() => pendingSupport.delete(def.id));
+    pendingSupport.set(def.id, p);
   }
-  return s;
+  return p;
 }
 
 const descriptionCache = new Map<string, LanguageDescription>();
-/** Resolves fenced code block info strings (```python) to a loaded language. */
+/** Resolves fenced code block info strings (```python) to a lazily loaded language. */
 function resolveCodeLanguage(info: string): LanguageDescription | null {
   const def = BY_NAME.get(info.trim().split(/[\s{,]/)[0].toLowerCase());
   if (!def) return null;
   let desc = descriptionCache.get(def.id);
   if (!desc) {
-    desc = LanguageDescription.of({ name: def.id, alias: def.aliases, support: supportFor(def) });
+    desc = LanguageDescription.of({
+      name: def.id,
+      alias: def.aliases,
+      load: async () => {
+        const s = await loadSupport(def);
+        if (!s) throw new Error(`failed to load ${def.id} grammar`);
+        return s;
+      },
+    });
     descriptionCache.set(def.id, desc);
   }
   return desc;
 }
 
-function markdownSupport(): LanguageSupport {
+async function markdownSupport(): Promise<LanguageSupport> {
+  const { markdown, markdownLanguage } = await import('@codemirror/lang-markdown');
   return markdown({ base: markdownLanguage, codeLanguages: resolveCodeLanguage });
 }
 
@@ -156,6 +194,7 @@ function findDefByPath(path: string): LangDef | null {
   return dot >= 0 ? BY_EXT.get(base.slice(dot + 1)) ?? null : null;
 }
 
+/** Loaded grammar for a path, or null when unsupported or not yet loaded (see `loadLanguageForPath`). */
 export function getLanguageSupport(path: string): LanguageSupport | null {
   const def = findDefByPath(path);
   return def ? supportFor(def) : null;
@@ -168,6 +207,18 @@ export function getLanguageSupportByName(name: string): LanguageSupport | null {
 
 export function getLanguageForPath(path: string): Language | null {
   return getLanguageSupport(path)?.language ?? null;
+}
+
+/** Fetches the grammar chunk for a path. Resolves true once usable, false when unsupported or failed. */
+export async function loadLanguageForPath(path: string): Promise<boolean> {
+  const def = findDefByPath(path);
+  return def ? (await loadSupport(def)) !== null : false;
+}
+
+/** Same as loadLanguageForPath, for a fence name (```py). */
+export async function loadLanguageByName(name: string): Promise<boolean> {
+  const def = BY_NAME.get(name.trim().toLowerCase());
+  return def ? (await loadSupport(def)) !== null : false;
 }
 
 export function isMarkdownPath(path: string): boolean {
@@ -395,10 +446,11 @@ function splitPlain(code: string): string[] {
 
 function highlightWithDef(code: string, def: LangDef | null, theme: LiteTheme): TokenSpan[][] {
   const lines = splitPlain(code);
-  if (!def || code.length > 250_000) {
+  const support = def ? supportFor(def) : null;
+  if (!def || !support || code.length > 250_000) {
     return lines.map((l) => (l ? [{ text: l }] : []));
   }
-  const lang = supportFor(def).language;
+  const lang = support.language;
 
   const normalized = lines.join('\n');
   const tree = lang.parser.parse(normalized);

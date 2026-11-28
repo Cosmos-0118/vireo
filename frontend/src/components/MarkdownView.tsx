@@ -48,7 +48,8 @@ const FencedCodeBlock: React.FC<{
     const timer = setTimeout(() => {
       lastHighlightRef.current = Date.now();
       import('../syntax')
-        .then((m) => {
+        .then(async (m) => {
+          await m.loadLanguageByName(normalizedLang);
           if (!cancelled) setHighlighted(m.highlightLinesByName(code, normalizedLang, theme));
         })
         .catch(() => {});

@@ -1,8 +1,9 @@
 import { Binary } from '@phosphor-icons/react';
 import { EmptyState } from './ui/EmptyState';
-import React, { useEffect, useRef, useState } from 'react';
+import React, { Suspense, useEffect, useRef, useState } from 'react';
 import {
   Annotation,
+  Compartment,
   EditorState,
   Extension,
   RangeSet,
@@ -47,8 +48,16 @@ import {
   RotateCcw,
   Save,
 } from 'lucide-react';
-import { buildHighlightStyle, getLanguageSupport, isMarkdownPath, semanticHighlighting } from '../syntax';
-import { MarkdownMessage } from './MarkdownView';
+import {
+  buildHighlightStyle,
+  getLanguageSupport,
+  isMarkdownPath,
+  loadLanguageForPath,
+  semanticHighlighting,
+} from '../syntax';
+
+// react-markdown + rehype-sanitize are heavy; only fetch them when a markdown preview opens.
+const MarkdownMessage = React.lazy(() => import('./MarkdownView').then((m) => ({ default: m.MarkdownMessage })));
 import type { LiteTheme } from '../themes';
 
 interface CodeEditorProps {
@@ -639,6 +648,8 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       }
     );
 
+    const langCompartment = new Compartment();
+    let disposed = false;
     const state = EditorState.create({
       doc: carried ? carried.doc : normalizeNewlines(contentRef.current),
       selection: carried ? { anchor: Math.min(carried.anchor, carried.doc.length) } : undefined,
@@ -670,7 +681,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
           ...defaultKeymap,
           ...historyKeymap,
         ]),
-        ...langExtension(path, theme),
+        langCompartment.of(langExtension(path, theme)),
         syntaxHighlighting(buildHighlightStyle(theme)),
         EditorView.updateListener.of((u) => {
           if (u.docChanged && !u.transactions.some((t) => t.annotation(externalChange))) {
@@ -717,6 +728,13 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       parent: containerRef.current,
     });
     viewRef.current = view;
+    // Grammars load on demand: paint plain text now, then attach the language once its chunk arrives.
+    if (!getLanguageSupport(path)) {
+      void loadLanguageForPath(path).then(() => {
+        if (disposed || viewRef.current !== view) return;
+        view.dispatch({ effects: langCompartment.reconfigure(langExtension(path, theme)) });
+      });
+    }
     hadHunksRef.current = false;
     readyRef.current = !!carried || !loading;
     setNavIdx(-1);
@@ -729,6 +747,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
     if (jumpToLine && readyRef.current) jumpTo(view, jumpToLine, jumpToColumn, jumpToEndColumn);
 
     return () => {
+      disposed = true;
       carryRef.current = {
         path,
         doc: view.state.doc.toString(),
@@ -1084,7 +1103,9 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       {isMarkdown && mode === 'preview' && (
         <div className="flex-1 min-h-0 overflow-auto px-6 py-4 bg-[var(--bg-base)]">
           <div className="max-w-[860px] mx-auto">
-            <MarkdownMessage content={previewText} theme={theme} variant="document" filePath={path} />
+            <Suspense fallback={null}>
+              <MarkdownMessage content={previewText} theme={theme} variant="document" filePath={path} />
+            </Suspense>
           </div>
         </div>
       )}

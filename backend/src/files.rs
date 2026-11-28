@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceInfo {
     pub path: String,
     pub name: String,

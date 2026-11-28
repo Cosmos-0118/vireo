@@ -477,10 +477,13 @@ export const api = {
     if (!res.ok) throw new Error((await res.text()) || `HTTP ${res.status}`);
     return res.json();
   },
-  agentModels: (ollamaBase?: string) =>
-    jsonFetch<LocalModelsInfo>(
-      `/api/agent/models${ollamaBase ? `?ollama_base=${encodeURIComponent(ollamaBase)}` : ''}`
-    ),
+  agentModels: (ollamaBase?: string, probeOllama = true) => {
+    const params = new URLSearchParams();
+    if (ollamaBase) params.set('ollama_base', ollamaBase);
+    if (!probeOllama) params.set('probe_ollama', 'false');
+    const qs = params.toString();
+    return jsonFetch<LocalModelsInfo>(`/api/agent/models${qs ? `?${qs}` : ''}`);
+  },
 };
 
 // Git ops that rewrite working-tree files: their watcher events are ours, not the agent's.

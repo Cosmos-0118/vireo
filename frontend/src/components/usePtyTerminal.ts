@@ -549,12 +549,14 @@ export function usePtyTerminal(
         term.dispose();
       };
 
-      // Measure with the real font and connect only once the grid size is known.
-      await waitForFont(fontSize);
-      if (disposed) return;
+      // Connect immediately so the shell attaches without waiting on webfont decode; re-fit
+      // once the real font metrics finish loading.
       fitNow();
       sync();
       connect();
+      void waitForFont(fontSize).then(() => {
+        if (!disposed) refit();
+      });
     };
 
     void start();

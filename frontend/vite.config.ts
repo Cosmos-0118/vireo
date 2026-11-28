@@ -39,14 +39,17 @@ export default defineConfig({
           if (norm.includes('/@xterm/')) {
             return 'vendor-xterm';
           }
+          // Language grammars (@codemirror/lang-*, legacy-modes, @lezer/<lang>) are dynamically
+          // imported by syntax.ts; leave them to Rollup so each becomes its own on-demand chunk.
           if (
             norm.includes('/@codemirror/lang-') ||
+            norm.includes('/@codemirror/legacy-modes/') ||
             (norm.includes('/@lezer/') &&
               !norm.includes('/@lezer/common/') &&
               !norm.includes('/@lezer/highlight/') &&
               !norm.includes('/@lezer/lr/'))
           ) {
-            return 'vendor-langs';
+            return;
           }
           if (
             norm.includes('/@codemirror/') ||

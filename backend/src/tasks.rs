@@ -828,7 +828,7 @@ fn extract_vscode(ws: &Path, out: &mut Vec<TaskItem>) {
             Some("test") => Some("test"),
             _ => None,
         };
-        let dir = Dir { abs: ws.join(&cwd), rel: cwd };
+        let dir = Dir { abs: ws.join(&cwd), rel: cwd, files: HashSet::new() };
         let mut item = make_task(
             format!("vscode::{}", label),
             label.to_string(),

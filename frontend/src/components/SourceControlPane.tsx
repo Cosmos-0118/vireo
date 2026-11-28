@@ -300,18 +300,29 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
 
   const lastBranchesKeyRef = useRef('');
   useEffect(() => {
-    if (!active || !gitStatus?.is_repo) return;
-    const key = `${workspacePath}|${gitRev}`;
+    if (!active || !workspacePath || gitStatus?.is_repo === false) return;
+    const rev = gitStatus ? gitRev : '__init__';
+    const key = `${workspacePath}|${rev}`;
     if (lastBranchesKeyRef.current === key) return;
+    if (lastBranchesKeyRef.current === `${workspacePath}|__init__` && gitStatus) {
+      lastBranchesKeyRef.current = key;
+      return;
+    }
     lastBranchesKeyRef.current = key;
     fetchBranches();
-  }, [active, fetchBranches, workspacePath, gitStatus?.is_repo, gitRev]);
+  }, [active, fetchBranches, workspacePath, gitStatus, gitRev]);
 
   const lastLogKeyRef = useRef('');
   useEffect(() => {
-    if (!active || !gitStatus?.is_repo) return;
-    const key = `${workspacePath}|${gitRev}|${allBranches ? 1 : 0}|${graphSearch}`;
+    if (!active || !workspacePath || gitStatus?.is_repo === false) return;
+    const rev = gitStatus ? gitRev : '__init__';
+    const key = `${workspacePath}|${rev}|${allBranches ? 1 : 0}|${graphSearch}`;
+    const initKey = `${workspacePath}|__init__|${allBranches ? 1 : 0}|${graphSearch}`;
     if (lastLogKeyRef.current === key) return;
+    if (lastLogKeyRef.current === initKey && gitStatus) {
+      lastLogKeyRef.current = key;
+      return;
+    }
     if (!graphSearch) {
       lastLogKeyRef.current = key;
       void fetchLog({ append: false, skip: 0 });
@@ -322,7 +333,7 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       void fetchLog({ append: false, skip: 0 });
     }, 180);
     return () => window.clearTimeout(t);
-  }, [active, fetchLog, workspacePath, gitStatus?.is_repo, gitRev, allBranches, graphSearch]);
+  }, [active, fetchLog, workspacePath, gitStatus, gitRev, allBranches, graphSearch]);
 
   const runAction = useCallback(
     async (fn: () => Promise<void>) => {

@@ -23,7 +23,7 @@ import {
   UnfoldVertical,
   WrapText,
 } from 'lucide-react';
-import { highlightLines, type TokenSpan } from '../syntax';
+import { getLanguageSupport, highlightLines, loadLanguageForPath, type TokenSpan } from '../syntax';
 import type { LiteTheme } from '../themes';
 import type { GitDiffRes, GitFileStatus } from '../types';
 
@@ -645,16 +645,62 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
     setWin({ start: 0, end: WINDOW_CHUNK * 7 });
   }, [diff?.path, diff?.staged, commitContext?.hash]);
 
-  const syntaxTokens = useMemo(() => {
+  // Highlighting is progressive: the first frame paints plain rows, tokens arrive once the grammar
+  // chunk is loaded and the Lezer parse has run off the critical path.
+  const [highlight, setHighlight] = useState<{
+    original?: string;
+    modified?: string;
+    path?: string;
+    oldLines: TokenSpan[][];
+    newLines: TokenSpan[][];
+  } | null>(null);
+  useEffect(() => {
     if (!diff || diff.binary) {
-      return { oldLines: [] as TokenSpan[][], newLines: [] as TokenSpan[][] };
+      setHighlight(null);
+      return;
     }
-    return {
-      oldLines: highlightLines((diff.original || '').replace(/\r\n/g, '\n'), diff.path, theme),
-      newLines: highlightLines((diff.modified || '').replace(/\r\n/g, '\n'), diff.path, theme),
+    const { original, modified, path } = diff;
+    const run = () => {
+      setHighlight({
+        original,
+        modified,
+        path,
+        oldLines: highlightLines((original || '').replace(/\r\n/g, '\n'), path, theme),
+        newLines: highlightLines((modified || '').replace(/\r\n/g, '\n'), path, theme),
+      });
+    };
+    const small = (original?.length ?? 0) + (modified?.length ?? 0) < 40_000;
+    if (small && getLanguageSupport(path)) {
+      run();
+      return;
+    }
+    let cancelled = false;
+    let raf = 0;
+    void loadLanguageForPath(path).then(() => {
+      if (cancelled) return;
+      raf = requestAnimationFrame(() => {
+        if (!cancelled) run();
+      });
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [diff?.original, diff?.modified, diff?.path, diff?.binary, theme]);
+  const syntaxTokens = useMemo(() => {
+    if (
+      highlight &&
+      diff &&
+      highlight.original === diff.original &&
+      highlight.modified === diff.modified &&
+      highlight.path === diff.path
+    ) {
+      return highlight;
+    }
+    return { oldLines: [] as TokenSpan[][], newLines: [] as TokenSpan[][] };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [highlight, diff?.original, diff?.modified, diff?.path]);
 
   const computed = useMemo(() => {
     if (!diff || diff.binary) {
@@ -1179,7 +1225,7 @@ export const DiffViewer: React.FC<DiffViewerProps> = ({
   }
 
   const askAboutWholeDiff = () => {
-    const excerpt = (diff.patch || diff.modified).slice(0, 3500);
+    const excerpt = (computed.hunks.map((h) => h.patch).join('\n') || diff.patch || diff.modified).slice(0, 3500);
     onAskAgent(`Review the changes in \`${diff.path}\`:\n\`\`\`diff\n${excerpt}\n\`\`\``);
   };
 

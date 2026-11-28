@@ -2,10 +2,25 @@
 // the backend's on-disk prefs file (/api/prefs) so settings survive desktop
 // restarts across ports and stay shared across windows.
 
+export interface VireoBootstrap {
+  workspace?: { path: string; name: string };
+  window?: { native: boolean; maximized: boolean; platform?: string };
+  shell?: string;
+}
+
 declare global {
   interface Window {
     __VIREO_PREFS__?: Record<string, string | null>;
+    __VIREO_BOOTSTRAP__?: VireoBootstrap;
   }
+}
+
+export function getBootstrap(): VireoBootstrap | null {
+  return typeof window !== 'undefined' &&
+    window.__VIREO_BOOTSTRAP__ &&
+    typeof window.__VIREO_BOOTSTRAP__ === 'object'
+    ? window.__VIREO_BOOTSTRAP__
+    : null;
 }
 
 const synced: Record<string, string | null> =

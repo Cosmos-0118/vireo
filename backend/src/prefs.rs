@@ -262,10 +262,6 @@ fn escape_inline_json(json: &str) -> String {
     out
 }
 
-fn render_bootstrap_script_for(prefs: &PrefsMap) -> String {
-    render_bootstrap_script_with(prefs, None)
-}
-
 fn render_bootstrap_script_with(prefs: &PrefsMap, bootstrap: Option<&BootstrapPayload>) -> String {
     let json = serde_json::to_string(prefs).unwrap_or_else(|_| "{}".to_string());
     let safe_json = escape_inline_json(&json);
