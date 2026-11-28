@@ -111,9 +111,14 @@ const TerminalPanel = lazy(() =>
 const AgentPanel = lazy(() =>
   import('./components/AgentPanel').then((m) => ({ default: m.AgentPanel }))
 );
-const QuickOpen = lazy(() =>
-  import('./components/QuickOpen').then((m) => ({ default: m.QuickOpen }))
-);
+const loadQuickOpen = () => import('./components/QuickOpen');
+const QuickOpen = lazy(() => loadQuickOpen().then((m) => ({ default: m.QuickOpen })));
+// Fetch the chunk once the app is idle so the first Ctrl+P opens instantly instead of waiting on it.
+if (typeof window !== 'undefined') {
+  const warm = () => void loadQuickOpen();
+  if ('requestIdleCallback' in window) window.requestIdleCallback(warm, { timeout: 3000 });
+  else setTimeout(warm, 1500);
+}
 
 /** Cap on cached file/diff text held in JS memory (chars, roughly bytes for source code). */
 const CACHE_BYTE_BUDGET = 12 * 1024 * 1024;

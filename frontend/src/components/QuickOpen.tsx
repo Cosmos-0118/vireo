@@ -1,10 +1,11 @@
 import { MagnifyingGlass } from '@phosphor-icons/react';
 import { EmptyRow } from './ui/EmptyState';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { Palette, Play, Search } from 'lucide-react';
 import { FileIcon } from './FileIcon';
 import type { LiteTheme } from '../themes';
 import type { TaskItem } from '../types';
+import { createFuzzySearcher, type FuzzySearcher } from '../utils/fuzzy';
 
 interface QuickOpenProps {
   open: boolean;
@@ -22,6 +23,54 @@ type PaletteEntry =
   | { kind: 'theme'; label: string; value: string }
   | { kind: 'task'; label: string; subtitle: string; task: TaskItem };
 
+const MAX_FILES = 40;
+
+// One searcher per file list, shared across opens so the lowercase index (and the
+// incremental-narrowing cache) is built once rather than on every keystroke / open.
+const searchers = new WeakMap<string[], FuzzySearcher>();
+const searcherFor = (files: string[]): FuzzySearcher => {
+  let s = searchers.get(files);
+  if (!s) {
+    s = createFuzzySearcher(files);
+    searchers.set(files, s);
+  }
+  return s;
+};
+
+const Row = memo(function Row({
+  item,
+  index,
+  active,
+  onPick,
+}: {
+  item: PaletteEntry;
+  index: number;
+  active: boolean;
+  onPick: (index: number) => void;
+}) {
+  return (
+    <div
+      data-active={active || undefined}
+      onClick={() => onPick(index)}
+      className={`flex items-center justify-between px-3 py-1.5 text-xs cursor-pointer ${
+        active
+          ? 'bg-[var(--accent)] text-[var(--accent-fg)]'
+          : 'text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
+      }`}
+    >
+      <div className="flex items-center gap-2 min-w-0">
+        {item.kind === 'file' && <FileIcon path={item.label} size={14} />}
+        {item.kind === 'theme' && <Palette size={13} className="shrink-0" />}
+        {item.kind === 'task' && <Play size={13} className="shrink-0" />}
+        <span className="font-mono truncate">{item.label}</span>
+      </div>
+      {item.kind === 'task' && (
+        <span className="text-[10px] opacity-75 font-mono ml-2 truncate">{item.subtitle}</span>
+      )}
+    </div>
+  );
+});
+
 export const QuickOpen: React.FC<QuickOpenProps> = ({
   open,
   files,
@@ -35,13 +84,15 @@ export const QuickOpen: React.FC<QuickOpenProps> = ({
   const [query, setQuery] = useState('');
   const [idx, setIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
 
-  useEffect(() => {
-    if (open) {
-      setQuery('');
-      setIdx(0);
-      setTimeout(() => inputRef.current?.focus(), 10);
-    }
+  // Focus before first paint (no 10ms timer). The modal is mounted fresh on every open,
+  // so state starts clean; only reset when `open` flips while staying mounted.
+  useLayoutEffect(() => {
+    if (!open) return;
+    setQuery('');
+    setIdx(0);
+    inputRef.current?.focus();
   }, [open]);
 
   const items = useMemo<PaletteEntry[]>(() => {
@@ -62,34 +113,33 @@ export const QuickOpen: React.FC<QuickOpenProps> = ({
       return out.slice(0, 30);
     }
 
-    const filtered = q
-      ? files.filter((f) => {
-          const fl = f.toLowerCase();
-          if (fl.includes(q)) return true;
-          // Simple subsequence fuzzy match
-          let qi = 0;
-          for (let i = 0; i < fl.length && qi < q.length; i++) {
-            if (fl[i] === q[qi]) qi++;
-          }
-          return qi === q.length;
-        })
-      : files;
-
-    return filtered.slice(0, 40).map((f) => ({ kind: 'file', label: f, value: f }));
+    return searcherFor(files)
+      .search(q, MAX_FILES)
+      .map((f) => ({ kind: 'file', label: f, value: f }));
   }, [query, files, themes, tasks]);
 
+  // Keep the highlighted row visible while navigating with the keyboard.
   useEffect(() => {
-    setIdx(0);
-  }, [query]);
+    listRef.current?.querySelector('[data-active]')?.scrollIntoView({ block: 'nearest' });
+  }, [idx, items]);
+
+  const latest = useRef({ items, onClose, onSelectFile, onSelectTheme, onRunTask });
+  latest.current = { items, onClose, onSelectFile, onSelectTheme, onRunTask };
+
+  const pick = useCallback((index: number) => {
+    const { items: list, onClose: close, onSelectFile: file, onSelectTheme: theme, onRunTask: run } =
+      latest.current;
+    const item = list[index];
+    if (!item) return;
+    close();
+    if (item.kind === 'file') file(item.value);
+    else if (item.kind === 'theme') theme(item.value);
+    else run(item.task);
+  }, []);
 
   if (!open) return null;
 
-  const activate = (item: PaletteEntry) => {
-    onClose();
-    if (item.kind === 'file') onSelectFile(item.value);
-    else if (item.kind === 'theme') onSelectTheme(item.value);
-    else if (item.kind === 'task') onRunTask(item.task);
-  };
+  const active = Math.min(idx, Math.max(0, items.length - 1));
 
   return (
     <div
@@ -105,52 +155,35 @@ export const QuickOpen: React.FC<QuickOpenProps> = ({
           <input
             ref={inputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => {
+                setQuery(e.target.value);
+                setIdx(0);
+              }}
             onKeyDown={(e) => {
               if (e.key === 'Escape') onClose();
               else if (e.key === 'ArrowDown') {
                 e.preventDefault();
-                setIdx((i) => Math.min(i + 1, Math.max(0, items.length - 1)));
+                setIdx(Math.min(active + 1, Math.max(0, items.length - 1)));
               } else if (e.key === 'ArrowUp') {
                 e.preventDefault();
-                setIdx((i) => Math.max(0, i - 1));
-              } else if (e.key === 'Enter' && items[idx]) {
+                setIdx(Math.max(0, active - 1));
+              } else if (e.key === 'Enter' && items[active]) {
                 e.preventDefault();
-                activate(items[idx]);
+                pick(active);
               }
             }}
             placeholder="Open file by name... (prefix with '>' for themes & tasks)"
             className="flex-1 bg-transparent text-sm text-[var(--text-primary)] placeholder:text-[var(--text-dim)] outline-none"
           />
         </div>
-        <div className="max-h-[340px] overflow-y-auto py-1">
+        <div ref={listRef} className="max-h-[340px] overflow-y-auto py-1">
           {items.length === 0 ? (
             <EmptyRow icon={MagnifyingGlass} className="!px-4 !py-3">
               No matching files or commands
             </EmptyRow>
           ) : (
             items.map((item, i) => (
-              <div
-                key={`${item.kind}-${item.label}`}
-                onClick={() => activate(item)}
-                className={`flex items-center justify-between px-3 py-1.5 text-xs cursor-pointer ${
-                  i === idx
-                    ? 'bg-[var(--accent)] text-[var(--accent-fg)]'
-                    : 'text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
-                }`}
-              >
-                <div className="flex items-center gap-2 min-w-0">
-                  {item.kind === 'file' && <FileIcon path={item.label} size={14} />}
-                  {item.kind === 'theme' && <Palette size={13} className="shrink-0" />}
-                  {item.kind === 'task' && <Play size={13} className="shrink-0" />}
-                  <span className="font-mono truncate">{item.label}</span>
-                </div>
-                {item.kind === 'task' && (
-                  <span className="text-[10px] opacity-75 font-mono ml-2 truncate">
-                    {item.subtitle}
-                  </span>
-                )}
-              </div>
+              <Row key={`${item.kind}-${item.label}`} item={item} index={i} active={i === active} onPick={pick} />
             ))
           )}
         </div>
