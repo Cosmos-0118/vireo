@@ -319,14 +319,10 @@ export const BranchBar: React.FC<BranchBarProps> = ({
 
   /* Status line ---------------------------------------------------------- */
   const fetched = branchInfo.last_fetched ? `fetched ${shortAgo(branchInfo.last_fetched, now)}` : '';
-  let statusIcon: React.ReactNode = <Cloud size={11} className="shrink-0" />;
+  let statusIcon: React.ReactNode = null;
   let statusText: React.ReactNode;
   let statusTone = 'text-[var(--text-dim)]';
   switch (sync.kind) {
-    case 'no-remote':
-      // The Publish button already says it; keep the panel quiet like VS Code.
-      statusText = null;
-      break;
     case 'detached':
       statusIcon = <AlertTriangle size={11} className="shrink-0" />;
       statusText = 'Not on a branch — create one to keep new commits';
@@ -337,27 +333,10 @@ export const BranchBar: React.FC<BranchBarProps> = ({
       statusText = `Finish or abort the ${gitStatus.state} first`;
       statusTone = 'text-[var(--modified-fg)]';
       break;
-    case 'publish':
-      statusIcon = <CloudOff size={11} className="shrink-0" />;
-      statusText = `Not published to ${sync.remote} yet`;
-      break;
     case 'gone':
       statusIcon = <AlertTriangle size={11} className="shrink-0" />;
       statusText = `${upstreamLabel} was deleted on the remote`;
       statusTone = 'text-[var(--modified-fg)]';
-      break;
-    case 'diverged':
-      statusText = (
-        <>
-          <span className="text-[var(--modified-fg)]">Diverged</span> from {upstreamLabel}
-        </>
-      );
-      break;
-    case 'pull':
-      statusText = `${sync.behind} to pull from ${upstreamLabel}`;
-      break;
-    case 'push':
-      statusText = `${sync.ahead} to push to ${upstreamLabel}`;
       break;
     default:
       statusText = null;

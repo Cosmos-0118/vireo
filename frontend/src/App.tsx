@@ -2115,7 +2115,7 @@ export function App() {
 
         {/* Right: actions, layout toggles, window controls */}
         <div className="flex items-center justify-end h-full min-w-0">
-          <div className="flex items-center gap-0.5 pr-2">
+          <div className="flex items-center gap-1 pr-2">
             {/* Run Scripts */}
             <RunMenu
               open={showRunMenu}
@@ -2215,7 +2215,7 @@ export function App() {
               )}
             </div>
 
-            <div className="h-4 w-px bg-[var(--border)] mx-1.5" />
+            <div className="h-4 w-px bg-[var(--border)] mx-1" />
 
             {/* Layout Toggles */}
             {(

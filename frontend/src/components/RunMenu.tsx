@@ -344,7 +344,7 @@ export const RunMenu: React.FC<RunMenuProps> = ({
     <div className="relative flex items-center" data-no-drag ref={rootRef}>
       {/* Split pill: primary action + menu toggle */}
       <div
-        className={`flex items-center h-7 rounded-md transition-colors ${
+        className={`flex items-center gap-0.5 h-7 pr-0.5 rounded-md transition-colors ${
           open ? 'bg-[var(--bg-active)]' : 'hover:bg-[var(--bg-hover)]'
         }`}
       >
@@ -369,23 +369,26 @@ export const RunMenu: React.FC<RunMenuProps> = ({
           <>
             <button
               onClick={() => onRun(primary)}
-              className="h-7 px-1 text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer"
+              className="w-6 h-6 flex items-center justify-center rounded text-[var(--text-muted)] hover:bg-[var(--bg-active)] hover:text-[var(--text-primary)] cursor-pointer transition-colors"
               title="Restart"
+              aria-label="Restart"
             >
               <RotateCw size={12} />
             </button>
             <button
               onClick={() => onStop(primary)}
-              className="h-7 px-1 text-[var(--text-muted)] hover:text-[var(--danger)] cursor-pointer"
+              className="w-6 h-6 flex items-center justify-center rounded text-[var(--text-muted)] hover:bg-[var(--bg-active)] hover:text-[var(--danger)] cursor-pointer transition-colors"
               title="Stop (closes the task's terminal tab)"
+              aria-label="Stop"
             >
               <Square size={12} />
             </button>
           </>
         )}
+        <span className="w-px h-4 bg-[var(--border)] mx-0.5 shrink-0" aria-hidden />
         <button
           onClick={() => onOpenChange(!open)}
-          className="h-7 px-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] cursor-pointer border-l border-[var(--border)]"
+          className="w-6 h-6 flex items-center justify-center rounded text-[var(--text-muted)] hover:bg-[var(--bg-active)] hover:text-[var(--text-primary)] cursor-pointer transition-colors"
           title="Run a project task"
           aria-label="Open run menu"
         >

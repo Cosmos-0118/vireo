@@ -459,14 +459,6 @@ fn split_globs(raw: &str) -> Vec<String> {
         .collect()
 }
 
-fn utf16_offset(text: &str, byte_idx: usize) -> usize {
-    let idx = byte_idx.min(text.len());
-    text.char_indices()
-        .take_while(|(i, _)| *i < idx)
-        .map(|(_, c)| c.len_utf16())
-        .sum()
-}
-
 /// Subset of rg's `--json` message we read (unknown fields are ignored).
 #[derive(Deserialize)]
 struct RgMsg {
@@ -920,6 +912,14 @@ pub async fn replace_in_files(
 #[cfg(test)]
 mod bench {
     use super::*;
+
+    fn utf16_offset(text: &str, byte_idx: usize) -> usize {
+        let idx = byte_idx.min(text.len());
+        text.char_indices()
+            .take_while(|(i, _)| *i < idx)
+            .map(|(_, c)| c.len_utf16())
+            .sum()
+    }
 
     #[test]
     fn utf16_ranges_match_reference() {
