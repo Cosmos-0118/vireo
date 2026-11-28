@@ -70,6 +70,7 @@ import { AgentEditsStrip } from './components/AgentEditsStrip';
 import { FileIcon } from './components/FileIcon';
 import { FloatingContextMenu, type ContextMenuItem } from './components/CommitContextMenu';
 import { VireoLogo } from './components/VireoLogo';
+import { WelcomeScreen } from './components/WelcomeScreen';
 import Toast, { type ToastData } from './components/Toast';
 import ResizeHandle from './components/ResizeHandle';
 import {
@@ -2588,57 +2589,14 @@ export function App() {
               </div>
             )}
             {!activeTab ? (
-              <div className="flex-1 min-h-0 overflow-y-auto flex flex-col items-center justify-center-safe p-8 text-center gap-5">
-                <VireoLogo size={56} className="drop-shadow-lg" />
-                <div className="space-y-1.5 max-w-md">
-                  <h2 className="text-lg font-semibold tracking-tight text-[var(--text-primary)]">
-                    Welcome to Vireo
-                  </h2>
-                  <p className="text-[13.5px] text-[var(--text-muted)] leading-relaxed">
-                    Review your coding agent's changes as they happen, inspect Git history & branches,
-                    and commit to GitHub, all from one lightweight window.
-                  </p>
-                </div>
-                <div className="flex flex-wrap items-center justify-center gap-2.5 text-[13px]">
-                  <button
-                    onClick={() => setQuickOpenVisible(true)}
-                    className="px-3.5 py-2 rounded-lg bg-[var(--accent)] text-[var(--accent-fg)] font-medium cursor-pointer hover:opacity-95 transition-opacity"
-                  >
-                    {withShortcut('Quick Open', 'quickOpen')}
-                  </button>
-                  {gitStatus?.is_repo && (
-                    <button
-                      onClick={() => openGraphTab()}
-                      className="px-3.5 py-2 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 cursor-pointer transition-colors"
-                    >
-                      <GitFork size={15} className="text-[var(--accent)]" />
-                      Git Commit Graph
-                    </button>
-                  )}
-                  <button
-                    onClick={() => {
-                      setShowSidebar(true);
-                      setSidebarTab('explorer');
-                    }}
-                    className="px-3.5 py-2 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
-                  >
-                    Browse Files
-                  </button>
-                  <button
-                    onClick={handlePickWorkspace}
-                    className="px-3.5 py-2 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] flex items-center gap-1.5 cursor-pointer transition-colors"
-                  >
-                    <FolderOpen size={15} className="text-[var(--accent)]" />
-                    Open Folder
-                  </button>
-                  <button
-                    onClick={() => setShowTerminal(true)}
-                    className="px-3.5 py-2 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] cursor-pointer transition-colors"
-                  >
-                    {withShortcut('Open Terminal', 'toggleTerminal')}
-                  </button>
-                </div>
-              </div>
+              <WelcomeScreen
+                actions={[
+                  { label: withShortcut('Quick Open', 'quickOpen'), onClick: () => setQuickOpenVisible(true), primary: true },
+                  ...(gitStatus?.is_repo ? [{ label: 'Git Graph', onClick: () => openGraphTab() }] : []),
+                  { label: 'Open Folder', onClick: handlePickWorkspace },
+                  { label: withShortcut('Terminal', 'toggleTerminal'), onClick: () => setShowTerminal(true) },
+                ]}
+              />
             ) : activeTab.mode === 'release' ? null : activeTab.mode === 'settings' ? (
               <Suspense
                 fallback={

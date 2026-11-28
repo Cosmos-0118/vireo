@@ -497,8 +497,12 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   return (
     <div className="flex flex-col h-full bg-[var(--bg-panel)] border-t border-[var(--border)]">
       {/* Terminal tab bar */}
-      <div className="@container relative flex items-stretch justify-between gap-2 px-2 h-9 bg-[var(--bg-sidebar)] shrink-0">
-        {/* Baseline under the tabs; the active tab covers it so it merges into the terminal. */}
+      <div
+        style={{ background: theme.terminal.background }}
+        className="@container relative flex items-stretch justify-between gap-2 px-2 h-9 shrink-0"
+      >
+        {/* Baseline under the tabs; the active tab covers it so it merges into the terminal. The bar
+            shares the terminal background so there is no color step where they meet. */}
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-[var(--border)]" />
         <div className="flex items-end gap-0.5 min-w-0 flex-1 overflow-x-auto pt-1">
           {tabs.map((t) => (
@@ -506,12 +510,15 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
               key={t.id}
               onClick={() => setActiveId(t.id)}
               style={t.id === activeId ? { background: theme.terminal.background } : undefined}
-              className={`relative flex items-center gap-1.5 min-w-0 h-full whitespace-nowrap px-3 text-[12.5px] rounded-t-md cursor-pointer select-none transition-colors ${
+              className={`relative flex items-center gap-1.5 min-w-0 h-full whitespace-nowrap px-3 text-[12.5px] cursor-pointer select-none transition-colors ${
                 t.id === activeId
-                  ? 'z-10 text-[var(--text-primary)] font-medium shadow-[inset_0_2px_0_var(--accent)]'
+                  ? 'z-10 text-[var(--text-primary)] font-medium'
                   : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
               }`}
             >
+              {t.id === activeId && (
+                <span className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-[var(--accent)]" />
+              )}
               {t.kind === 'agent' ? (
                 <Sparkles size={13} className="text-[var(--accent)]" />
               ) : (

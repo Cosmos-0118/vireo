@@ -113,7 +113,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
   const [filterOpen, setFilterOpen] = useState(false);
   const [filterQuery, setFilterQuery] = useState('');
   const [allFiles, setAllFiles] = useState<string[] | null>(null);
-  const [menu, setMenu] = useState<{ x: number; y: number; entry: TreeEntry } | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; entry: TreeEntry | null } | null>(null);
   const [modal, setModal] = useState<GitModalState>(null);
   const [fsModal, setFsModal] = useState<FsModalState>(null);
   const [busy, setBusy] = useState(false);
@@ -399,6 +399,38 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
     return `${base}${sep}${rel.split('/').join(sep)}`;
   };
 
+  // Target dir for header buttons: the selected folder, or the selected file's parent, else root.
+  const createDir = () => {
+    if (!selectedPath) return '';
+    const sel = rows.find((r) => r.entry.path === selectedPath);
+    return sel?.entry.is_dir ? selectedPath : parentOf(selectedPath);
+  };
+
+  const buildRootMenu = (): ContextMenuItem[] => [
+    {
+      id: 'new-file',
+      label: 'New File…',
+      icon: <FilePlus size={13} />,
+      onClick: () => setFsModal({ kind: 'new-file', dir: '' }),
+    },
+    {
+      id: 'new-folder',
+      label: 'New Folder…',
+      icon: <FolderPlus size={13} />,
+      onClick: () => setFsModal({ kind: 'new-folder', dir: '' }),
+    },
+    ...(onOpenTerminal
+      ? [
+          {
+            id: 'open-terminal',
+            label: 'Open in Integrated Terminal',
+            icon: <SquareTerminal size={13} />,
+            dividerBefore: true,
+            onClick: () => onOpenTerminal(''),
+          },
+        ]
+      : []),
+  ];
   const buildMenu = (entry: TreeEntry): ContextMenuItem[] => {
     const st = statusByPath.get(entry.path);
     const items: ContextMenuItem[] = [];
@@ -579,6 +611,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
         }}
         onContextMenu={(e) => {
           e.preventDefault();
+          e.stopPropagation();
           setMenu({ x: e.clientX, y: e.clientY, entry });
         }}
         style={{ paddingLeft: `${8 + depth * 14}px` }}
@@ -672,6 +705,12 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
           Explorer
         </span>
         <div className="flex items-center gap-0.5">
+          <button onClick={() => setFsModal({ kind: 'new-file', dir: createDir() })} className={headerBtn} title="New file">
+            <FilePlus size={14} />
+          </button>
+          <button onClick={() => setFsModal({ kind: 'new-folder', dir: createDir() })} className={headerBtn} title="New folder">
+            <FolderPlus size={14} />
+          </button>
           <button
             onClick={() => {
               setFilterOpen((v) => !v);
@@ -727,7 +766,14 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
         </div>
       )}
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto py-1.5">
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto py-1.5"
+        onContextMenu={(e) => {
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY, entry: null });
+        }}
+      >
         {filterOpen && filterQuery.trim() ? (
           filterMatches.length === 0 ? (
             allFiles ? (
@@ -754,6 +800,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                   onClick={() => onOpenFile(f)}
                   onContextMenu={(e) => {
                     e.preventDefault();
+                    e.stopPropagation();
                     setMenu({
                       x: e.clientX,
                       y: e.clientY,
@@ -790,7 +837,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
         <FloatingContextMenu
           x={menu.x}
           y={menu.y}
-          items={buildMenu(menu.entry)}
+          items={menu.entry ? buildMenu(menu.entry) : buildRootMenu()}
           onClose={() => setMenu(null)}
         />
       )}
