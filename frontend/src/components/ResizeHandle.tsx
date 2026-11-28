@@ -137,16 +137,35 @@ const ResizeHandle: React.FC<ResizeHandleProps> = ({
       }}
       onDoubleClick={onReset}
       style={{ touchAction: 'none' }}
-      className={`relative shrink-0 z-10 outline-none transition-colors ${
+      className={`group relative shrink-0 z-10 outline-none transition-colors duration-150 ${
         vertical ? 'w-1 cursor-col-resize' : 'h-1 cursor-row-resize'
       } ${
         dragging
           ? 'bg-[var(--accent)]'
-          : 'hover:bg-[var(--accent)]/60 focus-visible:bg-[var(--accent)]/80'
+          : 'hover:bg-[var(--accent)]/70 hover:delay-150 focus-visible:bg-[var(--accent)]/80'
       } before:content-[''] before:absolute ${
         vertical ? 'before:inset-y-0 before:-inset-x-[3px]' : 'before:inset-x-0 before:-inset-y-[3px]'
       }`}
-    />
+    >
+      {/* Grip dots (VS Code style): faint at rest, light up on hover / drag / keyboard focus */}
+      <span
+        aria-hidden
+        className={`pointer-events-none absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 gap-[3px] ${
+          vertical ? 'flex-col' : 'flex-row'
+        }`}
+      >
+        {[0, 1, 2].map((i) => (
+          <span
+            key={i}
+            className={`block h-[2px] w-[2px] rounded-full transition-colors duration-150 ${
+              dragging
+                ? 'bg-[var(--accent-fg)]'
+                : 'bg-[var(--text-dim)]/70 group-hover:bg-[var(--accent-fg)] group-hover:delay-150 group-focus-visible:bg-[var(--accent-fg)]'
+            }`}
+          />
+        ))}
+      </span>
+    </div>
   );
 };
 

@@ -1,5 +1,6 @@
 import { Equals, FileDashed, GitCommit } from '@phosphor-icons/react';
 import { EmptyRow, EmptyState } from './ui/EmptyState';
+import ResizeHandle from './ResizeHandle';
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
@@ -183,7 +184,18 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
   const [stashesOpen, setStashesOpen] = useState(false);
   const [checkpointsOpen, setCheckpointsOpen] = useState(false);
   const [changesRatio, setChangesRatio] = useState(0.46); // split ratio between Changes & Graph
-  const splitContainerRef = useRef<HTMLDivElement>(null);
+  const [splitH, setSplitH] = useState(0);
+  const splitObserver = useRef<ResizeObserver | null>(null);
+  // Callback ref: the split container may mount after the pane (repo detected later), so observe on attach.
+  const splitContainerRef = useCallback((el: HTMLDivElement | null) => {
+    splitObserver.current?.disconnect();
+    splitObserver.current = null;
+    if (!el) return;
+    setSplitH(el.clientHeight);
+    const ro = new ResizeObserver(() => setSplitH(el.clientHeight));
+    ro.observe(el);
+    splitObserver.current = ro;
+  }, []);
 
   // Changes filter
   const [showChangesFilter, setShowChangesFilter] = useState(false);
@@ -613,23 +625,6 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
       if (msg && !commitMsg.trim()) setCommitMsg(msg);
       onToast('Undid last commit (changes kept staged).');
     });
-  };
-
-  const startSplitDrag = (e: React.MouseEvent) => {
-    e.preventDefault();
-    const container = splitContainerRef.current;
-    if (!container) return;
-    const rect = container.getBoundingClientRect();
-    const onMove = (ev: MouseEvent) => {
-      const rel = (ev.clientY - rect.top) / Math.max(1, rect.height);
-      setChangesRatio(Math.max(0.18, Math.min(0.82, rel)));
-    };
-    const onUp = () => {
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseup', onUp);
-    };
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseup', onUp);
   };
 
   const openFileContextMenu = (
@@ -1558,10 +1553,15 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
 
             {/* Draggable Splitter between Changes & Graph */}
             {graphOpen && totalChanged > 0 && changesOpen && (
-              <div
-                onMouseDown={startSplitDrag}
-                className="h-[3px] cursor-row-resize bg-[var(--border)]/70 hover:bg-[var(--accent)] shrink-0 transition-colors"
-                title="Drag to resize Changes and Graph sections"
+              <ResizeHandle
+                orientation="horizontal"
+                direction={1}
+                label="Resize Changes and Graph sections"
+                value={changesRatio * splitH}
+                min={0.18 * splitH}
+                max={0.82 * splitH}
+                onChange={(px) => setChangesRatio(px / Math.max(1, splitH))}
+                onReset={() => setChangesRatio(0.46)}
               />
             )}
 
