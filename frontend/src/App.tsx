@@ -1,3 +1,4 @@
+import { AgentUsage } from './components/AgentUsage';
 import React, {
   Suspense,
   lazy,
@@ -236,6 +237,16 @@ export function App() {
     workspace.path
   );
   const [liveConnected, setLiveConnected] = useState(false);
+  // Only surface a dropped watcher after a grace period, so startup and quick reconnects stay quiet.
+  const [watcherLost, setWatcherLost] = useState(false);
+  useEffect(() => {
+    if (liveConnected) {
+      setWatcherLost(false);
+      return;
+    }
+    const t = window.setTimeout(() => setWatcherLost(true), 3000);
+    return () => window.clearTimeout(t);
+  }, [liveConnected]);
 
   // Native window state for the custom title bar (null = running in a browser)
   // `mac`: macOS draws native traffic lights over the left of the title bar instead of our buttons.
@@ -2981,11 +2992,7 @@ export function App() {
 
       {/* Status Bar */}
       <footer
-        className="h-6 flex items-stretch justify-between text-[12px] leading-none border-t border-[var(--border)] shrink-0 select-none"
-        style={{
-          background: 'var(--status-bar-bg)',
-          color: 'var(--status-bar-fg)',
-        }}
+        className="h-[26px] flex items-stretch justify-between gap-3 text-[11.5px] leading-none border-t border-[var(--border)] bg-[var(--bg-activity)] text-[var(--text-dim)] shrink-0 select-none"
       >
         <div className="flex items-stretch min-w-0 pl-1">
           <button
@@ -3022,19 +3029,20 @@ export function App() {
               )}
             </button>
           )}
-          <span
-            className="flex items-center gap-1.5 px-2 opacity-80"
-            title={liveConnected ? 'Watching the workspace for changes' : 'Reconnecting to the file watcher'}
-          >
+          {watcherLost && (
             <span
-              className="w-1.5 h-1.5 rounded-full"
-              style={{ background: liveConnected ? '#10b981' : '#f59e0b' }}
-            />
-            {liveConnected ? 'Live' : 'Reconnecting'}
-          </span>
+              className="flex items-center gap-1.5 px-2 text-[var(--modified-fg)]"
+              title="Reconnecting to the file watcher; diffs may be stale until it is back"
+            >
+              <span className="w-1.5 h-1.5 rounded-full bg-[var(--modified-fg)] animate-pulse" />
+              Reconnecting
+            </span>
+          )}
         </div>
 
-        <div className="flex items-stretch pr-1">
+        <div className="flex items-stretch pr-1 min-w-0">
+          <AgentUsage />
+          <span className="self-center w-px h-3 mx-1.5 bg-[var(--border)]" />
           <div className="group flex items-stretch" title={`Zoom (${shortcutLabel('zoomIn')} / ${shortcutLabel('zoomOut')} / ${shortcutLabel('zoomReset')})`}>
             <button
               onClick={() => adjustZoom((z) => z - ZOOM_STEP)}

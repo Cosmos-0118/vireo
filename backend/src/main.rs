@@ -15,6 +15,7 @@ mod release;
 mod secrets;
 mod state;
 mod tasks;
+mod usage;
 mod watcher;
 
 use axum::{
@@ -332,6 +333,7 @@ fn build_router(
         .route("/api/prefs/bootstrap.js", get(prefs::bootstrap_js))
         .route("/api/window/zoom", post(set_window_zoom))
         .route("/api/window/control", post(window_control))
+        .route("/api/usage", get(usage::get_usage))
         .route(
             "/api/workspace",
             get(files::get_workspace).post(files::set_workspace),

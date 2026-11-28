@@ -64,7 +64,33 @@ function releaseRun<T>(action: string, opts: ReleaseRunOpts = {}): Promise<T> {
   });
 }
 
+export interface RateWindow {
+  used_percent: number;
+  window_minutes: number;
+  resets_at: number;
+}
+
+export interface AgentUsageRes {
+  claude: {
+    block_tokens: number;
+    block_resets_at: number;
+    day_tokens: number;
+    ctx_tokens: number;
+    ctx_window: number;
+    model: string;
+  } | null;
+  codex: {
+    day_tokens: number;
+    ctx_tokens: number;
+    ctx_window: number;
+    primary: RateWindow | null;
+    secondary: RateWindow | null;
+  } | null;
+}
+
 export const api = {
+  /** Agent token usage read from the CLIs' session logs. */
+  usage: () => jsonFetch<AgentUsageRes>('/api/usage'),
   setWindowZoom: (factor: number) =>
     jsonFetch<{ factor: number; native: boolean }>('/api/window/zoom', {
       method: 'POST',
