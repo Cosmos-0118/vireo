@@ -264,8 +264,15 @@ export function App() {
     api.askpassAnswer(id, value).catch(() => {});
   }, []);
   useEffect(() => {
-    if (!getBootstrap()?.window) {
+    // The webview can load before the backend stores the native window handle, so bootstrap may
+    // wrongly say `native: false`. Re-query until the backend reports a native window (bounded:
+    // a plain browser or server-only run never will).
+    const retryTimers: number[] = [];
+    if (!getBootstrap()?.window?.native) {
       windowAction('state');
+      for (const ms of [150, 400, 1000, 2500]) {
+        retryTimers.push(window.setTimeout(() => windowAction('state'), ms));
+      }
     }
     let timer: number | undefined;
     const onResize = () => {
@@ -276,6 +283,7 @@ export function App() {
     return () => {
       window.removeEventListener('resize', onResize);
       window.clearTimeout(timer);
+      retryTimers.forEach((t) => window.clearTimeout(t));
     };
   }, [windowAction]);
 
