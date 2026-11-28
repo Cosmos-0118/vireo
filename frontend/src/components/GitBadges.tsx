@@ -1,5 +1,5 @@
 import React from 'react';
-import { ArrowDown, ArrowUp, Cloud, GitBranch, Tag } from 'lucide-react';
+import { ArrowDown, ArrowUp, ChevronDown, ChevronUp, Cloud, GitBranch, Tag } from 'lucide-react';
 import type { GitRef } from '../types';
 
 const SYNC_OUT = 'var(--accent-hover)';
@@ -11,7 +11,7 @@ const SYNC_IN = 'color-mix(in srgb, #a78bfa 75%, var(--text-primary))';
  * next to the message rather than another badge competing with ref labels.
  */
 export const SyncMark: React.FC<{ dir: 'outgoing' | 'incoming'; size?: number }> = React.memo(({ dir, size = 14 }) => {
-  const Icon = dir === 'outgoing' ? ArrowUp : ArrowDown;
+  const Icon = dir === 'outgoing' ? ChevronUp : ChevronDown;
   return (
     <span
       role="img"
