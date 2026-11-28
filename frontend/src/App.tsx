@@ -303,6 +303,25 @@ export function App() {
   // Menus & modals
   const [showThemeMenu, setShowThemeMenu] = useState(false);
   const [showRunMenu, setShowRunMenu] = useState(false);
+
+  // Dismiss the theme menu on outside click or Escape.
+  useEffect(() => {
+    if (!showThemeMenu) return;
+    const onDown = (e: MouseEvent) => {
+      const el = e.target as HTMLElement | null;
+      if (el?.closest?.('[data-theme-menu],[data-theme-toggle]')) return;
+      setShowThemeMenu(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowThemeMenu(false);
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [showThemeMenu]);
   const [quickOpenVisible, setQuickOpenVisible] = useState(false);
   const [toast, setToast] = useState<ToastData | null>(null);
 
@@ -2145,6 +2164,7 @@ export function App() {
                   setShowThemeMenu((v) => !v);
                   setShowRunMenu(false);
                 }}
+                data-theme-toggle
                 className={`w-7 h-7 flex items-center justify-center rounded-md cursor-pointer transition-colors ${
                   showThemeMenu
                     ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
@@ -2156,7 +2176,10 @@ export function App() {
                 <Palette size={15} />
               </button>
               {showThemeMenu && (
-                <div className="absolute right-0 top-full mt-1.5 w-60 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 flex flex-col max-h-[min(75vh,640px)]">
+                <div
+                  data-theme-menu
+                  className="absolute right-0 top-full mt-1.5 w-60 rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] shadow-xl z-40 flex flex-col max-h-[min(75vh,640px)]"
+                >
                   <div className="overflow-y-auto py-1">
                     {themeGroups.map((group) => (
                       <div key={group.label}>
@@ -2984,6 +3007,7 @@ export function App() {
               setShowThemeMenu((v) => !v);
               setShowRunMenu(false);
             }}
+            data-theme-toggle
             className="flex items-center gap-1.5 px-2 status-item"
             title="Change theme"
           >

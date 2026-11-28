@@ -488,15 +488,18 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   return (
     <div className="flex flex-col h-full bg-[var(--bg-panel)] border-t border-[var(--border)]">
       {/* Terminal tab bar */}
-      <div className="@container flex items-center justify-between gap-2 px-3 h-9 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
-        <div className="flex items-center gap-1.5 min-w-0 flex-1 overflow-x-auto">
+      <div className="@container relative flex items-stretch justify-between gap-2 px-2 h-9 bg-[var(--bg-sidebar)] shrink-0">
+        {/* Baseline under the tabs; the active tab covers it so it merges into the terminal. */}
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-[var(--border)]" />
+        <div className="flex items-end gap-0.5 min-w-0 flex-1 overflow-x-auto pt-1">
           {tabs.map((t) => (
             <div
               key={t.id}
               onClick={() => setActiveId(t.id)}
-              className={`flex items-center gap-1.5 min-w-0 whitespace-nowrap px-3 py-1 text-[12.5px] rounded-md cursor-pointer select-none transition-colors ${
+              style={t.id === activeId ? { background: theme.terminal.background } : undefined}
+              className={`relative flex items-center gap-1.5 min-w-0 h-full whitespace-nowrap px-3 text-[12.5px] rounded-t-md cursor-pointer select-none transition-colors ${
                 t.id === activeId
-                  ? 'bg-[var(--bg-active)] text-[var(--text-primary)] font-medium'
+                  ? 'z-10 text-[var(--text-primary)] font-medium shadow-[inset_0_2px_0_var(--accent)]'
                   : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
               }`}
             >
@@ -543,7 +546,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           </button>
         </div>
 
-        <div className="flex items-center gap-1.5 shrink-0">
+        <div className="flex items-center gap-1.5 shrink-0 self-center">
           {activeTab?.kind === 'agent' && (
             <button
               onClick={() => restartTab(activeTab.id)}
@@ -597,7 +600,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
       </div>
 
       {/* Terminal viewport */}
-      <div className="flex-1 min-h-0 relative">
+      <div className="flex-1 min-h-0 relative" style={{ background: theme.terminal.background }}>
         {!workspacePath && (
           <EmptyState
             size="sm"
