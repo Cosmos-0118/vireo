@@ -70,14 +70,36 @@ export interface RateWindow {
   resets_at: number;
 }
 
+/** A Claude plan limit window from the OAuth usage endpoint. */
+export interface QuotaWindow {
+  /** 0..100 */
+  used_percent: number;
+  /** Unix seconds; 0 when the window has not started. */
+  resets_at: number;
+}
+
+export interface ClaudeQuota {
+  five_hour: QuotaWindow | null;
+  seven_day: QuotaWindow | null;
+  seven_day_opus: QuotaWindow | null;
+  seven_day_sonnet: QuotaWindow | null;
+}
+
 export interface AgentUsageRes {
   claude: {
     block_tokens: number;
     block_resets_at: number;
     day_tokens: number;
+    /** Share of this workspace's prompt tokens (24h) served from cache, 0..1. */
+    cache_hit: number;
     ctx_tokens: number;
     ctx_window: number;
+    /** Unix seconds the latest conversation last changed; 0 when none. */
+    ctx_updated_at: number;
     model: string;
+    quota: ClaudeQuota | null;
+    quota_status: 'ok' | 'no_credentials' | 'expired' | 'error';
+    plan: string;
   } | null;
   codex: {
     day_tokens: number;

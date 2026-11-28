@@ -84,6 +84,8 @@ import {
   type PanelSide,
 } from './layout';
 import { flushPrefs, getBootstrap, hasPersistedPref, setPref, setPrefs } from './prefs';
+import type { LiveTask } from './components/TerminalPanel';
+import { EditorStatusItem } from './components/EditorStatusItem';
 
 /** Files whose changes can add, remove or rename Run tasks. */
 const TASK_SOURCE_RE =
@@ -143,6 +145,12 @@ function trimToBudget<V>(map: Map<string, V>, sizeOf: (v: V) => number, budget =
 const ZOOM_MIN = 0.7;
 const ZOOM_MAX = 2.0;
 const ZOOM_STEP = 0.1;
+const GIT_STATE_LABEL: Record<NonNullable<GitStatusRes['state']>, string> = {
+  rebase: 'Rebasing',
+  merge: 'Merging',
+  'cherry-pick': 'Cherry-picking',
+  revert: 'Reverting',
+};
 const REPEATABLE = new Set<ActionId>(['zoomIn', 'zoomOut', 'nextTab', 'prevTab']);
 /** Minimum time between automatic follow-edits tab switches. */
 const FOLLOW_SWITCH_DWELL_MS = 700;
@@ -234,6 +242,16 @@ export function App() {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
   const [projectDefaultTask, setProjectDefaultTask] = useState<string | null>(null);
   const [runningTaskIds, setRunningTaskIds] = useState<string[]>([]);
+  /** Task tabs whose process is still alive (status bar pill). */
+  const [liveTasks, setLiveTasks] = useState<LiveTask[]>([]);
+  const [focusTask, setFocusTask] = useState<{ taskId: string; n: number } | null>(null);
+  const handleLiveTasksChange = useCallback((next: LiveTask[]) => {
+    setLiveTasks((prev) =>
+      prev.length === next.length && prev.every((t, i) => t.taskId === next[i].taskId && t.title === next[i].title)
+        ? prev
+        : next
+    );
+  }, []);
   const { prefs: taskPrefs, setPinned, recordRun, saveLocal, removeLocal } = useTaskPrefs(
     workspace.path
   );
@@ -2146,7 +2164,7 @@ export function App() {
       {/* Title Bar (custom, frameless window) */}
       <header
         onMouseDown={handleTitleBarMouseDown}
-        className="h-[38px] grid grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-[var(--border)] bg-[var(--bg-activity)] shrink-0 select-none"
+        className="h-[38px] grid grid-cols-[1fr_auto_1fr] items-center gap-3 border-b border-[var(--divider)] bg-[var(--bg-activity)] shrink-0 select-none"
       >
         {/* Left: brand and workspace */}
         <div className={`flex items-center gap-1 min-w-0 ${nativeWindow?.mac ? 'pl-[84px]' : 'pl-3'}`}>
@@ -2458,8 +2476,15 @@ export function App() {
         <div className="flex-1 flex flex-col min-w-0 min-h-0">
           {/* Open Tabs Bar */}
           {tabs.length > 0 && (
+            <div className="relative h-10 shrink-0 bg-[var(--bg-sidebar)]">
+              {/* One unbroken hairline under the bar; the active tab's underline paints over it. */}
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-[var(--divider)]" />
             <div
-              className="flex items-center h-10 bg-[var(--bg-sidebar)] border-b border-[var(--border)] overflow-x-auto shrink-0"
+              className="relative flex items-stretch gap-0.5 h-full px-1 overflow-x-auto overflow-y-hidden [scrollbar-width:none]"
+              onWheel={(e) => {
+                // No visible scrollbar: map a plain mouse wheel to horizontal scrolling.
+                if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) e.currentTarget.scrollLeft += e.deltaY;
+              }}
               onWheelCapture={() => (userActivityRef.current = Date.now())}
               onPointerDownCapture={() => (userActivityRef.current = Date.now())}
             >
@@ -2494,16 +2519,19 @@ export function App() {
                       e.preventDefault();
                       setTabMenu({ x: e.clientX, y: e.clientY, tabId: tab.id });
                     }}
-                    className={`group flex items-center gap-2 px-3.5 h-full text-[13px] border-r border-[var(--border)] cursor-pointer select-none shrink-0 transition-colors ${
+                    className={`group relative flex items-center gap-2 pl-3 pr-2 h-full text-[13px] cursor-pointer select-none shrink-0 transition-colors ${
                       tabPulse[tab.path] !== undefined
                         ? `tab-pulse-${tabPulse[tab.path] % 2}`
                         : ''
                     } ${
                       active
-                        ? 'bg-[var(--bg-base)] text-[var(--text-primary)] font-medium border-t-2 border-t-[var(--accent)]'
-                        : 'text-[var(--text-muted)] hover:bg-[var(--bg-hover)]'
+                        ? 'text-[var(--text-primary)]'
+                        : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
                     }`}
                   >
+                    {active && (
+                      <span className="pointer-events-none absolute inset-x-2 bottom-0 z-[1] h-0.5 rounded-full bg-[var(--accent)]" />
+                    )}
                     {tab.mode === 'graph' ? (
                       <GitFork size={14} className="text-[var(--accent)] shrink-0" />
                     ) : tab.mode === 'settings' ? (
@@ -2538,7 +2566,9 @@ export function App() {
                         e.stopPropagation();
                         closeTab(tab.id);
                       }}
-                      className="ml-0.5 p-0.5 rounded hover:bg-[var(--bg-hover)] hover:text-[var(--danger)] cursor-pointer"
+                      className={`ml-0.5 p-0.5 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-opacity ${
+                        active ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
+                      }`}
                       title="Close tab"
                     >
                       <X size={13} />
@@ -2546,6 +2576,7 @@ export function App() {
                   </div>
                 );
               })}
+            </div>
             </div>
           )}
           {tabMenu && (
@@ -2764,13 +2795,16 @@ export function App() {
               </Suspense>
             )}
 
-            {/* Agent edits bar: docked under the viewer (never covers code), same chrome as the toolbars */}
           </div>
 
           {!pillDismissed &&
             (pillVisible || pausedJump || reviewPaths.length > 0) &&
             liveEdits.length > 0 && (
-              <div className="shrink-0 flex items-center gap-2 h-9 px-3 border-t border-[var(--border)] bg-[var(--bg-sidebar)] text-xs">
+              /* Floating agent-edits pill: zero-height anchor sits on the viewer's bottom edge, so the pill
+                 hovers just above the terminal and fits its content (shrinking to the window width). */
+              <div className="relative h-0 shrink-0 z-30">
+              <div className="absolute inset-x-4 bottom-2.5 flex justify-center pointer-events-none">
+              <div className="agent-bar-in pointer-events-auto flex items-center gap-1.5 h-8 max-w-full pl-2 pr-1 rounded-[10px] border border-[var(--divider)] bg-[var(--bg-elevated)] shadow-[0_10px_30px_-8px_rgba(0,0,0,0.6),0_2px_6px_rgba(0,0,0,0.25)] text-xs">
                 <AgentEditsStrip
                   edits={liveEdits}
                   activePath={activeTab?.path ?? null}
@@ -2862,6 +2896,8 @@ export function App() {
                   </button>
                 </div>
               </div>
+              </div>
+              </div>
             )}
 
           {/* Bottom Terminal */}
@@ -2898,6 +2934,8 @@ export function App() {
                     onSendOutputToAgent={handleAskAgent}
                     onClosePanel={() => setShowTerminal(false)}
                     visible={showTerminal}
+                    onLiveTasksChange={handleLiveTasksChange}
+                    focusTask={focusTask}
                   />
                 </Suspense>
               </div>
@@ -2950,7 +2988,7 @@ export function App() {
 
       {/* Status Bar */}
       <footer
-        className="h-[26px] flex items-stretch justify-between gap-3 text-[11.5px] leading-none border-t border-[var(--border)] bg-[var(--bg-activity)] text-[var(--text-dim)] shrink-0 select-none"
+        className="h-[26px] flex items-stretch justify-between gap-3 text-[11.5px] leading-none border-t border-[var(--divider)] bg-[var(--bg-activity)] text-[var(--text-dim)] shrink-0 select-none"
       >
         <div className="flex items-stretch min-w-0 pl-1">
           <button
@@ -2959,12 +2997,34 @@ export function App() {
               setSidebarTab('changes');
             }}
             className="flex items-center gap-1.5 px-2 status-item"
-            title={gitStatus?.is_repo ? 'Show changes' : 'This folder is not a Git repository'}
+            title={
+              !gitStatus?.is_repo
+                ? 'This folder is not a Git repository'
+                : [
+                    `Branch ${gitStatus.branch || 'HEAD (detached)'}`,
+                    gitStatus.ahead > 0 && `${gitStatus.ahead} commit${gitStatus.ahead === 1 ? '' : 's'} to push`,
+                    gitStatus.behind > 0 && `${gitStatus.behind} commit${gitStatus.behind === 1 ? '' : 's'} to pull`,
+                    gitStatus.state && `${GIT_STATE_LABEL[gitStatus.state]} in progress`,
+                  ]
+                    .filter(Boolean)
+                    .join('\n')
+            }
           >
             <GitBranch size={12} className="shrink-0" />
             <span className="truncate max-w-[180px]">
               {gitStatus?.is_repo ? gitStatus.branch || 'HEAD' : 'No Git'}
             </span>
+            {gitStatus?.is_repo && (gitStatus.ahead > 0 || gitStatus.behind > 0) && (
+              <span className="flex items-center gap-1 tabular-nums opacity-80">
+                {gitStatus.ahead > 0 && <span>↑{gitStatus.ahead}</span>}
+                {gitStatus.behind > 0 && <span>↓{gitStatus.behind}</span>}
+              </span>
+            )}
+            {gitStatus?.is_repo && gitStatus.state && (
+              <span className="font-medium tracking-wide text-[var(--modified-fg)]">
+                {GIT_STATE_LABEL[gitStatus.state].toUpperCase()}
+              </span>
+            )}
           </button>
           {gitStatus?.is_repo && (
             <button
@@ -2987,6 +3047,24 @@ export function App() {
               )}
             </button>
           )}
+          {liveTasks.length > 0 && (
+            <button
+              onClick={() => {
+                setShowTerminal(true);
+                setFocusTask({ taskId: liveTasks[liveTasks.length - 1].taskId, n: Date.now() });
+              }}
+              className="flex items-center gap-1.5 px-2 min-w-0 status-item"
+              title={`Running: ${liveTasks.map((t) => t.title).join(', ')}\nClick to show in the terminal`}
+            >
+              <span className="relative flex w-1.5 h-1.5 shrink-0">
+                <span className="absolute inset-0 rounded-full bg-[var(--added-fg)] opacity-60 animate-ping [animation-duration:2s]" />
+                <span className="relative w-1.5 h-1.5 rounded-full bg-[var(--added-fg)]" />
+              </span>
+              <span className="truncate max-w-[160px]">
+                {liveTasks.length === 1 ? liveTasks[0].title : `${liveTasks.length} tasks`}
+              </span>
+            </button>
+          )}
           {watcherLost && (
             <span
               className="flex items-center gap-1.5 px-2 text-[var(--modified-fg)]"
@@ -2998,44 +3076,40 @@ export function App() {
           )}
         </div>
 
+        {/* Groups are divided by .sb-group (index.css), so a group that renders nothing leaves no
+            stray divider behind. */}
         <div className="flex items-stretch pr-1 min-w-0">
           <AgentUsage />
-          <span className="self-center w-px h-3 mx-1.5 bg-[var(--border)]" />
-          <div className="group flex items-stretch" title={`Zoom (${shortcutLabel('zoomIn')} / ${shortcutLabel('zoomOut')} / ${shortcutLabel('zoomReset')})`}>
-            <button
-              onClick={() => adjustZoom((z) => z - ZOOM_STEP)}
-              className="px-1.5 flex items-center opacity-0 group-hover:opacity-80 hover:!opacity-100 status-item"
-              aria-label="Zoom out"
+          {activeTab?.mode === 'code' && <EditorStatusItem path={activeTab.path} />}
+          {/* Zoom only earns space when it differs from 100% (shortcuts still work at any time). */}
+          {Math.round(zoom * 100) !== 100 && (
+            <div
+              className="sb-group group flex items-stretch"
+              title={`Zoom (${shortcutLabel('zoomIn')} / ${shortcutLabel('zoomOut')} / ${shortcutLabel('zoomReset')})`}
             >
-              <Minus size={11} />
-            </button>
-            <button
-              onClick={() => adjustZoom(1.0)}
-              className="px-1 flex items-center tabular-nums status-item"
-              title="Reset zoom to 100%"
-            >
-              {Math.round(zoom * 100)}%
-            </button>
-            <button
-              onClick={() => adjustZoom((z) => z + ZOOM_STEP)}
-              className="px-1.5 flex items-center opacity-0 group-hover:opacity-80 hover:!opacity-100 status-item"
-              aria-label="Zoom in"
-            >
-              <Plus size={11} />
-            </button>
-          </div>
-          <button
-            onClick={() => {
-              setShowThemeMenu((v) => !v);
-              setShowRunMenu(false);
-            }}
-            data-theme-toggle
-            className="flex items-center gap-1.5 px-2 status-item"
-            title="Change theme"
-          >
-            <Palette size={12} className="shrink-0" />
-            {activeTheme.name}
-          </button>
+              <button
+                onClick={() => adjustZoom((z) => z - ZOOM_STEP)}
+                className="px-1.5 flex items-center opacity-0 group-hover:opacity-80 hover:!opacity-100 status-item"
+                aria-label="Zoom out"
+              >
+                <Minus size={11} />
+              </button>
+              <button
+                onClick={() => adjustZoom(1.0)}
+                className="px-1 flex items-center tabular-nums status-item"
+                title="Reset zoom to 100%"
+              >
+                {Math.round(zoom * 100)}%
+              </button>
+              <button
+                onClick={() => adjustZoom((z) => z + ZOOM_STEP)}
+                className="px-1.5 flex items-center opacity-0 group-hover:opacity-80 hover:!opacity-100 status-item"
+                aria-label="Zoom in"
+              >
+                <Plus size={11} />
+              </button>
+            </div>
+          )}
         </div>
       </footer>
 

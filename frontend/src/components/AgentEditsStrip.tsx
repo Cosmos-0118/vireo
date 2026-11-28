@@ -90,6 +90,8 @@ export function AgentEditsStrip({ edits, activePath, tabPulse, onFocus }: Props)
   }, [items, n, widths, avail, activeIdx]);
 
   const hiddenCount = n - visible.length;
+  const naturalWidth =
+    n > 0 && widths.length === n ? widths.reduce((s, w) => s + w, 0) + CHIP_GAP * (n - 1) + 1 : undefined;
 
   // --- stepper ---
   const step = (dir: 1 | -1) => {
@@ -164,7 +166,13 @@ export function AgentEditsStrip({ edits, activePath, tabPulse, onFocus }: Props)
         )}
       </div>
       <span className="w-px h-4 bg-[var(--border)] shrink-0" />
-      <div ref={stripRef} className="relative flex items-center gap-0.5 min-w-0 flex-1 overflow-hidden">
+      {/* Explicit natural width (not derived from the visible chips) lets the floating pill grow as files
+          arrive without the fit calculation feeding back on itself; it shrinks when the pill hits max-w. */}
+      <div
+        ref={stripRef}
+        style={naturalWidth ? { width: naturalWidth } : undefined}
+        className="relative flex items-center gap-0.5 min-w-0 shrink overflow-hidden"
+      >
         {visible.map((i) => chip(items[i]))}
         {hiddenCount > 0 && (
           <button

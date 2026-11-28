@@ -1414,7 +1414,7 @@ ${hunk.excerpt.slice(0, 3500)}
       )}
 
       {/* Diff Toolbar */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-b border-[var(--border)] bg-[var(--bg-sidebar)] gap-2 shrink-0 flex-wrap">
+      <div className="flex items-center justify-between px-3 py-1.5 border-b border-[var(--divider)] bg-[var(--bg-sidebar)] gap-2 shrink-0 flex-wrap">
         <div className="flex items-center gap-2 min-w-0">
           <span className="font-mono text-xs truncate" title={diff.path}>
             <span className="text-[var(--text-dim)]">{pathDir}</span>

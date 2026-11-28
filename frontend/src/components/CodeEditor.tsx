@@ -50,6 +50,7 @@ import {
 } from 'lucide-react';
 import {
   buildHighlightStyle,
+  getLanguageLabel,
   getLanguageSupport,
   isMarkdownPath,
   loadLanguageForPath,
@@ -59,6 +60,7 @@ import {
 // react-markdown + rehype-sanitize are heavy; only fetch them when a markdown preview opens.
 const MarkdownMessage = React.lazy(() => import('./MarkdownView').then((m) => ({ default: m.MarkdownMessage })));
 import type { LiteTheme } from '../themes';
+import { clearEditorStatus, publishEditorStatus } from '../editorStatus';
 
 interface CodeEditorProps {
   path: string;
@@ -650,6 +652,34 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
     const langCompartment = new Compartment();
     let disposed = false;
+    /** Cursor / selection for the status bar (Ln, Col, selection size). */
+    const publishStatus = (v: EditorView) => {
+      const s = v.state;
+      const main = s.selection.main;
+      const line = s.doc.lineAt(main.head);
+      let selChars = 0;
+      let selLines = 0;
+      for (const r of s.selection.ranges) {
+        if (r.empty) continue;
+        selChars += r.to - r.from;
+        selLines += s.doc.lineAt(r.to).number - s.doc.lineAt(r.from).number + 1;
+      }
+      publishEditorStatus(
+        {
+          path,
+          line: line.number,
+          col: main.head - line.from + 1,
+          selChars,
+          selLines,
+          cursors: s.selection.ranges.length,
+          language: getLanguageLabel(path),
+        },
+        () => {
+          v.focus();
+          gotoLine(v);
+        }
+      );
+    };
     const state = EditorState.create({
       doc: carried ? carried.doc : normalizeNewlines(contentRef.current),
       selection: carried ? { anchor: Math.min(carried.anchor, carried.doc.length) } : undefined,
@@ -684,6 +714,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
         langCompartment.of(langExtension(path, theme)),
         syntaxHighlighting(buildHighlightStyle(theme)),
         EditorView.updateListener.of((u) => {
+          if (u.selectionSet || u.docChanged) publishStatus(u.view);
           if (u.docChanged && !u.transactions.some((t) => t.annotation(externalChange))) {
             setDirty(true);
           }
@@ -728,6 +759,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       parent: containerRef.current,
     });
     viewRef.current = view;
+    publishStatus(view);
     // Grammars load on demand: paint plain text now, then attach the language once its chunk arrives.
     if (!getLanguageSupport(path)) {
       void loadLanguageForPath(path).then(() => {
@@ -755,6 +787,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
       };
       view.destroy();
       viewRef.current = null;
+      clearEditorStatus(path);
     };
     // Recreate only for a different file or theme; content changes are patched in place below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -971,7 +1004,7 @@ export const CodeEditor: React.FC<CodeEditorProps> = ({
 
   return (
     <div className="flex-1 flex flex-col min-h-0">
-      <div className="flex items-center justify-between h-9 px-3.5 border-b border-[var(--border)] bg-[var(--bg-sidebar)] shrink-0">
+      <div className="flex items-center justify-between h-9 px-3.5 border-b border-[var(--divider)] bg-[var(--bg-sidebar)] shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="font-mono text-[13px] truncate text-[var(--text-primary)]">{path}</span>
           {dirty && (

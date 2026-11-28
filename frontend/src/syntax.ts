@@ -230,6 +230,41 @@ export function getLanguageId(path: string): string | null {
   return findDefByPath(path)?.id ?? null;
 }
 
+const LANG_LABELS: Record<string, string> = {
+  typescript: 'TypeScript',
+  tsx: 'TypeScript JSX',
+  javascript: 'JavaScript',
+  jsx: 'JavaScript JSX',
+  rust: 'Rust',
+  python: 'Python',
+  json: 'JSON',
+  css: 'CSS',
+  html: 'HTML',
+  markdown: 'Markdown',
+  yaml: 'YAML',
+  xml: 'XML',
+  sql: 'SQL',
+  cpp: 'C++',
+  java: 'Java',
+  go: 'Go',
+  toml: 'TOML',
+  shell: 'Shell',
+  powershell: 'PowerShell',
+  dockerfile: 'Dockerfile',
+  ini: 'INI',
+  ruby: 'Ruby',
+  csharp: 'C#',
+  kotlin: 'Kotlin',
+  swift: 'Swift',
+  lua: 'Lua',
+};
+
+/** Human-readable language name for a path ("TypeScript JSX"), or "Plain Text". */
+export function getLanguageLabel(path: string): string {
+  const id = getLanguageId(path);
+  return id ? LANG_LABELS[id] ?? id : 'Plain Text';
+}
+
 /* ------------------------------------------------------------------ */
 /* Token styling                                                       */
 /* ------------------------------------------------------------------ */

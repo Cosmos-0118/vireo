@@ -62,6 +62,9 @@
   --bg-active: #2e3340;
   --bg-input: #121316;
   --border: #2a2d35;
+  /* Structural seams between bars (title bar, tab bars, toolbars, terminal, status bar). Derived
+     from each theme's own border + text so it stays visible on dark and light themes alike. */
+  --divider: color-mix(in srgb, var(--border) 66%, var(--text-muted));
   --text-primary: #e4e7ee;
   --text-muted: #9aa3b2;
   --text-dim: #646d7c;
@@ -732,4 +735,33 @@ html.platform-mac .cm-editor {
 html.platform-mac .diff-scroll {
   font-size: 12px;
   line-height: 18px;
+}
+
+/* Floating agent-edits pill: slides up into place. */
+@keyframes agent-bar-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to { opacity: 1; transform: none; }
+}
+.agent-bar-in { animation: agent-bar-in 160ms ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .agent-bar-in { animation: none; }
+}
+/* Status bar detail cards: same motion as the pill, growing from the bar. */
+.usage-card-in { animation: agent-bar-in 140ms ease-out; transform-origin: bottom right; }
+@media (prefers-reduced-motion: reduce) {
+  .usage-card-in { animation: none; }
+}
+
+/* Status bar groups: a short divider between neighbours, so an empty group leaves none behind. */
+.sb-group { position: relative; }
+.sb-group + .sb-group { margin-left: 4px; padding-left: 4px; }
+.sb-group + .sb-group::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 50%;
+  width: 1px;
+  height: 12px;
+  margin-top: -6px;
+  background: var(--border);
 }

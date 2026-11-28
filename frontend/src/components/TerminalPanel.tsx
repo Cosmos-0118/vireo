@@ -30,7 +30,7 @@ import { getBootstrap } from '../prefs';
 
 const IS_WINDOWS_UA = typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent);
 /** Title of plain shell tabs; hydrated from bootstrap or replaced by the backend's shell name. */
-let shellTitle = getBootstrap()?.shell || (IS_WINDOWS_UA ? 'PowerShell' : 'Terminal');
+let shellTitle = getBootstrap()?.shell || (IS_WINDOWS_UA ? 'pwsh' : 'Terminal');
 const IS_MAC = typeof navigator !== 'undefined' && /Macintosh|Mac OS X/i.test(navigator.userAgent);
 
 export interface TermTabSpec {
@@ -64,6 +64,17 @@ export interface PendingTaskCommand {
   tasks: TaskLaunch[];
 }
 
+/**
+ * Every plain shell tab is named after the real shell: "PowerShell", then "PowerShell 2",
+ * "PowerShell 3"... using the lowest number not already on screen.
+ */
+function nextShellTitle(tabs: TermTabSpec[]): string {
+  const used = new Set(tabs.map((t) => t.title));
+  if (!used.has(shellTitle)) return shellTitle;
+  let n = 2;
+  while (used.has(`${shellTitle} ${n}`)) n++;
+  return `${shellTitle} ${n}`;
+}
 const ptySid = (workspace: string, tab: TermTabSpec) =>
   `term::${workspace}::${tab.id}::${tab.runKey ?? 0}::${tab.cmd ?? ''}`;
 
@@ -84,6 +95,10 @@ const FALLBACK_AGENT_PRESETS: { id: string; label: string; cmd: string }[] = [
   { id: 'kiro', label: 'Kiro', cmd: 'kiro-cli' },
 ];
 
+export interface LiveTask {
+  taskId: string;
+  title: string;
+}
 interface SingleTerminalProps {
   tab: TermTabSpec;
   active: boolean;
@@ -91,6 +106,7 @@ interface SingleTerminalProps {
   theme: LiteTheme;
   workspaceKey: string;
   registerReader: (id: string, reader: (() => string) | null) => void;
+  onExit: (sid: string) => void;
 }
 
 const SingleTerminal: React.FC<SingleTerminalProps> = ({
@@ -100,6 +116,7 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
   theme,
   workspaceKey,
   registerReader,
+  onExit,
 }) => {
   const hostRef = useRef<HTMLDivElement>(null);
   const isAgent = tab.kind === 'agent';
@@ -116,6 +133,7 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
     scrollback: isAgent ? 3000 : 1500,
     exitMessage: isAgent ? '[Agent session ended]' : '[Process exited]',
     focusOnOpen: isAgent,
+    onExit: () => onExit(ptySid(workspaceKey, tab)),
   });
 
   useEffect(() => {
@@ -129,7 +147,9 @@ const SingleTerminal: React.FC<SingleTerminalProps> = ({
       style={{
         display: active ? 'block' : 'none',
         background: theme.terminal.background,
-        padding: '8px 10px',
+        // No right padding: xterm reserves its own scrollbar lane on the right, so padding there
+        // would double the gutter and the text would stop well short of the panel edge.
+        padding: '6px 0 4px 12px',
       }}
       onClick={() => termRef.current?.focus()}
     >
@@ -322,6 +342,10 @@ interface TerminalPanelProps {
   onClosePanel?: () => void;
   /** False while the dock is collapsed: tabs stay alive but drop GPU/blink work. */
   visible?: boolean;
+  /** Task tabs whose process is still running (for the status bar). */
+  onLiveTasksChange?: (tasks: LiveTask[]) => void;
+  /** Bring the given task's tab to the front; `n` changes on every request. */
+  focusTask?: { taskId: string; n: number } | null;
 }
 
 export const TerminalPanel: React.FC<TerminalPanelProps> = ({
@@ -337,7 +361,15 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   onSendOutputToAgent,
   onClosePanel,
   visible = true,
+  onLiveTasksChange,
+  focusTask,
 }) => {
+  // Backend sessions whose process has ended (keyed by session id, so a restart is live again).
+  const [exited, setExited] = useState<ReadonlySet<string>>(() => new Set());
+  const markExited = React.useCallback(
+    (sid: string) => setExited((s) => (s.has(sid) ? s : new Set(s).add(sid))),
+    []
+  );
   const [tabs, setTabs] = useState<TermTabSpec[]>([
     { id: 'shell-1', title: shellTitle, kind: 'shell' },
   ]);
@@ -352,7 +384,14 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
         if (cancelled || !name || name === shellTitle) return;
         const prev = shellTitle;
         shellTitle = name;
-        setTabs((ts) => ts.map((t) => (t.kind === 'shell' && t.title === prev ? { ...t, title: name } : t)));
+        // "zsh", "zsh 2", ... keep their numbers.
+        setTabs((ts) =>
+          ts.map((t) =>
+            t.kind === 'shell' && !t.taskId && (t.title === prev || t.title.startsWith(`${prev} `))
+              ? { ...t, title: name + t.title.slice(prev.length) }
+              : t
+          )
+        );
       })
       .catch(() => {});
     return () => {
@@ -415,6 +454,21 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     onTaskTabsChange?.(tabs.flatMap((t) => (t.taskId ? [t.taskId] : [])));
   }, [tabs, onTaskTabsChange]);
 
+  useEffect(() => {
+    onLiveTasksChange?.(
+      tabs.flatMap((t) =>
+        t.taskId && !exited.has(ptySid(workspacePath, t)) ? [{ taskId: t.taskId, title: t.title }] : []
+      )
+    );
+  }, [tabs, exited, workspacePath, onLiveTasksChange]);
+
+  useEffect(() => {
+    if (!focusTask) return;
+    const t = tabs.find((x) => x.taskId === focusTask.taskId);
+    if (t) setActiveId(t.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusTask]);
+
   const openMenu = () => {
     // The button can be unmounted or display:none (dock just revealed); fall back to the
     // bottom-left corner instead of silently refusing to open the menu.
@@ -437,10 +491,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
 
   const addShell = (cwd?: string) => {
     const id = `shell-${Date.now()}`;
-    setTabs((prev) => [
-      ...prev,
-      { id, title: `Shell ${prev.length + 1}`, kind: 'shell', ...(cwd ? { cwd } : {}) },
-    ]);
+    setTabs((prev) => [...prev, { id, title: nextShellTitle(prev), kind: 'shell', ...(cwd ? { cwd } : {}) }]);
     setActiveId(id);
   };
 
@@ -495,29 +546,28 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   const activeTab = tabs.find((t) => t.id === activeId);
 
   return (
-    <div className="flex flex-col h-full bg-[var(--bg-panel)] border-t border-[var(--border)]">
+    <div className="flex flex-col h-full bg-[var(--bg-panel)] border-t border-[var(--divider)]">
       {/* Terminal tab bar */}
       <div
         style={{ background: theme.terminal.background }}
-        className="@container relative flex items-stretch justify-between gap-2 px-2 h-9 shrink-0"
+        className="@container relative flex items-stretch justify-between gap-2 pl-1.5 pr-2 h-9 shrink-0"
       >
-        {/* Baseline under the tabs; the active tab covers it so it merges into the terminal. The bar
-            shares the terminal background so there is no color step where they meet. */}
-        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-[var(--border)]" />
-        <div className="flex items-end gap-0.5 min-w-0 flex-1 overflow-x-auto pt-1">
+        {/* One unbroken hairline separates the header from the terminal (same background on both
+            sides); the active tab's underline sits on top of it. */}
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-px bg-[var(--divider)]" />
+        <div className="flex items-stretch gap-0.5 min-w-0 flex-1 overflow-x-auto overflow-y-hidden [scrollbar-width:none]">
           {tabs.map((t) => (
             <div
               key={t.id}
               onClick={() => setActiveId(t.id)}
-              style={t.id === activeId ? { background: theme.terminal.background } : undefined}
-              className={`relative flex items-center gap-1.5 min-w-0 h-full whitespace-nowrap px-3 text-[12.5px] cursor-pointer select-none transition-colors ${
+              className={`group relative flex items-center gap-1.5 min-w-0 h-full whitespace-nowrap pl-2.5 pr-1.5 text-[12.5px] cursor-pointer select-none transition-colors ${
                 t.id === activeId
-                  ? 'z-10 text-[var(--text-primary)] font-medium'
-                  : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
+                  ? 'text-[var(--text-primary)]'
+                  : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
               }`}
             >
               {t.id === activeId && (
-                <span className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-[var(--accent)]" />
+                <span className="pointer-events-none absolute inset-x-1.5 bottom-0 h-0.5 rounded-full bg-[var(--accent)]" />
               )}
               {t.kind === 'agent' ? (
                 <Sparkles size={13} className="text-[var(--accent)]" />
@@ -531,7 +581,10 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
                     e.stopPropagation();
                     closeTab(t.id);
                   }}
-                  className="hover:text-[var(--danger)] cursor-pointer"
+                  className={`p-0.5 rounded text-[var(--text-dim)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] cursor-pointer transition-opacity ${
+                    t.id === activeId ? 'opacity-100' : 'opacity-0 group-hover:opacity-100 focus-visible:opacity-100'
+                  }`}
+                  title="Close terminal"
                 >
                   <X size={12} />
                 </button>
@@ -540,7 +593,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
           ))}
           <button
             onClick={() => addShell()}
-            className="shrink-0 p-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer"
+            className="shrink-0 self-center ml-1 p-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer"
             title="New terminal"
           >
             <Plus size={15} />
@@ -549,7 +602,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
             ref={launcherBtnRef}
             data-launcher-btn
             onClick={() => (menuAnchor ? setMenuAnchor(null) : openMenu())}
-            className={`shrink-0 flex items-center gap-1 px-2 py-1 text-[12px] rounded-md cursor-pointer whitespace-nowrap transition-colors ${
+            className={`shrink-0 self-center flex items-center gap-1 px-2 py-1 text-[12px] rounded-md cursor-pointer whitespace-nowrap transition-colors ${
               menuAnchor
                 ? 'bg-[var(--bg-active)] text-[var(--text-primary)]'
                 : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)]'
@@ -635,6 +688,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
             theme={theme}
             workspaceKey={workspacePath}
             registerReader={registerReader}
+            onExit={markExited}
           />
         ))}
       </div>

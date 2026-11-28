@@ -427,14 +427,21 @@ fn login_shell_path() -> Vec<PathBuf> {
 
 #[derive(Serialize)]
 pub struct ShellInfo {
-    /// Display name for a plain terminal tab ("zsh", "bash", "PowerShell").
+    /// Display name for a plain terminal tab ("zsh", "bash", "pwsh").
     pub name: String,
 }
 
 pub fn default_shell_name() -> String {
+    // Short executable name, matching what `spawn` actually starts: pwsh (PowerShell 7) when it
+    // is on PATH, otherwise Windows PowerShell. Cached: the PATH scan only needs to run once.
     #[cfg(windows)]
     {
-        "PowerShell".to_string()
+        static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        NAME.get_or_init(|| {
+            let pwsh = find_command_in_path("pwsh.exe", &augmented_path_env()).is_some();
+            if pwsh { "pwsh" } else { "powershell" }.to_string()
+        })
+        .clone()
     }
     #[cfg(not(windows))]
     {
@@ -834,6 +841,9 @@ fn build_unix_shell(
 // can rebuild its screen, and delivery is flow-controlled with client ACKs.
 // ---------------------------------------------------------------------------
 
+/// Set once app exit begins; no new shell is spawned after that.
+static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
+
 /// How long a shell gets to exit by itself after its PTY is closed, before it is terminated.
 const SHELL_EXIT_GRACE: Duration = Duration::from_millis(1200);
 
@@ -935,6 +945,9 @@ fn sessions() -> &'static Mutex<HashMap<String, Arc<PtySession>>> {
 /// App exit: ends every shell and waits (up to `timeout`) for each to close cleanly, so the
 /// shells are not terminated mid-write when the process goes away.
 pub fn shutdown_all(timeout: Duration) {
+    // From here on nothing may start a shell: a process born while the app is exiting would be
+    // torn down mid-startup.
+    SHUTTING_DOWN.store(true, Ordering::SeqCst);
     let all: Vec<Arc<PtySession>> = match sessions().lock() {
         Ok(mut map) => map.drain().map(|(_, s)| s).collect(),
         Err(_) => return,
@@ -1049,6 +1062,9 @@ fn spawn_session(
 
     let child = spawn_result.map_err(|e| format!("Failed to spawn shell: {}", e))?;
     drop(pair.slave);
+    // The shell and everything it launches, so teardown can end them together.
+    #[cfg(windows)]
+    let tree = child.process_id().and_then(crate::jobobject::ProcessTree::adopt);
 
     let mut reader = pair
         .master
@@ -1154,17 +1170,29 @@ fn spawn_session(
                 Ok(PtyCmd::Kill) | Err(_) => break,
             }
         }
-        // Close the pseudoconsole first: ConPTY then sends the shell a close event and it exits
-        // on its own (history saved, no half-written output). Terminating a live shell is the
-        // fallback for one that ignores it.
+        // Close the pseudoconsole first: ConPTY then sends its processes a close event and they
+        // exit on their own (history saved, no half-written output). ClosePseudoConsole can
+        // block until every console client has left, so it runs on a helper thread while this
+        // one enforces the grace period.
         drop(writer);
-        drop(master);
-        let deadline = Instant::now() + SHELL_EXIT_GRACE;
-        while !child_done.load(Ordering::Acquire) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        if !child_done.load(Ordering::Acquire) {
+        let (gone_tx, gone_rx) = std_mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            drop(master);
+            let _ = gone_tx.send(());
+        });
+        let console_gone = gone_rx.recv_timeout(SHELL_EXIT_GRACE).is_ok();
+        if !console_gone || !child_done.load(Ordering::Acquire) {
+            // Still running: end the shell and everything it started while their console is
+            // still alive. If the console host disappears under a process that is still
+            // handling its close event (e.g. the app exits first), Windows fails that process
+            // with 0xc0000142 "The application was unable to start correctly".
+            #[cfg(windows)]
+            if let Some(tree) = &tree {
+                tree.terminate();
+            }
             let _ = killer.kill();
+            // With the clients gone, closing the console finishes promptly.
+            let _ = gone_rx.recv_timeout(Duration::from_millis(1000));
         }
         closed.store(true, Ordering::Release);
     });
@@ -1185,8 +1213,17 @@ fn get_or_create(
             return Ok(existing.clone());
         }
     }
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        return Err("Vireo is shutting down".into());
+    }
     let session = spawn_session(sid, cols, rows, workspace, custom_cmd, extra)?;
     let mut map = sessions().lock().unwrap();
+    // Exit began while this shell was starting: `shutdown_all` already drained the map and will
+    // never see it, so end it here.
+    if SHUTTING_DOWN.load(Ordering::SeqCst) {
+        session.kill();
+        return Err("Vireo is shutting down".into());
+    }
     if let Some(existing) = map.get(sid) {
         if !existing.exited.load(Ordering::SeqCst) {
             session.kill();

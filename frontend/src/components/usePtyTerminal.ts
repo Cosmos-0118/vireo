@@ -95,6 +95,8 @@ export interface PtyTerminalOptions {
   scrollback: number;
   exitMessage: string;
   focusOnOpen?: boolean;
+  /** The shell's process ended (the backend closed the session normally). */
+  onExit?: () => void;
 }
 
 /** Clean plain-text tail of the terminal, read from the parsed buffer (no ANSI). */
@@ -286,9 +288,26 @@ export function usePtyTerminal(
         sock.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
       };
 
+      // xterm measures its cell once, at open(). If that ran before the webfont finished loading
+      // (or while the tab was display:none), the grid keeps the fallback font's metrics: glyphs
+      // are clipped at their left/right edges and the column count no longer matches the panel
+      // width. Changing fontFamily is the public way to force a re-measure.
+      let needsMeasure = built.engine === 'xterm';
+      const remeasure = () => {
+        needsMeasure = false;
+        try {
+          const family = term.options.fontFamily || FONT_FAMILY;
+          term.options.fontFamily = `${family} `;
+          term.options.fontFamily = family;
+        } catch {
+          // best-effort
+        }
+      };
+
       /** Fit to the host. Returns false (and changes nothing) while hidden or collapsed. */
       const fitNow = (): boolean => {
         if (disposed || host.clientWidth < 40 || host.clientHeight < 30) return false;
+        if (needsMeasure) remeasure();
         try {
           const dims = fit.proposeDimensions();
           if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows)) return false;
@@ -516,6 +535,7 @@ export function usePtyTerminal(
           reveal();
           if (ev.code === 1000) {
             term.write('\r\n\x1b[90m' + exitMessage + '\x1b[0m\r\n');
+            optsRef.current.onExit?.();
             return;
           }
           if (attempt >= MAX_RECONNECTS) {
@@ -555,7 +575,9 @@ export function usePtyTerminal(
       sync();
       connect();
       void waitForFont(fontSize).then(() => {
-        if (!disposed) refit();
+        if (disposed) return;
+        needsMeasure = built.engine === 'xterm';
+        refit();
       });
     };
 

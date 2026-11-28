@@ -50,6 +50,77 @@ pub fn init() {
 #[cfg(not(windows))]
 pub fn init() {}
 
+/// One process and every descendant it starts, held in a Job Object of their own (nested inside
+/// the app-wide job) so they can be ended together: a terminal's shell plus the dev server,
+/// agent CLI or build it launched. Closing the handle (drop) does *not* kill anything; call
+/// [`ProcessTree::terminate`] for that.
+#[cfg(windows)]
+pub struct ProcessTree(windows_sys::Win32::Foundation::HANDLE);
+
+// SAFETY: a job handle is a kernel object handle; Win32 job calls are thread-safe.
+#[cfg(windows)]
+unsafe impl Send for ProcessTree {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessTree {}
+
+#[cfg(windows)]
+impl ProcessTree {
+    /// Puts process `pid` (and, from then on, everything it spawns) in a new job. None when the
+    /// OS refuses (pre-Windows 8 without nested jobs, or the process already exited).
+    pub fn adopt(pid: u32) -> Option<Self> {
+        use std::mem::{size_of, zeroed};
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_BREAKAWAY_OK,
+        };
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+
+        // SAFETY: plain Win32 calls; every handle opened here is closed or owned by the result.
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return None;
+            }
+            let tree = ProcessTree(job);
+            let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+            // Same breakaway rule as the app job: a spawn that explicitly asks to leave may.
+            info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &info as *const _ as *const _,
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, 0, pid);
+            if process.is_null() {
+                return None;
+            }
+            let ok = AssignProcessToJobObject(job, process);
+            CloseHandle(process);
+            (ok != 0).then_some(tree)
+        }
+    }
+
+    /// Ends every process still in the tree.
+    pub fn terminate(&self) {
+        // SAFETY: `self.0` is a live job handle owned by this value.
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.0, 1);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessTree {
+    fn drop(&mut self) {
+        // SAFETY: closing the job handle this value owns, exactly once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
 /// `CREATE_BREAKAWAY_FROM_JOB`: the spawned process leaves the kill-on-close job.
 #[cfg(windows)]
 pub const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
