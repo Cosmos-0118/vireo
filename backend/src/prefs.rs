@@ -1,4 +1,5 @@
 use axum::{
+    extract::State,
     http::{header, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -19,7 +20,52 @@ const DEFAULT_WINDOW_BG: (u8, u8, u8) = (27, 28, 31);
 const MAX_KEY_LEN: usize = 128;
 
 static WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static PREFS_CACHE: OnceLock<Mutex<Option<PrefsMap>>> = OnceLock::new();
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BootstrapWindow {
+    pub native: bool,
+    pub maximized: bool,
+    pub platform: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BootstrapPayload {
+    pub workspace: crate::files::WorkspaceInfo,
+    pub window: BootstrapWindow,
+    pub shell: String,
+}
+
+pub async fn build_bootstrap(state: &crate::state::AppState) -> BootstrapPayload {
+    let ws = state.workspace_path().await;
+    let name = ws
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(if ws.as_os_str().is_empty() { "Vireo" } else { "workspace" })
+        .to_string();
+    let workspace = crate::files::WorkspaceInfo {
+        path: ws.to_string_lossy().to_string(),
+        name,
+    };
+    let window = match state.main_window.get() {
+        Some(win) => BootstrapWindow {
+            native: true,
+            maximized: win.is_maximized().unwrap_or(false),
+            platform: std::env::consts::OS,
+        },
+        None => BootstrapWindow {
+            native: false,
+            maximized: false,
+            platform: std::env::consts::OS,
+        },
+    };
+    BootstrapPayload {
+        workspace,
+        window,
+        shell: crate::pty::default_shell_name(),
+    }
+}
 
 #[derive(Debug, Default, Deserialize)]
 pub struct PatchPrefsReq {
@@ -56,11 +102,20 @@ fn load_from(path: &Path) -> PrefsMap {
     serde_json::from_str::<PrefsMap>(&raw).unwrap_or_default()
 }
 
+fn prefs_cache() -> &'static Mutex<Option<PrefsMap>> {
+    PREFS_CACHE.get_or_init(|| Mutex::new(None))
+}
+
 fn load_prefs() -> PrefsMap {
+    if let Some(cached) = prefs_cache().lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        return cached.clone();
+    }
     let Some(path) = prefs_file() else {
         return PrefsMap::new();
     };
-    load_from(&path)
+    let loaded = load_from(&path);
+    *prefs_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some(loaded.clone());
+    loaded
 }
 
 /// Re-reads the file under a lock, merges the patch, and atomically replaces it so multiple
@@ -100,6 +155,10 @@ fn patch_at(path: &Path, req: PatchPrefsReq) -> Result<PrefsMap, String> {
         let fallback = std::fs::write(path, &bytes);
         let _ = std::fs::remove_file(&tmp);
         fallback.map_err(|fe| format!("persist prefs ({e}; fallback: {fe})"))?;
+    }
+
+    if prefs_file().as_deref() == Some(path) {
+        *prefs_cache().lock().unwrap_or_else(|e| e.into_inner()) = Some(map.clone());
     }
 
     Ok(map)
@@ -204,19 +263,38 @@ fn escape_inline_json(json: &str) -> String {
 }
 
 fn render_bootstrap_script_for(prefs: &PrefsMap) -> String {
+    render_bootstrap_script_with(prefs, None)
+}
+
+fn render_bootstrap_script_with(prefs: &PrefsMap, bootstrap: Option<&BootstrapPayload>) -> String {
     let json = serde_json::to_string(prefs).unwrap_or_else(|_| "{}".to_string());
     let safe_json = escape_inline_json(&json);
+    let boot_assign = match bootstrap {
+        Some(b) => {
+            let b_json = serde_json::to_string(b).unwrap_or_else(|_| "null".to_string());
+            format!("window.__VIREO_BOOTSTRAP__={};", escape_inline_json(&b_json))
+        }
+        None => String::new(),
+    };
     format!(
-        "(function(){{var p={safe_json};window.__VIREO_PREFS__=p;try{{for(var k in p){{if(!Object.prototype.hasOwnProperty.call(p,k))continue;var v=p[k];if(v===null)localStorage.removeItem(k);else if(typeof v==='string')localStorage.setItem(k,v);}}}}catch(e){{}}try{{var m=p['{THEME_META_KEY}'];if(typeof m==='string'){{var meta=JSON.parse(m);var r=document.documentElement;if(meta&&(meta.type==='dark'||meta.type==='light')){{r.dataset.themeType=meta.type;r.style.colorScheme=meta.type;}}if(meta&&meta.vars&&typeof meta.vars==='object'){{for(var vk in meta.vars){{if(vk.indexOf('--')===0&&typeof meta.vars[vk]==='string')r.style.setProperty(vk,meta.vars[vk]);}}}}}}}}catch(e){{}}}})();"
+        "(function(){{var p={safe_json};window.__VIREO_PREFS__=p;{boot_assign}try{{for(var k in p){{if(!Object.prototype.hasOwnProperty.call(p,k))continue;var v=p[k];if(v===null)localStorage.removeItem(k);else if(typeof v==='string')localStorage.setItem(k,v);}}}}catch(e){{}}try{{var m=p['{THEME_META_KEY}'];if(typeof m==='string'){{var meta=JSON.parse(m);var r=document.documentElement;if(meta&&(meta.type==='dark'||meta.type==='light')){{r.dataset.themeType=meta.type;r.style.colorScheme=meta.type;}}if(meta&&meta.vars&&typeof meta.vars==='object'){{for(var vk in meta.vars){{if(vk.indexOf('--')===0&&typeof meta.vars[vk]==='string')r.style.setProperty(vk,meta.vars[vk]);}}}}}}}}catch(e){{}}}})();"
     )
 }
 
 fn inject_into_html_for(html: &str, prefs: &PrefsMap) -> String {
+    inject_into_html_with(html, prefs, None)
+}
+
+fn inject_into_html_with(
+    html: &str,
+    prefs: &PrefsMap,
+    bootstrap: Option<&BootstrapPayload>,
+) -> String {
     if !html.contains(BOOTSTRAP_TAG) {
         return html.to_string();
     }
     let css = render_theme_style(prefs);
-    let script = render_bootstrap_script_for(prefs);
+    let script = render_bootstrap_script_with(prefs, bootstrap);
     let replacement = if css.is_empty() {
         format!("<script>{script}</script>")
     } else {
@@ -227,14 +305,17 @@ fn inject_into_html_for(html: &str, prefs: &PrefsMap) -> String {
 
 /// Replaces the `<script src="/api/prefs/bootstrap.js"></script>` placeholder in embedded
 /// `index.html` with inline theme styles and synchronous `localStorage` hydration.
+#[allow(dead_code)]
 pub fn inject_into_html(html: &str) -> String {
     inject_into_html_for(html, &load_prefs())
 }
 
+pub fn inject_into_html_with_bootstrap(html: &str, bootstrap: &BootstrapPayload) -> String {
+    inject_into_html_with(html, &load_prefs(), Some(bootstrap))
+}
+
 pub async fn get_prefs() -> Response {
-    let map = tokio::task::spawn_blocking(load_prefs)
-        .await
-        .unwrap_or_default();
+    let map = load_prefs();
     let body = serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string());
     Response::builder()
         .status(StatusCode::OK)
@@ -255,10 +336,9 @@ pub async fn patch_prefs(Json(req): Json<PatchPrefsReq>) -> Response {
     }
 }
 
-pub async fn bootstrap_js() -> Response {
-    let script = tokio::task::spawn_blocking(|| render_bootstrap_script_for(&load_prefs()))
-        .await
-        .unwrap_or_default();
+pub async fn bootstrap_js(State(state): State<crate::state::AppState>) -> Response {
+    let boot = build_bootstrap(&state).await;
+    let script = render_bootstrap_script_with(&load_prefs(), Some(&boot));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")

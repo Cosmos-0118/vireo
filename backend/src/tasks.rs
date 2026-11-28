@@ -55,6 +55,7 @@ pub struct TasksRes {
 struct Dir {
     abs: PathBuf,
     rel: String,
+    files: HashSet<String>,
 }
 
 impl Dir {
@@ -64,6 +65,17 @@ impl Dir {
         } else {
             self.rel.rsplit('/').next().unwrap_or(&self.rel).to_string()
         }
+    }
+
+    fn has_file(&self, name: &str) -> bool {
+        self.files.contains(name)
+    }
+
+    fn read_if_present(&self, name: &str) -> Option<String> {
+        if !self.has_file(name) {
+            return None;
+        }
+        read(&self.abs.join(name))
     }
 }
 
@@ -156,27 +168,47 @@ fn is_plain_name(name: &str) -> bool {
 // Directory scan
 // ---------------------------------------------------------------------------
 
+fn scan_dir_entries(path: &Path) -> (Vec<String>, HashSet<String>) {
+    let Ok(rd) = std::fs::read_dir(path) else {
+        return (Vec::new(), HashSet::new());
+    };
+    let mut subdirs = Vec::new();
+    let mut files = HashSet::new();
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if ft.is_dir() {
+            if !name.starts_with('.')
+                && !is_ignored_dir_name(&name)
+                && !matches!(name.as_str(), "vendor" | "out" | "coverage" | "site-packages" | "src")
+            {
+                subdirs.push(name);
+            }
+        } else if ft.is_file() {
+            files.insert(name);
+        }
+    }
+    subdirs.sort();
+    (subdirs, files)
+}
+
 fn collect_dirs(ws: &Path) -> Vec<Dir> {
     let mut out = vec![Dir {
         abs: ws.to_path_buf(),
         rel: String::new(),
+        files: HashSet::new(),
     }];
     let mut frontier = vec![0usize];
     for depth in 1..=MAX_DEPTH {
         let mut next = Vec::new();
         for idx in frontier {
             let (parent_abs, parent_rel) = (out[idx].abs.clone(), out[idx].rel.clone());
-            let Ok(rd) = std::fs::read_dir(&parent_abs) else {
-                continue;
-            };
-            let mut names: Vec<String> = rd
-                .flatten()
-                .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| !n.starts_with('.') && !is_ignored_dir_name(n))
-                .filter(|n| !matches!(n.as_str(), "vendor" | "out" | "coverage" | "site-packages"))
-                .collect();
-            names.sort();
+            let (names, files) = scan_dir_entries(&parent_abs);
+            out[idx].files = files;
             for n in names {
                 if out.len() >= MAX_DIRS {
                     return out;
@@ -186,9 +218,16 @@ fn collect_dirs(ws: &Path) -> Vec<Dir> {
                 } else {
                     format!("{}/{}", parent_rel, n)
                 };
+                let abs = parent_abs.join(&n);
+                let leaf_files = if depth == MAX_DEPTH {
+                    scan_dir_entries(&abs).1
+                } else {
+                    HashSet::new()
+                };
                 out.push(Dir {
-                    abs: parent_abs.join(&n),
+                    abs,
                     rel,
+                    files: leaf_files,
                 });
                 if depth < MAX_DEPTH {
                     next.push(out.len() - 1);
@@ -267,12 +306,7 @@ fn is_lifecycle(name: &str, scripts: &serde_json::Map<String, serde_json::Value>
 }
 
 fn extract_node(ws: &Path, dir: &Dir, out: &mut Vec<TaskItem>) {
-    let manifest = if dir.abs.join("package.json").is_file() {
-        ("package.json", "package.json")
-    } else {
-        return;
-    };
-    let Some(raw) = read(&dir.abs.join(manifest.0)) else {
+    let Some(raw) = dir.read_if_present("package.json") else {
         return;
     };
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
@@ -310,7 +344,7 @@ fn extract_node(ws: &Path, dir: &Dir, out: &mut Vec<TaskItem>) {
 
 fn extract_deno(dir: &Dir, out: &mut Vec<TaskItem>) {
     for f in ["deno.json", "deno.jsonc"] {
-        let Some(raw) = read(&dir.abs.join(f)) else {
+        let Some(raw) = dir.read_if_present(f) else {
             continue;
         };
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(&raw)) else {
@@ -357,7 +391,6 @@ fn toml_section_keys(raw: &str, header: &str) -> Vec<String> {
 }
 
 fn toml_string_in_section(raw: &str, header: &str, key: &str) -> Option<String> {
-    let re = Regex::new(&format!(r#"^\s*{}\s*=\s*"([^"]*)""#, regex::escape(key))).ok()?;
     let mut inside = false;
     for line in raw.lines() {
         let t = line.trim();
@@ -366,8 +399,15 @@ fn toml_string_in_section(raw: &str, header: &str, key: &str) -> Option<String> 
             continue;
         }
         if inside {
-            if let Some(c) = re.captures(line) {
-                return Some(c[1].to_string());
+            if let Some((lhs, rhs)) = t.split_once('=') {
+                if lhs.trim() == key {
+                    let val = rhs.trim();
+                    if let Some(rest) = val.strip_prefix('"') {
+                        if let Some((inner, _)) = rest.split_once('"') {
+                            return Some(inner.to_string());
+                        }
+                    }
+                }
             }
         }
     }
@@ -375,7 +415,7 @@ fn toml_string_in_section(raw: &str, header: &str, key: &str) -> Option<String> 
 }
 
 fn extract_cargo(dir: &Dir, out: &mut Vec<TaskItem>) {
-    let Some(raw) = read(&dir.abs.join("Cargo.toml")) else {
+    let Some(raw) = dir.read_if_present("Cargo.toml") else {
         return;
     };
     let has_package = raw.lines().any(|l| l.trim() == "[package]");
@@ -475,9 +515,9 @@ fn extract_cargo(dir: &Dir, out: &mut Vec<TaskItem>) {
 }
 
 fn extract_python(ws: &Path, dir: &Dir, out: &mut Vec<TaskItem>) {
-    let pyproject = read(&dir.abs.join("pyproject.toml"));
-    let has_pytest_ini = dir.abs.join("pytest.ini").is_file();
-    let has_manage = dir.abs.join("manage.py").is_file();
+    let pyproject = dir.read_if_present("pyproject.toml");
+    let has_pytest_ini = dir.has_file("pytest.ini");
+    let has_manage = dir.has_file("manage.py");
     if pyproject.is_none() && !has_pytest_ini && !has_manage {
         return;
     }
@@ -505,9 +545,9 @@ fn extract_python(ws: &Path, dir: &Dir, out: &mut Vec<TaskItem>) {
     if let Some(raw) = &pyproject {
         let mut scripts = toml_section_keys(raw, "project.scripts");
         scripts.extend(toml_section_keys(raw, "tool.poetry.scripts"));
-        scripts.extend(toml_section_keys(raw, "tool.poe.tasks"));
-        let poe = !toml_section_keys(raw, "tool.poe.tasks").is_empty();
         let n_poe = toml_section_keys(raw, "tool.poe.tasks");
+        let poe = !n_poe.is_empty();
+        scripts.extend(n_poe.iter().cloned());
         for s in scripts.iter().take(MAX_PER_SOURCE) {
             if !is_plain_name(s) {
                 continue;
@@ -540,12 +580,12 @@ fn extract_python(ws: &Path, dir: &Dir, out: &mut Vec<TaskItem>) {
 }
 
 fn extract_go(dir: &Dir, out: &mut Vec<TaskItem>) {
-    if !dir.abs.join("go.mod").is_file() {
+    if !dir.has_file("go.mod") {
         return;
     }
     let label = dir.label("go");
     let id = |n: &str| format!("go:{}:{}", dir.rel, n);
-    if dir.abs.join("main.go").is_file() {
+    if dir.has_file("main.go") {
         out.push(make_task(id("run"), format!("{}: go run .", label), "go run .".into(), "go.mod", dir, Some("run"), 0));
     }
     if let Ok(rd) = std::fs::read_dir(dir.abs.join("cmd")) {
@@ -580,7 +620,7 @@ fn extract_make_like(dir: &Dir, out: &mut Vec<TaskItem>) {
         ("justfile", "just", &name_re_just),
         ("Justfile", "just", &name_re_just),
     ] {
-        if let Some(raw) = read(&dir.abs.join(file)) {
+        if let Some(raw) = dir.read_if_present(file) {
             let mut seen = HashSet::new();
             for c in re.captures_iter(&raw).take(MAX_PER_SOURCE * 2) {
                 let n = c[1].to_string();
@@ -601,7 +641,7 @@ fn extract_make_like(dir: &Dir, out: &mut Vec<TaskItem>) {
         }
     }
     for file in ["Taskfile.yml", "Taskfile.yaml"] {
-        if let Some(raw) = read(&dir.abs.join(file)) {
+        if let Some(raw) = dir.read_if_present(file) {
             let key_re = lazy_re!(r"^  ([A-Za-z0-9_:-]+):");
             let mut inside = false;
             let mut count = 0;
@@ -638,7 +678,7 @@ fn extract_make_like(dir: &Dir, out: &mut Vec<TaskItem>) {
 
 fn extract_compose(dir: &Dir, out: &mut Vec<TaskItem>) {
     for f in ["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"] {
-        if dir.abs.join(f).is_file() {
+        if dir.has_file(f) {
             let label = dir.label("docker");
             out.push(make_task(
                 format!("compose:{}:up", dir.rel),
@@ -674,14 +714,7 @@ fn extract_launchers(ws: &Path, dir: &Dir, out: &mut Vec<TaskItem>) {
         .unwrap_or("")
         .to_lowercase();
     let re = lazy_re!(r"^(run|dev|start|serve|launch|build-and-run)([-_.][\w.-]*)?\.(ps1|sh|bat|cmd)$");
-    let Ok(rd) = std::fs::read_dir(&dir.abs) else {
-        return;
-    };
-    let mut names: Vec<String> = rd
-        .flatten()
-        .filter(|e| e.path().is_file())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect();
+    let mut names: Vec<String> = dir.files.iter().cloned().collect();
     names.sort();
     for name in names {
         let lower = name.to_lowercase();

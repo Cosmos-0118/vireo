@@ -248,11 +248,19 @@ const KNOWN_CLI_TOOLS: &[CliToolSpec] = &[
 const PATH_ENV_TTL: Duration = Duration::from_secs(60);
 
 static PATH_ENV_CACHE: Mutex<Option<(Instant, OsString)>> = Mutex::new(None);
+static PATH_COMPUTE_LOCK: Mutex<()> = Mutex::new(());
 static CLI_TOOLS_CACHE: Mutex<Option<(Instant, Vec<CliToolStatus>)>> = Mutex::new(None);
+static CLI_TOOLS_COMPUTE_LOCK: Mutex<()> = Mutex::new(());
 
-/// PATH extended with the usual CLI-tool install locations. The disk scan behind it is ~370 ms on
-/// Windows, so the result is cached for `PATH_ENV_TTL`.
+/// PATH extended with the usual CLI-tool install locations. Cached for `PATH_ENV_TTL` with
+/// single-flight coalescing so concurrent startup callers share one scan.
 pub fn augmented_path_env() -> OsString {
+    if let Some((at, p)) = PATH_ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        if at.elapsed() < PATH_ENV_TTL {
+            return p.clone();
+        }
+    }
+    let _guard = PATH_COMPUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((at, p)) = PATH_ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
         if at.elapsed() < PATH_ENV_TTL {
             return p.clone();
@@ -267,6 +275,10 @@ pub fn augmented_path_env() -> OsString {
 pub fn invalidate_path_caches() {
     *PATH_ENV_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
     *CLI_TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+fn has_fallback_dirs(cmd: &str) -> bool {
+    matches!(cmd, "claude" | "codex" | "agy" | "cursor-agent" | "agent" | "copilot")
 }
 
 fn compute_augmented_path_env() -> OsString {
@@ -308,6 +320,7 @@ fn compute_augmented_path_env() -> OsString {
             }
         }
         if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
+            candidates.push(local.join("Microsoft").join("WinGet").join("Links"));
             candidates.push(local.join("agy").join("bin"));
             candidates.push(local.join("cursor-agent"));
             candidates.push(local.join("pnpm"));
@@ -340,13 +353,16 @@ fn compute_augmented_path_env() -> OsString {
     }
 
     // Agent CLIs that ship inside desktop apps / IDE extensions live in version- or
-    // hash-named folders that are never on PATH. Resolve them now (not once at startup, since
-    // app updates replace those folders) and expose the folder to every child process.
+    // hash-named folders that are never on PATH. Only probe the few tools that actually have
+    // bundle fallback locations instead of scanning all 14 tools across every PATH dir.
     for spec in KNOWN_CLI_TOOLS {
+        if !spec.all_cmds().any(has_fallback_dirs) {
+            continue;
+        }
         if spec.all_cmds().any(|c| find_in_dirs(c, dirs.iter().cloned()).is_some()) {
             continue;
         }
-        for c in spec.all_cmds() {
+        for c in spec.all_cmds().filter(|c| has_fallback_dirs(c)) {
             if let Some(found) = find_in_dirs(c, fallback_tool_dirs(c)) {
                 if let Some(parent) = found.parent() {
                     push_unique_dir(&mut dirs, parent.to_path_buf());
@@ -415,16 +431,25 @@ pub struct ShellInfo {
     pub name: String,
 }
 
+pub fn default_shell_name() -> String {
+    #[cfg(windows)]
+    {
+        "PowerShell".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("SHELL")
+            .ok()
+            .and_then(|s| Path::new(&s).file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "bash".to_string())
+    }
+}
+
 /// `GET /api/terminal/shell`: what a new terminal tab runs, for its tab title.
 pub async fn shell_info() -> Json<ShellInfo> {
-    #[cfg(windows)]
-    let name = "PowerShell".to_string();
-    #[cfg(not(windows))]
-    let name = std::env::var("SHELL")
-        .ok()
-        .and_then(|s| Path::new(&s).file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "bash".to_string());
-    Json(ShellInfo { name })
+    Json(ShellInfo {
+        name: default_shell_name(),
+    })
 }
 
 /// Directory holding the `vx` helper binary (next to this executable), if it was built.
@@ -450,13 +475,22 @@ fn push_unique_dir(dirs: &mut Vec<PathBuf>, cand: PathBuf) {
     }
 }
 
-/// Existing child directories of `dir`, most recently modified first.
-fn subdirs_newest(dir: &Path) -> Vec<PathBuf> {
+/// Existing child directories of `dir` (optionally filtered by lowercase name prefix before
+/// calling `metadata()`), most recently modified first.
+fn subdirs_newest_filtered(dir: &Path, prefix: Option<&str>) -> Vec<PathBuf> {
     let mut v: Vec<(std::time::SystemTime, PathBuf)> = std::fs::read_dir(dir)
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter(|e| {
+            if let Some(pref) = prefix {
+                let name = e.file_name();
+                if !name.to_string_lossy().to_ascii_lowercase().starts_with(pref) {
+                    return false;
+                }
+            }
+            e.file_type().map(|t| t.is_dir()).unwrap_or(false)
+        })
         .map(|e| {
             let mtime = e
                 .metadata()
@@ -467,6 +501,10 @@ fn subdirs_newest(dir: &Path) -> Vec<PathBuf> {
         .collect();
     v.sort_by(|a, b| b.0.cmp(&a.0));
     v.into_iter().map(|(_, p)| p).collect()
+}
+
+fn subdirs_newest(dir: &Path) -> Vec<PathBuf> {
+    subdirs_newest_filtered(dir, None)
 }
 
 /// Directories to probe, newest first, when `cmd` is not reachable through PATH.
@@ -537,15 +575,12 @@ fn fallback_tool_dirs(cmd: &str) -> Vec<PathBuf> {
             }
             "copilot" => {
                 if let Some(local) = &local {
-                    for pkg in subdirs_newest(&local.join("Microsoft").join("WinGet").join("Packages")) {
-                        let name = pkg
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_ascii_lowercase())
-                            .unwrap_or_default();
-                        if name.starts_with("github.copilot") {
-                            out.push(pkg.clone());
-                            out.extend(subdirs_newest(&pkg));
-                        }
+                    for pkg in subdirs_newest_filtered(
+                        &local.join("Microsoft").join("WinGet").join("Packages"),
+                        Some("github.copilot"),
+                    ) {
+                        out.push(pkg.clone());
+                        out.extend(subdirs_newest(&pkg));
                     }
                 }
             }
@@ -575,15 +610,12 @@ fn extension_dirs(profile: Option<&Path>, prefix: &str, sub: &[&str]) -> Vec<Pat
     let Some(profile) = profile else { return Vec::new() };
     let mut out = Vec::new();
     for ide in [".vscode", ".cursor", ".vscode-insiders", ".windsurf"] {
-        for ext in subdirs_newest(&profile.join(ide).join("extensions")) {
-            let name = ext.file_name().map(|n| n.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-            if name.starts_with(prefix) {
-                let mut p = ext.clone();
-                for s in sub {
-                    p = p.join(s);
-                }
-                out.push(p);
+        for ext in subdirs_newest_filtered(&profile.join(ide).join("extensions"), Some(prefix)) {
+            let mut p = ext;
+            for s in sub {
+                p = p.join(s);
             }
+            out.push(p);
         }
     }
     out
@@ -665,9 +697,17 @@ pub async fn list_cli_tools(Query(q): Query<CliToolsQuery>) -> Json<Vec<CliToolS
             return Json(items.clone());
         }
     }
-    let items = tokio::task::spawn_blocking(|| {
+    let items = tokio::task::spawn_blocking(move || {
+        let _guard = CLI_TOOLS_COMPUTE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        if !refresh {
+            if let Some((at, items)) = CLI_TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                if at.elapsed() < PATH_ENV_TTL {
+                    return items.clone();
+                }
+            }
+        }
         let path_env = augmented_path_env();
-        KNOWN_CLI_TOOLS
+        let computed = KNOWN_CLI_TOOLS
             .iter()
             .map(|spec| {
                 let resolved = spec
@@ -690,14 +730,15 @@ pub async fn list_cli_tools(Query(q): Query<CliToolsQuery>) -> Json<Vec<CliToolS
                     },
                 }
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        if !computed.is_empty() {
+            *CLI_TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), computed.clone()));
+        }
+        computed
     })
     .await
     .unwrap_or_default();
 
-    if !items.is_empty() {
-        *CLI_TOOLS_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), items.clone()));
-    }
     Json(items)
 }
 
@@ -1139,15 +1180,34 @@ fn get_or_create(
     custom_cmd: Option<&str>,
     extra: &SpawnExtra,
 ) -> Result<Arc<PtySession>, String> {
-    let mut map = sessions().lock().unwrap();
-    if let Some(existing) = map.get(sid) {
+    if let Some(existing) = sessions().lock().unwrap().get(sid) {
         if !existing.exited.load(Ordering::SeqCst) {
             return Ok(existing.clone());
         }
     }
     let session = spawn_session(sid, cols, rows, workspace, custom_cmd, extra)?;
+    let mut map = sessions().lock().unwrap();
+    if let Some(existing) = map.get(sid) {
+        if !existing.exited.load(Ordering::SeqCst) {
+            session.kill();
+            return Ok(existing.clone());
+        }
+    }
     map.insert(sid.to_string(), session.clone());
     Ok(session)
+}
+
+/// Pre-spawns the default terminal tab's shell in the background so PowerShell / `$SHELL` boots
+/// in parallel with WebView2 creation and is ready as soon as the UI connects.
+pub fn prewarm_default_shell(workspace: PathBuf) {
+    if workspace.as_os_str().is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let sid = format!("term::{}::shell-1::0::", workspace.to_string_lossy());
+        let extra = SpawnExtra::default();
+        let _ = get_or_create(&sid, 110, 28, &workspace, None, &extra);
+    });
 }
 
 /// Registers an attached client's cursor and unregisters it on drop.

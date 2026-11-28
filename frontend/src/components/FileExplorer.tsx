@@ -7,14 +7,21 @@ import {
   ChevronDown,
   ChevronRight,
   Copy,
+  ExternalLink,
   FileCode,
+  FilePlus,
+  FolderOpen,
+  FolderPlus,
   FoldVertical,
   GitCompare,
   ListFilter,
   LocateFixed,
   Minus,
+  Pencil,
   Plus,
   RefreshCw,
+  SquareTerminal,
+  Trash2,
   Undo2,
   X,
 } from 'lucide-react';
@@ -24,6 +31,15 @@ import { FileIcon, FolderIcon, isDimFile } from './FileIcon';
 import { fileStatusColor } from './GitBadges';
 import { FloatingContextMenu, type ContextMenuItem } from './CommitContextMenu';
 import { GitActionModal, type GitModalState } from './GitActionModal';
+import { FsActionModal, type FsModalState } from './FsActionModal';
+
+const IS_MAC = typeof navigator !== 'undefined' && /Mac/i.test(navigator.platform || '');
+const IS_WIN = typeof navigator !== 'undefined' && /Win/i.test(navigator.platform || '');
+const REVEAL_LABEL = IS_MAC
+  ? 'Reveal in Finder'
+  : IS_WIN
+  ? 'Reveal in File Explorer'
+  : 'Reveal in File Manager';
 
 interface FileExplorerProps {
   active: boolean;
@@ -37,6 +53,8 @@ interface FileExplorerProps {
   onOpenFile: (path: string) => void;
   onOpenDiff: (path: string, staged?: boolean) => void;
   onAskAgent: (text: string) => void;
+  /** Open a new integrated terminal in a workspace-relative folder ('' = root). */
+  onOpenTerminal?: (cwd: string) => void;
   onRefreshGit: () => Promise<void>;
   onToast: (msg: string, isError?: boolean) => void;
 }
@@ -85,6 +103,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
   onOpenFile,
   onOpenDiff,
   onAskAgent,
+  onOpenTerminal,
   onRefreshGit,
   onToast,
 }) => {
@@ -96,6 +115,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
   const [allFiles, setAllFiles] = useState<string[] | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; entry: TreeEntry } | null>(null);
   const [modal, setModal] = useState<GitModalState>(null);
+  const [fsModal, setFsModal] = useState<FsModalState>(null);
   const [busy, setBusy] = useState(false);
   const [revealTarget, setRevealTarget] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -321,6 +341,58 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
     [onToast]
   );
 
+  const runFs = useCallback(
+    async (fn: () => Promise<string | void>) => {
+      setBusy(true);
+      try {
+        const created = await fn();
+        setFsModal(null);
+        await refreshAll();
+        void onRefreshGit();
+        if (created) void reveal(created);
+      } catch (e: unknown) {
+        onToast(e instanceof Error ? e.message : String(e), true);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [refreshAll, onRefreshGit, reveal, onToast]
+  );
+
+  const osOpen = useCallback(
+    (path: string, mode: 'reveal' | 'open') => {
+      api.osOpen(path, mode).catch((e: unknown) =>
+        onToast(e instanceof Error ? e.message : String(e), true)
+      );
+    },
+    [onToast]
+  );
+
+  const confirmFsAction = (m: NonNullable<FsModalState>, value: string) => {
+    const join = (dir: string, name: string) => (dir ? `${dir}/${name}` : name);
+    if (m.kind === 'new-file' || m.kind === 'new-folder') {
+      const isDir = m.kind === 'new-folder';
+      const target = join(m.dir, value.replace(/^\/+|\/+$/g, ''));
+      void runFs(async () => {
+        await api.createEntry(target, isDir);
+        if (!isDir) onOpenFile(target);
+        return target;
+      });
+    } else if (m.kind === 'rename') {
+      const target = join(parentOf(m.path), value);
+      void runFs(async () => {
+        await api.renameEntry(m.path, target);
+        onToast(`Renamed to ${value}`);
+        return target;
+      });
+    } else {
+      void runFs(async () => {
+        await api.deleteEntry(m.path);
+        onToast(`Deleted ${m.path}`);
+      });
+    }
+  };
+
   const absolutePath = (rel: string) => {
     const sep = workspacePath.includes('\\') ? '\\' : '/';
     const base = workspacePath.replace(/[\\/]+$/, '');
@@ -346,13 +418,56 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
         onClick: () => onOpenDiff(entry.path, !!st && st.file.staged && !st.file.unstaged),
       });
     }
-    items.push({
-      id: 'agent',
-      label: 'Mention in Agent Chat',
-      icon: <AtSign size={13} />,
-      dividerBefore: !entry.is_dir,
-      onClick: () => onAskAgent(`@${entry.path}`),
-    });
+    const parentDir = entry.is_dir ? entry.path : parentOf(entry.path);
+    const gone = st?.badge === 'D';
+    items.push(
+      {
+        id: 'new-file',
+        label: 'New File…',
+        icon: <FilePlus size={13} />,
+        dividerBefore: !entry.is_dir,
+        onClick: () => setFsModal({ kind: 'new-file', dir: parentDir }),
+      },
+      {
+        id: 'new-folder',
+        label: 'New Folder…',
+        icon: <FolderPlus size={13} />,
+        onClick: () => setFsModal({ kind: 'new-folder', dir: parentDir }),
+      },
+      {
+        id: 'agent',
+        label: 'Mention in Agent Chat',
+        icon: <AtSign size={13} />,
+        dividerBefore: true,
+        onClick: () => onAskAgent(`@${entry.path}`),
+      },
+      {
+        id: 'reveal-os',
+        label: REVEAL_LABEL,
+        icon: <FolderOpen size={13} />,
+        dividerBefore: true,
+        disabled: gone,
+        onClick: () => osOpen(entry.path, 'reveal'),
+      }
+    );
+    if (!entry.is_dir) {
+      items.push({
+        id: 'open-default',
+        label: 'Open in Default App',
+        icon: <ExternalLink size={13} />,
+        disabled: gone,
+        onClick: () => osOpen(entry.path, 'open'),
+      });
+    }
+    if (onOpenTerminal) {
+      items.push({
+        id: 'open-terminal',
+        label: 'Open in Integrated Terminal',
+        icon: <SquareTerminal size={13} />,
+        disabled: gone,
+        onClick: () => onOpenTerminal(parentDir),
+      });
+    }
     if (st && !entry.is_dir) {
       if (st.file.unstaged || st.file.untracked) {
         items.push({
@@ -390,6 +505,22 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
       });
     }
     items.push(
+      {
+        id: 'rename',
+        label: 'Rename…',
+        icon: <Pencil size={13} />,
+        dividerBefore: true,
+        disabled: gone,
+        onClick: () => setFsModal({ kind: 'rename', path: entry.path, isDir: entry.is_dir }),
+      },
+      {
+        id: 'delete',
+        label: 'Delete…',
+        icon: <Trash2 size={13} />,
+        danger: true,
+        disabled: gone,
+        onClick: () => setFsModal({ kind: 'delete', path: entry.path, isDir: entry.is_dir }),
+      },
       {
         id: 'copy-rel',
         label: 'Copy Relative Path',
@@ -663,6 +794,13 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
           onClose={() => setMenu(null)}
         />
       )}
+
+      <FsActionModal
+        modal={fsModal}
+        busy={busy}
+        onClose={() => setFsModal(null)}
+        onConfirm={confirmFsAction}
+      />
 
       <GitActionModal
         modal={modal}

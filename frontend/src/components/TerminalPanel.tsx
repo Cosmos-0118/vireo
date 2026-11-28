@@ -312,6 +312,8 @@ interface TerminalPanelProps {
   launcherSignal?: number;
   /** Increment to open a new shell tab (the initial value is ignored). */
   newShellSignal?: number;
+  /** Workspace-relative working directory for the shell opened by `newShellSignal`. */
+  newShellCwd?: string;
   maximized?: boolean;
   onToggleMaximize?: () => void;
   onSendOutputToAgent: (output: string) => void;
@@ -327,6 +329,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   onTaskTabsChange,
   launcherSignal = 0,
   newShellSignal = 0,
+  newShellCwd = '',
   maximized = false,
   onToggleMaximize,
   onSendOutputToAgent,
@@ -429,9 +432,12 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [launcherSignal]);
 
-  const addShell = () => {
+  const addShell = (cwd?: string) => {
     const id = `shell-${Date.now()}`;
-    setTabs((prev) => [...prev, { id, title: `Shell ${prev.length + 1}`, kind: 'shell' }]);
+    setTabs((prev) => [
+      ...prev,
+      { id, title: `Shell ${prev.length + 1}`, kind: 'shell', ...(cwd ? { cwd } : {}) },
+    ]);
     setActiveId(id);
   };
 
@@ -439,7 +445,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
   useEffect(() => {
     if (newShellSignal === handledShellRef.current) return;
     handledShellRef.current = newShellSignal;
-    addShell();
+    addShell(newShellCwd || undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newShellSignal]);
 
@@ -523,7 +529,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
             </div>
           ))}
           <button
-            onClick={addShell}
+            onClick={() => addShell()}
             className="shrink-0 p-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] rounded-md cursor-pointer"
             title="New terminal"
           >

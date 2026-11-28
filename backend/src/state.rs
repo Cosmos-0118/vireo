@@ -52,7 +52,7 @@ pub struct AppState {
     /// Serializes undo/redo so a double click cannot apply a rollback twice.
     pub checkpoint_lock: Arc<tokio::sync::Mutex<()>>,
     pub watcher_retarget_tx: mpsc::Sender<PathBuf>,
-    pub http_client: reqwest::Client,
+    pub http_client: Arc<OnceLock<reqwest::Client>>,
     pub main_window: Arc<OnceLock<tauri::WebviewWindow>>,
     /// Tool-permission prompts from a running agent CLI awaiting the user's answer,
     /// keyed by `(turn_id, request_id)`.
@@ -93,7 +93,7 @@ impl AppState {
             checkpoints: Arc::new(RwLock::new(Vec::new())),
             checkpoint_lock: Arc::new(tokio::sync::Mutex::new(())),
             watcher_retarget_tx,
-            http_client: reqwest::Client::new(),
+            http_client: Arc::new(OnceLock::new()),
             main_window: Arc::new(OnceLock::new()),
             pending_permissions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             pending_questions: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -107,7 +107,12 @@ impl AppState {
         self.workspace.read().await.clone()
     }
 
+    pub fn http_client(&self) -> &reqwest::Client {
+        self.http_client.get_or_init(reqwest::Client::new)
+    }
+
     pub fn notify_fs_changed(&self, paths: Vec<String>) {
+        self.git_cache.invalidate_volatile();
         let _ = self.events_tx.send(WorkspaceEvent::FsChanged { paths });
     }
 }
@@ -182,6 +187,9 @@ pub fn is_ignored_dir_name(name: &str) -> bool {
             | ".svelte-kit"
             | ".parcel-cache"
             | ".gradle"
+            | "obj"
+            | ".vs"
+            | ".idea"
     )
 }
 

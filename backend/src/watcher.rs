@@ -211,6 +211,7 @@ fn unwatch_workspace(w: &mut RecommendedWatcher, ws: &Path, git_watch: &mut GitW
 pub fn spawn_watcher(
     initial_workspace: PathBuf,
     events_tx: broadcast::Sender<WorkspaceEvent>,
+    git_cache: std::sync::Arc<crate::git::GitCache>,
 ) -> mpsc::Sender<PathBuf> {
     let (retarget_tx, mut retarget_rx) = mpsc::channel::<PathBuf>(8);
     let (tx, rx) = std_mpsc::channel::<Msg>();
@@ -357,6 +358,7 @@ pub fn spawn_watcher(
                     overflow = false;
                     first_event = None;
                     last_event = None;
+                    git_cache.invalidate_volatile();
                     let _ = events_tx.send(WorkspaceEvent::FsChanged { paths });
                 }
             }

@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
 /// Resolved `.git` directories for a workspace (handles regular repos, linked worktrees,
@@ -268,6 +268,51 @@ fn read_default_branch_symref(dirs: &GitDirs) -> Option<String> {
     (!short.is_empty()).then(|| short.to_string())
 }
 
+/// Parses `[remote "<name>"]` sections and `origin`'s `url` directly from `.git/config` (~0.02 ms),
+/// avoiding `git remote` and `git remote get-url origin` spawns. Returns `None` if `.git/config`
+/// uses `[include` or `insteadOf` directives that require git's full config resolver.
+fn read_git_config_remotes(dirs: &GitDirs) -> Option<(Vec<String>, Option<String>)> {
+    let raw = std::fs::read_to_string(dirs.common_dir.join("config")).ok()?;
+    let lower = raw.to_ascii_lowercase();
+    if lower.contains("[include") || lower.contains("insteadof") {
+        return None;
+    }
+    let mut remotes: Vec<String> = Vec::new();
+    let mut origin_url: Option<String> = None;
+    let mut cur_remote: Option<String> = None;
+    for line in raw.lines() {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with('#') || t.starts_with(';') {
+            continue;
+        }
+        if t.starts_with('[') && t.ends_with(']') {
+            let inner = t[1..t.len() - 1].trim();
+            cur_remote = inner
+                .strip_prefix("remote ")
+                .and_then(|r| r.trim().strip_prefix('"'))
+                .and_then(|r| r.strip_suffix('"'))
+                .map(str::to_string);
+            if let Some(ref name) = cur_remote {
+                if !remotes.contains(name) {
+                    remotes.push(name.clone());
+                }
+            }
+            continue;
+        }
+        if cur_remote.as_deref() == Some("origin") && origin_url.is_none() {
+            if let Some((k, v)) = t.split_once('=') {
+                if k.trim().eq_ignore_ascii_case("url") {
+                    let val = v.trim().trim_matches('"').to_string();
+                    if !val.is_empty() {
+                        origin_url = Some(val);
+                    }
+                }
+            }
+        }
+    }
+    Some((remotes, origin_url))
+}
+
 #[derive(Default)]
 struct GitCacheInner {
     workspace: PathBuf,
@@ -276,12 +321,16 @@ struct GitCacheInner {
     branches: Option<(String, BranchesRes)>,
     logs_fp: String,
     logs: Vec<((usize, bool, Option<String>), CommitLogRes)>,
-    last_dirty: (bool, bool),
+    last_dirty: Option<(bool, bool)>,
+    recent_fp: Option<(Instant, String)>,
+    prewarmed_status: Option<(Instant, GitStatusRes)>,
+    prewarmed_diff: Option<(Instant, String, bool, GitDiffRes)>,
 }
 
 #[derive(Default)]
 pub struct GitCache {
     inner: Mutex<GitCacheInner>,
+    status_lock: tokio::sync::Mutex<()>,
 }
 
 impl GitCache {
@@ -294,6 +343,52 @@ impl GitCache {
             };
         }
         g
+    }
+
+    pub fn invalidate_volatile(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.recent_fp = None;
+        g.prewarmed_status = None;
+        g.prewarmed_diff = None;
+    }
+
+    fn get_or_compute_refs_fingerprint(&self, ws: &Path, dirs: &GitDirs) -> String {
+        {
+            let g = self.lock_ws(ws);
+            if let Some((at, ref fp)) = g.recent_fp {
+                if at.elapsed() < Duration::from_millis(450) {
+                    return fp.clone();
+                }
+            }
+        }
+        let fp = compute_refs_fingerprint(dirs);
+        self.lock_ws(ws).recent_fp = Some((Instant::now(), fp.clone()));
+        fp
+    }
+
+    fn set_prewarmed_status(&self, ws: &Path, status: GitStatusRes) {
+        self.lock_ws(ws).prewarmed_status = Some((Instant::now(), status));
+    }
+
+    fn take_prewarmed_status(&self, ws: &Path) -> Option<GitStatusRes> {
+        let mut g = self.lock_ws(ws);
+        let (at, status) = g.prewarmed_status.take()?;
+        (at.elapsed() < Duration::from_millis(2500)).then_some(status)
+    }
+
+    fn set_prewarmed_diff(&self, ws: &Path, path: String, staged: bool, diff: GitDiffRes) {
+        self.lock_ws(ws).prewarmed_diff = Some((Instant::now(), path, staged, diff));
+    }
+
+    fn take_prewarmed_diff(&self, ws: &Path, path: &str, staged: bool) -> Option<GitDiffRes> {
+        let mut g = self.lock_ws(ws);
+        if g.prewarmed_diff
+            .as_ref()
+            .is_some_and(|(at, p, s, _)| at.elapsed() < Duration::from_millis(3000) && p == path && *s == staged)
+        {
+            return g.prewarmed_diff.take().map(|(_, _, _, d)| d);
+        }
+        None
     }
 
     fn get_remote_url(&self, ws: &Path, stamp: &str) -> Option<String> {
@@ -376,11 +471,13 @@ impl GitCache {
     }
 
     fn last_dirty(&self, ws: &Path) -> (bool, bool) {
-        self.lock_ws(ws).last_dirty
+        // On cold start (`None`), speculatively run `git diff --numstat` in Wave 1 alongside
+        // `git status` so dirty repositories avoid a sequential second wave.
+        self.lock_ws(ws).last_dirty.unwrap_or((true, false))
     }
 
     fn set_last_dirty(&self, ws: &Path, unstaged_tracked: bool, staged: bool) {
-        self.lock_ws(ws).last_dirty = (unstaged_tracked, staged);
+        self.lock_ws(ws).last_dirty = Some((unstaged_tracked, staged));
     }
 }
 
@@ -727,6 +824,23 @@ pub struct OpenExternalReq {
     pub url: String,
 }
 
+fn git_exe() -> &'static str {
+    static GIT: OnceLock<String> = OnceLock::new();
+    GIT.get_or_init(|| {
+        #[cfg(windows)]
+        {
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            for dir in std::env::split_paths(&path) {
+                let cand = dir.join("git.exe");
+                if cand.is_file() {
+                    return cand.to_string_lossy().into_owned();
+                }
+            }
+        }
+        "git".to_string()
+    })
+}
+
 /// A `git` command for `ws` with the request-derived `args`, hardened against argument abuse:
 /// the `ext::` / `fd::` transports (which run arbitrary commands) are disabled even if a config
 /// file enables them, and option
@@ -754,7 +868,7 @@ fn git_command(ws: &Path, args: &[&str]) -> Result<tokio::process::Command, Stri
         }
         prev = a;
     }
-    let mut cmd = background_command("git");
+    let mut cmd = background_command(git_exe());
     // Read-only commands (status, diff) must not refresh and rewrite `.git/index`: that write is
     // itself a watcher event, so every refresh would trigger another one, and it contends with
     // user-run git commands on `index.lock`. Writes that need the lock still take it.
@@ -1157,21 +1271,39 @@ fn count_untracked_lines(ws: &Path, paths: Vec<String>) -> HashMap<String, usize
 pub async fn get_status(
     State(state): State<AppState>,
 ) -> Result<Json<GitStatusRes>, (StatusCode, String)> {
+    let _status_guard = state.git_cache.status_lock.lock().await;
     let ws = state.workspace_path().await;
+    if let Some(mut prewarmed) = state.git_cache.take_prewarmed_status(&ws) {
+        prewarmed.checkpoints = state.checkpoints.read().await.clone();
+        return Ok(Json(prewarmed));
+    }
+    compute_status(&state, &ws).await.map(Json)
+}
+
+async fn compute_status(
+    state: &AppState,
+    ws: &Path,
+) -> Result<GitStatusRes, (StatusCode, String)> {
     let checkpoints = state.checkpoints.read().await.clone();
 
-    let ws_meta = ws.clone();
+    let ws_meta = ws.to_path_buf();
+    let cached_remote_check = state.git_cache.clone();
     let meta = tokio::task::spawn_blocking(move || {
         let dirs = resolve_git_dirs(&ws_meta)?;
         let cfg_st = config_stamp(&dirs);
         let st_st = stash_stamp(&dirs);
-        Some((dirs, cfg_st, st_st))
+        let direct_origin = if cached_remote_check.get_remote_url(&ws_meta, &cfg_st).is_none() {
+            read_git_config_remotes(&dirs).map(|(_, orig)| orig.unwrap_or_default())
+        } else {
+            None
+        };
+        Some((dirs, cfg_st, st_st, direct_origin))
     })
     .await
     .unwrap_or(None);
 
-    let Some((dirs, cfg_stamp, stash_st)) = meta else {
-        return Ok(Json(GitStatusRes {
+    let Some((dirs, cfg_stamp, stash_st, direct_origin)) = meta else {
+        return Ok(GitStatusRes {
             is_repo: false,
             branch: String::new(),
             head_hash: String::new(),
@@ -1185,43 +1317,46 @@ pub async fn get_status(
             checkpoints,
             stashes: Vec::new(),
             refs_fingerprint: String::new(),
-        }));
+        });
     };
 
-    let cached_remote = state.git_cache.get_remote_url(&ws, &cfg_stamp);
+    if let Some(url) = direct_origin {
+        state.git_cache.set_remote_url(ws, cfg_stamp.clone(), url);
+    }
+    let cached_remote = state.git_cache.get_remote_url(ws, &cfg_stamp);
     let cached_stashes = match &stash_st {
         None => Some(Vec::new()),
-        Some(st) => state.git_cache.get_stashes(&ws, st),
+        Some(st) => state.git_cache.get_stashes(ws, st),
     };
-    let (hint_unstaged, hint_staged) = state.git_cache.last_dirty(&ws);
+    let (hint_unstaged, hint_staged) = state.git_cache.last_dirty(ws);
 
     // Run `git status` alongside only the queries that are uncached or hinted dirty.
     let (status, mut unstaged_stat, mut staged_stat, remote_res, stash_res) = tokio::join!(
-        run_git_bytes(&ws, &["status", "--porcelain=v2", "--branch", "-z", "-uall"]),
+        run_git_bytes(ws, &["status", "--porcelain=v2", "--branch", "-z", "-uall"]),
         async {
             if hint_unstaged {
-                Some(run_git(&ws, &["diff", "--numstat"]).await)
+                Some(run_git(ws, &["diff", "--numstat"]).await)
             } else {
                 None
             }
         },
         async {
             if hint_staged {
-                Some(run_git(&ws, &["diff", "--cached", "--numstat"]).await)
+                Some(run_git(ws, &["diff", "--cached", "--numstat"]).await)
             } else {
                 None
             }
         },
         async {
             if cached_remote.is_none() {
-                Some(run_git(&ws, &["remote", "get-url", "origin"]).await)
+                Some(run_git(ws, &["remote", "get-url", "origin"]).await)
             } else {
                 None
             }
         },
         async {
             if cached_stashes.is_none() {
-                Some(run_git(&ws, &["stash", "list", "--format=%gd%x1f%gs%x1f%ar"]).await)
+                Some(run_git(ws, &["stash", "list", "--format=%gd%x1f%gs%x1f%ar"]).await)
             } else {
                 None
             }
@@ -1234,11 +1369,11 @@ pub async fn get_status(
         Ok((true, out, _)) => out,
         _ => {
             tokio::time::sleep(std::time::Duration::from_millis(90)).await;
-            match run_git_bytes(&ws, &["status", "--porcelain=v2", "--branch", "-z", "-uall"]).await {
+            match run_git_bytes(ws, &["status", "--porcelain=v2", "--branch", "-z", "-uall"]).await {
                 Ok((true, out, _)) => out,
                 _ => {
-                    if resolve_git_dirs(&ws).is_none() {
-                        return Ok(Json(GitStatusRes {
+                    if resolve_git_dirs(ws).is_none() {
+                        return Ok(GitStatusRes {
                             is_repo: false,
                             branch: String::new(),
                             head_hash: String::new(),
@@ -1252,7 +1387,7 @@ pub async fn get_status(
                             checkpoints,
                             stashes: Vec::new(),
                             refs_fingerprint: String::new(),
-                        }));
+                        });
                     }
                     return Err((
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -1266,7 +1401,7 @@ pub async fn get_status(
 
     let has_unstaged_tracked = parsed.entries.iter().any(|(x, y, _)| !(*x == '?' && *y == '?') && *y != ' ');
     let has_staged = parsed.entries.iter().any(|(x, y, _)| !(*x == '?' && *y == '?') && *x != ' ');
-    state.git_cache.set_last_dirty(&ws, has_unstaged_tracked, has_staged);
+    state.git_cache.set_last_dirty(ws, has_unstaged_tracked, has_staged);
 
     let untracked_paths: Vec<String> = parsed
         .entries
@@ -1278,19 +1413,20 @@ pub async fn get_status(
     // Compute any missing numstats + untracked line counts + post-status refs_fingerprint in parallel.
     let need_unstaged = has_unstaged_tracked && unstaged_stat.is_none();
     let need_staged = has_staged && staged_stat.is_none();
-    let ws2 = ws.clone();
+    let ws2 = ws.to_path_buf();
     let dirs_post = dirs.clone();
+    let git_cache_fp = state.git_cache.clone();
     let (extra_unstaged, extra_staged, (untracked_lines, git_state, refs_fingerprint)) = tokio::join!(
         async {
             if need_unstaged {
-                Some(run_git(&ws, &["diff", "--numstat"]).await)
+                Some(run_git(ws, &["diff", "--numstat"]).await)
             } else {
                 None
             }
         },
         async {
             if need_staged {
-                Some(run_git(&ws, &["diff", "--cached", "--numstat"]).await)
+                Some(run_git(ws, &["diff", "--cached", "--numstat"]).await)
             } else {
                 None
             }
@@ -1303,7 +1439,7 @@ pub async fn get_status(
                     count_untracked_lines(&ws2, untracked_paths)
                 };
                 let gs = detect_git_state(&dirs_post);
-                let fp = compute_refs_fingerprint(&dirs_post);
+                let fp = git_cache_fp.get_or_compute_refs_fingerprint(&ws2, &dirs_post);
                 (ul, gs, fp)
             })
             .await
@@ -1325,7 +1461,7 @@ pub async fn get_status(
             .filter(|(ok, _, _)| *ok)
             .map(|(_, o, _)| o.trim().to_string())
             .unwrap_or_default();
-        state.git_cache.set_remote_url(&ws, cfg_stamp, u.clone());
+        state.git_cache.set_remote_url(ws, cfg_stamp, u.clone());
         u
     };
 
@@ -1346,7 +1482,7 @@ pub async fn get_status(
             }
         }
         if let Some(st) = stash_st {
-            state.git_cache.set_stashes(&ws, st, list.clone());
+            state.git_cache.set_stashes(ws, st, list.clone());
         }
         list
     };
@@ -1390,7 +1526,7 @@ pub async fn get_status(
         });
     }
 
-    Ok(Json(GitStatusRes {
+    Ok(GitStatusRes {
         is_repo: true,
         branch: parsed.branch,
         head_hash: parsed.head_hash,
@@ -1404,7 +1540,7 @@ pub async fn get_status(
         checkpoints,
         stashes,
         refs_fingerprint,
-    }))
+    })
 }
 
 pub async fn get_diff(
@@ -1414,31 +1550,38 @@ pub async fn get_diff(
     let ws = state.workspace_path().await;
     let rel = q.path.replace('\\', "/");
     let staged = q.staged.unwrap_or(false);
+    if let Some(prewarmed) = state.git_cache.take_prewarmed_diff(&ws, &rel, staged) {
+        return Ok(Json(prewarmed));
+    }
+    compute_diff(&ws, rel, staged).await.map(Json)
+}
 
-    let (original, modified, patch) = if staged {
+async fn compute_diff(
+    ws: &Path,
+    rel: String,
+    staged: bool,
+) -> Result<GitDiffRes, (StatusCode, String)> {
+    let (original, modified) = if staged {
         let head_spec = format!("HEAD:{}", rel);
         let idx_spec = format!(":{}", rel);
         let head_args = ["show", head_spec.as_str()];
         let idx_args = ["show", idx_spec.as_str()];
-        let patch_args = ["diff", "--cached", "--", rel.as_str()];
-        let (orig_res, mod_res, patch_res) = tokio::join!(
-            run_git_bytes(&ws, &head_args),
-            run_git_bytes(&ws, &idx_args),
-            run_git(&ws, &patch_args),
+        let (orig_res, mod_res) = tokio::join!(
+            run_git_bytes(ws, &head_args),
+            run_git_bytes(ws, &idx_args),
         );
         let (ok_orig, orig_bytes, _) = orig_res.unwrap_or((false, Vec::new(), String::new()));
         let (ok_mod, mod_bytes, _) = mod_res.unwrap_or((false, Vec::new(), String::new()));
         if (ok_orig && is_binary_bytes(&orig_bytes)) || (ok_mod && is_binary_bytes(&mod_bytes)) {
-            return Ok(Json(GitDiffRes {
+            return Ok(GitDiffRes {
                 path: rel,
                 staged,
                 original: String::new(),
                 modified: String::new(),
                 patch: String::new(),
                 binary: true,
-            }));
+            });
         }
-        let (_, patch_out, _) = patch_res.unwrap_or((false, String::new(), String::new()));
         (
             if ok_orig {
                 String::from_utf8_lossy(&orig_bytes).to_string()
@@ -1450,30 +1593,27 @@ pub async fn get_diff(
             } else {
                 String::new()
             },
-            patch_out,
         )
     } else {
         // Compare index (if file is staged too, VS Code compares index vs working tree) or HEAD vs working tree.
         let idx_spec = format!(":{}", rel);
         let idx_args = ["show", idx_spec.as_str()];
-        let patch_args = ["diff", "--", rel.as_str()];
-        let safe_full = resolve_safe_path(&ws, &rel).ok();
-        let (idx_res, wt_bytes, patch_res) = tokio::join!(
-            run_git_bytes(&ws, &idx_args),
+        let safe_full = resolve_safe_path(ws, &rel).ok();
+        let (idx_res, wt_bytes) = tokio::join!(
+            run_git_bytes(ws, &idx_args),
             async {
                 match safe_full {
                     Some(full) => tokio::fs::read(&full).await.ok(),
                     None => None,
                 }
             },
-            run_git(&ws, &patch_args),
         );
         let (ok_idx, idx_bytes, _) = idx_res.unwrap_or((false, Vec::new(), String::new()));
         let (orig_ok, orig_bytes) = if ok_idx {
             (true, idx_bytes)
         } else {
             let head_spec = format!("HEAD:{}", rel);
-            let (ok_head, head_bytes, _) = run_git_bytes(&ws, &["show", &head_spec])
+            let (ok_head, head_bytes, _) = run_git_bytes(ws, &["show", &head_spec])
                 .await
                 .unwrap_or((false, Vec::new(), String::new()));
             (ok_head, head_bytes)
@@ -1481,14 +1621,14 @@ pub async fn get_diff(
         if (orig_ok && is_binary_bytes(&orig_bytes))
             || wt_bytes.as_deref().map(is_binary_bytes).unwrap_or(false)
         {
-            return Ok(Json(GitDiffRes {
+            return Ok(GitDiffRes {
                 path: rel,
                 staged,
                 original: String::new(),
                 modified: String::new(),
                 patch: String::new(),
                 binary: true,
-            }));
+            });
         }
         let original_text = if orig_ok {
             String::from_utf8_lossy(&orig_bytes).to_string()
@@ -1498,18 +1638,55 @@ pub async fn get_diff(
         let modified_text = wt_bytes
             .map(|b| String::from_utf8_lossy(&b).to_string())
             .unwrap_or_default();
-        let (_, patch_out, _) = patch_res.unwrap_or((false, String::new(), String::new()));
-        (original_text, modified_text, patch_out)
+        (original_text, modified_text)
     };
 
-    Ok(Json(GitDiffRes {
+    Ok(GitDiffRes {
         path: rel,
         staged,
         original,
         modified,
-        patch,
+        patch: String::new(),
         binary: false,
-    }))
+    })
+}
+
+/// Pre-warms git status, branches, commit log, and the first modified file's diff in parallel
+/// with WebView2 startup so the UI's initial requests hit warm memory instead of waiting on `git.exe`.
+pub fn prewarm_workspace(state: AppState) {
+    tokio::spawn(async move {
+        let ws = state.workspace_path().await;
+        if ws.as_os_str().is_empty() {
+            return;
+        }
+        let status_fut = async {
+            let _guard = state.git_cache.status_lock.lock().await;
+            if let Ok(status) = compute_status(&state, &ws).await {
+                let first = status
+                    .files
+                    .first()
+                    .map(|f| (f.path.clone(), f.staged && !f.unstaged));
+                state.git_cache.set_prewarmed_status(&ws, status);
+                if let Some((path, staged)) = first {
+                    if let Ok(diff) = compute_diff(&ws, path.clone(), staged).await {
+                        state.git_cache.set_prewarmed_diff(&ws, path, staged, diff);
+                    }
+                }
+            }
+        };
+        let branches_fut = get_branches(State(state.clone()));
+        let log_fut = get_log(
+            State(state.clone()),
+            Query(LogQuery {
+                limit: Some(60),
+                skip: Some(0),
+                all: Some(true),
+                search: None,
+                branch: None,
+            }),
+        );
+        let _ = tokio::join!(status_fut, branches_fut, log_fut);
+    });
 }
 
 pub async fn stage_files(
@@ -1799,22 +1976,24 @@ pub async fn auto_fetch(State(state): State<AppState>) -> Json<AutoFetchRes> {
 pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
     let ws = state.workspace_path().await;
     let ws_meta = ws.clone();
+    let git_cache_fp = state.git_cache.clone();
     let meta = tokio::task::spawn_blocking(move || {
         let dirs = resolve_git_dirs(&ws_meta)?;
-        let fp = compute_refs_fingerprint(&dirs);
+        let fp = git_cache_fp.get_or_compute_refs_fingerprint(&ws_meta, &dirs);
         let head = read_head_state(&dirs);
         let default_sym = read_default_branch_symref(&dirs);
+        let direct_remotes = read_git_config_remotes(&dirs).map(|(r, _)| r);
         let last_fetched = std::fs::metadata(dirs.git_dir.join("FETCH_HEAD"))
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64);
-        Some((fp, head, default_sym, last_fetched))
+        Some((fp, head, default_sym, direct_remotes, last_fetched))
     })
     .await
     .unwrap_or(None);
 
-    let Some((refs_fp, head_state, default_sym, last_fetched)) = meta else {
+    let Some((refs_fp, head_state, default_sym, direct_remotes, last_fetched)) = meta else {
         return Json(BranchesRes {
             current: String::new(),
             branches: Vec::new(),
@@ -1834,15 +2013,21 @@ pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
         return Json(cached);
     }
 
-    // Only 2 concurrent git commands replace the previous 8-9 spawns:
-    // `for-each-ref` provides all local+remote branch details, and `remote` lists remotes.
+    // `for-each-ref` provides all local+remote branch details; remotes come directly from `.git/config`
+    // (falling back to `git remote` only when config uses `[include` or `insteadOf`).
     let none = || (false, String::new(), String::new());
     let (refs_out, remotes_out) = tokio::join!(
         run_git(
             &ws,
             &["for-each-ref", "--sort=-committerdate", BRANCH_REF_FORMAT, "refs/heads", "refs/remotes"],
         ),
-        run_git(&ws, &["remote"]),
+        async {
+            if direct_remotes.is_none() {
+                Some(run_git(&ws, &["remote"]).await)
+            } else {
+                None
+            }
+        },
     );
 
     let (_, refs_out, _) = refs_out.unwrap_or_else(|_| none());
@@ -1884,12 +2069,17 @@ pub async fn get_branches(State(state): State<AppState>) -> Json<BranchesRes> {
         .map(|b| (b.upstream.clone(), b.upstream_gone))
         .unwrap_or_default();
 
-    let (_, remotes_out, _) = remotes_out.unwrap_or_else(|_| none());
-    let remotes: Vec<String> = remotes_out
-        .lines()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let remotes: Vec<String> = match direct_remotes {
+        Some(r) => r,
+        None => {
+            let (_, remotes_out, _) = remotes_out.and_then(|r| r.ok()).unwrap_or_else(none);
+            remotes_out
+                .lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        }
+    };
 
     let default_branch = if let Some(sym) = default_sym {
         sym
@@ -2005,9 +2195,10 @@ pub async fn get_log(
         .filter(|s| !s.is_empty());
 
     let ws_meta = ws.clone();
+    let git_cache_fp = state.git_cache.clone();
     let meta = tokio::task::spawn_blocking(move || {
         let dirs = resolve_git_dirs(&ws_meta)?;
-        let fp = compute_refs_fingerprint(&dirs);
+        let fp = git_cache_fp.get_or_compute_refs_fingerprint(&ws_meta, &dirs);
         let head_sha = read_head_state(&dirs).and_then(|(_, sha)| sha);
         Some((fp, head_sha))
     })
@@ -2266,17 +2457,10 @@ pub async fn get_commit_diff(
     let orig_args = ["show", orig_spec.as_str()];
     let mod_args = ["show", mod_spec.as_str()];
 
-    // Run parent blob, commit blob, and diff concurrently (1 wave instead of 4 sequential spawns).
-    let (orig_res, mod_res, diff_res) = tokio::join!(
+    // Run parent blob and commit blob concurrently.
+    let (orig_res, mod_res) = tokio::join!(
         run_git_bytes(&ws, &orig_args),
         run_git_bytes(&ws, &mod_args),
-        async {
-            if old_rel != rel {
-                run_git(&ws, &["diff", &parent_ref, hash, "--", &old_rel, &rel]).await
-            } else {
-                run_git(&ws, &["diff", &parent_ref, hash, "--", &rel]).await
-            }
-        },
     );
 
     let (ok_orig, orig_bytes, _) = orig_res.unwrap_or((false, Vec::new(), String::new()));
@@ -2293,17 +2477,6 @@ pub async fn get_commit_diff(
         }));
     }
 
-    let patch_out = match diff_res {
-        Ok((true, out, _)) => out,
-        _ => {
-            // Root commit (no `^1` parent): fall back to `git show --format=`.
-            run_git(&ws, &["show", "--format=", hash, "--", &rel])
-                .await
-                .map(|(_, o, _)| o)
-                .unwrap_or_default()
-        }
-    };
-
     Ok(Json(GitDiffRes {
         path: rel,
         staged: false,
@@ -2317,7 +2490,7 @@ pub async fn get_commit_diff(
         } else {
             String::new()
         },
-        patch: patch_out,
+        patch: String::new(),
         binary: false,
     }))
 }
@@ -2370,10 +2543,21 @@ pub async fn compare_diff(
         .map(|p| p.replace('\\', "/"))
         .unwrap_or_else(|| rel.clone());
 
-    let (ok_orig, orig_bytes, _) = run_git_bytes(&ws, &["show", &format!("{}:{}", base, old_rel)])
-        .await
-        .unwrap_or((false, Vec::new(), String::new()));
-    if ok_orig && is_binary_bytes(&orig_bytes) {
+    let orig_spec = format!("{}:{}", base, old_rel);
+    let safe_full = resolve_safe_path(&ws, &rel).ok();
+    let (orig_res, wt_bytes) = tokio::join!(
+        run_git_bytes(&ws, &["show", &orig_spec]),
+        async {
+            match safe_full {
+                Some(full) => tokio::fs::read(&full).await.ok(),
+                None => None,
+            }
+        },
+    );
+    let (ok_orig, orig_bytes, _) = orig_res.unwrap_or((false, Vec::new(), String::new()));
+    if (ok_orig && is_binary_bytes(&orig_bytes))
+        || wt_bytes.as_deref().map(is_binary_bytes).unwrap_or(false)
+    {
         return Ok(Json(GitDiffRes {
             path: rel,
             staged: false,
@@ -2384,29 +2568,9 @@ pub async fn compare_diff(
         }));
     }
 
-    let modified_text = match resolve_safe_path(&ws, &rel) {
-        Ok(full) => match tokio::fs::read(&full).await {
-            Ok(bytes) => {
-                if is_binary_bytes(&bytes) {
-                    return Ok(Json(GitDiffRes {
-                        path: rel,
-                        staged: false,
-                        original: String::new(),
-                        modified: String::new(),
-                        patch: String::new(),
-                        binary: true,
-                    }));
-                }
-                String::from_utf8_lossy(&bytes).to_string()
-            }
-            Err(_) => String::new(),
-        },
-        Err(_) => String::new(),
-    };
-
-    let (_, patch_out, _) = run_git(&ws, &["diff", base, "--", &rel])
-        .await
-        .unwrap_or((false, String::new(), String::new()));
+    let modified_text = wt_bytes
+        .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+        .unwrap_or_default();
 
     Ok(Json(GitDiffRes {
         path: rel,
@@ -2417,7 +2581,7 @@ pub async fn compare_diff(
             String::new()
         },
         modified: modified_text,
-        patch: patch_out,
+        patch: String::new(),
         binary: false,
     }))
 }

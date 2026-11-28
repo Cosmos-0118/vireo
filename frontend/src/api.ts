@@ -110,6 +110,26 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ path, content }),
     }),
+  createEntry: (path: string, isDir: boolean) =>
+    jsonFetch<{ ok: boolean; path: string }>('/api/files/create', {
+      method: 'POST',
+      body: JSON.stringify({ path, is_dir: isDir }),
+    }),
+  renameEntry: (from: string, to: string) =>
+    jsonFetch<{ ok: boolean; path: string }>('/api/files/rename', {
+      method: 'POST',
+      body: JSON.stringify({ from, to }),
+    }),
+  deleteEntry: (path: string) =>
+    jsonFetch<{ ok: boolean }>('/api/files/delete', {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    }),
+  osOpen: (path: string, mode: 'reveal' | 'open') =>
+    jsonFetch<{ ok: boolean }>('/api/files/os-open', {
+      method: 'POST',
+      body: JSON.stringify({ path, mode }),
+    }),
   searchFiles: (opts: SearchOptions, signal?: AbortSignal) =>
     jsonFetch<SearchRes>('/api/files/search', {
       method: 'POST',

@@ -164,12 +164,14 @@ pub async fn set_workspace(
     }
     crate::state::save_last_workspace(&cleaned_path);
     state.checkpoints.write().await.clear();
+    state.git_cache.invalidate_volatile();
     // Agent processes keep their working directory open; end them so the old folder is released.
     state.sessions.close_all().await;
     let _ = state.watcher_retarget_tx.send(cleaned_path.clone()).await;
     let _ = state.events_tx.send(WorkspaceEvent::WorkspaceSwitched {
         path: cleaned_str.clone(),
     });
+    crate::git::prewarm_workspace(state.clone());
 
     let name = cleaned_path
         .file_name()
@@ -210,10 +212,12 @@ pub async fn pick_workspace(
     }
     crate::state::save_last_workspace(&cleaned_path);
     state.checkpoints.write().await.clear();
+    state.git_cache.invalidate_volatile();
     let _ = state.watcher_retarget_tx.send(cleaned_path.clone()).await;
     let _ = state.events_tx.send(WorkspaceEvent::WorkspaceSwitched {
         path: cleaned_str.clone(),
     });
+    crate::git::prewarm_workspace(state.clone());
 
     let name = cleaned_path
         .file_name()
@@ -388,6 +392,186 @@ pub async fn write_file(
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     state.notify_fs_changed(vec![req.path.clone()]);
     Ok(Json(serde_json::json!({ "ok": true, "path": req.path })))
+}
+
+#[derive(Deserialize)]
+pub struct CreateEntryReq {
+    pub path: String,
+    #[serde(default)]
+    pub is_dir: bool,
+}
+
+#[derive(Deserialize)]
+pub struct RenameEntryReq {
+    pub from: String,
+    pub to: String,
+}
+
+#[derive(Deserialize)]
+pub struct PathReq {
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct OsOpenReq {
+    /// Workspace-relative path; empty means the workspace root.
+    pub path: String,
+    /// `reveal` selects the item in the OS file manager; `open` uses the default application.
+    pub mode: String,
+}
+
+fn fs_err(e: std::io::Error) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+}
+
+fn bad(msg: &str) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, msg.to_string())
+}
+
+/// Creates an empty file or a folder (with any missing parents); fails if it already exists.
+pub async fn create_entry(
+    State(state): State<AppState>,
+    Json(req): Json<CreateEntryReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let rel = req.path.trim().replace('\\', "/");
+    if rel.trim_matches('/').is_empty() {
+        return Err(bad("Name is required"));
+    }
+    let full = resolve_safe_path(&ws, &rel).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if full.exists() {
+        return Err((StatusCode::CONFLICT, format!("'{rel}' already exists")));
+    }
+    if req.is_dir {
+        tokio::fs::create_dir_all(&full).await.map_err(fs_err)?;
+    } else {
+        if let Some(parent) = full.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(fs_err)?;
+        }
+        tokio::fs::write(&full, b"").await.map_err(fs_err)?;
+    }
+    state.notify_fs_changed(vec![rel.clone()]);
+    Ok(Json(serde_json::json!({ "ok": true, "path": rel })))
+}
+
+/// Renames or moves a file or folder inside the workspace; never overwrites.
+pub async fn rename_entry(
+    State(state): State<AppState>,
+    Json(req): Json<RenameEntryReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let from_rel = req.from.trim().replace('\\', "/");
+    let to_rel = req.to.trim().replace('\\', "/");
+    if from_rel.trim_matches('/').is_empty() || to_rel.trim_matches('/').is_empty() {
+        return Err(bad("Name is required"));
+    }
+    let from = resolve_safe_path(&ws, &from_rel).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let to = resolve_safe_path(&ws, &to_rel).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if !from.exists() {
+        return Err((StatusCode::NOT_FOUND, format!("'{from_rel}' no longer exists")));
+    }
+    if from != to && to.exists() {
+        // Case-only renames on case-insensitive filesystems resolve to the same entry.
+        let same = from_rel.eq_ignore_ascii_case(&to_rel);
+        if !same {
+            return Err((StatusCode::CONFLICT, format!("'{to_rel}' already exists")));
+        }
+    }
+    if let Some(parent) = to.parent() {
+        tokio::fs::create_dir_all(parent).await.map_err(fs_err)?;
+    }
+    tokio::fs::rename(&from, &to).await.map_err(fs_err)?;
+    state.notify_fs_changed(vec![from_rel, to_rel.clone()]);
+    Ok(Json(serde_json::json!({ "ok": true, "path": to_rel })))
+}
+
+/// Permanently deletes a file or folder inside the workspace (never the workspace root).
+pub async fn delete_entry(
+    State(state): State<AppState>,
+    Json(req): Json<PathReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let rel = req.path.trim().replace('\\', "/");
+    if rel.trim_matches('/').is_empty() || rel == "." {
+        return Err(bad("Refusing to delete the workspace root"));
+    }
+    let full = resolve_safe_path(&ws, &rel).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    if full == ws {
+        return Err(bad("Refusing to delete the workspace root"));
+    }
+    let meta = tokio::fs::symlink_metadata(&full).await.map_err(fs_err)?;
+    if meta.is_dir() {
+        tokio::fs::remove_dir_all(&full).await.map_err(fs_err)?;
+    } else {
+        tokio::fs::remove_file(&full).await.map_err(fs_err)?;
+    }
+    state.notify_fs_changed(vec![rel.clone()]);
+    Ok(Json(serde_json::json!({ "ok": true, "path": rel })))
+}
+
+/// Reveals an item in the OS file manager, or opens it with the default application.
+pub async fn os_open(
+    State(state): State<AppState>,
+    Json(req): Json<OsOpenReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let ws = state.workspace_path().await;
+    let rel = req.path.trim().replace('\\', "/");
+    let full = if rel.trim_matches('/').is_empty() {
+        ws.clone()
+    } else {
+        resolve_safe_path(&ws, &rel).map_err(|e| (StatusCode::BAD_REQUEST, e))?
+    };
+    if !full.exists() {
+        return Err((StatusCode::NOT_FOUND, format!("'{rel}' no longer exists")));
+    }
+    let reveal = match req.mode.as_str() {
+        "reveal" => true,
+        "open" => false,
+        _ => return Err(bad("Unknown mode")),
+    };
+    let target = full.to_string_lossy().to_string();
+
+    #[cfg(windows)]
+    let mut cmd = {
+        // Strip the `\\?\` verbatim prefix; explorer and `start` don't understand it.
+        let target = target.trim_start_matches(r"\\?\").replace('/', "\\");
+        if reveal && full.is_file() {
+            let mut c = background_command("explorer");
+            c.raw_arg(format!("/select,\"{target}\""));
+            c
+        } else if reveal {
+            let mut c = background_command("explorer");
+            c.raw_arg(format!("\"{target}\""));
+            c
+        } else {
+            let mut c = background_command("cmd");
+            c.args(["/C", "start", ""]).raw_arg(format!("\"{target}\""));
+            c
+        }
+    };
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut c = background_command("open");
+        if reveal {
+            c.arg("-R");
+        }
+        c.arg(&target);
+        c
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut c = background_command("xdg-open");
+        let dir = if reveal && full.is_file() {
+            full.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or(target.clone())
+        } else {
+            target.clone()
+        };
+        c.arg(dir);
+        c
+    };
+
+    cmd.spawn().map_err(fs_err)?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 /// Largest pasted/dropped chat attachment accepted (bytes).

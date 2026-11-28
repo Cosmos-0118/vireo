@@ -499,6 +499,8 @@ async fn exec_tool(
 pub struct ModelsQuery {
     /// Ollama base URL as stored in the UI (with or without the trailing `/v1`).
     pub ollama_base: Option<String>,
+    /// When explicitly `false`, skip probing the local Ollama HTTP daemon.
+    pub probe_ollama: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -513,6 +515,7 @@ pub async fn list_models(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<ModelsQuery>,
 ) -> Json<Value> {
+    let should_probe = q.probe_ollama.unwrap_or(true);
     let base = q
         .ollama_base
         .as_deref()
@@ -521,8 +524,11 @@ pub async fn list_models(
         .unwrap_or_else(|| "http://127.0.0.1:11434".to_string());
 
     let probe = async {
+        if !should_probe {
+            return None;
+        }
         let resp = state
-            .http_client
+            .http_client()
             .get(format!("{base}/api/tags"))
             .timeout(Duration::from_millis(800))
             .send()
@@ -612,7 +618,7 @@ pub async fn list_api_models(
         _ => "https://api.openai.com/v1",
     };
     let base_checked = secure_base(base, default_base, !key.is_empty()).map_err(bad)?;
-    let client = state.http_client.clone();
+    let client = state.http_client().clone();
     let timeout = Duration::from_secs(8);
 
     let (builder, id_field) = match req.provider.as_str() {
@@ -911,7 +917,7 @@ async fn run_openai_loop(
         round += 1;
         total_rounds += 1;
 
-        let mut builder = state.http_client.post(&url).json(&json!({
+        let mut builder = state.http_client().post(&url).json(&json!({
             "model": req.model,
             "messages": messages,
             "tools": openai_tools_schema(),
@@ -1050,7 +1056,7 @@ async fn run_anthropic_loop(
         total_rounds += 1;
 
         let builder = state
-            .http_client
+            .http_client()
             .post(&url)
             .header("x-api-key", api_key.trim())
             .header("anthropic-version", "2023-06-01")
@@ -1190,7 +1196,7 @@ async fn run_gemini_loop(
         total_rounds += 1;
 
         let builder = state
-            .http_client
+            .http_client()
             .post(&url)
             .header("x-goog-api-key", api_key.trim())
             .json(&json!({

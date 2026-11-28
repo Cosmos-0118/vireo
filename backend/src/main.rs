@@ -49,7 +49,7 @@ fn embedded_body(data: std::borrow::Cow<'static, [u8]>) -> Body {
     }
 }
 
-async fn serve_embedded(uri: Uri) -> Response {
+async fn serve_embedded(State(state): State<AppState>, uri: Uri) -> Response {
     let raw_path = uri.path().trim_start_matches('/');
     let path = if raw_path.is_empty() {
         "index.html"
@@ -60,7 +60,8 @@ async fn serve_embedded(uri: Uri) -> Response {
     if path == "index.html" {
         if let Some(index) = FrontendAssets::get("index.html") {
             let html = String::from_utf8_lossy(&index.data);
-            let body = prefs::inject_into_html(&html);
+            let boot = prefs::build_bootstrap(&state).await;
+            let body = prefs::inject_into_html_with_bootstrap(&html, &boot);
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -90,7 +91,8 @@ async fn serve_embedded(uri: Uri) -> Response {
     // SPA fallback to index.html
     if let Some(index) = FrontendAssets::get("index.html") {
         let html = String::from_utf8_lossy(&index.data);
-        let body = prefs::inject_into_html(&html);
+        let boot = prefs::build_bootstrap(&state).await;
+        let body = prefs::inject_into_html_with_bootstrap(&html, &boot);
         return Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
@@ -309,13 +311,20 @@ fn parse_args() -> CliArgs {
 fn build_router(
     initial_workspace: PathBuf,
     main_window: Arc<OnceLock<tauri::WebviewWindow>>,
-) -> (Router, Arc<agent_session::SessionManager>) {
+) -> (Router, Arc<agent_session::SessionManager>, AppState) {
+    let git_cache = Arc::new(git::GitCache::default());
     let (events_tx, _) = tokio::sync::broadcast::channel(128);
-    let watcher_tx = watcher::spawn_watcher(initial_workspace.clone(), events_tx.clone());
+    let watcher_tx = watcher::spawn_watcher(
+        initial_workspace.clone(),
+        events_tx.clone(),
+        git_cache.clone(),
+    );
     let mut app_state = AppState::new(initial_workspace, watcher_tx);
     app_state.events_tx = events_tx;
     app_state.main_window = main_window;
+    app_state.git_cache = git_cache;
     let sessions = app_state.sessions.clone();
+    let state_out = app_state.clone();
 
     let router = Router::new()
         .route("/api/health", get(health))
@@ -333,6 +342,10 @@ fn build_router(
         .route("/api/files/read", get(files::read_file))
         .route("/api/files/raw", get(files::read_raw))
         .route("/api/files/write", post(files::write_file))
+        .route("/api/files/create", post(files::create_entry))
+        .route("/api/files/rename", post(files::rename_entry))
+        .route("/api/files/delete", post(files::delete_entry))
+        .route("/api/files/os-open", post(files::os_open))
         .route("/api/files/search", post(files::search_files))
         .route("/api/files/replace", post(files::replace_in_files))
         .route("/api/tasks", get(tasks::get_tasks))
@@ -407,8 +420,8 @@ fn build_router(
             app_state.clone(),
             require_workspace,
         ))
-        .with_state(app_state)
         .fallback(serve_embedded)
+        .with_state(app_state)
         .layer(
             CorsLayer::new()
                 // Only pages served from this machine (the app itself, or a local dev server) may
@@ -423,7 +436,7 @@ fn build_router(
                 .allow_methods(Any)
                 .allow_headers(Any),
         );
-    (router, sessions)
+    (router, sessions, state_out)
 }
 
 /// Routes that operate on the open folder are refused while no folder is open.
@@ -507,7 +520,7 @@ fn main() {
     });
     let cli = parse_args();
     let main_window: Arc<OnceLock<tauri::WebviewWindow>> = Arc::new(OnceLock::new());
-    let (app_router, sessions) = build_router(cli.workspace.clone(), main_window.clone());
+    let (app_router, sessions, app_state) = build_router(cli.workspace.clone(), main_window.clone());
 
     // A single-user local app: a handful of workers is plenty (blocking work has its own pool).
     let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 4);
@@ -516,6 +529,15 @@ fn main() {
         .enable_all()
         .build()
         .expect("Failed to initialize Tokio runtime");
+
+    if !cli.workspace.as_os_str().is_empty() {
+        let warm_state = app_state.clone();
+        let _guard = rt.enter();
+        git::prewarm_workspace(warm_state);
+        if !cli.server_only {
+            pty::prewarm_default_shell(cli.workspace.clone());
+        }
+    }
 
     // Desktop mode prefers a dedicated local port (4318, distinct from server-only/dev 4317)
     // so origin-scoped browser storage stays stable for single-window launches, falling back to

@@ -289,6 +289,7 @@ export function App() {
   const [terminalMaximized, setTerminalMaximized] = useState(false);
   const [launcherSignal, setLauncherSignal] = useState(0);
   const [newShellSignal, setNewShellSignal] = useState(0);
+  const [newShellCwd, setNewShellCwd] = useState('');
   const [panelPriority, setPanelPriority] = useState<PanelSide>('sidebar');
   const [workbenchSize, setWorkbenchSize] = useState({ w: 0, h: 0 });
   const workbenchRef = useRef<HTMLDivElement>(null);
@@ -1960,6 +1961,11 @@ export function App() {
     const i = list.findIndex((t) => t.id === activeTabIdRef.current);
     setActiveTabId(list[(i + dir + list.length) % list.length].id);
   };
+  const openTerminalAt = (cwd: string) => {
+    setNewShellCwd(cwd);
+    setShowTerminal(true);
+    setNewShellSignal((n) => n + 1);
+  };
   const showSidebarView = (tab: SidebarTab) => {
     setShowSidebar(true);
     setSidebarTab(tab);
@@ -1970,6 +1976,7 @@ export function App() {
     quickOpen: () => setQuickOpenVisible((v) => !v),
     openFolder: () => void handlePickWorkspace(),
     newTerminal: () => {
+      setNewShellCwd('');
       setShowTerminal(true);
       setNewShellSignal((n) => n + 1);
     },
@@ -2343,6 +2350,7 @@ export function App() {
                 fsVersion={fsVersion}
                 recentPaths={tabPulse}
                 onAskAgent={handleAskAgent}
+                onOpenTerminal={openTerminalAt}
                 onOpenShortcuts={openShortcutsTab}
                 onOpenRelease={openReleaseTab}
                 releaseActive={activeTab?.mode === 'release'}
@@ -2873,6 +2881,7 @@ export function App() {
                     onTaskTabsChange={handleTaskTabsChange}
                     launcherSignal={launcherSignal}
                     newShellSignal={newShellSignal}
+                    newShellCwd={newShellCwd}
                     maximized={terminalMaximized}
                     onToggleMaximize={() => setTerminalMaximized((v) => !v)}
                     onSendOutputToAgent={handleAskAgent}

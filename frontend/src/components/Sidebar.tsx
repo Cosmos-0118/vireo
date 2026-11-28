@@ -38,6 +38,8 @@ interface SidebarProps {
   onToast: (msg: string, isError?: boolean) => void;
   fsVersion: number;
   onAskAgent: (text: string) => void;
+  /** Open a new integrated terminal in a workspace-relative folder ('' = root). */
+  onOpenTerminal?: (cwd: string) => void;
   /** Open the Keyboard Shortcuts tab. */
   onOpenShortcuts: () => void;
   /** Open the Releases page (an editor tab, not a sidebar view). */
@@ -66,6 +68,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onToast,
   fsVersion,
   onAskAgent,
+  onOpenTerminal,
   onOpenShortcuts,
   onOpenRelease,
   releaseActive = false,
@@ -193,6 +196,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onOpenFile={(p) => onOpenFile(p)}
             onOpenDiff={onOpenDiff}
             onAskAgent={onAskAgent}
+            onOpenTerminal={onOpenTerminal}
             onRefreshGit={onRefreshGit}
             onToast={onToast}
           />
