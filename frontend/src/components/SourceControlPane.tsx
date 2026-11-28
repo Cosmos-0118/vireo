@@ -1347,6 +1347,14 @@ export const SourceControlPane: React.FC<SourceControlPaneProps> = ({
 
           {/* Resizable Split between CHANGES and GRAPH (VS Code Accordion style) */}
           <div ref={splitContainerRef} className="flex-1 flex flex-col min-h-0 overflow-hidden">
+            {/* Clean tree: keep the graph at its normal size, leaving the Changes area empty */}
+            {totalChanged === 0 && graphOpen && (
+              <div
+                aria-hidden
+                style={{ flex: `0 0 ${Math.round(changesRatio * 100)}%` }}
+                className="min-h-0"
+              />
+            )}
             {/* SECTION 1: CHANGES (omitted entirely when the tree is clean) */}
             {totalChanged > 0 && (
             <div
