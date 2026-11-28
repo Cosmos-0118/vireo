@@ -137,14 +137,28 @@ export function groupRefs(refs: GitRef[]): DisplayRef[] {
   });
 }
 
-const RefIcon: React.FC<{ kind: GitRef['kind']; size: number }> = ({ kind, size }) =>
-  kind === 'tag' ? (
-    <Tag size={size} className="shrink-0" />
-  ) : kind === 'remote' ? (
-    <Cloud size={size} className="shrink-0" />
-  ) : (
-    <GitBranch size={size} className="shrink-0" />
-  );
+const TAG_COLOR = '#d9a441';
+
+/** Neutral chip surface shared by every non-current ref: reads on dark and light themes alike. */
+const QUIET_BG = 'color-mix(in srgb, var(--text-primary) 7%, transparent)';
+const QUIET_RING = 'inset 0 0 0 1px color-mix(in srgb, var(--text-primary) 13%, transparent)';
+
+/** Icon tint: lane colour for branches, amber for tags, dim for remotes. */
+function iconColor(kind: GitRef['kind'], lane: string): string {
+  if (kind === 'tag') return TAG_COLOR;
+  if (kind === 'remote') return 'var(--text-dim)';
+  return lane;
+}
+
+const RefIcon: React.FC<{ kind: GitRef['kind']; size: number; color?: string; strokeWidth?: number }> = ({
+  kind,
+  size,
+  color,
+  strokeWidth = 2.25,
+}) => {
+  const Icon = kind === 'tag' ? Tag : kind === 'remote' ? Cloud : GitBranch;
+  return <Icon size={size} strokeWidth={strokeWidth} color={color} className="shrink-0" />;
+};
 
 function refTitle(d: DisplayRef): string {
   const label =
@@ -159,7 +173,11 @@ function refTitle(d: DisplayRef): string {
   return `${label}: ${d.ref.name}${sync}`;
 }
 
-/** A single ref label tinted with the lane colour (solid for the checked-out branch). */
+/**
+ * A single ref label. The checked-out branch is solid in its lane colour; every
+ * other ref is a quiet neutral chip (hairline ring, readable text) where only the
+ * icon carries colour, so a row of refs never turns into a rainbow.
+ */
 export const RefLabel: React.FC<{
   d: DisplayRef;
   color: string;
@@ -172,21 +190,32 @@ export const RefLabel: React.FC<{
   tooltip = true,
 }) => {
   const solid = d.ref.is_current;
+  const remote = d.ref.kind === 'remote';
   return (
     <span
       title={tooltip ? refTitle(d) : undefined}
-      className="inline-flex items-center gap-[3px] h-[18px] px-[6px] rounded-[5px] text-[10.5px] font-medium shrink-0 min-w-0"
+      className="inline-flex items-center gap-[4px] h-[18px] pl-[5px] pr-[6px] rounded-[5px] text-[11px] font-medium tracking-[0.005em] shrink-0 min-w-0"
       style={{
         maxWidth,
-        color: solid ? '#fff' : color,
-        background: solid ? color : `color-mix(in srgb, ${color} 14%, transparent)`,
-        boxShadow: solid ? undefined : `inset 0 0 0 1px color-mix(in srgb, ${color} 32%, transparent)`,
+        color: solid ? '#fff' : remote ? 'var(--text-muted)' : 'var(--text-primary)',
+        background: solid ? color : QUIET_BG,
+        fontWeight: solid ? 600 : 500,
+        boxShadow: solid
+          ? 'inset 0 1px 0 rgba(255,255,255,0.22), inset 0 0 0 1px rgba(0,0,0,0.12)'
+          : QUIET_RING,
       }}
     >
-      <RefIcon kind={d.ref.kind} size={10} />
+      <RefIcon kind={d.ref.kind} size={11} color={solid ? '#fff' : iconColor(d.ref.kind, color)} />
       {/* Explicit line box: `truncate` clips overflow, so leading-none would cut descenders (g, p, y). */}
       <span className="truncate leading-[16px]">{d.ref.name}</span>
-      {d.syncedWith.length > 0 && <Cloud size={10} className="shrink-0 opacity-80" />}
+      {d.syncedWith.length > 0 && (
+        <Cloud
+          size={11}
+          strokeWidth={2.25}
+          className="shrink-0"
+          color={solid ? 'rgba(255,255,255,0.75)' : 'var(--text-dim)'}
+        />
+      )}
     </span>
   );
 };
@@ -229,9 +258,10 @@ export const RefBadges: React.FC<{
         <span
           key={kind}
           title={tooltips ? list.map(refTitle).join('\n') : undefined}
-          className="inline-flex items-center gap-[2px] h-[18px] px-[5px] rounded-[5px] text-[10px] font-medium leading-none shrink-0 text-[var(--text-muted)] bg-[var(--bg-elevated)] shadow-[inset_0_0_0_1px_var(--border)]"
+          className="inline-flex items-center gap-[3px] h-[18px] px-[5px] rounded-[5px] text-[10.5px] font-medium leading-none shrink-0 text-[var(--text-muted)]"
+          style={{ background: QUIET_BG, boxShadow: QUIET_RING }}
         >
-          <RefIcon kind={kind} size={10} />
+          <RefIcon kind={kind} size={11} color={iconColor(kind, color)} />
           {list.length > 1 && <span className="tabular-nums">{list.length}</span>}
         </span>
       ))}
